@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>JD Samps</title>
+    <link rel="stylesheet" href="popup.css" />
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        <span class="dot"></span>
+        <div class="brand-text">
+          <h1>JD Samps</h1>
+          <span class="tag">made by godspee</span>
+        </div>
+      </div>
+      <div class="meta" id="engineMeta">—</div>
+    </header>
+
+    <section class="toolbar">
+      <button id="refreshBtn" class="ghost" title="Reload tab list">⟳ Tabs</button>
+      <button id="formatBtn" class="ghost" title="Toggle recording file format">WAV</button>
+      <button id="mixRecBtn" class="rec" title="Record a combined mix of all captured tabs">● Mix</button>
+      <button id="stopAllBtn" class="danger" title="Stop capturing everything">■ Stop all</button>
+    </section>
+
+    <section class="lists">
+      <h2 class="section-title">Capturing <span id="capCount" class="badge">0</span></h2>
+      <div id="captured" class="captured"></div>
+
+      <h2 class="section-title">Available tabs</h2>
+      <div id="available" class="available"></div>
+    </section>
+
+    <footer>
+      <span id="status">Ready.</span>
+    </footer>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

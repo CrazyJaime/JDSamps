@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "JD Samps",
+  "version": "1.0.0",
+  "description": "Capture audio from multiple Chrome tabs simultaneously, kept as separate streams for per-tab metering, recording and mixing. Made by godspee.",
+  "permissions": [
+    "tabCapture",
+    "offscreen",
+    "tabs",
+    "downloads",
+    "storage"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_title": "JD Samps"
+  },
+  "icons": {
+    "16": "icons/icon16.png",
+    "48": "icons/icon48.png",
+    "128": "icons/icon128.png"
+  }
+}
