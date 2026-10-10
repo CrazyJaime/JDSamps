@@ -69,10 +69,23 @@ async function run(browser, name, opts) {
   check(before > 20 && during < before * 0.3, 'real renderer skips the text being edited', { before, during });
   await page.keyboard.press('End');
   await page.keyboard.type('!');
-  await page.keyboard.press('Enter');
+  let expected = 'Hello from the beach!';
+  if (name === 'phone') {
+    // Touch: Return makes a new line (soft keyboards have no Shift+Return); Done finishes.
+    await page.keyboard.press('Enter');
+    await page.keyboard.type('Line 2');
+    const still = await page.evaluate(() => ({ editing: T.app.preview.editingTextId, done: !!document.querySelector('.pv-edit-done'), hint: document.querySelector('.pv-text-editor').getAttribute('enterkeyhint') }));
+    check(still.editing === 'cap-1' && still.done && still.hint === 'enter', 'phone: Return adds a line and a Done button is shown', still);
+    await page.tap('.pv-edit-done');
+    expected = 'Hello from the beach!\nLine 2';
+  } else {
+    await page.keyboard.press('Enter');
+  }
   await page.waitForTimeout(500);
   const after = await textPixels();
-  check((await page.evaluate(() => T.app.store.find('cap-1').obj.text)) === 'Hello from the beach!' && after > 20, 'commit updates the store and the text is drawn again', after);
+  const text = await page.evaluate(() => T.app.store.find('cap-1').obj.text);
+  check(text === expected && after > 20, 'commit updates the store and the text is drawn again', { text, after });
+  check(!(await page.evaluate(() => !!document.querySelector('.pv-edit-done:not(:disabled)'))), 'no Done button after editing');
 
   // play through the real player for a moment
   await page.click('.pv-play');

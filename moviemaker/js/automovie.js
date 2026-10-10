@@ -44,6 +44,8 @@ const STYLE_KEYS = ['font', 'size', 'bold', 'italic', 'color', 'outline', 'outli
 function isObj(v) { return v !== null && typeof v === 'object' && !Array.isArray(v); }
 function finite(v, def) { return typeof v === 'number' && Number.isFinite(v) ? v : def; }
 function round3(v) { return Math.round(v * 1000) / 1000; }
+/** Same rounding as reanchorTexts(), so texts placed at the end of the pictures stay put there. */
+function round6(v) { return Math.round(v * 1e6) / 1e6; }
 
 function catalogList(name) {
   const list = catalog[name];
@@ -351,7 +353,7 @@ export function autoMovieEdit(project, mediaMap, theme, opts = {}) {
       : (typeof model.DEFAULT_CREDITS_TEXT === 'string' ? model.DEFAULT_CREDITS_TEXT : FALLBACK_CREDITS_TEXT);
     const c = model.createTextItem('credits', {
       text,
-      start: round3(end),
+      start: round6(end),
       duration: creditsDuration,
       style: themedStyle('credits', theme.creditsStyle),
       effect: theme.creditsEffect,
@@ -377,7 +379,8 @@ export function autoMovieEdit(project, mediaMap, theme, opts = {}) {
 /**
  * Apply an AutoMovie theme to the store's project as ONE undo step.
  * opts: { label?, titleText?, creditsText?, minDuration? }
- * Returns the summary from autoMovieEdit, or { ok:false, reason:'empty' } for an empty project.
+ * Returns the summary from autoMovieEdit plus `changed` (false: the theme was already applied, so
+ * nothing was done and no undo step was added), or { ok:false, reason:'empty' } for an empty project.
  */
 export function applyAutoMovie(store, themeId, opts = {}) {
   if (!store || typeof store.update !== 'function' || !store.project) {
@@ -386,8 +389,36 @@ export function applyAutoMovie(store, themeId, opts = {}) {
   const theme = resolveTheme(themeId);
   const items = Array.isArray(store.project.items) ? store.project.items : [];
   if (!items.length) return { ok: false, reason: 'empty', theme: theme.id, themeName: theme.name };
+  // Dry run on a copy first: re-applying a theme that is already applied changes nothing, and an
+  // edit that changes nothing must not add an (empty) undo step.
+  const trial = cloneProject(store.project);
+  const preview = autoMovieEdit(trial, store.media, theme, opts);
+  if (sameProject(trial, store.project)) return { ...preview, changed: false };
   const label = typeof opts.label === 'string' && opts.label ? opts.label : `AutoMovie theme: ${theme.name}`;
-  return store.update((p) => autoMovieEdit(p, store.media, theme, opts), { label });
+  const res = store.update((p) => autoMovieEdit(p, store.media, theme, opts), { label });
+  return res && typeof res === 'object' ? { ...res, changed: true } : res;
+}
+
+function cloneProject(p) {
+  if (typeof structuredClone === 'function') {
+    try { return structuredClone(p); } catch (_) { /* fall back */ }
+  }
+  return JSON.parse(JSON.stringify(p));
+}
+
+/** Deep equality of two plain project values (key order ignored; the project's updatedAt ignored). */
+function sameProject(a, b) {
+  const eq = (x, y, top) => {
+    if (x === y) return true;
+    if (typeof x === 'number' && typeof y === 'number') return Number.isNaN(x) && Number.isNaN(y);
+    if (!x || !y || typeof x !== 'object' || typeof y !== 'object') return false;
+    if (Array.isArray(x) !== Array.isArray(y)) return false;
+    if (Array.isArray(x)) return x.length === y.length && x.every((v, i) => eq(v, y[i], false));
+    const kx = Object.keys(x).filter((k) => x[k] !== undefined && !(top && k === 'updatedAt'));
+    const ky = Object.keys(y).filter((k) => y[k] !== undefined && !(top && k === 'updatedAt'));
+    return kx.length === ky.length && kx.every((k) => Object.prototype.hasOwnProperty.call(y, k) && eq(x[k], y[k], false));
+  };
+  return eq(a, b, true);
 }
 
 export default applyAutoMovie;

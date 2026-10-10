@@ -12,7 +12,7 @@
 // and one scrolling row of 44px+ commands, galleries/menus open as bottom sheets.
 
 import {
-  h, on, clamp, rafThrottle, debounce, isPhone, watchLayout, prefersReducedMotion, clear,
+  h, on, clamp, rafThrottle, debounce, isPhone, watchLayout, prefersReducedMotion, clear, backGuard,
 } from './dom.js';
 import { icon } from './icons.js';
 import { TRANSITIONS, PANZOOM, EFFECTS, TEXT_EFFECTS, AUTOMOVIE_THEMES } from '../catalog.js';
@@ -31,17 +31,38 @@ const FALLBACK_PRESETS = [
   { id: 'email', name: 'For email', height: 240 },
 ];
 const PRESET_ICONS = {
-  recommended: 'save-movie', hd1080: 'aspect-wide', hd720: 'aspect-wide', wide480: 'film', mobile: 'aspect-portrait', email: 'share',
+  recommended: 'save-movie', hd1080: 'aspect-wide', hd720: 'aspect-wide', wide480: 'film', mobile: 'phone-landscape', email: 'email',
 };
 let exportPresets = FALLBACK_PRESETS;
+let exportSizeFn = null;      // exporter.exportSize(presetId, project, media) → { width, height }
+let videoBitrateFn = null;    // exporter.videoBitrate(width, height, fps) → bits per second
 let presetsPromise = null;
 function loadPresets() {
   if (!presetsPromise) {
     presetsPromise = import('../exporter.js').then((m) => {
       if (m && Array.isArray(m.EXPORT_PRESETS) && m.EXPORT_PRESETS.length) exportPresets = m.EXPORT_PRESETS;
+      if (m && typeof m.exportSize === 'function') exportSizeFn = m.exportSize;
+      if (m && typeof m.videoBitrate === 'function') videoBitrateFn = m.videoBitrate;
     }).catch((err) => { console.warn('[ribbon] export presets unavailable, using defaults:', err && err.message); });
   }
   return presetsPromise;
+}
+
+/** "854 × 480 · about 11 MB per minute" for a preset, from the size the export will really use. */
+function presetDesc(p, store) {
+  let size = null;
+  if (exportSizeFn && store) {
+    try { size = exportSizeFn(p.id, store.project, store.media); } catch (_) { size = null; }
+  }
+  if (!size || !(size.width > 0) || !(size.height > 0)) return p.height ? `${p.height}p` : '';
+  let desc = `${size.width} × ${size.height}`;
+  if (videoBitrateFn) {
+    try {
+      const mb = ((videoBitrateFn(size.width, size.height, 30) + 128000) * 60) / 8 / 1e6;
+      if (Number.isFinite(mb) && mb > 0) desc += ` · about ${mb < 1 ? '1' : Math.round(mb)} MB per minute`;
+    } catch (_) { /* size only */ }
+  }
+  return desc;
 }
 
 let renderThumbFn = null;
@@ -246,6 +267,152 @@ class ThumbAnimator {
 }
 
 // ---------------------------------------------------------------------------
+// Live preview (WLMM): resting the mouse on a transition / pan & zoom / effect / text effect
+// thumbnail plays that look on the selected item in the preview monitor. It goes through
+// player.setPreviewOverride({ itemIds, patch } | null) — a temporary render-only patch (no store
+// change, no undo step); without that player API nothing happens (the thumbnail still animates).
+
+const LIVE_KINDS = new Set(['transition', 'panzoom', 'effect', 'text']);
+const LIVE_DWELL_MS = 250;
+const LIVE_LEAVE_MS = 140;     // moving to the next tile keeps the loop running
+const LIVE_LOOP_MAX = 6;       // seconds of a long clip that loop while hovering
+
+class LivePreview {
+  constructor(ribbon) {
+    this.ribbon = ribbon;
+    this.timer = 0;
+    this.leaveTimer = 0;
+    this.active = null;   // { time, wasPlaying, loop, startedPlay }
+    this.key = '';
+  }
+
+  get player() { return this.ribbon.app && this.ribbon.app.player; }
+
+  supported() {
+    const p = this.player;
+    return !!(p && typeof p.setPreviewOverride === 'function');
+  }
+
+  hover(kind, entry) {
+    clearTimeout(this.timer);
+    clearTimeout(this.leaveTimer);
+    if (!LIVE_KINDS.has(kind) || !entry || !this.supported()) return;
+    this.timer = setTimeout(() => { this.timer = 0; this._start(kind, entry); }, this.active ? 60 : LIVE_DWELL_MS);
+  }
+
+  leave() {
+    clearTimeout(this.timer);
+    this.timer = 0;
+    if (!this.active) return;
+    clearTimeout(this.leaveTimer);
+    this.leaveTimer = setTimeout(() => this.stop(), LIVE_LEAVE_MS);
+  }
+
+  /** Stop right away and put the player back (time, paused state, loop). */
+  stop() {
+    clearTimeout(this.timer);
+    clearTimeout(this.leaveTimer);
+    this.timer = 0;
+    this.leaveTimer = 0;
+    const a = this.active;
+    if (!a) return;
+    this.active = null;
+    this.key = '';
+    const p = this.player;
+    if (!p) return;
+    try { p.setPreviewOverride(null); } catch (_) { /* ignore */ }
+    if (a.startedPlay) {
+      try { p.pause(); } catch (_) { /* ignore */ }
+      try { p.loopRange = a.loop; } catch (_) { /* ignore */ }
+      try { const r = p.seek(a.time); if (r && r.catch) r.catch(() => {}); } catch (_) { /* ignore */ }
+    }
+  }
+
+  /** The selected items this gallery applies to, the render patch and the time range to loop. */
+  _target(kind, entry) {
+    const store = this.ribbon.app.store;
+    if (!store) return null;
+    const sel = store.selection || { type: null, ids: [] };
+    if (!sel.ids || !sel.ids.length) return null;
+    let objs = [];
+    try { objs = typeof store.selectedItems === 'function' ? store.selectedItems() || [] : []; } catch (_) { objs = []; }
+    if (!objs.length) return null;
+    let tl = null;
+    try { tl = store.timeline; } catch (_) { tl = null; }
+    if (!tl) return null;
+    const first = objs[0];
+    let patch = null, ids = sel.ids.slice(), entryRange = null, lead = 0;
+    if (kind === 'text') {
+      if (sel.type === 'text') { patch = { effect: entry.id }; } else if (sel.type === 'item' && first.kind === 'title') {
+        patch = { textEffect: entry.id };
+        ids = objs.filter((o) => o.kind === 'title').map((o) => o.id);
+      } else return null;
+    } else {
+      if (sel.type !== 'item') return null;
+      if (kind === 'transition') {
+        const d = first.transition && first.transition.duration > 0 ? first.transition.duration : DEFAULT_TRANSITION_DURATION;
+        patch = { transition: { type: entry.id, duration: d } };
+        lead = Math.max(1, d);
+      } else if (kind === 'panzoom') {
+        ids = objs.filter((o) => o.kind === 'image').map((o) => o.id);
+        if (!ids.length) return null;
+        patch = { panZoom: entry.id };
+      } else {
+        patch = { effect: entry.id };
+      }
+    }
+    const id0 = ids[0];
+    // The loop: the item (up to LIVE_LOOP_MAX), with `lead` seconds before it for transitions.
+    // Computed on the timeline the player shows, i.e. with the patch applied (a transition
+    // patch moves the item).
+    const rangeOf = (timeline, patched = false) => {
+      if (!timeline) return null;
+      if (sel.type === 'text') entryRange = (timeline.texts || []).find((x) => x.item && x.item.id === id0);
+      else entryRange = (timeline.segments || []).find((x) => x.item && x.item.id === id0);
+      if (!entryRange || !(entryRange.end > entryRange.start)) return null;
+      // On the patched timeline the item starts where its transition starts: show 1s before it.
+      // On the store's timeline the transition would start up to `lead` earlier.
+      const start = Math.max(0, entryRange.start - (lead ? (patched ? 1 : lead) : 0));
+      const end = Math.min(entryRange.end, entryRange.start + LIVE_LOOP_MAX) + (lead ? 0.25 : 0);
+      return { start, end: Math.max(start + 0.5, end) };
+    };
+    const range = rangeOf(tl);
+    if (!range) return null;
+    return { ids, patch, range, rangeOf };
+  }
+
+  _start(kind, entry) {
+    const p = this.player;
+    if (!p || typeof p.setPreviewOverride !== 'function') return;
+    const t = this._target(kind, entry);
+    if (!t) return;
+    const key = `${kind}:${entry.id}`;
+    if (key === this.key && this.active) return;
+    if (!this.active) {
+      let loop = null;
+      try { loop = p.loopRange; } catch (_) { loop = null; }
+      this.active = { time: num(p.currentTime, 0), wasPlaying: !!p.playing, loop, startedPlay: false };
+    }
+    this.key = key;
+    try { p.setPreviewOverride({ itemIds: t.ids, patch: t.patch }); } catch (err) { console.warn('[ribbon] live preview failed', err); this.stop(); return; }
+    if (this.active.wasPlaying) return; // already playing: the look just changes
+    let shown = null;
+    try { shown = p.timeline ? t.rangeOf(p.timeline, true) : null; } catch (_) { shown = null; }
+    if (shown) t.range = shown;
+    try { p.loopRange = t.range; } catch (_) { /* ignore */ }
+    if (!this.active.startedPlay) {
+      this.active.startedPlay = true;
+      Promise.resolve()
+        .then(() => p.seek(t.range.start))
+        .then(() => { if (this.active && this.active.startedPlay && !p.playing) return p.play(); return undefined; })
+        .catch(() => { /* no playback (e.g. audio blocked): the paused frame still shows the look */ });
+    } else {
+      try { const r = p.seek(t.range.start); if (r && r.catch) r.catch(() => {}); } catch (_) { /* ignore */ }
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Popups: desktop dropdowns and phone bottom sheets
 
 class Popups {
@@ -292,7 +459,10 @@ class Popups {
     }
     this.layer.appendChild(root);
     const toggle = opts.toggle || anchor || null;
-    this.cur = { anchor, toggle, root, panel, sheet, onClose: opts.onClose };
+    const cur = { anchor, toggle, root, panel, sheet, onClose: opts.onClose, release: null };
+    this.cur = cur;
+    // Android Back / iOS swipe-back closes the sheet or dropdown instead of leaving the app.
+    cur.release = backGuard(this.ribbon && this.ribbon.app, () => { if (this.cur === cur) this.close({ fromBack: true }); });
     if (toggle && toggle.setAttribute) toggle.setAttribute('aria-expanded', 'true');
     if (!sheet) this._position(anchor, panel, opts);
     document.addEventListener('pointerdown', this._onDown, true);
@@ -388,10 +558,11 @@ class Popups {
     return false;
   }
 
-  close() {
+  close({ fromBack = false } = {}) {
     const c = this.cur;
     if (!c) return;
     this.cur = null;
+    if (c.release && !fromBack) c.release();
     document.removeEventListener('pointerdown', this._onDown, true);
     document.removeEventListener('keydown', this._onKey, true);
     window.removeEventListener('resize', this._onResize);
@@ -452,11 +623,13 @@ export class Ribbon {
       ? new IntersectionObserver((entries) => this._onVisible(entries), { root: null, rootMargin: '40px' })
       : null;
     this.animator = new ThumbAnimator();
+    this.live = new LivePreview(this);
     this._galleryLoaded = false;
     this._pendingDraw = new Set();
     this.popups = new Popups(this);
     this.refresh = this.refresh.bind(this);
     this.scheduleRefresh = rafThrottle(() => { if (!this._destroyed) this.refresh(); });
+    this._clipSoon = rafThrottle(() => { if (!this._destroyed) this._updateClip(); });
     this._layoutSoon = debounce(() => this._layoutPanel(), 80);
 
     this._build();
@@ -501,6 +674,7 @@ export class Ribbon {
     if (prev !== id) {
       this.popups.close();
       this.animator.stop();
+      this.live.stop();
       const p = this._panels.get(id);
       if (p && p.el) p.el.scrollLeft = 0;
     }
@@ -511,6 +685,21 @@ export class Ribbon {
       if (isPhone() && typeof tabBtn.scrollIntoView === 'function') {
         try { tabBtn.scrollIntoView({ block: 'nearest', inline: 'nearest', behavior: prefersReducedMotion() ? 'auto' : 'smooth' }); } catch (_) { /* old Safari */ }
       }
+    }
+    this._clipSoon();
+  }
+
+  /** Phones: fade the edge of the tab strip / command row that scrolls further. */
+  _updateClip() {
+    const phone = isPhone();
+    const p = this._panels.get(this._active);
+    for (const el of [this.tabsEl, p && p.el]) {
+      if (!el) continue;
+      const max = el.scrollWidth - el.clientWidth;
+      const left = phone && max > 1 && el.scrollLeft > 1;
+      const right = phone && max > 1 && el.scrollLeft < max - 1;
+      if (el.classList.contains('is-clip-left') !== left) el.classList.toggle('is-clip-left', left);
+      if (el.classList.contains('is-clip-right') !== right) el.classList.toggle('is-clip-right', right);
     }
   }
 
@@ -525,6 +714,7 @@ export class Ribbon {
       try { u(c); } catch (err) { console.error('[ribbon] update failed:', err); }
     }
     this._updateStatusText();
+    this._clipSoon();
   }
 
   destroy() {
@@ -532,7 +722,9 @@ export class Ribbon {
     this._offs.forEach((f) => f());
     this._offs = [];
     this.scheduleRefresh.cancel();
+    this._clipSoon.cancel();
     this.animator.stop();
+    this.live.stop();
     this.popups.destroy();
     if (this._io) this._io.disconnect();
     clear(this.root);
@@ -731,7 +923,9 @@ export class Ribbon {
     const { store, player } = this.app;
     if (store && typeof store.addEventListener === 'function') {
       for (const type of ['change', 'selection', 'view', 'media']) this._offs.push(on(store, type, this.scheduleRefresh));
+      this._offs.push(on(store, 'selection', () => this.live.stop()));
     }
+    this._offs.push(on(window, 'blur', () => this.live.stop()));
     if (player && typeof player.addEventListener === 'function') {
       this._offs.push(on(player, 'play', this.scheduleRefresh));
       this._offs.push(on(player, 'pause', this.scheduleRefresh));
@@ -739,6 +933,9 @@ export class Ribbon {
       this._offs.push(on(player, 'durationchange', this.scheduleRefresh));
       const statusTick = rafThrottle(() => this._updateStatusText());
       this._offs.push(on(player, 'timeupdate', statusTick));
+      // Snapshot (and other playhead-dependent commands) are enabled by what is under the playhead:
+      // keep their state current while scrubbing or stepping when paused (refresh is rAF-throttled).
+      this._offs.push(on(player, 'timeupdate', () => { if (!player.playing) this.scheduleRefresh(); }));
     }
     this._offs.push(watchLayout(() => {
       this.popups.close();
@@ -747,7 +944,9 @@ export class Ribbon {
       this._layoutPanel();
       this.refresh();
     }));
-    const onResize = () => { this._layoutSoon(); this._positionTitle(); };
+    const onResize = () => { this._layoutSoon(); this._positionTitle(); this._clipSoon(); };
+    if (this.tabsEl) this._offs.push(on(this.tabsEl, 'scroll', this._clipSoon, { passive: true }));
+    for (const rec of this._panels.values()) this._offs.push(on(rec.el, 'scroll', this._clipSoon, { passive: true }));
     this._offs.push(on(window, 'resize', onResize));
     const fsChange = () => this.scheduleRefresh();
     this._offs.push(on(document, 'fullscreenchange', fsChange));
@@ -876,9 +1075,35 @@ export class Ribbon {
       best.setCols(best.cols - 1, true);
       over -= TILE_STEP_X;
     }
+    if (over <= 0 && p.galleries.length) this._growGalleries(p);
     if (panel.scrollWidth > panel.clientWidth + 1) panel.classList.add('is-condensed');
     if (panel.scrollWidth > panel.clientWidth + 1) panel.classList.add('is-scroll');
     for (const g of p.galleries) g.setCols(g.cols, false);
+  }
+
+  /** Wide windows: galleries show more thumbnails per row while the groups still fit (WLMM). */
+  _growGalleries(p) {
+    const panel = p.el;
+    const free = () => {
+      const pr = panel.getBoundingClientRect();
+      const cs = getComputedStyle(panel);
+      let right = pr.left;
+      for (const g of panel.children) { const r = g.getBoundingClientRect(); if (r.width) right = Math.max(right, r.right); }
+      return pr.right - (parseFloat(cs.paddingRight) || 0) - right;
+    };
+    let room = free();
+    let guard = 96;
+    while (room >= TILE_STEP_X && guard-- > 0) {
+      let best = null;
+      for (const g of p.galleries) {
+        if (g.cols >= g.maxCols) continue;
+        if (!best || g.maxCols - g.cols > best.maxCols - best.cols) best = g;
+      }
+      if (!best) break;
+      best.setCols(best.cols + 1, true);
+      room = free();
+      if (room < 0) { best.setCols(best.cols - 1, true); break; }
+    }
   }
 
   // ---------------------------------------------------------------- control factory
@@ -1011,17 +1236,17 @@ export class Ribbon {
 
   _split(spec) {
     const size = spec.size || 'large';
-    const main = h('button.rb-btn.rb-split-main', {
-      type: 'button', title: this._tooltip(spec), 'aria-label': spec.label,
+    const main = h(`button.rb-btn.rb-split-main${size === 'small' ? '.rb-small' : ''}`, {
+      type: 'button', title: this._tooltip(spec), 'aria-label': spec.label, dataset: { cmd: spec.cmd || '' },
       onclick: () => this._run(spec.cmd, spec.arg),
     }, icon(spec.icon, size === 'large' ? 32 : 16), size === 'large' ? h('span.rb-label.rb-label-phone', null, spec.phoneLabel || spec.label) : h('span.rb-label', null, spec.label));
-    const menuBtn = h('button.rb-btn.rb-split-menu', {
+    const menuBtn = h(`button.rb-btn.rb-split-menu${size === 'small' ? '.rb-small' : ''}`, {
       type: 'button', title: `${spec.label} options`, 'aria-label': `${spec.label} options`, 'aria-haspopup': 'menu', 'aria-expanded': 'false',
       onclick: () => {
         const run = () => this._openMenu(menuBtn, spec.label, spec.items, { large: size === 'large', minWidth: 260 });
         if (spec.beforeMenu) Promise.resolve(spec.beforeMenu()).then(run, run); else run();
       },
-    }, size === 'large' ? h('span.rb-label', null, spec.label, ' ', this._caret()) : this._caret());
+    }, size === 'large' ? this._caretLabel(spec.label) : this._caret());
     const el = h(`div.rb-split.rb-${size}-split`, { role: 'group', 'aria-label': spec.label }, main, menuBtn);
     const update = (c) => {
       const mainOn = this._enabled(spec.cmd);
@@ -1041,12 +1266,22 @@ export class Ribbon {
     return svg;
   }
 
+  /** Label of a large dropdown: the caret always stays on the line of the last word
+   *  ("Thumbnail / size ▾", "Preview / size ▾"), never alone on a line. */
+  _caretLabel(label) {
+    const text = String(label || '');
+    const i = text.lastIndexOf(' ');
+    const head = i > 0 ? text.slice(0, i + 1) : '';
+    const tail = i > 0 ? text.slice(i + 1) : text;
+    return h('span.rb-label', null, head, h('span.rb-nowrap', null, tail, '\u00a0', this._caret()));
+  }
+
   _menuButton(spec) {
     const size = spec.size || 'large';
     const el = h(`button.rb-btn.rb-${size}`, {
       type: 'button', title: this._tooltip(spec), 'aria-label': spec.label, 'aria-haspopup': 'menu', 'aria-expanded': 'false',
       onclick: () => this._openMenu(el, spec.label, spec.items, { minWidth: 180 }),
-    }, icon(spec.icon, size === 'large' ? 32 : 16), h('span.rb-label', null, spec.label, ' ', this._caret()));
+    }, icon(spec.icon, size === 'large' ? 32 : 16), this._caretLabel(spec.label));
     const update = (c) => {
       const items = typeof spec.items === 'function' ? spec.items() : spec.items;
       el.disabled = typeof spec.enabled === 'function' ? !spec.enabled(c)
@@ -1176,7 +1411,7 @@ export class Ribbon {
           const cur = spec.get ? spec.get(c) : NaN;
           this._openMenu(btn, spec.label, spec.presets.map((v) => ({
             label: spec.presetLabel ? spec.presetLabel(v) : `${fmtSeconds(v)} s`,
-            run: () => this._run(this._cmdOf(spec, this._context()), v),
+            run: () => send(v, this._context()),
             checked: () => Number.isFinite(cur) && Math.abs(cur - v) < 0.005,
           })), { minWidth: 120 });
         },
@@ -1210,7 +1445,11 @@ export class Ribbon {
       }
       const clamped = clamp(v, spec.min != null ? spec.min : 0, spec.max != null ? spec.max : 36000);
       if (Number.isFinite(cur) && Math.abs(cur - clamped) < 0.0005) { show(cur); return; }
-      this._run(this._cmdOf(spec, c), clamped);
+      send(clamped, c);
+    };
+    const send = (v, c) => {
+      if (typeof spec.apply === 'function') { try { spec.apply(v, c); } catch (err) { this._fail(err); } this.scheduleRefresh(); return; }
+      this._run(this._cmdOf(spec, c), v);
     };
     let skipBlurCommit = false;
     input.addEventListener('focus', () => { editing = true; try { input.select(); } catch (_) { /* ignore */ } });
@@ -1230,7 +1469,7 @@ export class Ribbon {
         const base = Number.isFinite(parseSeconds(input.value)) ? parseSeconds(input.value) : (current() || 0);
         const next = clamp(Math.round((base + (e.key === 'ArrowUp' ? step : -step)) / step) * step, spec.min != null ? spec.min : 0, spec.max != null ? spec.max : 36000);
         show(next);
-        this._run(this._cmdOf(spec, lastC || this._context()), next);
+        send(next, lastC || this._context());
       }
     });
     const update = (c) => {
@@ -1313,11 +1552,16 @@ export class Ribbon {
     canvas._thumb = { kind, entry, drawn: false };
     el.addEventListener('click', () => {
       this.animator.stop(canvas);
+      this.live.stop();
       if (onPick) onPick(entry);
       this._run(cmd, entry.id);
     });
-    el.addEventListener('pointerenter', (e) => { if (e.pointerType === 'mouse' && !el.disabled) this.animator.start(canvas, kind, entry); });
-    el.addEventListener('pointerleave', () => this.animator.stop(canvas));
+    el.addEventListener('pointerenter', (e) => {
+      if (e.pointerType !== 'mouse' || el.disabled) return;
+      this.animator.start(canvas, kind, entry);
+      this.live.hover(kind, entry);
+    });
+    el.addEventListener('pointerleave', () => { this.animator.stop(canvas); this.live.leave(); });
     el.addEventListener('pointerdown', (e) => { if (e.pointerType !== 'mouse' && !el.disabled) this.animator.start(canvas, kind, entry); });
     el.addEventListener('pointerup', (e) => { if (e.pointerType !== 'mouse') this.animator.stop(canvas); });
     el.addEventListener('pointercancel', () => this.animator.stop(canvas));
@@ -1365,7 +1609,7 @@ export class Ribbon {
     for (const t of tiles) items.appendChild(t.el);
     const view = h('div.rb-gal-view', null, items);
     let rowIdx = 0;
-    const g = { prefCols: spec.cols || 6, minCols: spec.minCols || 3, cols: spec.cols || 6, setCols: null };
+    const g = { prefCols: spec.cols || 6, minCols: spec.minCols || 3, maxCols: tiles.length, cols: spec.cols || 6, setCols: null };
     const perRow = () => Math.max(1, g.cols);
     const rows = () => Math.max(1, Math.ceil(tiles.length / perRow()));
     const up = h('button', { type: 'button', title: 'Previous row', 'aria-label': `Previous row of ${spec.label}`, onclick: () => page(-1) }, icon('chevron-up', 11));
@@ -1470,9 +1714,10 @@ export class Ribbon {
     const cols = Math.min(8, Math.max(4, Math.ceil(Math.sqrt(list.length * 1.6))));
     this.popups.open(phone ? null : anchor, content, {
       sheet: phone, title: spec.label, className: 'rb-popup-gallery', align: 'cover',
-      width: cols * 78 + 26, focus: true, toggle: toggleEl,
+      width: cols * 84 + 26, focus: true, toggle: toggleEl,
       onClose: () => {
         this.animator.stop();
+        this.live.stop();
         // These tiles are gone: stop observing / queueing them.
         for (const t of created) {
           if (this._io) this._io.unobserve(t.canvas);
@@ -1502,8 +1747,9 @@ export class Ribbon {
     const save = mk('saveProject', 'Save project', 'save', 'Save project (Ctrl+S)', 'qat-desktop');
     const undo = mk('undo', 'Undo', 'undo', 'Undo (Ctrl+Z)');
     const redo = mk('redo', 'Redo', 'redo', 'Redo (Ctrl+Y)');
-    const movie = mk('saveMovie', 'Save', 'save-movie', 'Save movie', 'qat-phone qat-save-movie');
-    movie.setAttribute('aria-label', 'Save movie');
+    // Phones: "Save movie" (WLMM's name for exporting) — "Save" alone reads like saving the
+    // project, which happens automatically.
+    const movie = mk('saveMovie', 'Save movie', 'save-movie', 'Save movie: make a video file of your project', 'qat-phone qat-save-movie');
     qat.append(save, undo, redo, movie);
     this._globalUpdaters.push((c) => {
       const store = c.store;
@@ -1602,6 +1848,9 @@ export class Ribbon {
   _setPreviewSize(v) {
     if (this._cmds && this._enabled('setPreviewSize')) this._run('setPreviewSize', v);
     else if (this.app.store && typeof this.app.store.setView === 'function') this.app.store.setView({ previewSize: v });
+    // The View preset replaces a split the user dragged (also when the preset is already active).
+    const pv = this.app.preview;
+    if (pv && typeof pv.setSplitRatio === 'function') { try { pv.setSplitRatio(null); } catch (_) { /* ignore */ } }
   }
 
   _updateStatusText() {
@@ -1620,8 +1869,16 @@ export class Ribbon {
       kind = 1; total = p.texts.length;
       for (let i = 0; i < total; i++) if (p.texts[i].id === first) { idx = i; break; }
     } else if (sel.type === 'music' && first) {
-      kind = 2; total = p.music.length;
-      for (let i = 0; i < total; i++) if (p.music[i].id === first) { idx = i; break; }
+      // "Music 1 of 2" / "Narration 1 of 1": counted among the items of the same kind.
+      let k = -1;
+      for (let i = 0; i < p.music.length; i++) if (p.music[i].id === first) { k = i; break; }
+      const narr = k >= 0 && p.music[k].kind === 'narration';
+      kind = narr ? 4 : 2;
+      for (let i = 0; i < p.music.length; i++) {
+        if ((p.music[i].kind === 'narration') !== narr) continue;
+        if (i === k) idx = total;
+        total++;
+      }
     } else if (p.items.length) {
       kind = 3; total = p.items.length;
       if (sel.type === 'item' && first) {
@@ -1643,15 +1900,51 @@ export class Ribbon {
     st.kind = kind; st.idx = idx; st.total = total; st.multi = multi;
     let text = '';
     if (kind === 1 && idx >= 0) text = `Text ${idx + 1} of ${total}`;
-    else if (kind === 2 && idx >= 0) text = `Audio ${idx + 1} of ${total}`;
+    else if (kind === 2 && idx >= 0) text = `Music ${idx + 1} of ${total}`;
+    else if (kind === 4 && idx >= 0) text = `Narration ${idx + 1} of ${total}`;
     else if (kind === 3) text = `Item ${Math.max(0, idx) + 1} of ${total}${multi ? ` (${multi} selected)` : ''}`;
     if (el.textContent !== text) el.textContent = text;
     this._statusOwnText = text;
   }
 
+  /**
+   * Music Tools › Start point / End point typed in: musicSetStartPoint / musicSetEndPoint with the
+   * point in seconds into the song. A commands.js that predates the seconds argument would apply
+   * the playhead position instead; that step is recognised (value = playhead point ≠ typed value)
+   * and undone, so typing a value never trims the song somewhere else.
+   */
+  _setMusicPoint(which, secs, c) {
+    const store = c && c.store;
+    const music = c && c.music;
+    if (!store || !music) return;
+    const key = which === 'start' ? 'trimStart' : 'trimEnd';
+    const cmd = which === 'start' ? 'musicSetStartPoint' : 'musicSetEndPoint';
+    const id = music.id;
+    const before = music[key];
+    let atPlayhead = NaN;
+    try {
+      const e = (store.timeline.music || []).find((x) => x.item && x.item.id === id);
+      const player = this.app.player;
+      if (e && player) atPlayhead = num(music.trimStart, 0) + (num(player.currentTime, 0) - e.start);
+    } catch (_) { atPlayhead = NaN; }
+    const verify = () => {
+      const f = typeof store.find === 'function' ? store.find(id) : null;
+      const now = f && f.obj ? f.obj[key] : undefined;
+      if (now == null || now === before || !Number.isFinite(+now)) return;
+      if (Math.abs(now - secs) > 0.011 && Number.isFinite(atPlayhead) && Math.abs(now - atPlayhead) < 0.002) {
+        try { if (store.canUndo) store.undo(); } catch (_) { /* ignore */ }
+        this._toast('Move the playhead to the new point and use Set start point or Set end point.', 'info');
+      }
+    };
+    const r = this._run(cmd, secs);
+    if (r && typeof r.then === 'function') r.then(verify, () => {}); else verify();
+  }
+
   // ---------------------------------------------------------------- full screen preview
 
   _isFullscreen() {
+    const pv = this.app.preview;
+    if (pv && typeof pv.isFullscreen === 'function') { try { return !!pv.isFullscreen(); } catch (_) { /* fall through */ } }
     const d = document;
     const fs = d.fullscreenElement || d.webkitFullscreenElement;
     return !!fs || (this.appEl && this.appEl.classList.contains('is-pseudo-fullscreen'));
@@ -1662,6 +1955,13 @@ export class Ribbon {
     try {
       if (c && typeof c.list === 'function' && c.list().includes('fullscreen')) { this._run('fullscreen'); return; }
     } catch (_) { /* use the built-in implementation */ }
+    // The preview owns full screen (pseudo full screen fallback, Back to exit, auto-hiding transport).
+    const pv = this.app.preview;
+    if (pv && typeof pv.toggleFullscreen === 'function') {
+      try { pv.toggleFullscreen(); } catch (err) { this._fail(err); }
+      this.scheduleRefresh();
+      return;
+    }
     const d = document;
     const fsEl = d.fullscreenElement || d.webkitFullscreenElement;
     if (fsEl) {
@@ -1712,10 +2012,19 @@ export class Ribbon {
     const saveMovieItems = () => {
       const list = exportPresets.map((p) => ({
         cmd: 'saveMovie', arg: p.id, label: p.name,
-        desc: p.height ? `${p.height}p${p.id === 'recommended' ? ' • best for most people' : ''}` : '',
+        desc: presetDesc(p, self.app.store),
         icon: PRESET_ICONS[p.id] || 'save-movie',
       }));
       return [{ heading: 'Save movie' }, ...list];
+    };
+    // Music Tools › Start point / End point: seconds into the song (source in/out points).
+    const musicPoint = (which) => (c) => {
+      if (!c.music) return NaN;
+      if (which === 'start') return num(c.music.trimStart, 0);
+      if (c.music.trimEnd != null && Number.isFinite(+c.music.trimEnd)) return +c.music.trimEnd;
+      const store = c.store;
+      const media = store && typeof store.getMedia === 'function' ? store.getMedia(c.music.mediaId) : null;
+      return media && media.duration > 0 ? media.duration : NaN;
     };
 
     return [
@@ -1750,7 +2059,18 @@ export class Ribbon {
               stack([
                 S('addTitle', 'Title', 'title', { title: 'Add a title before the selected item' }),
                 S('addCaption', 'Caption', 'caption', { title: 'Add a caption at the current point' }),
-                S('addCredits', 'Credits', 'credits', { title: 'Add credits at the end of the movie' }),
+                {
+                  // WLMM: Credits ▾ adds a credits block (Credits, Director, Starring, Location, Soundtrack).
+                  type: 'split', size: 'small', cmd: 'addCredits', label: 'Credits', icon: 'credits',
+                  title: 'Add credits at the end of the movie',
+                  items: [
+                    { cmd: 'addCredits', arg: 'credits', label: 'Credits', icon: 'credits' },
+                    { cmd: 'addCredits', arg: 'director', label: 'Director', icon: 'credits' },
+                    { cmd: 'addCredits', arg: 'starring', label: 'Starring', icon: 'credits' },
+                    { cmd: 'addCredits', arg: 'location', label: 'Location', icon: 'credits' },
+                    { cmd: 'addCredits', arg: 'soundtrack', label: 'Soundtrack', icon: 'credits' },
+                  ],
+                },
               ]),
             ],
           },
@@ -1978,8 +2298,8 @@ export class Ribbon {
               L('trimTool', 'Trim tool', 'trim', { title: 'Trim the beginning and end of the video' }),
               L('split', 'Split', 'split', { shortcut: 'M', title: 'Split the item at the current point (M)' }),
               stack([
-                S('setStartPoint', 'Set start point', 'set-start', { title: 'Trim the video so it starts at the current point' }),
-                S('setEndPoint', 'Set end point', 'set-end', { title: 'Trim the video so it ends at the current point' }),
+                S('setStartPoint', 'Set start point', 'set-start', { shortcut: 'I', title: 'Set start point (I): trim the video so it starts at the current point' }),
+                S('setEndPoint', 'Set end point', 'set-end', { shortcut: 'O', title: 'Set end point (O): trim the video so it ends at the current point' }),
               ]),
             ],
           },
@@ -2022,8 +2342,20 @@ export class Ribbon {
                 S('remove', 'Remove', 'remove', { shortcut: 'Delete', title: 'Remove the selected music' }),
               ]),
               stack([
-                S('musicSetStartPoint', 'Set start point', 'set-start', { title: 'Trim the music so it starts at the current point' }),
-                S('musicSetEndPoint', 'Set end point', 'set-end', { title: 'Trim the music so it ends at the current point' }),
+                {
+                  type: 'combo', cmd: 'musicSetStartPoint', label: 'Start point', icon: 'set-start', time: true, min: 0, max: 36000, step: 0.5, inputWidth: 70, labelWidth: 62,
+                  get: musicPoint('start'), apply: (v, c) => self._setMusicPoint('start', v, c),
+                  title: 'Where the music starts playing in the song',
+                },
+                {
+                  type: 'combo', cmd: 'musicSetEndPoint', label: 'End point', icon: 'set-end', time: true, min: 0, max: 36000, step: 0.5, inputWidth: 70, labelWidth: 62,
+                  get: musicPoint('end'), apply: (v, c) => self._setMusicPoint('end', v, c),
+                  title: 'Where the music stops playing in the song',
+                },
+              ]),
+              stack([
+                S('musicSetStartPoint', 'Set start point', 'set-start', { shortcut: 'I', title: 'Set start point (I): trim the music so it starts at the current point' }),
+                S('musicSetEndPoint', 'Set end point', 'set-end', { shortcut: 'O', title: 'Set end point (O): trim the music so it ends at the current point' }),
               ]),
             ],
           },
@@ -2104,8 +2436,13 @@ export class Ribbon {
                   S('textSet', 'Align right', 'align-right', { iconOnly: true, enabled: textOn, arg: { key: 'align', value: 'right' }, checked: (c) => !!c.style && c.style.align === 'right' }),
                 ]),
                 {
+                  // Presets: Top / Middle / Bottom also drop a position the text box was dragged to
+                  // (blank while the text sits where it was dragged).
                   type: 'select', cmd: 'textSet', label: 'Position', options: VALIGN_OPTIONS, width: 80, labelWidth: 48,
-                  enabled: textOn, get: textStyleKey('valign'), toArg: textSet('valign'),
+                  enabled: textOn,
+                  get: (c) => (c.style && !(Number.isFinite(c.style.x) && Number.isFinite(c.style.y)) ? c.style.valign : null),
+                  toArg: (v, c) => (c.style && (c.style.x != null || c.style.y != null || c.style.w != null)
+                    ? { valign: v, x: null, y: null, w: null } : { key: 'valign', value: v }),
                 },
               ]),
               L('textEdit', 'Edit text', 'edit-text', { title: 'Edit the text in the preview' }),

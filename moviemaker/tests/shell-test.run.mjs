@@ -168,6 +168,30 @@ try {
     check(before !== during, 'hovering a gallery tile animates its preview');
     await page.mouse.move(5, 700);
 
+    // live preview (WLMM): resting the mouse on a tile plays that look on the selected item through
+    // player.setPreviewOverride; leaving puts the player back
+    await page.evaluate(() => {
+      const p = mock.app.player;
+      p.calls = []; p.playing = false; p.loopRange = null; p.currentTime = 2;
+      p.setPreviewOverride = (o) => { p.calls.push(['override', o ? JSON.parse(JSON.stringify(o)) : null]); };
+      p.seek = (t) => { p.calls.push(['seek', t]); p.currentTime = t; return Promise.resolve(); };
+      p.play = () => { p.calls.push(['play']); p.playing = true; return Promise.resolve(); };
+      p.pause = () => { p.calls.push(['pause']); p.playing = false; };
+    });
+    await page.hover(tileSel);
+    await page.waitForTimeout(450);
+    const lp = await page.evaluate(() => mock.app.player.calls.slice());
+    await page.mouse.move(5, 700);
+    await page.waitForTimeout(350);
+    const lp2 = await page.evaluate(() => { const p = mock.app.player; const c = p.calls.slice(); delete p.setPreviewOverride; return { c, t: p.currentTime, playing: p.playing, loop: p.loopRange }; });
+    const ov = lp.find(([k, o]) => k === 'override' && o);
+    const img2Id = await page.evaluate(() => mock.ids.img2);
+    check(!!ov && ov[1].itemIds.join() === img2Id && (ov[1].patch.transition ? ov[1].patch.transition.type === hoverId : ov[1].patch.panZoom === hoverId)
+      && lp.some(([k]) => k === 'play'), 'resting on a tile previews it on the selected item (override + play)', lp);
+    const lastOv = lp2.c.filter(([k]) => k === 'override').pop();
+    check(lastOv && lastOv[1] === null && !lp2.playing && lp2.t === 2 && lp2.loop === null, 'leaving the tile restores the player (no override, paused, same time)', lp2);
+    check(await page.evaluate(() => !mock.log.some(([n]) => n === 'setPanZoom') && mock.log.filter(([n]) => n === 'setTransition').length === 1), 'live preview changes nothing in the project');
+
     // expand gallery
     await page.click('#rb-panel-animations .rb-gal-scroll button:last-child');
     await page.waitForTimeout(250);
@@ -198,15 +222,20 @@ try {
     await setState(page, 'music', 'mus');
     await page.waitForTimeout(50);
     check(await page.evaluate(() => mock.ribbon.activeTab === 'ctx-music'), 'Music Tools › Options auto-activates for music');
+    check(await page.evaluate(() => /^Music 1 of 1$/.test(document.getElementById('status-text').textContent)), 'status bar names the music ("Music 1 of 1")', await page.evaluate(() => document.getElementById('status-text').textContent));
+    check(await page.evaluate(() => ['Start point', 'End point'].every((l) => [...document.querySelectorAll('#rb-panel-ctx-music .rb-field-label')].some((e) => e.textContent === l))), 'Music Tools has Start point / End point fields');
     await page.screenshot({ path: join(OUT, 'desktop-music-tools.png') });
     await setState(page, null);
     await page.waitForTimeout(50);
     check(await page.evaluate(() => mock.ribbon.activeTab === 'home'), 'clearing the selection returns to the last regular tab');
 
     // split menu (Save movie)
-    await page.click('#rb-panel-home .rb-split:last-of-type .rb-split-menu, #rb-panel-home [aria-label="Save movie options"]');
+    await page.click('#rb-panel-home [aria-label="Save movie options"]');
     await page.waitForTimeout(200);
     check(await page.evaluate(() => document.querySelectorAll('.rb-popup .menu-item').length >= 6), 'Save movie menu lists the export presets');
+    const descs = await page.evaluate(() => [...document.querySelectorAll('.rb-popup .menu-item')].map((b) => `${b.querySelector('.menu-label').textContent}|${(b.querySelector('.menu-desc') || {}).textContent || ''}|${b.querySelector('svg').getAttribute('class')}`));
+    check(/^Recommended for this project\|\d+ × \d+/.test(descs[0] || '') && descs.some((d) => d.startsWith('For email|') && /ic-email/.test(d))
+      && descs.some((d) => d.startsWith('For mobile phone|') && /ic-phone-landscape/.test(d)), 'Save movie menu shows the real output sizes and fitting icons', descs);
     await page.screenshot({ path: join(OUT, 'desktop-save-movie-menu.png') });
     await page.click('.rb-popup .menu-item >> nth=2');
     check(await page.evaluate(() => mock.log.some(([n, a]) => n === 'saveMovie' && a === 'hd720')), 'choosing a preset runs saveMovie(presetId)');

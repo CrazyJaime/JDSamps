@@ -127,6 +127,9 @@ export class Store extends EventTarget {
   _afterHistory(label, selection) {
     this._lastCoalesce = null;
     this._timeline = null;
+    // Undo/redo is a modification too: the restored snapshot keeps its content but not its old
+    // time, so "Modified" and the project list order never go back in time.
+    this.project.updatedAt = Date.now();
     let selChanged = false;
     if (selection && (selection.type !== this.selection.type
       || selection.ids.join('|') !== this.selection.ids.join('|'))) {
@@ -190,6 +193,29 @@ export class Store extends EventTarget {
 
   getMedia(id) { return id ? this.media.get(id) : undefined; }
 
+  /**
+   * Ids of the media that can still appear in this project: used by the project, by any undo/redo
+   * step, or by the clipboard. Everything else in `media` is unreachable (persist.js uses this to
+   * drop removed media from storage).
+   */
+  mediaInUse() {
+    const ids = new Set();
+    const addProject = (p) => {
+      if (!p) return;
+      for (const it of p.items || []) if (it && it.mediaId) ids.add(it.mediaId);
+      for (const m of p.music || []) if (m && m.mediaId) ids.add(m.mediaId);
+    };
+    addProject(this.project);
+    for (const e of this._undo) addProject(e && e.project);
+    for (const e of this._redo) addProject(e && e.project);
+    const c = this.clipboard;
+    if (c && typeof c === 'object') {
+      for (const o of Array.isArray(c.objs) ? c.objs : []) if (o && typeof o.mediaId === 'string' && o.mediaId) ids.add(o.mediaId);
+      for (const m of Array.isArray(c.media) ? c.media : []) if (m && typeof m.id === 'string' && m.id) ids.add(m.id);
+    }
+    return ids;
+  }
+
   /** Notify listeners that a media record was mutated in place (e.g. peaks computed). */
   touchMedia(id) {
     if (!this.media.has(id)) return;
@@ -209,6 +235,8 @@ export class Store extends EventTarget {
     if (!t || !list.length) { t = null; list = []; }
     if (t === this.selection.type && list.join('|') === this.selection.ids.join('|')) return;
     this.selection = { type: t, ids: list };
+    // A slider drag on another object is a new undo step: never merge edits across selections.
+    this._lastCoalesce = null;
     this._emit('selection', { type: t, ids: list.slice() });
   }
 

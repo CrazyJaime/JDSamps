@@ -39,8 +39,8 @@ function once(target, type, timeout = 10000) {
   });
 }
 
-async function loadMedia(file, type) {
-  const blob = await (await fetch('./fixtures/' + file)).blob();
+async function loadMedia(file, type, url0 = './fixtures/' + file) {
+  const blob = await (await fetch(url0)).blob();
   const url = URL.createObjectURL(blob);
   let duration = 0, width = 0, height = 0;
   if (type === 'image') {
@@ -226,9 +226,133 @@ async function offlineAudioTests() {
     check('audio: music ducked under narration', near(valAt(out, at + 1.5), 0.15, 0.01), valAt(out, at + 1.5));
     check('audio: music restored after narration', near(valAt(out, at + 2.6), 0.5, 0.01), valAt(out, at + 2.6));
   }
+  // 4) A hard cut between two parts of a sound ramps out/in over a few ms (no click), while the
+  // pieces of a split stay continuous (no dip at the joint).
+  {
+    const { off, eng } = offlineEngine(3);
+    putBuffer(eng, 'dc', dcBuffer(off, 6, 0.5));
+    const project = {
+      audioMix: 0, texts: [], music: [],
+      items: [
+        createVisualItem('video', { id: 'c1', mediaId: 'dc', trimStart: 0, trimEnd: 1 }),
+        createVisualItem('video', { id: 'c2', mediaId: 'dc', trimStart: 3, trimEnd: 4 }), // cut at t = 1
+        createVisualItem('video', { id: 'c3', mediaId: 'dc', trimStart: 4, trimEnd: 5 }), // split: continues c2 at t = 2
+      ],
+    };
+    const at = eng.start(project, computeTimeline(project, new Map([['dc', { id: 'dc', type: 'video', duration: 6 }]])), 0);
+    const out = await off.startRendering();
+    const v = (t) => valAt(out, at + t);
+    check('audio: hard cut is de-clicked (ramps through silence)', Math.abs(v(1.0)) < 0.06 && near(v(0.99), 0.5, 0.01) && near(v(1.01), 0.5, 0.01),
+      [v(0.99), v(1.0), v(1.01)].map((x) => x.toFixed(3)).join(' '));
+    check('audio: split pieces stay continuous', near(v(2.0), 0.5, 0.01) && near(v(2.0 - 1 / 8000), 0.5, 0.01) && near(v(2.0 + 1 / 8000), 0.5, 0.01),
+      [v(2.0 - 1 / 8000), v(2.0), v(2.0 + 1 / 8000)].map((x) => x.toFixed(3)).join(' '));
+  }
+  {
+    const { off, eng } = offlineEngine(3);
+    putBuffer(eng, 'm', dcBuffer(off, 6, 0.5));
+    const project = {
+      audioMix: 0, items: [], texts: [],
+      music: [
+        createMusicItem({ id: 'ma', mediaId: 'm', start: 0, trimStart: 1, trimEnd: 2 }),
+        createMusicItem({ id: 'mb', mediaId: 'm', start: 1, trimStart: 2, trimEnd: 2.5 }), // Music › Split
+      ],
+    };
+    const at = eng.start(project, computeTimeline(project, new Map([['m', { id: 'm', type: 'audio', duration: 6 }]])), 0);
+    const out = await off.startRendering();
+    const v = (t) => valAt(out, at + t);
+    check('audio: trimmed music starts and ends with a de-click ramp', Math.abs(v(1 / 8000)) < 0.06 && Math.abs(v(1.5 - 1 / 8000)) < 0.06 && near(v(0.02), 0.5, 0.01),
+      [v(1 / 8000), v(0.02), v(1.5 - 1 / 8000)].map((x) => x.toFixed(3)).join(' '));
+    check('audio: split music stays continuous', near(v(1.0), 0.5, 0.01) && near(v(1.0 - 1 / 8000), 0.5, 0.01), v(1.0).toFixed(3));
+  }
+}
+
+/** Decoding readiness (whenReady / soundReadyAt) and the budget for sound of removed clips. */
+async function decodeReadinessTests() {
+  const s3 = new Store();
+  const bad = {
+    id: 'bad-music', type: 'audio', name: 'broken.ogg', mime: 'audio/ogg', duration: 3, width: 0, height: 0, hasAudio: true,
+    blob: new Blob([new Uint8Array(4096).fill(7)], { type: 'audio/ogg' }), thumb: '', filmstrip: [], peaks: null,
+  };
+  bad.url = URL.createObjectURL(bad.blob);
+  for (const m of [M.video, M.music, bad]) s3.addMedia(m);
+  s3.update((p) => {
+    p.items.push(createVisualItem('video', { mediaId: M.video.id }));
+    p.music.push(createMusicItem({ mediaId: M.music.id, start: 0 }), createMusicItem({ mediaId: bad.id, start: 1 }));
+  });
+  const eng = new AudioEngine();
+  const gm = (id) => s3.getMedia(id);
+  check('audio: soundReadyAt is false while the sound still has to be decoded', eng.soundReadyAt(s3.project, s3.timeline, 0, { getMedia: gm }) === false);
+  const prog = [];
+  const res = await eng.whenReady(s3.project, s3, { onProgress: (d, n) => prog.push(d + '/' + n) });
+  check('audio: whenReady waits for every soundtrack', res.total === 3 && !res.pending.length && !!eng.peekBuffer(M.video.id) && !!eng.peekBuffer(M.music.id),
+    JSON.stringify({ total: res.total, pending: res.pending.length, prog }));
+  check("audio: whenReady reports music that can't be decoded", res.failed.length === 1 && res.failed[0].id === bad.id, res.failed.map((m) => m.name).join());
+  check('audio: soundReadyAt is true once decoded', eng.soundReadyAt(s3.project, s3.timeline, 0, { getMedia: gm }) === true);
+  const stuck = new AudioEngine();
+  stuck._decode = () => new Promise(() => {}); // a decode that never finishes
+  const r2 = await stuck.whenReady(s3.project, s3, { stallMs: 200 });
+  check('audio: whenReady gives up when decoding stalls', r2.pending.length === 3 && r2.done === 0, JSON.stringify({ pending: r2.pending.length, done: r2.done }));
+
+  // Decoded sound of clips the project no longer uses is kept only up to a small budget.
+  const eng3 = new AudioEngine();
+  eng3._concurrency = 1; // phone budgets
+  const s4 = new Store();
+  const fake = (id) => ({ id, type: 'audio', name: id, url: 'blob:' + id, blob: null, duration: 10 });
+  for (const id of ['r', 'u1', 'u2', 'u3']) s4.addMedia(fake(id));
+  s4.update((p) => { p.music.push(createMusicItem({ mediaId: 'r', start: 0 })); });
+  let used = 1;
+  for (const id of ['r', 'u1', 'u2', 'u3']) {
+    eng3._cache.set(id, { blob: null, url: 'blob:' + id, buffer: { length: 1, numberOfChannels: 1, duration: 10 }, promise: null, failed: false, reason: '', used: used++, bytes: 5e6 });
+  }
+  await eng3.prepare(s4.project, s4);
+  const kept = ['r', 'u1', 'u2', 'u3'].filter((id) => eng3._cache.has(id));
+  check('audio: sound of removed clips is dropped beyond a small budget (most recent kept)', kept.join() === 'r,u3', kept.join());
 }
 
 // ---------------------------------------------------------------------------
+// Frame-number fixture (tests/engine-bars.webm, made by engine.test.mjs): 30 fps, the frame
+// number as 12 bars in the top half, a 440 Hz tone. Its WebM timestamps are rounded to whole
+// ms, so frame k often starts a hair after k/30 s.
+
+/** Frame number shown in a canvas region (x, y, w, h in backing pixels) of a bars frame. */
+function readBars(canvas, x, y, w, h) {
+  const row = canvas.getContext('2d').getImageData(Math.floor(x), Math.floor(y + h / 4), Math.max(1, Math.floor(w)), 1).data;
+  let code = 0;
+  for (let q = 0; q < 12; q++) if (row[Math.floor(((q + 0.5) * w) / 12) * 4] >= 128) code |= 1 << q;
+  return code;
+}
+
+async function barsPausedTests() {
+  const bars = await loadMedia('engine-bars.webm', 'video', './engine-bars.webm');
+  M.bars = bars;
+  const s5 = new Store();
+  s5.addMedia(bars);
+  s5.update((p) => { p.items.push(createVisualItem('video', { id: 'b1', mediaId: bars.id, trimEnd: 4 })); });
+  const c5 = document.createElement('canvas');
+  c5.style.cssText = 'width:320px;height:180px;display:block';
+  document.body.appendChild(c5);
+  const p5 = new Player({ store: s5, audio: null, canvas: c5, mediaHost: document.getElementById('media-host') });
+  const read = () => {
+    const r = p5.frameRect, k = c5.width / c5.clientWidth;
+    return readBars(c5, r.x * k, r.y * k, r.width * k, r.height * k);
+  };
+  await p5.seek(1);
+  const seq = [read()];
+  for (let i = 0; i < 30; i++) { await p5.stepFrame(1); seq.push(read()); }
+  check('player: every "next frame" shows the next frame (ms-rounded WebM)', seq.every((c, i) => c === 30 + i), seq.join(' '));
+  await p5.seek(4.1 - 4 + 2.0); // float error: 4.1 - 4 = 0.0999…
+  check('player: paused seek lands inside the wanted frame', read() === 63, read());
+  const e5 = new Exporter({ store: s5, player: p5, audio: null });
+  const snap = await e5.snapshot(59 / 30);
+  const bmp = await createImageBitmap(snap);
+  const sc = document.createElement('canvas');
+  sc.width = bmp.width; sc.height = bmp.height;
+  sc.getContext('2d').drawImage(bmp, 0, 0);
+  const code = readBars(sc, 0, 0, bmp.width, bmp.height);
+  check('snapshot: shows the frame at exactly its time (59/30 s → frame 59)', code === 59, code);
+  p5.destroy();
+  c5.remove();
+}
 
 let store, audio, player, exporter, M;
 
@@ -265,6 +389,7 @@ async function phase1() {
   check('decode: main AudioContext not created before a gesture', audio.contextIfCreated === null);
 
   await offlineAudioTests();
+  await decodeReadinessTests();
 
   player = new Player({ store, audio, canvas: stage, mediaHost: document.getElementById('media-host') });
   exporter = new Exporter({ store, player, audio });
@@ -368,6 +493,7 @@ async function phase1() {
   const fm = supportedFormats();
   check('export: supportedFormats lists webm', fm.some((f) => f.ext === 'webm'), JSON.stringify(fm));
   check('export: presets', EXPORT_PRESETS.length === 6 && EXPORT_PRESETS[0].id === 'recommended');
+  await barsPausedTests();
   window.__phase1Done = true;
   log('Phase 1 done — click "Run playback tests".');
 }
@@ -538,6 +664,83 @@ async function phase2() {
       check('export (sync clip): done', false, err.message);
     }
     p2.destroy();
+  }
+
+  // --- iOS before 16.4 (no navigator.audioSession): Web Audio alone is muted by the Ring/Silent
+  // switch, so unlock() starts a silent, unmuted, looping <audio> and stops it after playback.
+  if (!navigator.audioSession) {
+    const uaDesc = Object.getOwnPropertyDescriptor(navigator, 'userAgent');
+    Object.defineProperty(navigator, 'userAgent', {
+      configurable: true, get: () => 'Mozilla/5.0 (iPhone; CPU iPhone OS 15_7 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.6 Mobile/15E148 Safari/604.1',
+    });
+    const ios = new AudioEngine();
+    try {
+      check('audio (iOS 15): needs the media-session keeper', ios.needsSessionKeeper === true);
+      await ios.unlock();
+      await sleep(200);
+      const k1 = ios.sessionKeeper;
+      check('audio (iOS 15): unlock starts a silent unmuted media element', k1.active && k1.playing && !k1.muted, JSON.stringify(k1));
+      const proj = { audioMix: 0, items: [], texts: [], music: [] };
+      ios.start(proj, computeTimeline(proj, new Map()), 0);
+      ios.stop();
+      await sleep(400);
+      check('audio (iOS 15): keeper still playing right after stop (quick restarts)', ios.sessionKeeper.playing);
+      await sleep(1600);
+      check('audio (iOS 15): keeper paused once playback has stopped', !ios.sessionKeeper.playing, JSON.stringify(ios.sessionKeeper));
+    } finally {
+      await ios.close();
+      if (uaDesc) Object.defineProperty(navigator, 'userAgent', uaDesc); else delete navigator.userAgent;
+    }
+    check('audio (iOS 15): not used elsewhere', new AudioEngine().needsSessionKeeper === false);
+  }
+
+  // --- clips cut from the frame-number fixture: the pieces of a split share one <video> and
+  // play on smoothly; clips start exactly on their in-point frame and never show trimmed-out
+  // frames; the export waits for slow decoding (sound from the very start) and warns about
+  // music it can't read.
+  {
+    const bars = { ...M.bars, id: 'bars-export' };
+    const broken = {
+      id: 'broken-music', type: 'audio', name: 'broken.ogg', mime: 'audio/ogg', duration: 3, width: 0, height: 0, hasAudio: true,
+      blob: new Blob([new Uint8Array(4096).fill(7)], { type: 'audio/ogg' }), thumb: '', filmstrip: [], peaks: null,
+    };
+    broken.url = URL.createObjectURL(broken.blob);
+    const s6 = new Store();
+    s6.addMedia(bars);
+    s6.addMedia(broken);
+    const clip = (id, a, b) => createVisualItem('video', { id, mediaId: bars.id, trimStart: a, trimEnd: b, transition: { type: 'none', duration: 0 } });
+    s6.update((p) => {
+      p.items.push(createVisualItem('title', { id: 'T', duration: 1, background: '#000000', text: '', transition: { type: 'none', duration: 0 } }),
+        clip('A1', 1.0, 1.6), clip('A2', 1.6, 2.2), clip('A3', 2.2, 2.8), // a split clip
+        clip('B', 59 / 30, 59 / 30 + 0.6), clip('C', 116 / 30, 116 / 30 + 0.6), clip('D', 0.5, 1.1));
+      p.music.push(createMusicItem({ mediaId: broken.id, start: 0 }));
+    });
+    const realDecode = audio._decode;
+    audio._decode = async (m) => { if (m.id === bars.id) await sleep(1500); return realDecode.call(audio, m); }; // a slow phone decode
+    const off6 = document.createElement('canvas');
+    const p6 = new Player({ store: s6, audio, canvas: off6, mediaHost: document.getElementById('media-host') });
+    const e6 = new Exporter({ store: s6, player: p6, audio });
+    const states = [];
+    try {
+      const b = await e6.exportMovie({ presetId: 'email', fps: 30, onProgress: (pp, t, info) => states.push(info.state + (info.message ? ':' + info.message : '')) });
+      const tl = s6.timeline.segments;
+      const segs = tl.filter((sg) => sg.item.kind === 'video').map((sg) => ({
+        start: sg.start, end: sg.end, sIn: sg.sourceIn, sOut: sg.sourceOut,
+        chainedIn: sg.item.id === 'A2' || sg.item.id === 'A3', chainedOut: sg.item.id === 'A1' || sg.item.id === 'A2',
+      }));
+      const mid = (id) => { const sg = tl.find((x) => x.item.id === id); return (sg.start + sg.end) / 2; };
+      window.__exports.push({ name: 'export-bars.webm', b64: await blobToBase64(b), expect: s6.timeline.duration, soundFrom: tl[1].start,
+        bars: { segs, splits: [tl[2].start, tl[3].start], controls: [mid('A1'), mid('A2'), mid('A3')] } });
+      const vids = [...document.querySelectorAll('#media-host video')].filter((v) => v.src === bars.url).length;
+      check('export (bars): the pieces of a split share one <video>', vids === 4, vids + ' elements for 6 clips (3 of them one split clip)');
+      check('export (bars): waits for slow decoding and says so', states.some((x) => x.startsWith('preparing:Preparing the sound')), [...new Set(states.map((x) => x.split(':')[0]))].join(','));
+      check("export (bars): warns about music it can't read", states.some((x) => x.startsWith('warning:') && x.includes('broken.ogg')), states.filter((x) => x.startsWith('warning')).join(' | '));
+    } catch (err) {
+      check('export (bars): done', false, err.message);
+    } finally {
+      audio._decode = realDecode;
+      p6.destroy();
+    }
   }
 
   // --- abort

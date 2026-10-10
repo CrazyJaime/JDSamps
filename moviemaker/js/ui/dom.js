@@ -6,6 +6,7 @@
 //   clamp(v, min, max), debounce(fn, ms), rafThrottle(fn)
 //   isPhone() / isPhoneLandscape() / isCompact() / watchLayout(cb)   responsive helpers
 //   longPress(el, cb, opts)      press-and-hold on touch/pen/mouse via Pointer Events
+//   backGuard(app, onBack)       Android Back / iOS swipe-back closes a transient surface
 //   icon(name, size), iconSVG(name)   re-exported from ./icons.js
 //
 // Layout queries (keep in sync with css/moviemaker.css):
@@ -321,6 +322,45 @@ export function longPress(el, cb, { ms = 500, tolerance = 10, mouse = true } = {
     on(el, 'contextmenu', ctx),
   ];
   return () => { cancel(); offs.forEach((f) => f()); };
+}
+
+// ---------------------------------------------------------------------------
+// Back button / swipe-back
+
+/**
+ * Let Android Back / iOS swipe-back close a transient surface (ribbon sheet or dropdown, storyboard
+ * popover, inline text editor, pseudo full screen…) instead of leaving the app. Uses the one shared
+ * history back stack owned by app.dialogs (public pushBack/releaseBack, or the older
+ * _pushBack/_releaseBack), so dialogs and these surfaces unwind in the right order.
+ *   const release = backGuard(app, () => close({ fromBack: true }));
+ *   …later, when the surface closes any other way: release();
+ * onBack runs at most once; release() after Back (or twice) is a no-op. Without a back stack
+ * (desktop, old dialogs module) it does nothing and release() is a no-op.
+ */
+export function backGuard(app, onBack) {
+  const d = app && app.dialogs;
+  if (!d || typeof onBack !== 'function') return () => {};
+  const push = typeof d.pushBack === 'function' ? d.pushBack : (typeof d._pushBack === 'function' ? d._pushBack : null);
+  const rel = typeof d.releaseBack === 'function' ? d.releaseBack : (typeof d._releaseBack === 'function' ? d._releaseBack : null);
+  if (!push) return () => {};
+  let done = false;
+  let token = null;
+  try {
+    token = push.call(d, () => {
+      if (done) return;
+      done = true;
+      try { onBack(); } catch (err) { console.error(err); }
+    });
+  } catch (_) { token = null; }
+  return () => {
+    if (done) return;
+    done = true;
+    if (token == null || !rel) return;
+    // Releasing steps history back. Do it after the current task: a surface that closes because
+    // the next one opens (menu item → dialog, one sheet → another) pushes its entry first, and a
+    // history.back() queued *before* that pushState can land one entry too far (out of the app).
+    setTimeout(() => { try { rel.call(d, token); } catch (_) { /* ignore */ } }, 0);
+  };
 }
 
 /** Format seconds for compact UI fields: 7 → "7.00", 65.4 → "1:05.40". */

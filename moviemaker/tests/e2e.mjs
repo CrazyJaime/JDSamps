@@ -16,7 +16,11 @@
 //   add music, title, caption, credits → transition / pan & zoom / effect from the ribbon galleries →
 //   aspect 9:16 and back → play (clock advances, canvas changes) → scrub → split → trim tool →
 //   drag-reorder (mouse, or touch long-press on phones) → undo/redo → AutoMovie → Save movie
-//   ('For email') → ffprobe the file → reload and check the project was restored.
+//   ('For email') → ffprobe the file → reload and check the project was restored → (phones) real
+//   browser heights: Play stays on screen in landscape, storyboard lanes stay inside the pane in
+//   portrait → app-menu dialogs close without leaving the app (arriving from another page).
+// Inline text editing finishes with Enter on desktop and with the Done button on touch screens
+// (Return adds a new line there).
 // Exit code 0 only when every step of every profile passed.
 
 import { createRequire } from 'module';
@@ -239,6 +243,19 @@ async function runProfile(browser, base, name) {
     return { w, h, mean: sum / n / 3, nonBlack: nonBlack / n, hash };
   });
   const dialogButton = (label) => page.locator(`#dialog-root .dlg-buttons button:has-text("${label}")`).last();
+  /** Finish inline text editing: Enter on desktop; on touch screens Return is a new line, so tap Done. */
+  const finishTextEdit = async () => {
+    if (!touch) { await page.keyboard.press('Enter'); return; }
+    const done = page.locator('.pv-edit-done');
+    await done.waitFor({ state: 'visible', timeout: 4000 });
+    await done.tap();
+    await page.locator('#preview-pane .pv-text-editor').waitFor({ state: 'hidden', timeout: 4000 }).catch(() => {});
+  };
+  /** Dismiss sticky info toasts (e.g. Safari's "may delete projects" notice) that could cover controls. */
+  const dismissToasts = async () => {
+    await ev(() => { for (const b of document.querySelectorAll('#toast-root .toast .toast-close')) b.click(); });
+    await sleep(250);
+  };
 
   let files = null;
   let expectedItems = 0;
@@ -311,6 +328,27 @@ async function runProfile(browser, base, name) {
     }, { critical: true });
     await layoutCheck('after import');
 
+    // Safari (iPhone UA here) may delete stored projects after a while without use: the first
+    // autosave brings a one-time note; desktop Chromium never shows it.
+    await step('storage note after the first save (Safari only), dismissed', async () => {
+      const safari = /iPhone|iPad/.test(opts.userAgent || '');
+      const sel = '#toast-root .toast:has-text("Safari may delete")';
+      if (!safari) {
+        await sleep(2500);
+        assert(!(await page.locator(sel).count()), 'storage note shown outside Safari');
+        return 'not shown (not Safari)';
+      }
+      const toast = page.locator(sel).first();
+      await toast.waitFor({ state: 'visible', timeout: 8000 });
+      assert(await toast.locator('.toast-action:has-text("Keep them safe")').count(), 'no "Keep them safe" action');
+      const h = await toast.evaluate((e) => e.getBoundingClientRect().height);
+      assert(h <= 90, `storage note is ${Math.round(h)}px tall (covers too much)`);
+      await shot('storage-note');
+      await act(toast.locator('.toast-close'));
+      await toast.waitFor({ state: 'detached', timeout: 3000 });
+      return `shown (${Math.round(h)}px), dismissed`;
+    });
+
     // ------------------------------------------------------------------ music, title, caption, credits
     await step('add music (Home › Add music)', async () => {
       await tab('home');
@@ -332,7 +370,8 @@ async function runProfile(browser, base, name) {
       await ed.waitFor({ state: 'visible', timeout: 5000 });
       await page.keyboard.press('Control+A').catch(() => {});
       await page.keyboard.type('Summer Trip');
-      await page.keyboard.press('Enter');
+      // Touch screens: Return adds a new line (multi-line titles); the Done button finishes.
+      await finishTextEdit();
       await waitFor(() => window.app.store.project.items[0].kind === 'title' && window.app.store.project.items[0].text === 'Summer Trip', null, 5000);
       await shot('title');
     });
@@ -349,7 +388,7 @@ async function runProfile(browser, base, name) {
       if (await ed.isVisible().catch(() => false)) {
         await page.keyboard.press('Control+A').catch(() => {});
         await page.keyboard.type('Day one');
-        await page.keyboard.press('Enter');
+        await finishTextEdit();
       } else {
         // Fall back to the command (some layouts may not open the editor automatically).
         await ev(() => window.app.commands.run('textEdit', 'Day one'));
@@ -381,10 +420,17 @@ async function runProfile(browser, base, name) {
         // A tile visible in the ribbon row itself (hovered first: it animates).
         const inline = page.locator('#ribbon .rb-panel[data-tab="animations"] .rb-gallery[aria-label="Transitions"] .rb-gal-item:not([disabled])').nth(1);
         const tid = await inline.getAttribute('data-id');
+        await ev(() => window.app.player.pause());
+        const before = await ev((i) => window.app.store.find(i).obj.transition.type, id1);
         await inline.hover();
-        await sleep(300);
+        // Live preview (WLMM): hovering shows the transition on the monitor without changing the project.
+        await waitFor((t) => { const o = window.app.player.previewOverride; return !!(o && o.patch && o.patch.transition && o.patch.transition.type === t); }, tid, 3000);
+        const lp = await ev((i) => ({ type: window.app.store.find(i).obj.transition.type, undo: window.app.store.canUndo, loop: window.app.player.loopRange }), id1);
+        assert(lp.type === before, `hover changed the project (${before} → ${lp.type})`);
+        assert(lp.loop && lp.loop.end > lp.loop.start, 'live preview did not loop the item');
         await inline.click();
         await waitFor(([i, t]) => window.app.store.find(i).obj.transition.type === t, [id1, tid], 4000);
+        await waitFor(() => !window.app.player.previewOverride, null, 3000);
       }
       await pickGallery('animations', 'Transitions', 'crossfade');
       await waitFor((i) => window.app.store.find(i).obj.transition.type === 'crossfade', id1, 4000);
@@ -740,6 +786,68 @@ async function runProfile(browser, base, name) {
       return `${q.items.length} items, ${q.duration.toFixed(2)}s`;
     });
 
+    // ------------------------------------------------------------------ real phone browser heights
+    if (touch) {
+      await step('viewport sizes: transport and storyboard lanes stay on screen', async () => {
+        const full = opts.viewport;
+        const checks = [];
+        const playBottom = () => ev(() => {
+          const b = document.querySelector('#preview-pane .pv-play').getBoundingClientRect();
+          return { bottom: b.bottom, ih: innerHeight, w: b.width };
+        });
+        const lanes = () => ev(() => {
+          const pane = document.getElementById('storyboard-pane').getBoundingClientRect();
+          const out = {};
+          for (const k of ['item', 'music', 'text']) {
+            const els = [...document.querySelectorAll(`#storyboard-pane [data-sb="${k}"]`)].filter((e) => e.getClientRects().length);
+            out[k] = { n: els.length, bad: els.filter((e) => { const r = e.getBoundingClientRect(); return r.height < 8 || r.top < pane.top - 1 || r.bottom > pane.bottom + 1; }).length };
+          }
+          return { pane: { top: pane.top, bottom: pane.bottom, h: pane.height }, ...out };
+        });
+        const resize = async (w, h) => { await page.setViewportSize({ width: w, height: h }); await sleep(700); };
+        try {
+          if (name === 'landscape') {
+            // Landscape phones with the browser's toolbars showing.
+            for (const [w, h] of [[667, 325], [732, 304], [740, 280]]) {
+              await resize(w, h);
+              const r = await playBottom();
+              checks.push(`${w}x${h}: play bottom ${Math.round(r.bottom)}/${r.ih}`);
+              assert(r.w > 10 && r.bottom <= r.ih + 0.5, `${w}x${h}: Play button bottom ${r.bottom} below the screen (${r.ih})`);
+            }
+          } else {
+            // Portrait phones at real browser heights (toolbars + keyboard-free).
+            const sizes = [[375, 553], [320, 460], [390, 664]];
+            for (const [w, h] of sizes) {
+              await resize(w, h);
+              const r = await lanes();
+              checks.push(`${w}x${h}: pane ${Math.round(r.pane.h)}px`);
+              for (const k of ['item', 'music', 'text']) {
+                assert(r[k].n > 0, `${w}x${h}: no ${k} shown in the storyboard`);
+                assert(r[k].bad === 0, `${w}x${h}: ${r[k].bad} ${k} element(s) outside the storyboard pane`);
+              }
+            }
+            // A 9:16 project takes more height for the picture: the lanes must still fit.
+            await resize(375, 553);
+            await ev(() => window.app.commands.run('setAspect', '9:16'));
+            await sleep(600);
+            const r = await lanes();
+            checks.push(`375x553 9:16: pane ${Math.round(r.pane.h)}px`);
+            for (const k of ['item', 'music', 'text']) {
+              assert(r[k].n > 0 && r[k].bad === 0, `375x553 9:16: ${k} lane hidden or outside the pane (${JSON.stringify(r[k])})`);
+            }
+            const pb = await playBottom();
+            assert(pb.bottom <= pb.ih + 0.5, `375x553 9:16: Play button off screen`);
+            await ev(() => window.app.store.undo());
+            await sleep(300);
+          }
+        } finally {
+          await page.setViewportSize(full);
+          await sleep(600);
+        }
+        return checks.join('; ');
+      });
+    }
+
     // ------------------------------------------------------------------ extra looks for review
     await step('screens for review (tabs, menu)', async () => {
       for (const t of ['animations', 'effects', 'project', 'view']) { await tab(t); await sleep(250); await shot(`tab-${t}`); }
@@ -758,6 +866,51 @@ async function runProfile(browser, base, name) {
       await shot('app-menu');
       await page.keyboard.press('Escape');
       await sleep(300);
+    });
+
+    // ------------------------------------------------------------------ Back stack (phones)
+    await step('app menu dialogs close without leaving the app', async () => {
+      // Arrive from another page, so a history.back() that goes one entry too far leaves index.html.
+      await page.goto(`${base}icons/icon.svg`);
+      await page.goto(`${base}index.html`, { waitUntil: 'load' });
+      await waitFor(() => window.app && window.app.store && document.querySelector('#ribbon .rb-tab'), null, 15000);
+      await page.waitForSelector('#boot-splash', { state: 'detached', timeout: 15000 });
+      await sleep(600);
+      await dismissToasts();
+      const flows = [
+        ['Help', 'OK'],
+        ['Open project', 'Close'],
+        ['Options', 'Cancel'],
+        ['Save project as', 'Cancel'],
+        ['New project', 'Cancel'],
+      ];
+      const done = [];
+      for (const [label, closeLabel] of flows) {
+        await act(page.locator('#app-menu-btn'));
+        await sleep(350);
+        await act(page.locator('.app-menu .app-menu-item', { hasText: label }).first());
+        await waitFor(() => window.app.dialogs.isModalOpen, null, 4000);
+        await act(dialogButton(closeLabel));
+        await sleep(900);
+        const url = page.url();
+        assert(/index\.html/.test(url), `${label} › ${closeLabel} left the app (now at ${url})`);
+        const st = await ev(() => ({ open: window.app.dialogs.isModalOpen, items: window.app.store.project.items.length }));
+        assert(!st.open, `${label} still open after ${closeLabel}`);
+        assert(st.items > 0, `${label} › ${closeLabel} lost the project`);
+        done.push(label);
+      }
+      // Touch screens: Back (Android button, iOS swipe) with a dialog open closes it and stays.
+      // (Desktop keeps the browser's own Back: the back stack is only installed for coarse pointers.)
+      if (!touch) return done.join(', ');
+      await act(page.locator('#app-menu-btn'));
+      await sleep(350);
+      await act(page.locator('.app-menu .app-menu-item', { hasText: 'Help' }).first());
+      await waitFor(() => window.app.dialogs.isModalOpen, null, 4000);
+      await page.goBack({ timeout: 1500 }).catch(() => {});
+      await sleep(700);
+      assert(/index\.html/.test(page.url()), `Back with Help open left the app (${page.url()})`);
+      assert(!(await ev(() => window.app.dialogs.isModalOpen)), 'Back did not close Help');
+      return `${done.join(', ')} + Back`;
     });
   } catch (err) {
     if (!(err instanceof StepError)) record(name, 'unexpected exception', false, err && err.stack ? err.stack.split('\n').slice(0, 3).join(' ') : String(err));

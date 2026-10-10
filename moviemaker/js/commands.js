@@ -37,6 +37,14 @@ const DEFAULT_CAPTION_DURATION = num(model.DEFAULT_CAPTION_DURATION, 3.5);
 const DEFAULT_TRANSITION_DURATION = num(model.DEFAULT_TRANSITION_DURATION, 1.5);
 const DEFAULT_CREDITS_TEXT = typeof model.DEFAULT_CREDITS_TEXT === 'string'
   ? model.DEFAULT_CREDITS_TEXT : 'CREDITS\nDirector\nStarring\nLocation';
+// Home › Credits ▾ (WLMM): the heading each kind of credits starts with; the name goes below.
+const CREDITS_TEXTS = {
+  credits: DEFAULT_CREDITS_TEXT,
+  director: 'DIRECTED BY\nYour name',
+  starring: 'STARRING\nNames of the cast',
+  location: 'FILMED ON LOCATION IN\nPlace',
+  soundtrack: 'SOUNDTRACK\nSong title — Artist',
+};
 const ASPECTS = model.ASPECTS || { '16:9': 16 / 9, '4:3': 4 / 3, '9:16': 9 / 16, '1:1': 1 };
 
 const MSG = {
@@ -172,7 +180,19 @@ const STYLE_KEYS = {
   valign: { label: 'Change text position', coalesce: false, check: (v) => (VALIGNS.includes(v) ? v : undefined) },
   opacity: { label: 'Change transparency', coalesce: true, check: (v) => { const n = toNum(v); return Number.isFinite(n) ? clamp(n, 0, 1) : undefined; } },
   background: { label: 'Change text background', coalesce: true, check: (v) => (v === null || v === '' || v === 'none' ? null : (isColor(v) ? v.trim() : undefined)) },
+  // Free placement (dragging / resizing the text box on the preview): centre x, y and wrap width w
+  // as fractions of the frame. null removes the key (back to align / valign placement).
+  x: { label: 'Move text', coalesce: true, clearable: true, check: (v) => fracOrNull(v, 0, 1) },
+  y: { label: 'Move text', coalesce: true, clearable: true, check: (v) => fracOrNull(v, 0, 1) },
+  w: { label: 'Resize text', coalesce: true, clearable: true, check: (v) => fracOrNull(v, 0.05, 1) },
 };
+
+/** null → null (clear), a number → clamped to lo..hi, anything else → undefined (ignored). */
+function fracOrNull(v, lo, hi) {
+  if (v === null) return null;
+  const n = toNum(v);
+  return Number.isFinite(n) ? clamp(n, lo, hi) : undefined;
+}
 
 // ---------------------------------------------------------------------------------------------
 
@@ -185,10 +205,10 @@ export function createCommands(app) {
   const dialogs = () => app.dialogs || null;
   const player = () => app.player || null;
 
-  function toast(msg, type = 'info') {
+  function toast(msg, type = 'info', extra = null) {
     const d = dialogs();
     if (d && typeof d.toast === 'function') {
-      try { d.toast(msg, { type }); return; } catch (_) { /* fall through */ }
+      try { d.toast(msg, extra ? { ...extra, type } : { type }); return; } catch (_) { /* fall through */ }
     }
     if (typeof console !== 'undefined') (type === 'error' ? console.error : console.info)(`[Movie Maker] ${msg}`);
   }
@@ -206,11 +226,16 @@ export function createCommands(app) {
   const exporting = () => !!app.exporting;
   const trimActive = () => { try { return !!(app.dialogs && app.dialogs.trimActive); } catch (_) { return false; } };
 
-  /** Why a command of this kind can't run right now ('' = it can). */
+  /**
+   * Why a command of this kind can't run right now ('' = it can). Kinds: 'edit' (changes the
+   * project), 'save' (writes the project or the movie somewhere: while the Trim tool shows the clip
+   * untrimmed that half-done state must never be saved), 'project' (opens/replaces the project;
+   * the dialogs end trimming themselves), 'nav', 'view', 'app'.
+   */
   function busyReason(kind) {
     if (kind === 'app') return '';
     if (exporting()) return MSG.exporting;
-    if (kind === 'edit' && trimActive()) return MSG.trimming;
+    if ((kind === 'edit' || kind === 'save') && trimActive()) return MSG.trimming;
     return '';
   }
 
@@ -315,13 +340,15 @@ export function createCommands(app) {
     const ids = objs.map((o) => o.id);
     if (!ids.length) return false;
     if (typeof same === 'function' && objs.every((o) => same(o))) return false;
+    // A slider drag merges into one undo step only while it keeps editing the same objects.
+    const key = coalesceKey ? `${coalesceKey}:${type}:${ids.slice().sort().join(',')}` : undefined;
     (structural ? structuralUpdate : store.update.bind(store))((p) => {
       const coll = collectionOf(p, type);
       for (const id of ids) {
         const o = coll.find((x) => x.id === id);
         if (o) apply(o, p);
       }
-    }, { label, coalesceKey });
+    }, { label, coalesceKey: key });
     return true;
   }
 
@@ -633,11 +660,42 @@ export function createCommands(app) {
     return ids[0];
   }
 
+  /** The video segment on screen at time t (the incoming one during a transition), or null. */
+  function videoSegmentAt(t) {
+    let segs;
+    try { segs = store.timeline.segments; } catch (_) { return null; }
+    if (!segs || !segs.length || !Number.isFinite(t)) return null;
+    const last = segs[segs.length - 1];
+    let hit = null;
+    for (const seg of segs) {
+      if (seg.item.kind !== 'video' || !(seg.duration > 0)) continue;
+      if (t >= seg.start - 1e-6 && (t < seg.end || (seg === last && t <= seg.end + 1e-6))) hit = seg;
+    }
+    return hit;
+  }
+
+  /** Let the user keep the snapshot picture too (WLMM saved it as a file): download / share sheet. */
+  function offerSnapshotFile(file, name) {
+    const save = () => {
+      const d = dialogs();
+      let job;
+      try {
+        job = d && typeof d._offerFile === 'function'
+          ? d._offerFile(file, name, 'Your snapshot is ready.')
+          : downloadFile(file, name);
+      } catch (err) { report(err, 'The picture couldn’t be saved.'); return; }
+      Promise.resolve(job).catch((err) => report(err, 'The picture couldn’t be saved.'));
+    };
+    toast('Snapshot added to your movie.', 'success', { action: { label: 'Save picture', onClick: save } });
+  }
+
   async function snapshot() {
     const ex = app.exporter;
     if (!ex || typeof ex.snapshot !== 'function') { toast('Snapshots aren’t available right now.', 'error'); return false; }
     if (!(timelineDuration() > 0)) { toast('Add some videos or photos before taking a snapshot.'); return false; }
     const t = now();
+    // Like WLMM, a snapshot is a still of a video frame.
+    if (!videoSegmentAt(t)) { toast('Move the playhead onto a video to take a snapshot of it.'); return false; }
     const at0 = insertIndex('after');
     const blob = await ex.snapshot(t);
     if (!blob || typeof blob.size !== 'number' || !blob.size) throw friendlyError('The snapshot couldn’t be taken. Please try again.');
@@ -655,6 +713,7 @@ export function createCommands(app) {
     let at = at0;
     structuralUpdate((p) => { at = clamp(at, 0, p.items.length); p.items.splice(at, 0, item); }, { label: 'Add snapshot' });
     select('item', item.id);
+    offerSnapshotFile(file, name);
     return item.id;
   }
 
@@ -709,14 +768,19 @@ export function createCommands(app) {
     return it.id;
   }
 
-  function addCredits() {
+  /**
+   * Credits at the end of the movie. kind (Home › Credits ▾, like WLMM): 'credits' (default),
+   * 'director', 'starring', 'location' or 'soundtrack' picks the heading the text starts with.
+   */
+  function addCredits(kind) {
     const tl = store.timeline;
     let start = visualsEndOf(tl);
     // More credits go after the credits that already follow the pictures.
     for (const x of tl.texts) {
       if (x.item.kind === 'credits' && x.start >= start - 0.05) start = Math.max(start, x.end);
     }
-    const it = model.createTextItem('credits', { text: DEFAULT_CREDITS_TEXT, start: round3(start), effect: 'scroll' });
+    const text = typeof kind === 'string' && CREDITS_TEXTS[kind] ? CREDITS_TEXTS[kind] : DEFAULT_CREDITS_TEXT;
+    const it = model.createTextItem('credits', { text, start: round3(start), effect: 'scroll' });
     store.update((p) => { p.texts.push(it); }, { label: 'Add credits' });
     select('text', it.id);
     seekToShow(it.start, it.duration);
@@ -731,6 +795,10 @@ export function createCommands(app) {
     const res = applyAutoMovie(store, typeof themeId === 'string' ? themeId : 'default');
     if (!res || !res.ok) {
       toast(res && res.reason === 'empty' ? 'Add some videos and photos first, then choose an AutoMovie theme.' : 'The AutoMovie theme couldn’t be applied.', 'error');
+      return false;
+    }
+    if (res.changed === false) {
+      toast(`AutoMovie theme “${res.themeName}” is already applied.`);
       return false;
     }
     const done = [];
@@ -1082,9 +1150,15 @@ export function createCommands(app) {
     const srcSplit = seg.sourceIn + local * speed;
     const secondId = newId('item');
     const def = transitionDuration();
+    const rest = seg.duration - local;
     store.update((p) => {
       const idx = p.items.findIndex((i) => i.id === item.id);
       if (idx < 0) return;
+      // Where every caption / end credit sits before the split (see structuralUpdate). A half can be
+      // shorter than twice a neighbouring transition, which then gets shorter (computeTimeline's
+      // clamp) and moves everything after it: texts must travel with their pictures.
+      let anchors = null;
+      try { anchors = anchorTexts(p, store.media); } catch (_) { anchors = null; }
       const a = p.items[idx];
       const b = deepClone(a);
       b.id = secondId;
@@ -1095,13 +1169,34 @@ export function createCommands(app) {
         b.fadeIn = 'none';
       } else {
         a.duration = local;
-        b.duration = seg.duration - local;
+        b.duration = rest;
       }
       // The two halves play back to back.
       b.transition = { type: 'none', duration: a.transition && num(a.transition.duration, 0) > 0 ? a.transition.duration : def };
       p.items.splice(idx + 1, 0, b);
+      if (anchors && anchors.length) {
+        // A text on the split item stays on the same frame: on the first half before the split
+        // point, on the second half from it on.
+        for (const an of anchors) {
+          if (an.end || an.itemId !== item.id) continue;
+          if (an.offset >= local - 1e-9) {
+            an.itemId = secondId;
+            an.offset = Math.max(0, an.offset - local);
+            an.duration = rest;
+            an.ratio = rest > 0 ? an.offset / rest : 0;
+          } else {
+            an.duration = local;
+            an.ratio = local > 0 ? an.offset / local : 0;
+          }
+        }
+        reanchorTexts(p, store.media, anchors);
+      }
     }, { label: 'Split' });
     select('item', secondId);
+    // The split point is where the second half starts; keep it under the playhead even when a
+    // shortened transition moved the pictures.
+    const ns = store.timeline.segments.find((x) => x.item.id === secondId);
+    if (ns && Math.abs(ns.start - t) > 1e-3) seek(ns.start);
     return secondId;
   }
 
@@ -1176,7 +1271,40 @@ export function createCommands(app) {
       { coalesceKey: explicit ? 'musicStart' : undefined });
   }
 
-  function musicPoint(which) {
+  /**
+   * Music Tools › Start point / End point typed in: the selected music's source in / out point,
+   * `secs` seconds into the song (the start time in the movie stays, like WLMM). Start is kept in
+   * 0..end − 0.1, end in start + 0.1..the song's length. Consecutive typed values coalesce.
+   */
+  function musicPointAt(which, secs) {
+    const objs = selMusic();
+    if (!objs.length) { toast(MSG.selectMusic); return false; }
+    const o = objs[0];
+    const media = store.getMedia ? store.getMedia(o.mediaId) : null;
+    const songLen = media && media.duration > 0 ? media.duration : Infinity;
+    const inPt = Math.max(0, num(o.trimStart, 0));
+    const outPt = o.trimEnd == null || !Number.isFinite(+o.trimEnd) ? songLen : +o.trimEnd;
+    let v;
+    if (which === 'start') {
+      const hi = Number.isFinite(outPt) ? outPt - 0.1 : Infinity;
+      v = round3(clamp(secs, 0, Math.max(0, hi)));
+      if (Math.abs(v - inPt) < 1e-4) return false;
+    } else {
+      v = round3(clamp(secs, inPt + 0.1, songLen));
+      if (!Number.isFinite(v)) return false;
+      if (Number.isFinite(outPt) && Math.abs(v - outPt) < 1e-4) return false;
+    }
+    return editObjs('music', [o], which === 'start' ? 'Set music start point' : 'Set music end point', (x) => {
+      if (which === 'start') x.trimStart = v; else x.trimEnd = v;
+    }, { coalesceKey: which === 'start' ? 'musicStartPoint' : 'musicEndPoint' });
+  }
+
+  function musicPoint(which, secs) {
+    if ((which === 'start' || which === 'end') && (typeof secs === 'number' || (typeof secs === 'string' && secs.trim() !== ''))) {
+      const v = toNum(secs);
+      if (!Number.isFinite(v)) return false;
+      return musicPointAt(which, v);
+    }
     const t = now();
     const r = musicForPlayhead(t);
     if (r.error) { toast(r.error); return false; }
@@ -1230,13 +1358,20 @@ export function createCommands(app) {
     if (!keys.length) return false;
     const { type, objs } = textTargets();
     if (!objs.length) { toast(MSG.selectText); return false; }
-    const label = keys.length === 1 ? STYLE_KEYS[keys[0]].label : 'Change text format';
+    const placeKeys = keys.filter((k) => STYLE_KEYS[k].clearable);
+    const label = keys.length === 1 ? STYLE_KEYS[keys[0]].label
+      : placeKeys.length === keys.length ? (keys.includes('w') ? 'Resize text' : 'Move text')
+        : keys.includes('valign') && placeKeys.length + 1 === keys.length ? STYLE_KEYS.valign.label
+          : 'Change text format';
     const coalesceKey = keys.length === 1 && STYLE_KEYS[keys[0]].coalesce ? `textSet:${keys[0]}` : undefined;
+    const isClear = (k) => changes[k] === null && STYLE_KEYS[k].clearable;
     return editObjs(type, objs, label, (o) => {
       const kind = type === 'text' ? o.kind : 'title';
       const base = isObj(o.style) ? o.style : (typeof model.defaultTextStyle === 'function' ? model.defaultTextStyle(kind) : {});
-      o.style = { ...base, ...changes };
-    }, { same: (o) => isObj(o.style) && keys.every((k) => o.style[k] === changes[k]), coalesceKey });
+      const next = { ...base, ...changes };
+      for (const k of keys) if (isClear(k)) delete next[k];
+      o.style = next;
+    }, { same: (o) => isObj(o.style) && keys.every((k) => (isClear(k) ? o.style[k] == null : o.style[k] === changes[k])), coalesceKey });
   }
 
   function textEdit(text) {
@@ -1251,7 +1386,7 @@ export function createCommands(app) {
     if (startTextEdit(target.id)) return true;
     const d = dialogs();
     if (d && typeof d.promptText === 'function') {
-      return Promise.resolve(d.promptText('Edit text', target.text || '', { label: 'Text', okLabel: 'OK' })).then((v) => {
+      return Promise.resolve(d.promptText('Edit text', target.text || '', { label: 'Text', okLabel: 'OK', multiline: true })).then((v) => {
         if (typeof v !== 'string' || busyReason('edit')) return false;
         const o = store.find ? store.find(target.id) : null;
         if (!o) return false;
@@ -1499,17 +1634,21 @@ export function createCommands(app) {
   const hasTextTarget = () => textTargets().objs.length > 0;
   const viewVal = (k, def) => (store.view && store.view[k] !== undefined ? store.view[k] : def);
 
-  /** name → { kind, run(arg), enabled?(), checked?(arg) }. kind: edit | nav | view | project | app */
+  /** name → { kind, run(arg), enabled?(), checked?(arg) }. kind: edit | nav | view | project | save | app */
   const C = {
     addMedia: { kind: 'edit', run: (files) => addMedia(files) },
     addMusic: { kind: 'edit', run: (files) => addMusic(files, false) },
     addMusicAtPlayhead: { kind: 'edit', run: (files) => addMusic(files, true) },
     webcam: { kind: 'edit', run: () => webcam() },
     narration: { kind: 'edit', run: () => narration() },
-    snapshot: { kind: 'edit', run: () => snapshot(), enabled: () => hasDuration() && !!(app.exporter && typeof app.exporter.snapshot === 'function') },
+    snapshot: {
+      kind: 'edit', run: () => snapshot(),
+      // Greyed out unless a video is under the playhead (as in WLMM).
+      enabled: () => !!(app.exporter && typeof app.exporter.snapshot === 'function') && !!videoSegmentAt(now()),
+    },
     addTitle: { kind: 'edit', run: () => addTitle() },
     addCaption: { kind: 'edit', run: () => addCaption(), enabled: () => hasItems() && hasDuration() },
-    addCredits: { kind: 'edit', run: () => addCredits() },
+    addCredits: { kind: 'edit', run: (kind) => addCredits(kind) },
     autoMovie: { kind: 'edit', run: (id) => autoMovie(id), enabled: hasItems, checked: () => false },
 
     cut: { kind: 'edit', run: () => cut(), enabled: hasSelection },
@@ -1610,8 +1749,8 @@ export function createCommands(app) {
       checked: (v) => { const o = firstMusic(); return !!o && (o.fadeOut || 'none') === v; },
     },
     musicStartTime: { kind: 'edit', run: (v) => musicStartTime(v), enabled: hasMusicSel },
-    musicSetStartPoint: { kind: 'edit', run: () => musicPoint('start'), enabled: hasMusicSel },
-    musicSetEndPoint: { kind: 'edit', run: () => musicPoint('end'), enabled: hasMusicSel },
+    musicSetStartPoint: { kind: 'edit', run: (secs) => musicPoint('start', secs), enabled: hasMusicSel },
+    musicSetEndPoint: { kind: 'edit', run: (secs) => musicPoint('end', secs), enabled: hasMusicSel },
     musicSplit: { kind: 'edit', run: () => musicPoint('split'), enabled: hasMusicSel },
 
     textSet: {
@@ -1659,11 +1798,11 @@ export function createCommands(app) {
 
     newProject: { kind: 'project', run: () => newProject() },
     openProject: { kind: 'project', run: () => openProject() },
-    saveProject: { kind: 'project', run: () => saveProject() },
-    saveProjectAs: { kind: 'project', run: () => saveProjectAs() },
+    saveProject: { kind: 'save', run: () => saveProject() },
+    saveProjectAs: { kind: 'save', run: () => saveProjectAs() },
     importProjectFile: { kind: 'project', run: (f) => importProjectFile(f) },
-    exportProjectFile: { kind: 'project', run: () => exportProjectFile() },
-    saveMovie: { kind: 'project', run: (id) => saveMovie(id), enabled: hasItems },
+    exportProjectFile: { kind: 'save', run: () => exportProjectFile() },
+    saveMovie: { kind: 'save', run: (id) => saveMovie(id), enabled: hasItems },
     about: { kind: 'app', run: () => dialogCall('openAbout', 'About isn’t available right now.') },
     help: { kind: 'app', run: () => dialogCall('openHelp', 'Help isn’t available right now.') },
   };

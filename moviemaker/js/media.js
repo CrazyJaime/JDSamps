@@ -926,15 +926,26 @@ export function bufferToPeaks(buffer, perSecond = PEAKS_PER_SECOND) {
 }
 
 const peakJobs = new Map();
+// Blobs whose sound could not be turned into peaks this session (decode error with a known
+// soundtrack, or a decode that timed out): don't burn another minute on them.
+const peakFailures = typeof WeakSet === 'function' ? new WeakSet() : null;
+const DECODE_TIMED_OUT = Symbol('decode timed out');
 
 /**
  * Decode the media's sound and return waveform peaks (~20/s, 0..1), or null if the
  * file has no decodable audio. Updates media.peaks / media.hasAudio (and a missing
  * duration) in place. Concurrent calls for the same media share one decode.
+ *
+ * hasAudio is only cleared on a real "no soundtrack" answer: the decode succeeded with no
+ * samples, or (for a video whose element did not report an audio track — Chromium never does)
+ * decodeAudioData refused the file. A timeout, an unreadable file or a decode error for a video
+ * that does have an audio track (media.hasAudioHint === true, e.g. a codec this engine's
+ * decodeAudioData can't read) leave it alone, so the audio engine can still try later.
  */
 export function computePeaks(media, audioCtx) {
   if (!media || media.type === 'image' || !media.blob) return Promise.resolve(null);
   if (Array.isArray(media.peaks) && media.peaks.length) return Promise.resolve(media.peaks);
+  if (peakFailures && typeof media.blob === 'object' && peakFailures.has(media.blob)) return Promise.resolve(null);
   const key = media.id || media;
   if (peakJobs.has(key)) return peakJobs.get(key);
   const job = (async () => {
@@ -948,9 +959,24 @@ export function computePeaks(media, audioCtx) {
     }
     if (!ctx && audioCtx && typeof audioCtx.decodeAudioData === 'function') ctx = audioCtx;
     if (!ctx) return null;
+    const failed = () => { try { if (peakFailures) peakFailures.add(media.blob); } catch (_) { /* ignore */ } };
     try {
-      const data = await readArrayBuffer(media.blob);
-      const buffer = await withTimeout(decodeWith(ctx, data), DECODE_TIMEOUT, null);
+      let data;
+      try {
+        data = await readArrayBuffer(media.blob);
+      } catch (_) {
+        return null; // the file can't be read right now: says nothing about its sound
+      }
+      let buffer;
+      try {
+        buffer = await withTimeout(decodeWith(ctx, data), DECODE_TIMEOUT, DECODE_TIMED_OUT);
+      } catch (_) {
+        if (media.type === 'video' && media.hasAudioHint !== true) media.hasAudio = false;
+        else failed();
+        return null;
+      }
+      data = null;
+      if (buffer === DECODE_TIMED_OUT) { failed(); return null; } // slow device: still unknown
       if (!buffer || !buffer.length || !buffer.numberOfChannels) {
         if (media.type === 'video') media.hasAudio = false;
         return null;
@@ -961,7 +987,6 @@ export function computePeaks(media, audioCtx) {
       media.hasAudio = true;
       return peaks;
     } catch (_) {
-      if (media.type === 'video') media.hasAudio = false;
       return null;
     } finally {
       if (holder && holder.close) holder.close();
@@ -1052,6 +1077,9 @@ async function importVideo(blob, name, mime, report, signal) {
     width: probe.width,
     height: probe.height,
     hasAudio: probe.hasAudioHint !== false,
+    // What the <video> element said about an audio track: true / false, or null when the engine
+    // can't tell (Chromium). computePeaks uses it to tell "no soundtrack" from "can't decode it".
+    hasAudioHint: typeof probe.hasAudioHint === 'boolean' ? probe.hasAudioHint : null,
     thumb: probe.thumb,
     filmstrip: probe.filmstrip,
     peaks: null,

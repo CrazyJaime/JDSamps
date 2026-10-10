@@ -1,7 +1,7 @@
 // Node unit tests for the pure storyboard layout math (StripLayout, packLanes).
 // Run: node tests/storyboard.unit.mjs
 import assert from 'node:assert/strict';
-import { StripLayout, packLanes } from '../js/ui/storyboard.js';
+import { StripLayout, packLanes, thumbLook } from '../js/ui/storyboard.js';
 import { computeTimeline, createProject, createVisualItem, createTextItem, createMusicItem } from '../js/model.js';
 
 let passed = 0;
@@ -111,6 +111,18 @@ test('lane packing', () => {
   assert.equal(r.lanes.get('c'), 0);
   assert.equal(r.lanes.get('d'), 2);
   assert.equal(r.lanes.get('e'), 0);
+});
+
+test('thumbnail look for visual effects and brightness', () => {
+  assert.deepEqual(thumbLook('none', 0), { filter: '', mirror: '', badge: false });
+  assert.equal(thumbLook('sepia', 0).filter, 'sepia(1)');
+  assert.match(thumbLook('bw-orange', 0).filter, /grayscale\(1\)/);
+  assert.equal(thumbLook(null, 50).filter, 'brightness(1.5)');
+  assert.equal(thumbLook('invert', -100).filter, 'invert(1) brightness(0.15)');
+  assert.deepEqual(thumbLook('mirror-h', 0), { filter: '', mirror: 'scaleX(-1)', badge: false });
+  assert.equal(thumbLook('fade-in-black', 0).badge, true);
+  assert.equal(thumbLook('pixelate', 0).badge, true);
+  assert.equal(thumbLook('sepia', 0).badge, false);
 });
 
 console.log(`\n${passed} passed${process.exitCode ? ', with failures' : ''}`);

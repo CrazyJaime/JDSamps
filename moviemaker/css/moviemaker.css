@@ -216,7 +216,10 @@ svg.ic { flex: none; display: block; overflow: visible; }
   grid-template-rows: auto auto minmax(0, 1fr) auto;
   grid-template-columns: minmax(0, 1fr);
   width: 100%;
-  height: 100vh;
+  /* Without dvh support (Chrome Android < 108, Safari < 15.4) fall back to the html/body height,
+     which follows the small viewport (toolbar shown). 100vh would be the toolbar-hidden height
+     there, pushing the transport below the screen because the root never scrolls. */
+  height: 100%;
   height: 100dvh;
   overflow: hidden;
   background: linear-gradient(var(--c-frame-top), var(--c-frame-mid) 40px, var(--c-frame-bot) 160px, var(--c-frame-bot));
@@ -611,7 +614,7 @@ svg.ic { flex: none; display: block; overflow: visible; }
 }
 .rb-large > svg.ic:not(.rb-caret) { width: 32px; height: 32px; margin: 0 auto 1px; }
 .rb-btn svg.rb-caret { width: 8px; height: 8px; margin: 0 0 0 1px; }
-.rb-label > svg.rb-caret { display: inline-block; vertical-align: middle; margin: -2px 0 0; }
+.rb-label svg.rb-caret { display: inline-block; vertical-align: middle; margin: -2px 0 0; }
 .rb-large .rb-label {
   display: -webkit-box;
   -webkit-line-clamp: 2;
@@ -923,9 +926,21 @@ svg.ic { flex: none; display: block; overflow: visible; }
   font-size: 11.5px;
 }
 .rb-gal-full-items { display: flex; flex-wrap: wrap; gap: 2px; padding: 2px 0; }
-.rb-gal-full .rb-gal-item { width: 76px; height: auto; padding: 3px 2px 2px; }
+.rb-gal-full .rb-gal-item { width: 82px; height: auto; padding: 3px 2px 2px; }
 .rb-gal-full .rb-gal-item canvas, .rb-gal-full .rb-gal-fallback { width: 68px; height: 51px; }
-.rb-gal-full .rb-gal-name { font-size: 10.5px; line-height: 12px; }
+/* Names wrap to two lines so variants stay apart ("Black and white - orange filter"). */
+.rb-gal-full .rb-gal-name {
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+  height: 24px;
+  white-space: normal;
+  overflow-wrap: break-word;
+  text-align: center;
+  font-size: 10.5px;
+  line-height: 12px;
+}
+.rb-nowrap { white-space: nowrap; }
 
 /* ---------------------------------------------------------------------------
    Ribbon popups: dropdowns, menus, palettes, bottom sheets
@@ -1082,7 +1097,8 @@ svg.ic { flex: none; display: block; overflow: visible; }
   border-radius: 50%;
 }
 .rb-sheet-close:active { background: rgba(0, 0, 0, 0.06); }
-.rb-sheet-body { flex: 1 1 auto; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; padding: 4px 8px 12px; }
+/* No top padding: it would deflate the sticky area, so tiles would show above a stuck group heading. */
+.rb-sheet-body { flex: 1 1 auto; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; padding: 0 8px 12px; }
 .rb-sheet .menu { min-width: 0; }
 .rb-sheet .menu-item { min-height: var(--touch); font-size: 16px; padding: 6px 12px 6px 8px; }
 .rb-sheet .rb-gal-full-heading { font-size: 13px; padding: 6px 12px; margin: 0 -8px 4px; }
@@ -1094,7 +1110,7 @@ svg.ic { flex: none; display: block; overflow: visible; }
 .rb-sheet .rb-gal-full .rb-gal-item { width: auto; height: auto; padding: 3px 3px 2px; }
 .rb-sheet .rb-gal-full .rb-gal-item canvas,
 .rb-sheet .rb-gal-full .rb-gal-fallback { width: 100%; height: auto; aspect-ratio: 4 / 3; }
-.rb-sheet .rb-gal-full .rb-gal-name { font-size: 11.5px; line-height: 14px; }
+.rb-sheet .rb-gal-full .rb-gal-name { font-size: 11.5px; line-height: 14px; height: 28px; }
 .rb-sheet .rb-palette { grid-template-columns: repeat(8, 1fr); gap: 8px; padding: 8px 4px; }
 .rb-sheet .rb-swatch { width: 100%; height: auto; aspect-ratio: 1; border-radius: 4px; min-height: 32px; }
 .rb-sheet .rb-slider-pop { padding: 16px 8px 8px; }
@@ -1105,14 +1121,45 @@ svg.ic { flex: none; display: block; overflow: visible; }
    --------------------------------------------------------------------------- */
 .main {
   display: grid;
-  grid-template-columns: minmax(280px, 40%) minmax(0, 1fr);
+  /* preview | splitter (zero-width column, wider hit area) | storyboard. --pv-ratio is the split
+     the user dragged (preview.js); otherwise View › Preview size picks 40% / 60%. */
+  grid-template-columns: minmax(280px, var(--pv-ratio, 40%)) 0 minmax(0, 1fr);
   min-height: 0;
   margin: 3px 3px 0;
   border: 1px solid #93a9c6;
   background: var(--c-workspace);
   overflow: hidden;
 }
-#app[data-preview-size="large"] .main { grid-template-columns: minmax(360px, 60%) minmax(0, 1fr); }
+#app[data-preview-size="large"] .main { grid-template-columns: minmax(280px, var(--pv-ratio, 60%)) 0 minmax(0, 1fr); }
+.main-splitter {
+  position: relative;
+  z-index: 6;
+  width: 0;
+  min-height: 0;
+  outline: none;
+  touch-action: none;
+}
+.main-splitter::before {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -4px;
+  width: 8px;
+  cursor: col-resize;
+}
+.main-splitter:hover::after, .main-splitter.is-dragging::after, .main-splitter:focus-visible::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: -2px;
+  width: 3px;
+  background: rgba(60, 140, 231, 0.55);
+  pointer-events: none;
+}
+html.mm-col-resizing, html.mm-col-resizing * { cursor: col-resize !important; -webkit-user-select: none; user-select: none; }
+@media (pointer: coarse) { .main-splitter::before { left: -12px; width: 24px; } }
 
 .preview-pane {
   position: relative;
@@ -1906,6 +1953,7 @@ progress.progress::-moz-progress-bar { background: linear-gradient(#7ce07c, #2fb
   .rb-tab.is-active { height: 32px; }
   .rb-icon-btn { width: 32px; height: 28px; }
   .rb-small { height: 28px; }
+  .rb-small-split > .rb-split-menu { height: 28px; }
   .rb-small.is-icon-only { width: 32px; }
   .rb-stack { gap: 1px; }
   .rb-field { height: 28px; }
@@ -1964,6 +2012,9 @@ progress.progress::-moz-progress-bar { background: linear-gradient(#7ce07c, #2fb
     text-align: left;
     text-shadow: none;
     pointer-events: auto;
+    /* tap to rename: a full-height (44px) hit box */
+    height: var(--touch);
+    line-height: var(--touch);
   }
   .doc-title .doc-title-app { display: none; }
   .titlebar-icon { display: none; }
@@ -2035,6 +2086,23 @@ progress.progress::-moz-progress-bar { background: linear-gradient(#7ce07c, #2fb
   .rb-ctx .rb-tab .rb-tab-ctx-label { display: block; font-size: 10px; font-weight: 600; color: var(--ctx-text); opacity: 0.85; }
   .rb-ctx .rb-tab.is-active { border-top: 0; color: var(--ctx-text); box-shadow: inset 0 -3px 0 var(--ctx-c); }
   .rb-tabrow-end { display: none; }
+  /* Contextual tabs sit right after Home, so selecting a clip never scrolls Home out of reach. */
+  .rb-tabs > .rb-tab { order: 2; }
+  .rb-tabs > .rb-tab[data-tab="home"] { order: 0; }
+  .rb-tabs > .rb-ctx { order: 1; }
+  /* Fade the edge of a row that scrolls further (ribbon.js sets is-clip-left / is-clip-right). */
+  .rb-tabs.is-clip-right, .rb-panel.is-clip-right {
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 32px), transparent);
+    mask-image: linear-gradient(to right, #000 calc(100% - 32px), transparent);
+  }
+  .rb-tabs.is-clip-left, .rb-panel.is-clip-left {
+    -webkit-mask-image: linear-gradient(to right, transparent, #000 32px);
+    mask-image: linear-gradient(to right, transparent, #000 32px);
+  }
+  .rb-tabs.is-clip-left.is-clip-right, .rb-panel.is-clip-left.is-clip-right {
+    -webkit-mask-image: linear-gradient(to right, transparent, #000 32px, #000 calc(100% - 32px), transparent);
+    mask-image: linear-gradient(to right, transparent, #000 32px, #000 calc(100% - 32px), transparent);
+  }
 
   .rb-body {
     height: auto;
@@ -2153,18 +2221,19 @@ progress.progress::-moz-progress-bar { background: linear-gradient(#7ce07c, #2fb
   .rb-field > svg.ic { display: none; }
   .rb-field-label { text-align: left; color: var(--c-text-muted); font-size: 11px; }
   .rb-field-label.is-fixed { width: auto; }
+  /* value controls: 40px tall touch targets (the 60px row has room for label + control) */
   .rb-select, .rb-input {
-    height: 34px;
+    height: 40px;
     font-size: 16px; /* no zoom on focus (iOS) */
     border-radius: 6px;
     padding: 0 6px;
   }
   .rb-select { padding-right: 22px; background-size: 11px 11px, auto; background-position: right 6px center, 0 0; min-width: 84px; }
-  .rb-combo { height: 34px; }
+  .rb-combo { height: 40px; }
   .rb-combo .rb-input { width: calc(var(--input-w, 54px) * 1.3); border-radius: 6px 0 0 6px; }
-  .rb-combo-btn { width: 30px; border-radius: 0 6px 6px 0; }
-  .rb-range-wrap { height: 34px; }
-  .rb-range { width: 132px; height: 34px; touch-action: none; }
+  .rb-combo-btn { width: 40px; border-radius: 0 6px 6px 0; }
+  .rb-range-wrap { height: 40px; }
+  .rb-range { width: 132px; height: 40px; touch-action: none; }
   .rb-l-full { display: none; }
   .rb-l-short { display: inline; }
   .rb-range::-webkit-slider-thumb { width: 22px; height: 22px; margin-top: -10px; border-radius: 50%; }
@@ -2201,8 +2270,13 @@ progress.progress::-moz-progress-bar { background: linear-gradient(#7ce07c, #2fb
     background: var(--c-storyboard);
   }
   #app[data-preview-size="large"] .main { grid-template-columns: none; }
+  .main-splitter { display: none; }
+  /* Height is shared by priority: the storyboard keeps what its filmstrip + music/caption lanes
+     need (--sb-need, set by storyboard.js), the transport always stays, and the picture takes the
+     rest (up to the project aspect at full width, max 45% of the screen), letterboxed inside. */
   .preview-pane {
-    flex: none;
+    flex: 0 1 auto;
+    min-height: 0;
     border-right: 0;
     border-bottom: 1px solid #b7c6d9;
     background: #111418;
@@ -2210,7 +2284,8 @@ progress.progress::-moz-progress-bar { background: linear-gradient(#7ce07c, #2fb
     padding-right: var(--safe-right);
   }
   .pv-stage {
-    flex: none;
+    flex: 0 1 auto;
+    min-height: 40px;
     margin: 0;
     border: 0;
     width: 100%;
@@ -2220,13 +2295,15 @@ progress.progress::-moz-progress-bar { background: linear-gradient(#7ce07c, #2fb
     box-shadow: none;
   }
   #app[data-preview-size="large"] .pv-stage { max-height: 58vh; max-height: 58dvh; }
-  .pv-transport { min-height: 52px; background: linear-gradient(#20252c, #15191e); }
+  .pv-transport { flex: none; min-height: 52px; background: linear-gradient(#20252c, #15191e); }
+  .pv-seekrow { flex: none; }
   .pv-time { color: #e3e8ef; font-size: 13px; }
   .pv-btn { width: var(--touch); height: var(--touch); border-color: #3b4552; background: linear-gradient(#3a424d, #262c33); }
   .pv-btn svg { width: 20px; height: 20px; }
   .pv-play { width: 48px; height: 48px; }
-  .storyboard-pane {
-    flex: 1 1 auto;
+  .main > .storyboard-pane {
+    flex: 1 1 0;
+    min-height: var(--sb-need, 150px);
     padding-left: var(--safe-left);
     padding-right: var(--safe-right);
     padding-bottom: var(--safe-bottom);
@@ -2275,8 +2352,8 @@ progress.progress::-moz-progress-bar { background: linear-gradient(#7ce07c, #2fb
   .dlg-buttons .btn { flex: 1 1 0; }
   .dlg-close {
     width: var(--touch);
-    height: 36px;
-    border-radius: 18px;
+    height: var(--touch);
+    border-radius: 50%;
     margin-top: 0;
     align-self: center;
     border: 0;
@@ -2328,6 +2405,12 @@ progress.progress::-moz-progress-bar { background: linear-gradient(#7ce07c, #2fb
   .sb-scroll { padding: 8px 0 12px; }
 }
 
+/* Very narrow phones (320px): "Save movie" without its icon leaves the project name some room. */
+@media (max-width: 359px) {
+  .qat-btn.qat-save-movie { padding: 0 11px; }
+  .qat-btn.qat-save-movie svg { display: none; }
+}
+
 /* =============================================================================
    PHONE (landscape): preview left, storyboard right, compact ribbon
    ============================================================================= */
@@ -2356,7 +2439,7 @@ progress.progress::-moz-progress-bar { background: linear-gradient(#7ce07c, #2fb
     text-align: left;
     text-shadow: none;
   }
-  #app-menu-btn { order: 1; height: 28px; border-radius: 5px; }
+  #app-menu-btn { order: 1; height: 34px; border-radius: 6px; }
   .titlebar-icon { display: none; }
   .qat { order: 3; }
   .qat-btn { width: 40px; height: 34px; border-radius: 6px; }
@@ -2367,9 +2450,9 @@ progress.progress::-moz-progress-bar { background: linear-gradient(#7ce07c, #2fb
     width: auto;
     gap: 4px;
     padding: 0 10px 0 8px;
-    height: 28px;
+    height: 34px;
     border: 1px solid #1f5fae;
-    border-radius: 14px;
+    border-radius: 17px;
     background: linear-gradient(#4a91e2, #1e5fb6);
     color: #fff;
     font-weight: 600;
@@ -2397,6 +2480,21 @@ progress.progress::-moz-progress-bar { background: linear-gradient(#7ce07c, #2fb
   .rb-ctx .rb-tab .rb-tab-ctx-label { display: block; font-size: 9.5px; font-weight: 600; color: var(--ctx-text); }
   .rb-ctx .rb-tab.is-active { border-top: 0; color: var(--ctx-text); box-shadow: inset 0 -3px 0 var(--ctx-c); }
   .rb-tabrow-end { display: none; }
+  .rb-tabs > .rb-tab { order: 2; }
+  .rb-tabs > .rb-tab[data-tab="home"] { order: 0; }
+  .rb-tabs > .rb-ctx { order: 1; }
+  .rb-tabs.is-clip-right, .rb-panel.is-clip-right {
+    -webkit-mask-image: linear-gradient(to right, #000 calc(100% - 32px), transparent);
+    mask-image: linear-gradient(to right, #000 calc(100% - 32px), transparent);
+  }
+  .rb-tabs.is-clip-left, .rb-panel.is-clip-left {
+    -webkit-mask-image: linear-gradient(to right, transparent, #000 32px);
+    mask-image: linear-gradient(to right, transparent, #000 32px);
+  }
+  .rb-tabs.is-clip-left.is-clip-right, .rb-panel.is-clip-left.is-clip-right {
+    -webkit-mask-image: linear-gradient(to right, transparent, #000 32px, #000 calc(100% - 32px), transparent);
+    mask-image: linear-gradient(to right, transparent, #000 32px, #000 calc(100% - 32px), transparent);
+  }
   .rb-body { height: auto; margin: 0; border: 0; border-radius: 0; background: transparent; box-shadow: none; }
   .rb-panel {
     height: auto;
@@ -2497,13 +2595,18 @@ progress.progress::-moz-progress-bar { background: linear-gradient(#7ce07c, #2fb
     padding-right: var(--safe-right);
   }
   #app[data-preview-size="large"] .main { grid-template-columns: minmax(0, 64%) minmax(0, 1fr); }
-  .preview-pane { border-right: 1px solid #2a3038; background: #111418; padding-bottom: var(--safe-bottom); }
-  .pv-stage { margin: 0; border: 0; box-shadow: none; }
+  .main-splitter { display: none; }
+  .preview-pane { border-right: 1px solid #2a3038; border-bottom: 0; background: #111418; padding-bottom: var(--safe-bottom); }
+  /* The picture takes the height the seek row and transport leave (the canvas letterboxes inside),
+     so Play stays on screen on short in-browser viewports (e.g. 667x325, 732x304). This undoes the
+     portrait rules, which also match landscape phones narrower than 760px. */
+  .pv-stage { flex: 1 1 auto; min-height: 0; width: auto; aspect-ratio: auto; max-height: none; margin: 0; border: 0; box-shadow: none; }
+  #app[data-preview-size="large"] .pv-stage { max-height: none; }
   .pv-transport { min-height: 44px; padding: 2px 8px; background: linear-gradient(#20252c, #15191e); }
   .pv-time { color: #e3e8ef; }
   .pv-btn { width: 40px; height: 40px; border-color: #3b4552; background: linear-gradient(#3a424d, #262c33); }
   .pv-play { width: 42px; height: 42px; }
-  .storyboard-pane { padding-bottom: var(--safe-bottom); }
+  .main > .storyboard-pane { min-height: 0; padding-bottom: var(--safe-bottom); }
   .statusbar { display: none; }
 
   .dlg-backdrop.is-sheet { align-items: flex-end; padding: 0 max(8px, var(--safe-right)) 0 max(8px, var(--safe-left)); }
@@ -2520,7 +2623,14 @@ progress.progress::-moz-progress-bar { background: linear-gradient(#7ce07c, #2fb
     padding: var(--safe-top) 0 var(--safe-bottom) var(--safe-left);
     border-top-width: 0;
   }
-  #toast-root { bottom: calc(12px + var(--safe-bottom)); }
+  /* Toasts sit over the storyboard (right) side, never over the picture's Play / seek row. */
+  #toast-root {
+    left: auto;
+    right: calc(8px + var(--safe-right));
+    bottom: calc(12px + var(--safe-bottom));
+    width: min(440px, calc(48vw - 16px - var(--safe-right)));
+    transform: none;
+  }
   html.mm-modal-open #toast-root { top: calc(6px + var(--safe-top)); bottom: auto; flex-direction: column; }
 }
 

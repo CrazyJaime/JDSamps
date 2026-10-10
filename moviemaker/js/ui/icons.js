@@ -232,6 +232,15 @@ const ICONS = {
   share: `<path d="M9 12H7a1.5 1.5 0 0 0-1.5 1.5v13A1.5 1.5 0 0 0 7 28h18a1.5 1.5 0 0 0 1.5-1.5v-13A1.5 1.5 0 0 0 25 12h-2" fill="none" stroke="#3b5878" ${SW}="2.2"/>`
     + `<path d="M16 20V4M10.5 9.5L16 4l5.5 5.5" fill="none" stroke="#1d5fc2" ${SW}="2.6"/>`,
   export: `${film(2, 6, 18, 20)}<path d="M18 16h11M24.5 11.5L29 16l-4.5 4.5" stroke="#2f9a27" ${SW}="3" fill="none"/>`,
+  // "Save movie › For email": an envelope with a small film frame
+  email: `<rect x="2.5" y="7" width="27" height="19" rx="2" fill="#fdfdfd" stroke="#4d6a8c" ${SW}="1.4"/>`
+    + `<path d="M3.5 8.5L16 18l12.5-9.5" fill="none" stroke="#4d6a8c" ${SW}="1.6"/>`
+    + `<path d="M3.5 24.5l9-8M28.5 24.5l-9-8" fill="none" stroke="#9fb3cb" ${SW}="1.2"/>`
+    + `<rect x="18" y="1.5" width="12" height="8.5" rx="1" fill="#34495e"/><rect x="19.5" y="3.6" width="9" height="4.2" fill="#79b4ec"/>`,
+  // "Save movie › For mobile phone": a phone held sideways (the output is landscape)
+  'phone-landscape': `<rect x="2" y="8" width="28" height="16" rx="3" fill="#2e3a48" stroke="#141c25" ${SW}="1.2"/>`
+    + `<rect x="5.5" y="10" width="21" height="12" fill="#5fa9ef"/><rect x="5.5" y="10" width="21" height="4" fill="#fff" opacity=".25"/>`
+    + `<circle cx="28.2" cy="16" r=".9" fill="#9aa8b8"/><path d="M14 13.4v5.2l4.6-2.6z" fill="#fff"/>`,
 
   // ---- transport ----
   play: `<path d="M9 5.5v21l17-10.5z" fill="#2f78d1" stroke="#163f7a" ${SW}="1.6"/><path d="M11 9v6l6-3.7z" fill="#fff" opacity=".4"/>`,

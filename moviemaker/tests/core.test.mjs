@@ -498,6 +498,58 @@ await test('importProjectFile rejects junk with a friendly error', async () => {
   await assert.rejects(P.importProjectFile(null), (e) => e.friendly === true);
 });
 
+await test('undo / redo stamp a new modification time', async () => {
+  const s = new Store();
+  s.update((p) => { p.name = 'A'; });
+  await sleep(5);
+  s.update((p) => { p.name = 'B'; });
+  await sleep(5);
+  const before = Date.now();
+  s.undo();
+  assert.equal(s.project.name, 'A');
+  assert.ok(s.project.updatedAt >= before, 'undo does not go back in time');
+  await sleep(5);
+  const before2 = Date.now();
+  s.redo();
+  assert.equal(s.project.name, 'B');
+  assert.ok(s.project.updatedAt >= before2, 'redo does not go back in time');
+});
+
+await test('changing the selection ends slider coalescing', () => {
+  const s = new Store();
+  const a = M.createVisualItem('image');
+  const b = M.createVisualItem('image');
+  s.update((p) => { p.items.push(a, b); });
+  const n = s._undo.length;
+  s.select('item', a.id);
+  s.update((p) => { p.items[0].brightness = 40; }, { coalesceKey: 'brightness' });
+  s.select('item', a.id); // same selection: still one drag
+  s.update((p) => { p.items[0].brightness = 50; }, { coalesceKey: 'brightness' });
+  assert.equal(s._undo.length, n + 1);
+  s.select('item', b.id);
+  s.update((p) => { p.items[1].brightness = -30; }, { coalesceKey: 'brightness' });
+  assert.equal(s._undo.length, n + 2, 'edit on another item is its own undo step');
+  s.undo();
+  assert.equal(s.project.items[0].brightness, 50, 'undo keeps the first item');
+  assert.equal(s.project.items[1].brightness, 0);
+});
+
+await test('mediaInUse: project, undo/redo history and clipboard', () => {
+  const s = new Store();
+  const item = (id) => M.createVisualItem('image', { mediaId: id });
+  s.update((p) => { p.items.push(item('m1'), item('m2')); p.music.push(M.createMusicItem({ mediaId: 'm3' })); });
+  s.update((p) => { p.items = p.items.filter((i) => i.mediaId !== 'm2'); });
+  assert.deepEqual([...s.mediaInUse()].sort(), ['m1', 'm2', 'm3'], 'm2 is still in the undo history');
+  s.update((p) => { p.items.push(item('m4')); });
+  s.undo();
+  assert.ok(s.mediaInUse().has('m4'), 'redo can bring m4 back');
+  s.clipboard = { type: 'item', objs: [item('m5')], media: [{ id: 'm6' }] };
+  assert.ok(s.mediaInUse().has('m5') && s.mediaInUse().has('m6'), 'clipboard');
+  s.replaceProject(M.createProject());
+  s.clipboard = null;
+  assert.equal(s.mediaInUse().size, 0, 'a loaded project has no history');
+});
+
 await test('IndexedDB unavailable → friendly errors, never crashes', async () => {
   await assert.rejects(P.saveProject(M.createProject(), new Map()), (e) => e.friendly && /IndexedDB|storage|private/i.test(e.message));
   await assert.rejects(P.listProjects(), (e) => e.friendly);

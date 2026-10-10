@@ -75,7 +75,7 @@ function makeApp() {
     promptAnswer: 'Copy name',
     webcamFile: null,
     narrationFile: null,
-    toast(msg, opts = {}) { log.toasts.push({ msg, type: opts.type || 'info' }); return { close() {} }; },
+    toast(msg, opts = {}) { log.toasts.push({ msg, type: opts.type || 'info', action: opts.action || null }); return { close() {} }; },
     progress(title, opts) {
       const ctl = new AbortController();
       const entry = { title, opts, sets: [], closed: false, ctl };
@@ -348,15 +348,26 @@ await test('webcam → video item at the playhead; narration → narration at th
   assert.equal(store.undoLabel, 'Record narration');
 });
 
-await test('snapshot → image item after the item under the playhead', async () => {
-  const { store, cmd, player } = makeApp();
-  const a = addVisual(store, 'image', { duration: 4 });
+await test('snapshot → image item after the video under the playhead, picture offered as a file', async () => {
+  const { store, cmd, player, log } = makeApp();
+  const a = addVisual(store, 'video', {}, 4);
   const b = addVisual(store, 'image', { duration: 4 });
   player.currentTime = 1;
+  assert.equal(cmd.isEnabled('snapshot'), true, 'video under the playhead');
   const id = await cmd.run('snapshot');
   assert.deepEqual(store.project.items.map((i) => i.id), [a.id, id, b.id]);
   assert.equal(store.find(id).obj.kind, 'image');
   assert.equal(store.undoLabel, 'Add snapshot');
+  const offer = log.toasts.at(-1);
+  assert.match(offer.msg, /Snapshot added/);
+  assert.equal(offer.action && offer.action.label, 'Save picture');
+  // Like WLMM: only a video frame can be snapshotted.
+  player.currentTime = store.timeline.segments[2].start + 1; // on the photo
+  assert.equal(cmd.isEnabled('snapshot'), false, 'photo under the playhead');
+  const n = store.project.items.length;
+  assert.equal(await cmd.run('snapshot'), false);
+  assert.equal(store.project.items.length, n);
+  assert.match(log.toasts.at(-1).msg, /playhead onto a video/);
   const empty = makeApp();
   assert.equal(empty.cmd.isEnabled('snapshot'), false);
 });
@@ -975,6 +986,96 @@ await test('musicSetStartPoint / musicSetEndPoint / musicSplit at the playhead',
   assert.equal(cmd.run('musicSplit'), false, 'playhead outside the music');
 });
 
+await test('musicSetStartPoint / musicSetEndPoint with typed seconds (Music Tools fields)', () => {
+  const { store, cmd, player } = makeApp();
+  addVisual(store, 'image', { duration: 20 });
+  const m = addMusicItem(store, 2, 10, { trimStart: 1 });
+  store.select('music', m.id);
+  player.currentTime = 5; // the playhead must not matter with an argument
+  const n = undoCount(store);
+  assert.ok(cmd.run('musicSetStartPoint', 3));
+  assert.equal(store.find(m.id).obj.trimStart, 3);
+  assert.equal(store.find(m.id).obj.start, 2, 'start time in the movie stays');
+  assert.equal(store.undoLabel, 'Set music start point');
+  cmd.run('musicSetStartPoint', '00:03.50');
+  assert.equal(store.find(m.id).obj.trimStart, 3.5);
+  assert.equal(undoCount(store), n + 1, 'consecutive typed values coalesce');
+  cmd.run('musicSetEndPoint', 8);
+  assert.equal(store.find(m.id).obj.trimEnd, 8);
+  cmd.run('musicSetEndPoint', 99);
+  assert.equal(store.find(m.id).obj.trimEnd, 10, 'end clamped to the song length');
+  cmd.run('musicSetEndPoint', 2);
+  assert.equal(store.find(m.id).obj.trimEnd, 3.6, 'end stays 0.1s after the start');
+  cmd.run('musicSetStartPoint', 50);
+  assert.equal(store.find(m.id).obj.trimStart, 3.5, 'start stays 0.1s before the end');
+  assert.equal(cmd.run('musicSetStartPoint', 3.5), false, 'no change, no undo step');
+  // No argument: still the playhead (5 → 3s into the music → source 6.5? clamped by the edge guard)
+  store.update((p) => { const o = p.music.find((x) => x.id === m.id); o.trimStart = 1; o.trimEnd = null; }, { label: 'reset' });
+  player.currentTime = 5;
+  cmd.run('musicSetStartPoint');
+  assert.equal(store.find(m.id).obj.trimStart, 4, 'playhead behaviour without an argument');
+});
+
+await test('addCredits(kind): Director / Starring / Location / Soundtrack headings', () => {
+  const { store, cmd } = makeApp();
+  addVisual(store, 'image', { duration: 5 });
+  const id0 = cmd.run('addCredits');
+  assert.match(store.find(id0).obj.text, /^CREDITS/);
+  const want = { director: /^DIRECTED BY\n/, starring: /^STARRING\n/, location: /^FILMED ON LOCATION IN\n/, soundtrack: /^SOUNDTRACK\n/ };
+  let last = store.find(id0).obj;
+  for (const [kind, re] of Object.entries(want)) {
+    const id = cmd.run('addCredits', kind);
+    const o = store.find(id).obj;
+    assert.match(o.text, re, kind);
+    assert.equal(o.kind, 'credits');
+    assert.equal(o.effect, 'scroll');
+    assert.ok(o.start >= last.start + last.duration - 1e-6, `${kind} goes after the previous credits`);
+    last = o;
+  }
+  const idx = cmd.run('addCredits', 'nonsense');
+  assert.match(store.find(idx).obj.text, /^CREDITS/, 'unknown kind → plain credits');
+});
+
+await test('textSet x / y / w: drag placement, one undo step, null clears, presets', () => {
+  const { store, cmd } = makeApp();
+  addVisual(store, 'image', { duration: 5 });
+  const cap = M.createTextItem('caption', { start: 0 });
+  store.update((p) => { p.texts.push(cap); });
+  store.select('text', cap.id);
+  const n = undoCount(store);
+  assert.ok(cmd.run('textSet', { x: 0.25, y: 0.3 }));
+  let st = store.find(cap.id).obj.style;
+  assert.equal(st.x, 0.25);
+  assert.equal(st.y, 0.3);
+  assert.equal(undoCount(store), n + 1, 'a move is one undo step');
+  assert.equal(store.undoLabel, 'Move text');
+  cmd.run('textSet', { x: 0.4, y: 0.5, w: 0.5 });
+  st = store.find(cap.id).obj.style;
+  assert.deepEqual([st.x, st.y, st.w], [0.4, 0.5, 0.5]);
+  assert.equal(store.undoLabel, 'Resize text');
+  cmd.run('textSet', { x: 7, y: -1, w: 0.001 });
+  st = store.find(cap.id).obj.style;
+  assert.deepEqual([st.x, st.y, st.w], [1, 0, 0.05], 'clamped');
+  const before = undoCount(store);
+  cmd.run('textSet', { valign: 'top', x: null, y: null, w: null });
+  st = store.find(cap.id).obj.style;
+  assert.equal(st.valign, 'top');
+  assert.ok(!('x' in st) && !('y' in st) && !('w' in st), 'null removes the keys');
+  assert.equal(undoCount(store), before + 1, 'preset is one undo step');
+  assert.equal(cmd.run('textSet', { x: null, y: null }), false, 'clearing absent keys changes nothing');
+  store.undo();
+  st = store.find(cap.id).obj.style;
+  assert.deepEqual([st.x, st.y, st.w], [1, 0, 0.05], 'undo brings the placement back');
+  // normalizeProject keeps valid x/y/w and drops invalid ones
+  const p = M.normalizeProject(JSON.parse(JSON.stringify(store.project)));
+  const ns = p.texts.find((x) => x.id === cap.id).style;
+  assert.deepEqual([ns.x, ns.y, ns.w], [1, 0, 0.05]);
+  const raw = JSON.parse(JSON.stringify(store.project));
+  raw.texts[0].style.x = 'left'; raw.texts[0].style.w = 3;
+  const ns2 = M.normalizeProject(raw).texts[0].style;
+  assert.ok(!('x' in ns2) && !('y' in ns2) && !('w' in ns2), 'invalid placement dropped (x and y go together)');
+});
+
 // ---------------------------------------------------------------- text tools
 
 await test('textSet on captions and on title items, validation and coalescing', () => {
@@ -1183,8 +1284,16 @@ await test('busy: exporting blocks editing & playback; trim mode blocks editing 
   assert.equal(cmd.isEnabled('remove'), false);
   assert.equal(cmd.isEnabled('undo'), false);
   assert.equal(cmd.isEnabled('play'), true);
-  assert.equal(cmd.isEnabled('saveProject'), true);
+  // The clip is shown untrimmed while trimming: that state must never be saved.
+  for (const n of ['saveProject', 'saveProjectAs', 'exportProjectFile', 'saveMovie']) {
+    assert.equal(cmd.isEnabled(n), false, n);
+    assert.equal(cmd.run(n), undefined, n);
+    assert.match(log.toasts.at(-1).msg, /Finish trimming/);
+  }
+  assert.equal(log.saved.length, 0);
+  assert.equal(cmd.isEnabled('openProject'), true, 'opening another project ends trimming itself');
   dialogs.trimActive = false;
+  assert.equal(cmd.isEnabled('saveProject'), true);
   assert.equal(cmd.isEnabled('remove'), true);
 });
 
@@ -1214,7 +1323,7 @@ await test('isEnabled: editing commands need a matching selection', () => {
 
 await test('errors inside a command become a toast, not an exception', async () => {
   const { store, cmd, app, log } = makeApp();
-  addVisual(store, 'image');
+  addVisual(store, 'video');
   app.exporter.snapshot = async () => { const e = new Error('The picture couldn’t be created.'); e.friendly = true; throw e; };
   const err = console.error;
   console.error = () => {};
@@ -1283,12 +1392,28 @@ await test('anchoring: transitions, durations, speed and trims keep captions on 
   cmd.run('setDuration', 8); // caption 1s into a 4s photo → 2s into an 8s photo
   const segC = store.timeline.segments[2];
   near(startOf(store, onC.id), segC.start + 2);
-  // split moves nothing
-  const before = store.project.texts.map((t) => t.start);
+  // split: every caption stays on its frame, even though the 1s first half shortens the
+  // crossfade into it (0.5s instead of 1.5s) and so moves everything after it by 1s
+  const offsets = () => {
+    const tl = store.timeline;
+    return [onV.id, onC.id].map((tid) => {
+      const t = startOf(store, tid);
+      const seg = tl.segments[M.segmentIndexAt(tl, t)];
+      return seg.item.kind === 'video' ? seg.sourceIn + (t - seg.start) * seg.item.speed : `${seg.item.id}+${(t - seg.start).toFixed(6)}`;
+    });
+  };
+  const before = offsets();
+  const endBefore = store.timeline.segments.at(-1).end;
   store.select('item', v.id);
   player.currentTime = store.timeline.segments[1].start + 1;
-  cmd.run('split');
-  assert.deepEqual(store.project.texts.map((t) => t.start), before);
+  const second = cmd.run('split');
+  assert.ok(second);
+  const after = offsets();
+  near(after[0], before[0], 'caption on the video keeps its frame');
+  assert.equal(after[1], before[1], 'caption on the next photo keeps its place in it');
+  near(store.timeline.segments.at(-1).end, endBefore + 1, 'the shortened crossfade made the movie 1s longer');
+  const secondSeg = store.timeline.segments.find((s) => s.item.id === second);
+  near(player.currentTime, secondSeg.start, 'the split point stays under the playhead');
   assert.ok(a);
 });
 
@@ -1400,6 +1525,57 @@ await test('AutoMovie: empty project is refused with a message', () => {
   assert.ok(log.toasts.length);
   assert.equal(store.canUndo, false);
   assert.equal(applyAutoMovie(store, 'default').ok, false);
+});
+
+await test('AutoMovie: re-applying a theme that is already applied adds no undo step', () => {
+  const { store, cmd, log } = makeApp();
+  addVisual(store, 'video', {}, 1);
+  addVisual(store, 'image');
+  addVisual(store, 'video', {}, 61);
+  assert.ok(cmd.run('autoMovie', 'default'));
+  const n = undoCount(store);
+  const json = JSON.stringify({ ...store.project, updatedAt: 0 });
+  for (const id of ['default', 'nope']) { // an unknown theme resolves to Default
+    assert.equal(cmd.run('autoMovie', id), false, id);
+    assert.equal(undoCount(store), n, `${id}: no undo step`);
+    assert.equal(JSON.stringify({ ...store.project, updatedAt: 0 }), json, `${id}: nothing changed`);
+    assert.match(log.toasts.at(-1).msg, /already applied/);
+  }
+  const res = applyAutoMovie(store, 'default');
+  assert.equal(res.ok, true);
+  assert.equal(res.changed, false);
+  assert.ok(cmd.run('autoMovie', 'sepia'), 'another theme still applies');
+  assert.equal(undoCount(store), n + 1);
+});
+
+await test('split next to a crossfade: captions keep their place in their clips, end credits follow the pictures', () => {
+  const { store, cmd, player } = makeApp();
+  const a = addVisual(store, 'image', { duration: 7 });
+  const b = addVisual(store, 'image', { duration: 7, transition: { type: 'crossfade', duration: 1.5 } });
+  const c = addVisual(store, 'image', { duration: 7 });
+  const onA = captionAt(store, 5);    // 5s into A — after the split point below
+  const onB = captionAt(store, 7.5);  // 2s into B (B starts at 5.5)
+  const onC = captionAt(store, 13);   // 0.5s into C (C starts at 12.5)
+  const credits = M.createTextItem('credits', { start: 19.5 });
+  store.update((p) => { p.texts.push(credits); }, { label: 'setup' });
+  store.select('item', a.id);
+  player.currentTime = 4.4; // A's second half (2.6s) is shorter than twice B's crossfade
+  const second = cmd.run('split');
+  assert.ok(second);
+  const seg = (id) => store.timeline.segments.find((x) => x.item.id === id);
+  near(seg(b.id).transitionIn.duration, 1.3, 'crossfade clamped by the short half');
+  near(startOf(store, onA.id) - seg(second).start, 0.6, 'caption on the second half of A');
+  near(startOf(store, onA.id), 5, 'which did not move');
+  near(startOf(store, onB.id) - seg(b.id).start, 2, 'caption stays 2s into B');
+  near(startOf(store, onC.id) - seg(c.id).start, 0.5, 'caption stays 0.5s into C');
+  near(startOf(store, credits.id), store.timeline.segments.at(-1).end, 'end credits start where the pictures end');
+  // splitting the clip after the crossfade, 1s into it
+  store.select('item', b.id);
+  player.currentTime = seg(b.id).start + 1;
+  const b2 = cmd.run('split');
+  near(startOf(store, onB.id) - seg(b2).start, 1, 'caption 2s into B is 1s into its second half');
+  near(startOf(store, onC.id) - seg(c.id).start, 0.5, 'caption on C still 0.5s into C');
+  near(startOf(store, credits.id), store.timeline.segments.at(-1).end, 'end credits still follow the pictures');
 });
 
 await test('fitVisualsToMusic is monotonic and exact with many transitions', () => {

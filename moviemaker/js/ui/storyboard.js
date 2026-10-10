@@ -9,10 +9,12 @@
 // strip seeks the movie (and playback scrolls the strip), music and caption lanes below.
 //
 // export class Storyboard { constructor(rootEl, app); refresh(); scrollToTime(t); destroy(); }
-// Also exported for tests: StripLayout, packLanes, cachedImageUrl.
+// Also exported for tests: StripLayout, packLanes, cachedImageUrl, thumbLook.
 
 import { formatTime } from '../model.js';
+import { TRANSITIONS, PANZOOM, EFFECTS, byId } from '../catalog.js';
 import * as Icons from './icons.js';
+import { backGuard } from './dom.js';
 
 const PHONE_QUERY = '(max-width: 760px), (pointer: coarse) and (max-width: 1024px)';
 const PHONE_LANDSCAPE_QUERY = '(pointer: coarse) and (orientation: landscape) and (max-height: 520px)';
@@ -20,14 +22,17 @@ const COARSE_QUERY = '(pointer: coarse)';
 
 const ZOOM_MIN = 5;
 const ZOOM_MAX = 400;
-const LONG_PRESS_MS = 350;
+// Touch long-press: ~ the platform norms (Android 400-500 ms, iOS ~500 ms), so a finger that
+// rests briefly before swiping still scrolls the strip instead of picking the clip up.
+const LONG_PRESS_MS = 450;
 const MOUSE_DRAG_PX = 5;
 const TOUCH_SLOP_PX = 9;
-const ARMED_DRAG_PX = 6;
+const ARMED_DRAG_PX = 12;         // an armed (long-pressed) clip needs a deliberate move to drag
 const SNAP_PX = 8;
 const DOUBLE_TAP_MS = 400;
 const DOUBLE_TAP_PX = 26;
 const MAX_TILES_PER_PIECE = 240;
+const MAX_WAVE_PX = 8192;         // widest waveform canvas backing store
 
 const ITEM_HEIGHTS = {
   desktop: { small: 46, medium: 66, large: 96 },
@@ -35,6 +40,11 @@ const ITEM_HEIGHTS = {
 };
 // Phones grow the strip into free vertical space, up to these heights.
 const PHONE_ITEM_MAX = { small: 64, medium: 96, large: 124 };
+const PHONE_ITEM_MIN = 40;        // a short pane shrinks the strip down to this before lanes scroll
+const PHONE_ITEM_NEED = 58;       // strip height the pane always reserves (medium thumbnails)
+const PHONE_LANE_TOUCH = 40;      // music/caption lanes grow to touch size first when there is room
+const PHONE_LANE_MAX = 44;
+const PHONE_PREVIEW_MIN = 150;    // keep at least this much of the main area for the preview
 
 // ---------------------------------------------------------------------------------------------
 // Small helpers
@@ -83,6 +93,44 @@ const WARN_SVG = '<path d="M8 1.5L15 14H1z" fill="#ffd21f" stroke="#7a5600" stro
 
 function vibrate(ms) {
   try { if (typeof navigator !== 'undefined' && typeof navigator.vibrate === 'function') navigator.vibrate(ms); } catch (_) { /* ignore */ }
+}
+
+/** Catalog display name for an id ('crossfade' → 'Crossfade'); the id itself when unknown. */
+function catName(list, id) {
+  const e = id ? byId(list, id) : null;
+  return e && e.name ? e.name : String(id || '');
+}
+
+// Visual effects on storyboard thumbnails: a CSS-filter approximation of each look (CSS filters on
+// elements work everywhere, including iOS 15), mirrors as tile transforms; effects that only show
+// over time (fades, motions, pixelate) get an "fx" badge instead.
+const FX_CSS = {
+  bw: 'grayscale(1)', 'bw-orange': 'grayscale(1) contrast(1.06)', 'bw-red': 'grayscale(1) contrast(1.14)',
+  'bw-yellow': 'grayscale(1) contrast(1.03)', sepia: 'sepia(1)', cyan: 'grayscale(1) sepia(1) hue-rotate(150deg) saturate(1.6)',
+  threshold: 'grayscale(1) contrast(8)', invert: 'invert(1)', posterize: 'saturate(1.5) contrast(1.6)',
+  edge: 'grayscale(1) invert(1) contrast(2.2)', emboss: 'grayscale(1) contrast(.55) brightness(1.2)', blur: 'blur(1.2px)',
+  warm: 'sepia(.32) saturate(1.35) brightness(1.04)', cool: 'hue-rotate(180deg) sepia(.3) hue-rotate(-180deg) saturate(1.1) brightness(1.02)',
+  vivid: 'saturate(1.7) contrast(1.08)', vintage: 'sepia(.55) contrast(.86) brightness(1.07) saturate(.85)',
+  'film-age': 'sepia(.85) contrast(1.12) brightness(.97)',
+};
+const FX_MIRROR = { 'mirror-h': 'scaleX(-1)', 'mirror-v': 'scaleY(-1)' };
+
+/** WLMM brightness (-100..100) → CSS brightness() factor (same curve as effects.js). */
+function brightnessFactor(b) {
+  let v = Number(b) || 0;
+  if (v > 100) v = 100; else if (v < -100) v = -100;
+  return v >= 0 ? 1 + v / 100 : 1 + (v / 100) * 0.85;
+}
+
+/** How a clip's thumbnails show its effect and brightness: { filter, mirror, badge }. Exported for tests. */
+export function thumbLook(effect, brightness) {
+  const id = effect && effect !== 'none' ? String(effect) : '';
+  const parts = [];
+  if (id && FX_CSS[id]) parts.push(FX_CSS[id]);
+  const k = brightnessFactor(brightness);
+  if (Math.abs(k - 1) > 0.004) parts.push(`brightness(${Math.round(k * 1000) / 1000})`);
+  const mirror = id && FX_MIRROR[id] ? FX_MIRROR[id] : '';
+  return { filter: parts.join(' ') || '', mirror, badge: !!id && !FX_CSS[id] && !mirror };
 }
 
 function firstLine(text, max = 60) {
@@ -370,7 +418,27 @@ const STYLE = `
 .sb-pop .sb-pop-item:hover:not(:disabled),.sb-pop .sb-pop-item:focus-visible{background:linear-gradient(var(--c-hot-top,#fffbec),var(--c-hot-bot,#fde8a8));border-color:var(--c-hot-border,#e8c46a);outline:none;}
 .sb-pop .sb-pop-item:disabled{opacity:.45;}
 .sb-pop .sb-pop-item svg{width:20px;height:20px;flex:none;}
+.sb-pop .sb-pop-label{flex:1 1 auto;white-space:nowrap;}
+.sb-pop .sb-pop-key{flex:none;margin-left:auto;padding-left:22px;color:var(--c-text-muted,#6b7c93);font-size:11px;white-space:nowrap;}
+.sb-pop .sb-pop-sep{height:1px;margin:3px 4px 3px 30px;background:#d5dfeb;}
 @media (pointer: coarse){.sb-pop .sb-pop-item{min-height:44px;font-size:15px;}}
+/* Desktop right-click menu: compact WLMM rows. */
+.sb-pop.is-compact{min-width:220px;padding:3px;border-radius:3px;}
+.sb-pop.is-compact .sb-pop-item{min-height:24px;padding:2px 10px 2px 6px;gap:8px;font-size:12px;border-radius:2px;}
+.sb-pop.is-compact .sb-pop-item svg{width:16px;height:16px;}
+/* WLMM's light-blue hover frame on clips and bars (mouse only). */
+@media (hover: hover) and (pointer: fine){
+  .sb-root .sb-item:not(.is-selected):hover{box-shadow:0 0 0 1px #9cc3f0,0 0 6px rgba(120,170,240,.55);z-index:1;}
+  .sb-root .sb-bar:not(.is-selected):not(.is-ghost):hover{filter:brightness(1.08);box-shadow:0 0 0 1px #9cc3f0,0 0 5px rgba(120,170,240,.5);}
+}
+/* Visual effects shown on the thumbnails (an approximation of the effect) and an "fx" badge
+   for effects that only show over time (fades, motions, pixelate). */
+.sb-root .sb-fx{position:absolute;inset:0;overflow:hidden;}
+.sb-root .sb-fx-badge{position:absolute;left:3px;bottom:2px;padding:0 3px;border-radius:3px;background:rgba(0,0,0,.6);color:#ffd34d;
+  font:italic 700 10px/13px var(--font-ui,system-ui,sans-serif);pointer-events:none;}
+/* View › Waveforms on clips that have sound. */
+.sb-root .sb-vwave{position:absolute;left:0;right:0;bottom:0;height:32%;pointer-events:none;background:rgba(0,0,0,.42);}
+.sb-root .sb-vwave canvas{position:absolute;left:0;top:0;width:100%;height:100%;}
 @media (prefers-reduced-motion: reduce){.sb-root .sb-item,.sb-root .sb-bar{transition:none;}}
 `;
 
@@ -736,6 +804,7 @@ export class Storyboard {
     const met = this._metrics();
     const cw = this.scroll.clientWidth;
     if (!(cw > 0)) return null;
+    if (!met.phone && this._needPx) { this._needPx = null; this.root.style.removeProperty('--sb-need'); }
     const zoom = clamp(num(store.view && store.view.zoom, 40), ZOOM_MIN, ZOOM_MAX);
     let padL, padR, W;
     if (met.phone) {
@@ -752,24 +821,8 @@ export class Storyboard {
     const text = packLanes(tl.texts || []);
     const aCount = (project.music && project.music.length) ? Math.max(1, audio.count) : 0;
     const tCount = (project.texts && project.texts.length) ? Math.max(1, text.count) : 0;
+    if (met.phone) this._fitPhone(met, aCount + tCount);
     const laneBlock = met.laneH + met.laneGap;
-    if (met.phone) {
-      // Phone portrait panes are tall: grow the filmstrip into the free height (bigger, easier
-      // touch targets, like phone editors) and keep what is still left over balanced above and
-      // below the strip instead of leaving a blank block under it.
-      const ch = this.scroll.clientHeight;
-      const lanesH = (aCount + tCount) * laneBlock;
-      const size = met.size;
-      const cap = PHONE_ITEM_MAX[size] || PHONE_ITEM_MAX.medium;
-      const avail = Math.floor(ch - met.padT - met.padB - lanesH - 2);
-      if (ch > 0 && avail > met.itemH) {
-        met.itemH = Math.min(cap, avail);
-        met.sp = met.itemH >= 60 ? (met.itemH >= 90 ? 7 : 6) : 5;
-        met.hole = met.sp >= 6 ? 3 : 2;
-      }
-      const extra = ch - (met.padT + met.itemH + lanesH + met.padB);
-      if (ch > 0 && extra > 12) met.padT += Math.floor(extra * 0.42);
-    }
     const rowH = met.itemH + (aCount + tCount) * laneBlock;
     const rowPitch = rowH + met.rowGap;
     const items = project.items || [];
@@ -786,6 +839,61 @@ export class Storyboard {
       audioLanes: audio.lanes, textLanes: text.lanes, laneBlock, contentW, contentH,
       duration: Math.max(num(tl.duration, 0), L.visualEndT), bounds,
     };
+  }
+
+  /**
+   * Phone strip sizing from the pane height. The pane always gets at least what the filmstrip and
+   * every music/caption lane need (published as --sb-need for the stylesheet, which gives the
+   * preview whatever is left). Free height then goes, in order, to touch-friendly lanes (40px),
+   * a bigger filmstrip (up to PHONE_ITEM_MAX) and roomier lanes (44px); the rest is balanced above
+   * and below the strip. Short panes shrink the strip instead of hiding the lanes.
+   */
+  _fitPhone(met, nLanes) {
+    const ch = this.scroll.clientHeight;
+    const cap = PHONE_ITEM_MAX[met.size] || PHONE_ITEM_MAX.medium;
+    const minItem = PHONE_ITEM_MIN;
+    const lanesMin = nLanes * (met.laneH + met.laneGap);
+    const fixed = met.padT + met.padB + 2;
+    this._publishNeed(fixed + Math.min(met.itemH, PHONE_ITEM_NEED) + lanesMin);
+    if (!(ch > 0)) return;
+    let free = ch - fixed - lanesMin - met.itemH;
+    if (free < 0) {
+      met.itemH = Math.max(minItem, met.itemH + free);
+      free = 0;
+    }
+    let lane = met.laneH;
+    if (nLanes && free > 0) {
+      const g = Math.min(free, nLanes * Math.max(0, PHONE_LANE_TOUCH - lane));
+      lane += g / nLanes;
+      free -= g;
+    }
+    if (free > 0 && met.itemH < cap) {
+      const g = Math.min(free, cap - met.itemH);
+      met.itemH += g;
+      free -= g;
+    }
+    if (nLanes && free > 0) {
+      const g = Math.min(free, nLanes * Math.max(0, PHONE_LANE_MAX - lane));
+      lane += g / nLanes;
+      free -= g;
+    }
+    met.itemH = Math.floor(met.itemH);
+    met.laneH = Math.floor(lane);
+    met.sp = met.itemH >= 60 ? (met.itemH >= 90 ? 7 : 6) : 5;
+    met.hole = met.sp >= 6 ? 3 : 2;
+    const extra = ch - (met.padT + met.itemH + nLanes * (met.laneH + met.laneGap) + met.padB);
+    if (extra > 12) met.padT += Math.floor(extra * 0.42);
+  }
+
+  /** Phones: tell the stylesheet how tall the storyboard must stay (never more than the main area
+   *  minus a usable preview, so a tiny screen still shows the picture and its transport). */
+  _publishNeed(px) {
+    let need = Math.ceil(px);
+    const main = this.root.parentElement;
+    const mh = main ? main.clientHeight : 0;
+    if (mh > 0) need = Math.min(need, Math.max(96, mh - PHONE_PREVIEW_MIN));
+    const v = `${need}px`;
+    if (this._needPx !== v) { this._needPx = v; this.root.style.setProperty('--sb-need', v); }
   }
 
   _rowTop(r) { const m = this._m; return m.padT + r * m.rowPitch; }
@@ -864,6 +972,7 @@ export class Storyboard {
     this.root.classList.toggle('is-empty', empty);
     if (this._emptyEl) { this._emptyEl.remove(); this._emptyEl = null; }
     if (empty) {
+      if (m.phone) this._publishNeed(150);
       this._emptyEl = this._buildEmptyState();
       this.viewport.appendChild(this._emptyEl);
       this.content.style.height = '0px';
@@ -906,7 +1015,8 @@ export class Storyboard {
     const btn = el('button', 'sb-empty-btn', { type: 'button', 'data-sb-btn': 'add' });
     btn.appendChild(iconEl('add-videos', 56));
     const main = el('span', 'sb-empty-main');
-    main.textContent = 'Click here to browse for videos and photos';
+    // Desktop keeps WLMM's wording; fingers tap.
+    main.textContent = this._coarse ? 'Tap here to add videos and photos' : 'Click here to browse for videos and photos';
     btn.appendChild(main);
     if (!this._coarse && !this._phone) {
       const sub = el('span', 'sb-empty-sub');
@@ -947,6 +1057,7 @@ export class Storyboard {
     const segs = m.tl.segments || [];
     const n = segs.length;
     const fine = !this._coarse && !m.phone;
+    const showWaves = !!(this.store.view && this.store.view.showWaveforms);
     const projectAspect = { '16:9': 16 / 9, '4:3': 4 / 3, '9:16': 9 / 16, '1:1': 1 }[m.project.aspect] || 16 / 9;
     const frameH = m.itemH - 2 * m.sp;
     for (let i = 0; i < n; i++) {
@@ -967,6 +1078,21 @@ export class Storyboard {
       const frames = media ? ((Array.isArray(media.filmstrip) && media.filmstrip.length) ? media.filmstrip : (media.thumb ? [media.thumb] : [])) : [];
       const name = item.kind === 'title' ? firstLine(item.text, 80) || 'Title' : (media ? media.name || 'Untitled' : 'Missing file');
       const trans = seg.transitionIn && seg.transitionIn.type && seg.transitionIn.type !== 'none' ? seg.transitionIn : null;
+      const hasPz = item.kind !== 'title' && item.panZoom && item.panZoom !== 'none';
+      const effect = item.effect && item.effect !== 'none' ? item.effect : '';
+      const look = thumbLook(effect, item.brightness);
+      const transName = trans ? catName(TRANSITIONS, trans.type) : '';
+      const pzName = hasPz ? catName(PANZOOM, item.panZoom) : '';
+      const fxName = effect ? catName(EFFECTS, effect) : '';
+      let tip = '';
+      if (fine) {
+        tip = `${name}\nDuration: ${formatTime(dur)}`;
+        if (trans) tip += `\nTransition: ${transName} (${num(trans.duration, 0).toFixed(2)}s)`;
+        if (hasPz) tip += `\nPan and zoom: ${pzName}`;
+        if (fxName) tip += `\nEffect: ${fxName}`;
+        if (item.brightness) tip += `\nBrightness: ${item.brightness > 0 ? '+' : ''}${Math.round(item.brightness)}`;
+      }
+      const wave = item.kind === 'video' && showWaves && media && media.hasAudio !== false && Array.isArray(media.peaks) && media.peaks.length > 1;
       const pxPerSec = m.L.t1[i] > m.L.t0[i] ? w / (m.L.t1[i] - m.L.t0[i]) : m.zoom;
       const els = [];
       let pieceIndex = 0;
@@ -980,8 +1106,16 @@ export class Storyboard {
         });
         p.style.cssText = `left:${(m.phone ? m.padL : m.padL) + rx}px;top:${this._rowTop(row)}px;width:${pw}px;height:${m.itemH}px`;
         const fr = el('div', 'sb-frames');
+        // Effect / brightness look: filter the pictures (not the selection tint on .sb-frames).
+        let host = fr;
+        if (look.filter && !missing) {
+          host = el('div', 'sb-fx');
+          host.style.filter = look.filter;
+          fr.appendChild(host);
+        }
         if (item.kind === 'title') {
           const slate = el('div', 'sb-slate');
+          if (look.mirror) slate.style.transform = look.mirror;
           slate.style.background = item.background || '#000';
           if (first) {
             const tx = el('span', 'sb-slate-text');
@@ -994,7 +1128,7 @@ export class Storyboard {
             tx.style.fontSize = `${Math.max(10, Math.round(frameH * 0.24))}px`;
             slate.appendChild(tx);
           }
-          fr.appendChild(slate);
+          host.appendChild(slate);
         } else if (missing || !frames.length) {
           const ms = el('div', 'sb-missing');
           if (first && pw > 40) {
@@ -1005,7 +1139,19 @@ export class Storyboard {
           }
           fr.appendChild(ms);
         } else {
-          this._buildTiles(fr, item, seg, media, frames, i, off, pw, tw, frameH, rot);
+          this._buildTiles(host, item, seg, media, frames, i, off, pw, tw, frameH, rot, look.mirror);
+        }
+        if (wave && pw >= 8) {
+          const bandH = Math.max(6, Math.round(frameH * 0.32));
+          const cv = this._waveCanvas(media, { kind: 'video', trimStart: num(seg.sourceIn, 0) }, seg, x0 + off, pw, bandH, {
+            rate: item.speed > 0 ? item.speed : 1, gain: Number.isFinite(item.volume) ? clamp(item.volume, 0, 1) : 1, color: '#a6e57e',
+          });
+          if (cv) {
+            const band = el('div', 'sb-vwave', { 'aria-hidden': 'true' });
+            cv.className = '';
+            band.appendChild(cv);
+            fr.appendChild(band);
+          }
         }
         p.appendChild(fr);
         if (first && trans) {
@@ -1013,13 +1159,17 @@ export class Storyboard {
           const zone = el('div', 'sb-trans-zone');
           zone.style.width = `${zw}px`;
           p.appendChild(zone);
-          p.appendChild(el('span', 'sb-trans', { title: fine ? `Transition: ${trans.type}` : null }));
+          p.appendChild(el('span', 'sb-trans', { 'aria-hidden': 'true' }));
         }
-        if (first && item.kind !== 'title' && item.panZoom && item.panZoom !== 'none' && pw >= 24) {
-          const pz = el('span', 'sb-pz');
+        if (first && hasPz && pw >= 24) {
+          const pz = el('span', 'sb-pz', { 'aria-hidden': 'true' });
           pz.appendChild(svgEl(PZ_SVG, 15));
-          if (fine) pz.title = `Pan and zoom: ${item.panZoom}`;
           p.appendChild(pz);
+        }
+        if (first && look.badge && pw >= 30) {
+          const fx = el('span', 'sb-fx-badge', { 'aria-hidden': 'true' });
+          fx.textContent = 'fx';
+          p.appendChild(fx);
         }
         if (first && m.phone && pw >= 50) {
           const d = el('span', 'sb-dur');
@@ -1031,16 +1181,16 @@ export class Storyboard {
           p.setAttribute('tabindex', '-1');
           p.setAttribute('aria-pressed', 'false');
           let label = `${KIND_LABEL[item.kind] || 'Item'} ${i + 1} of ${n}: ${name}, ${formatTime(dur)}`;
-          if (trans) label += `, transition ${trans.type}`;
-          if (item.panZoom && item.panZoom !== 'none' && item.kind !== 'title') label += ', pan and zoom';
-          if (item.effect && item.effect !== 'none') label += `, effect ${item.effect}`;
+          if (trans) label += `, transition ${transName}`;
+          if (hasPz) label += `, pan and zoom ${pzName}`;
+          if (fxName) label += `, effect ${fxName}`;
           if (missing) label += ' (file missing)';
           p.setAttribute('aria-label', label);
-          if (fine) p.title = `${name}\nDuration: ${formatTime(dur)}`;
+          if (tip) p.title = tip;
           this._focusEls.set(item.id, p);
         } else {
           p.setAttribute('aria-hidden', 'true');
-          if (fine) p.title = `${name}\nDuration: ${formatTime(dur)}`;
+          if (tip) p.title = tip;
         }
         els.push(p);
         frag.appendChild(p);
@@ -1055,7 +1205,7 @@ export class Storyboard {
     return c;
   }
 
-  _buildTiles(fr, item, seg, media, frames, index, off, pw, tw, frameH, rot) {
+  _buildTiles(fr, item, seg, media, frames, index, off, pw, tw, frameH, rot, mirror = '') {
     const m = this._m;
     const nF = frames.length;
     const k0 = Math.floor(off / tw);
@@ -1081,10 +1231,13 @@ export class Storyboard {
       img.decoding = 'async';
       img.src = cachedImageUrl(frames[fi]);
       const left = k * tw - off;
+      // A mirror effect flips each frame on screen (after its rotation), not the order of the frames.
+      const pre = mirror ? `${mirror} ` : '';
       if (rot === 90 || rot === 270) {
-        img.style.cssText = `left:${left + (tw - frameH) / 2}px;top:${(frameH - tw) / 2}px;width:${frameH}px;height:${tw}px;transform:rotate(${rot}deg)`;
+        img.style.cssText = `left:${left + (tw - frameH) / 2}px;top:${(frameH - tw) / 2}px;width:${frameH}px;height:${tw}px;transform:${pre}rotate(${rot}deg)`;
       } else {
-        img.style.cssText = `left:${left}px;width:${tw}px${rot === 180 ? ';transform:rotate(180deg)' : ''}`;
+        const tf = rot === 180 ? `${pre}rotate(180deg)` : mirror;
+        img.style.cssText = `left:${left}px;width:${tw}px${tf ? `;transform:${tf}` : ''}`;
       }
       fr.appendChild(img);
     }
@@ -1150,7 +1303,7 @@ export class Storyboard {
           'data-sb': which, 'data-id': item.id,
         });
         const top = which === 'music' ? this._audioTop(row, lane) : this._textTop(row, lane);
-        b.style.cssText = `left:${m.padL + rx}px;top:${top}px;width:${pw}px;height:${m.laneH}px;line-height:${m.laneH - 2}px`;
+        b.style.cssText = `left:${m.padL + rx}px;top:${top}px;width:${pw}px;height:${m.laneH}px;line-height:${m.laneH - 2}px${m.laneH >= 34 ? ';font-size:13px' : ''}`;
         if (which === 'music' && showWaves && media && Array.isArray(media.peaks) && media.peaks.length && pw >= 4) {
           const cv = this._waveCanvas(media, item, e, xa + off, pw, m.laneH - 2);
           if (cv) b.appendChild(cv);
@@ -1177,14 +1330,19 @@ export class Storyboard {
     });
   }
 
-  _waveCanvas(media, item, entry, stripX, pw, h) {
+  /**
+   * Waveform canvas for a piece of a bar or clip: strip x → timeline time → source seconds
+   * (trimStart + (t - entry.start) × rate). opts: { rate, gain (0..1), color }.
+   */
+  _waveCanvas(media, item, entry, stripX, pw, h, opts = {}) {
     if (!(h > 2)) return null;
     const peaks = media.peaks;
     const mediaDur = media.duration > 0 ? media.duration : 0;
     if (!mediaDur) return null;
     const pps = peaks.length / mediaDur;
-    const dpr = Math.min(2, (typeof window !== 'undefined' && window.devicePixelRatio) || 1);
     const w = Math.max(1, Math.round(pw));
+    // Long pieces at high zoom: keep the backing store within every browser's canvas limits.
+    const dpr = Math.min(2, (typeof window !== 'undefined' && window.devicePixelRatio) || 1, MAX_WAVE_PX / w);
     const cv = document.createElement('canvas');
     cv.className = 'sb-wave';
     cv.width = Math.max(1, Math.round(w * dpr));
@@ -1192,15 +1350,17 @@ export class Storyboard {
     const ctx = cv.getContext('2d');
     if (!ctx) return null;
     ctx.scale(dpr, dpr);
-    ctx.fillStyle = item.kind === 'narration' ? '#0b4d40' : '#1c4f0b';
+    ctx.fillStyle = opts.color || (item.kind === 'narration' ? '#0b4d40' : '#1c4f0b');
     const L = this._m.L;
     const trim = num(item.trimStart, 0);
+    const rate = opts.rate > 0 ? opts.rate : 1;
+    const gain = Number.isFinite(opts.gain) ? opts.gain : 1;
     const mid = h / 2;
     let tPrev = L.xToTime(stripX);
     for (let c = 0; c < w; c++) {
       const tNext = L.xToTime(stripX + c + 1);
-      const s0 = trim + (tPrev - entry.start);
-      const s1 = trim + (tNext - entry.start);
+      const s0 = trim + (tPrev - entry.start) * rate;
+      const s1 = trim + (tNext - entry.start) * rate;
       tPrev = tNext;
       let i0 = Math.floor(s0 * pps);
       let i1 = Math.ceil(s1 * pps);
@@ -1209,6 +1369,7 @@ export class Storyboard {
       if (i1 > peaks.length) i1 = peaks.length;
       let pk = 0;
       for (let j = i0; j < i1; j++) { const v = peaks[j]; if (v > pk) pk = v; }
+      pk *= gain;
       if (pk <= 0.01) continue;
       const bh = Math.max(1, Math.min(1, pk) * (h - 2) * 0.82);
       ctx.fillRect(c, mid - bh / 2, 1, bh);
@@ -1242,8 +1403,15 @@ export class Storyboard {
     const m = this._m;
     const api = this.app.media;
     if (!m || !this.store.view || !this.store.view.showWaveforms || !api || typeof api.computePeaks !== 'function') return;
-    for (const e of m.tl.music || []) {
-      const media = this._media(e.item && e.item.mediaId);
+    const want = [];
+    for (const e of m.tl.music || []) want.push(this._media(e.item && e.item.mediaId));
+    for (const seg of m.tl.segments || []) {
+      if (seg.item && seg.item.kind === 'video') {
+        const md = this._media(seg.item.mediaId);
+        if (md && md.hasAudio !== false) want.push(md);
+      }
+    }
+    for (const media of want) {
       if (!media || media.peaks || this._peaksReq.has(media.id) || !media.blob) continue;
       this._peaksReq.add(media.id);
       setTimeout(() => {
@@ -1559,7 +1727,7 @@ export class Storyboard {
     const dist = Math.hypot(e.clientX - p.x0, e.clientY - p.y0);
     if (p.armed) {
       this._flushDirty();
-      if (dist <= ARMED_DRAG_PX) this._openPopoverFor(p.hit, e.clientX, e.clientY, false);
+      if (dist <= ARMED_DRAG_PX) this._openPopoverFor(p.hit, e.clientX, e.clientY, false, { touch: true });
       return;
     }
     if (p.cancelled || p.panned || dist > (p.type === 'mouse' ? MOUSE_DRAG_PX : TOUCH_SLOP_PX)) { this._flushDirty(); return; }
@@ -1630,6 +1798,11 @@ export class Storyboard {
       this._openPopoverFor(hit, e.clientX, e.clientY, e.button === -1 || (e.clientX === 0 && e.clientY === 0));
     } else if (this._press && this._press.type !== 'mouse') {
       e.preventDefault();
+    } else if (hit.kind === 'blank' && e.pointerType !== 'touch' && !this._coarse && !this._drag && this._m
+      && !this.root.classList.contains('is-empty')) {
+      // Desktop: empty storyboard space gets the storyboard's menu, not the browser's.
+      e.preventDefault();
+      this._openBlankMenu(e.clientX, e.clientY);
     }
   }
 
@@ -1848,7 +2021,7 @@ export class Storyboard {
       g.className = `${cls} is-ghost`;
       g.firstChild.textContent = pw >= 18 ? label : '';
       const top = d.kind === 'music' ? this._audioTop(row, lane) : this._textTop(row, lane);
-      g.style.cssText = `left:${m.padL + rx}px;top:${top}px;width:${pw}px;height:${m.laneH}px;line-height:${m.laneH - 2}px`;
+      g.style.cssText = `left:${m.padL + rx}px;top:${top}px;width:${pw}px;height:${m.laneH}px;line-height:${m.laneH - 2}px${m.laneH >= 34 ? ';font-size:13px' : ''}`;
       if (!firstPl) firstPl = { left: m.padL + rx, top };
       i++;
     });
@@ -2044,10 +2217,19 @@ export class Storyboard {
     }
   }
 
-  _openPopoverFor(hit, cx, cy, viaKeyboard) {
+  /**
+   * Action menu for one storyboard item.
+   *  - touch long-press (opts.touch): a finger-sized popover about the PRESSED item only (the
+   *    selection becomes that item, so Remove/Split never act on a wider selection the phone strip
+   *    cannot show);
+   *  - mouse right-click / keyboard menu key on fine pointers: a compact WLMM-style context menu
+   *    (clipboard, select all, trim/split, rotate, add) acting on the selection, desktop convention.
+   */
+  _openPopoverFor(hit, cx, cy, viaKeyboard, { touch = false } = {}) {
     if (!hit || !hit.id) return;
     this._closePopover();
-    this._ensureSelected(hit);
+    if (touch) this._selectOnly(hit);
+    else this._ensureSelected(hit);
     // Split works at the playhead: put it where the user pressed (inside the item).
     // (On phones the playhead stays fixed in the middle, so Split uses the current position.)
     if (!viaKeyboard && this._m && !this._m.phone && hit.kind !== 'text') {
@@ -2056,25 +2238,127 @@ export class Storyboard {
     }
     const found = this.store.find ? this.store.find(hit.id) : null;
     const obj = found && found.obj;
+    const compact = !touch && !this._coarse;
+    const actions = compact ? this._desktopActions(hit, obj) : this._touchActions(hit, obj);
+    this._showMenu(actions, cx, cy, { viaKeyboard, compact, label: 'Storyboard item actions' });
+  }
+
+  _selectOnly(hit) {
+    const type = hit.kind === 'item' ? 'item' : hit.kind;
+    const sel = this.store.selection || { type: null, ids: [] };
+    if (sel.type === type && sel.ids && sel.ids.length === 1 && sel.ids[0] === hit.id) return;
+    this._anchorId = hit.id;
+    this.store.select(type, [hit.id]);
+  }
+
+  _touchActions(hit, obj) {
     const actions = [];
     const tab = this._contextTab(hit);
     actions.push({ label: 'Edit', icon: tab === 'text' ? 'edit-text' : 'edit', run: () => this._openContext({ kind: hit.kind, id: hit.id }) });
     if (hit.kind === 'item') {
       if (obj && obj.kind === 'video') actions.push({ label: 'Trim', icon: 'trim', cmd: 'trimTool', run: () => this._run('trimTool') });
-      actions.push({ label: 'Split', icon: 'split', cmd: 'split', run: () => this._run('split') });
+      actions.push({ label: 'Split', icon: 'split', cmd: 'split', run: () => this._splitPressed(hit, 'split') });
     } else if (hit.kind === 'music') {
-      actions.push({ label: 'Split', icon: 'split', cmd: 'musicSplit', run: () => this._run('musicSplit') });
+      actions.push({ label: 'Split', icon: 'split', cmd: 'musicSplit', run: () => this._splitPressed(hit, 'musicSplit') });
     }
-    actions.push({ label: 'Duplicate', icon: 'copy', cmd: 'copy', run: () => { this._run('copy'); this._run('paste'); } });
+    actions.push({ label: 'Duplicate', icon: 'copy', cmd: 'copy', run: () => this._duplicate() });
     actions.push({ label: 'Remove', icon: 'remove', cmd: 'remove', run: () => this._run('remove') });
+    return actions;
+  }
 
-    const pop = el('div', 'sb-pop', { role: 'menu', 'aria-label': 'Storyboard item actions' });
+  _desktopActions(hit, obj) {
+    const A = (label, cmd, icon, shortcut) => ({ label, cmd, icon, shortcut, run: () => this._run(cmd) });
+    const list = [];
+    const isText = hit.kind === 'text' || (hit.kind === 'item' && obj && obj.kind === 'title');
+    if (isText) {
+      list.push({ label: 'Edit text', icon: 'edit-text', run: () => this._openContext({ kind: hit.kind, id: hit.id }) }, '-');
+    }
+    list.push(A('Cut', 'cut', 'cut', 'Ctrl+X'), A('Copy', 'copy', 'copy', 'Ctrl+C'), A('Paste', 'paste', 'paste', 'Ctrl+V'),
+      A('Remove', 'remove', 'remove', 'Delete'), '-', A('Select all', 'selectAll', 'select-all', 'Ctrl+A'));
+    if (hit.kind === 'item') {
+      list.push('-');
+      if (obj && obj.kind === 'video') list.push(A('Trim tool', 'trimTool', 'trim'));
+      list.push(A('Split', 'split', 'split', 'M'));
+      if (obj && (obj.kind === 'video' || obj.kind === 'image')) list.push('-', A('Rotate left', 'rotateLeft', 'rotate-left'), A('Rotate right', 'rotateRight', 'rotate-right'));
+    } else if (hit.kind === 'music') {
+      list.push('-', A('Split', 'musicSplit', 'split'));
+    }
+    list.push('-', A('Add videos and photos…', 'addMedia', 'add-videos'), A('Add music…', 'addMusic', 'music-add'));
+    return list;
+  }
+
+  /** Desktop right-click on empty storyboard space (WLMM: Paste / Add… / Select all). */
+  _openBlankMenu(cx, cy) {
+    this._closePopover();
+    const A = (label, cmd, icon, shortcut) => ({ label, cmd, icon, shortcut, run: () => this._run(cmd) });
+    this._showMenu([
+      A('Paste', 'paste', 'paste', 'Ctrl+V'), '-',
+      A('Add videos and photos…', 'addMedia', 'add-videos'), A('Add music…', 'addMusic', 'music-add'), '-',
+      A('Select all', 'selectAll', 'select-all', 'Ctrl+A'),
+    ], cx, cy, { compact: true, label: 'Storyboard' });
+  }
+
+  /** Phones: Split cuts at the fixed playhead, so it must be over the clip that was pressed. */
+  _splitPressed(hit, cmd) {
+    if (this._m && this._m.phone && !this._playheadIn(hit)) {
+      this._toast('Scroll the storyboard so the playhead is over this clip, then tap Split.');
+      return;
+    }
+    this._run(cmd);
+  }
+
+  _playheadIn(hit) {
+    const m = this._m;
+    if (!m || !m.tl) return true;
+    const t = this._playerTime();
+    const list = hit.kind === 'music' ? (m.tl.music || []) : (m.tl.segments || []);
+    const e = list.find((x) => x.item && x.item.id === hit.id);
+    if (!e) return true;
+    return t > e.start + 0.02 && t < e.end - 0.02;
+  }
+
+  /** Duplicate = copy + paste, without replacing what the user had on the clipboard. */
+  _duplicate() {
+    const store = this.store;
+    const saved = store.clipboard;
+    let r;
+    try {
+      this._run('copy');
+      r = this._run('paste');
+    } finally {
+      const restore = () => { store.clipboard = saved; };
+      if (r && typeof r.then === 'function') r.then(restore, restore); else restore();
+    }
+  }
+
+  _toast(msg) {
+    const d = this.app.dialogs;
+    if (d && typeof d.toast === 'function') { try { d.toast(msg, { type: 'info' }); return; } catch (_) { /* ignore */ } }
+    console.info(`[Movie Maker] ${msg}`);
+  }
+
+  /** Render a menu of actions ('-' = separator) at a point. compact = desktop context menu. */
+  _showMenu(actions, cx, cy, { viaKeyboard = false, compact = false, label = 'Actions' } = {}) {
+    const pop = el('div', `sb-pop${compact ? ' is-compact' : ''}`, { role: 'menu', 'aria-label': label });
+    let lastSep = true;
     for (const a of actions) {
+      if (a === '-') {
+        if (!lastSep) pop.appendChild(el('div', 'sb-pop-sep', { role: 'separator' }));
+        lastSep = true;
+        continue;
+      }
+      lastSep = false;
       const b = el('button', 'sb-pop-item', { type: 'button', role: 'menuitem' });
-      b.appendChild(iconEl(a.icon, 20));
-      const s = el('span');
+      b.appendChild(iconEl(a.icon, compact ? 16 : 20));
+      const s = el('span', 'sb-pop-label');
       s.textContent = a.label;
       b.appendChild(s);
+      if (a.shortcut) {
+        const k = el('span', 'sb-pop-key', { 'aria-hidden': 'true' });
+        k.textContent = a.shortcut;
+        b.appendChild(k);
+        b.setAttribute('aria-keyshortcuts', a.shortcut.replace(/^Ctrl\+/, 'Control+'));
+      }
       if (a.cmd && !this._enabled(a.cmd)) b.disabled = true;
       b.addEventListener('click', (ev) => {
         ev.stopPropagation();
@@ -2083,6 +2367,7 @@ export class Storyboard {
       });
       pop.appendChild(b);
     }
+    if (pop.lastChild && pop.lastChild.classList.contains('sb-pop-sep')) pop.removeChild(pop.lastChild);
     pop.addEventListener('keydown', (ev) => {
       const btns = [...pop.querySelectorAll('button:not(:disabled)')];
       const i = btns.indexOf(document.activeElement);
@@ -2090,12 +2375,20 @@ export class Storyboard {
       ev.stopPropagation();
     });
     pop.addEventListener('pointerdown', (ev) => ev.stopPropagation());
+    pop.addEventListener('contextmenu', (ev) => ev.preventDefault());
     document.body.appendChild(pop);
     const vw = window.innerWidth, vh = window.innerHeight;
     const pw = pop.offsetWidth, ph = pop.offsetHeight;
-    let left = clamp(cx - pw / 2, 8, Math.max(8, vw - pw - 8));
-    let top = cy - ph - 16;
-    if (top < 8) top = Math.min(cy + 18, Math.max(8, vh - ph - 8));
+    let left, top;
+    if (compact) {
+      // Desktop context menu: top-left corner at the pointer, flipped to stay on screen.
+      left = cx + pw > vw - 4 ? Math.max(4, cx - pw) : cx;
+      top = cy + ph > vh - 4 ? Math.max(4, cy - ph) : cy;
+    } else {
+      left = clamp(cx - pw / 2, 8, Math.max(8, vw - pw - 8));
+      top = cy - ph - 16;
+      if (top < 8) top = Math.min(cy + 18, Math.max(8, vh - ph - 8));
+    }
     pop.style.left = `${Math.round(left)}px`;
     pop.style.top = `${Math.round(top)}px`;
     const returnFocus = viaKeyboard ? document.activeElement : null;
@@ -2104,29 +2397,35 @@ export class Storyboard {
     document.addEventListener('pointerdown', onDown, true);
     window.addEventListener('resize', onResize);
     window.addEventListener('blur', onResize);
-    this._pop = {
+    const pr = {
       el: pop,
       returnFocus,
+      release: null,
       off: () => {
         document.removeEventListener('pointerdown', onDown, true);
         window.removeEventListener('resize', onResize);
         window.removeEventListener('blur', onResize);
       },
     };
+    this._pop = pr;
+    // Android Back / iOS swipe-back closes the popover instead of leaving the app.
+    pr.release = backGuard(this.app, () => { if (this._pop === pr) this._closePopover(false, true); });
     if (viaKeyboard) {
       const b = pop.querySelector('button:not(:disabled)');
       if (b) b.focus();
     }
   }
 
-  _closePopover(restoreFocus) {
+  _closePopover(restoreFocus, fromBack = false) {
     const p = this._pop;
     if (!p) return;
     this._pop = null;
     p.off();
+    if (!fromBack && p.release) p.release();
     if (p.el.parentNode) p.el.parentNode.removeChild(p.el);
     if (restoreFocus && p.returnFocus && p.returnFocus.isConnected) {
       try { p.returnFocus.focus({ preventScroll: true }); } catch (_) { /* ignore */ }
     }
   }
+
 }

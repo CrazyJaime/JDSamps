@@ -78,7 +78,33 @@ async function desktop(browser) {
   check(L.missing === 1, 'missing media shows a placeholder');
   check(L.waves >= 2, 'waveforms drawn into music bars', L.waves);
   check(/Beach walk\.mp4\nDuration: 00:08\.00/.test(L.tip || ''), 'desktop tooltip has name + duration', L.tip);
-  check(/Photo 2 of 6: Sunset\.jpg, 00:07\.00, transition crossfade, pan and zoom/.test(L.aria || ''), 'aria-label describes the item', L.aria);
+  {
+    // effects, pan & zoom and transitions by name in the item tooltip; markers carry no dead tooltips
+    const fx = await page.evaluate(async () => {
+      const it = T.store.project.items.find((i) => i.id === 'item-p1');
+      T.store.update(() => { it.effect = 'sepia'; it.brightness = 20; });
+      await new Promise((r) => requestAnimationFrame(() => requestAnimationFrame(r)));
+      const p = document.querySelector('.sb-item[data-id="item-p1"]');
+      const look = p && p.querySelector('.sb-fx');
+      const r = {
+        tip: p ? p.title : '', filter: look ? look.style.filter : '',
+        deadTitles: document.querySelectorAll('.sb-trans[title], .sb-pz[title]').length,
+        vwave: document.querySelectorAll('.sb-item[data-id="item-v1"] .sb-vwave canvas').length,
+      };
+      T.store.update(() => { it.effect = 'pixelate'; it.brightness = 0; });
+      await new Promise((r2) => requestAnimationFrame(() => requestAnimationFrame(r2)));
+      r.badge = document.querySelectorAll('.sb-item[data-id="item-p1"] .sb-fx-badge').length;
+      return r;
+    });
+    check(/Transition: Crossfade \(\d+\.\d\ds\)\nPan and zoom: Zoom in\nEffect: Sepia tone/.test(fx.tip), 'item tooltip names transition, pan & zoom and effect', fx.tip);
+    check(/sepia\(1\)/.test(fx.filter) && /brightness\(1\.2\)/.test(fx.filter), 'thumbnails show the visual effect and brightness', fx.filter);
+    check(fx.badge === 1, 'effects without a still look get an fx badge', fx.badge);
+    check(fx.deadTitles === 0, 'no unreachable tooltips on pointer-events:none markers', fx.deadTitles);
+    check(fx.vwave >= 1, 'View › Waveforms draws the video clip soundtrack', fx.vwave);
+    await resetProject(page);
+    await page.waitForTimeout(60);
+  }
+  check(/Photo 2 of 6: Sunset\.jpg, 00:07\.00, transition Crossfade, pan and zoom Zoom in/.test(L.aria || ''), 'aria-label describes the item (catalog names)', L.aria);
   check(L.narration === 1 && L.credits === 1, 'narration and credits bars styled');
   check(L.firstTile.startsWith('blob:'), 'filmstrip tiles use cached object URLs');
   await page.screenshot({ path: join(OUT, 'desktop-storyboard.png') });
@@ -199,15 +225,27 @@ async function desktop(browser) {
   const vv = await rectOf(page, '.sb-item[data-id="item-v2"]');
   await page.mouse.click(vv.cx, vv.cy, { button: 'right' });
   await page.waitForTimeout(50);
-  const pop = await page.evaluate(() => [...document.querySelectorAll('.sb-pop .sb-pop-item')].map((b) => b.textContent + (b.disabled ? '(off)' : '')));
-  check(pop.join() === 'Edit,Trim,Split,Duplicate,Remove', 'right-click shows the action popover', pop);
+  const pop = await page.evaluate(() => [...document.querySelectorAll('.sb-pop .sb-pop-item')].map((b) => b.querySelector('.sb-pop-label').textContent));
+  const compact = await page.evaluate(() => { const p = document.querySelector('.sb-pop'); const b = p && p.querySelector('.sb-pop-item'); return !!p && p.classList.contains('is-compact') && b.getBoundingClientRect().height <= 30; });
+  check(pop.join() === 'Cut,Copy,Paste,Remove,Select all,Trim tool,Split,Rotate left,Rotate right,Add videos and photos…,Add music…', 'right-click shows the WLMM context menu', pop);
+  check(compact, 'desktop context menu uses compact rows');
   await page.screenshot({ path: join(OUT, 'desktop-popover.png') });
-  await page.evaluate(() => [...document.querySelectorAll('.sb-pop .sb-pop-item')].find((b) => b.textContent === 'Remove').click());
+  await page.evaluate(() => [...document.querySelectorAll('.sb-pop .sb-pop-item')].find((b) => b.querySelector('.sb-pop-label').textContent === 'Remove').click());
   const removed = await page.evaluate(() => !T.store.project.items.some((i) => i.id === 'item-v2'));
   check(removed && !(await page.evaluate(() => !!document.querySelector('.sb-pop'))), 'popover Remove runs remove and closes');
   await page.mouse.click(p2.cx, p2.cy, { button: 'right' });
   await page.mouse.click(5, 5);
   check(!(await page.evaluate(() => !!document.querySelector('.sb-pop'))), 'popover closes on outside click');
+  // right-click on blank storyboard space: Paste / Add… / Select all (not the browser menu)
+  {
+    const scr = await rectOf(page, '.sb-scroll');
+    await page.mouse.click(scr.x + scr.w - 20, scr.y + scr.h - 12, { button: 'right' });
+    await page.waitForTimeout(50);
+    const blank = await page.evaluate(() => [...document.querySelectorAll('.sb-pop .sb-pop-item')].map((b) => b.querySelector('.sb-pop-label').textContent));
+    check(blank.join() === 'Paste,Add videos and photos…,Add music…,Select all', 'right-click on blank space shows Paste / Add / Select all', blank);
+    await page.keyboard.press('Escape');
+    check(!(await page.evaluate(() => !!document.querySelector('.sb-pop'))), 'Escape closes the blank-area menu');
+  }
 
   // ---- ctrl+wheel zoom
   await resetProject(page);
@@ -422,9 +460,98 @@ async function previewDesktop(page) {
   const ps = await page.evaluate(() => { const c = T.app.preview.canvas.getBoundingClientRect(); return { pseudo: document.getElementById('app').classList.contains('is-pseudo-fullscreen'), exit: !!document.querySelector('.pv-fs-exit'), cw: c.width, ch: c.height }; });
   check(ps.pseudo && ps.exit && ps.cw > 1000, 'pseudo full screen overlay when element full screen is unavailable', ps);
   await page.screenshot({ path: join(OUT, 'desktop-pseudo-fullscreen.png') });
+  // full screen on a mouse: the transport hides while playing and the mouse rests, and comes back on movement
+  await page.mouse.move(cv.x + 40, cv.y + 40);
+  await page.evaluate(() => { T.player.seek(0); T.player.play(); });
+  await page.waitForTimeout(2900);
+  const idle = await page.evaluate(() => ({ idle: document.querySelector('.pv-root').classList.contains('is-idle'), op: getComputedStyle(document.querySelector('.pv-transport')).opacity, exitIdle: document.querySelector('.pv-fs-exit').classList.contains('is-idle') }));
+  await page.mouse.move(cv.x + 90, cv.y + 90);
+  await page.waitForTimeout(60);
+  const woke = await page.evaluate(() => !document.querySelector('.pv-root').classList.contains('is-idle'));
+  await page.evaluate(() => T.player.pause());
+  check(idle.idle && idle.exitIdle, 'full screen: transport auto-hides while playing', idle);
+  check(woke, 'full screen: moving the mouse shows the transport again');
   await page.click('.pv-fs-exit');
   await page.waitForTimeout(150);
   check(!(await page.evaluate(() => document.getElementById('app').classList.contains('is-pseudo-fullscreen') || !!document.querySelector('.pv-fs-exit'))), 'exit button leaves pseudo full screen');
+  check(!(await page.evaluate(() => document.querySelector('.pv-root').classList.contains('is-idle'))), 'leaving full screen clears the idle state');
+
+  // credits: Enter makes a new line on desktop too (Ctrl+Enter or a click outside finishes)
+  await page.evaluate(() => { T.store.replaceProject(T.buildProject()); T.player.seek(27); });
+  await page.waitForTimeout(200);
+  await page.evaluate(() => T.app.preview.editText('text-cr'));
+  await page.waitForTimeout(60);
+  await page.keyboard.press('Control+End');
+  await page.keyboard.press('Enter');
+  await page.keyboard.type('Camera: Me');
+  const crEditing = await page.evaluate(() => T.app.preview.editingTextId);
+  await page.keyboard.press('Control+Enter');
+  await page.waitForTimeout(60);
+  const crText = await page.evaluate(() => T.store.project.texts.find((x) => x.id === 'text-cr').text);
+  check(crEditing === 'text-cr' && /\nCamera: Me$/.test(crText) && !(await page.evaluate(() => T.app.preview.editingTextId)), 'credits: Enter adds a line, Ctrl+Enter finishes', { crEditing, crText });
+
+  // splitter between the preview and the storyboard (desktop)
+  const sp = await rectOf(page, '#main-splitter');
+  const w0 = (await rectOf(page, '#preview-pane')).w;
+  await page.mouse.move(sp.cx, sp.y + 200);
+  await page.mouse.down();
+  await page.mouse.move(sp.cx + 120, sp.y + 200, { steps: 6 });
+  await page.mouse.up();
+  await page.waitForTimeout(100);
+  const w1 = (await rectOf(page, '#preview-pane')).w;
+  const saved = await page.evaluate(() => { try { return localStorage.getItem('mm.previewSplit'); } catch (_) { return null; } });
+  const canvasGrew = await page.evaluate(() => T.app.preview.canvas.getBoundingClientRect().width);
+  check(Math.abs(w1 - w0 - 120) < 6 && saved, 'dragging the splitter resizes the preview (and is remembered)', { w0, w1, saved });
+  check(canvasGrew > pv.cw + 60, 'the monitor grows with the pane', { before: pv.cw, after: canvasGrew });
+  await page.mouse.dblclick(sp.cx + 120, sp.y + 200);
+  await page.waitForTimeout(100);
+  const w2 = (await rectOf(page, '#preview-pane')).w;
+  check(Math.abs(w2 - w0) < 3, 'double-clicking the splitter goes back to the preview size preset', { w0, w2 });
+  await page.mouse.move(sp.cx, sp.y + 200);
+  await page.mouse.down();
+  await page.mouse.move(sp.cx + 2000, sp.y + 200, { steps: 4 });
+  await page.mouse.up();
+  const sbw = (await rectOf(page, '#storyboard-pane')).w;
+  check(sbw >= 299, 'the storyboard keeps a usable width', sbw);
+  await page.evaluate(() => T.app.preview.setSplitRatio(null));
+
+  // moving / resizing the selected caption box (enabled when text.js places text by style.x/y/w;
+  // forced on here so the UI flow is tested against the fake commands)
+  await page.evaluate(() => {
+    T.store.replaceProject(T.buildProject()); T.player.seek(3); T.store.select('text', ['text-c1']);
+    const pv = T.app.preview; pv._tbSupport = true; pv._tbWidth = true; pv._updateSelBox(); T.log.length = 0;
+  });
+  await page.waitForTimeout(120);
+  const tb = await rectOf(page, '.pv-text-sel');
+  await page.mouse.move(tb.cx, tb.cy);
+  await page.mouse.down();
+  await page.mouse.move(tb.cx + 60, tb.cy - 40, { steps: 6 });
+  const ghost = await page.evaluate(() => !!document.querySelector('.pv-text-ghost') && T.player.hideTextIds && T.player.hideTextIds.has('text-c1'));
+  await page.mouse.up();
+  await page.waitForTimeout(60);
+  const tmv = await lastLog(page, 'textSet');
+  const afterMove = await page.evaluate(() => ({ ghost: !!document.querySelector('.pv-text-ghost'), editing: T.app.preview.editingTextId, hidden: !!T.player.hideTextIds }));
+  check(ghost && tmv && tmv.x > 0.5 && tmv.y < 0.9 && !('w' in tmv), 'dragging the selected caption box moves it (textSet x/y, one step)', tmv);
+  check(!afterMove.ghost && !afterMove.editing && !afterMove.hidden, 'the move ends cleanly (no editor, text drawn again)', afterMove);
+  await page.evaluate(() => { T.app.preview._updateSelBox(); T.log.length = 0; });
+  const hd = await rectOf(page, '.pv-text-handle');
+  check(!!hd, 'the selected box has a resize handle');
+  if (hd) {
+    await page.mouse.move(hd.cx, hd.cy);
+    await page.mouse.down();
+    await page.mouse.move(hd.cx + 50, hd.cy, { steps: 5 });
+    await page.mouse.up();
+    await page.waitForTimeout(60);
+    const trs = await lastLog(page, 'textSet');
+    check(trs && trs.w > 0 && trs.w <= 1 && Number.isFinite(trs.x), 'dragging the corner handle sets the wrap width (textSet w)', trs);
+  }
+  // a plain click on the selected box still edits it
+  await page.evaluate(() => { T.app.preview._updateSelBox(); });
+  const tb2 = await rectOf(page, '.pv-text-sel');
+  await page.mouse.click(tb2.cx, tb2.cy);
+  await page.waitForTimeout(60);
+  check((await page.evaluate(() => T.app.preview.editingTextId)) === 'text-c1', 'clicking the selected box still starts inline editing');
+  await page.evaluate(() => { T.app.preview.finishEditing(false); T.app.preview._tbSupport = null; T.app.preview._updateSelBox(); });
 }
 
 // ------------------------------------------------------------------------------------------ phone
@@ -486,16 +613,19 @@ async function phone(browser) {
   const tabs = await page.evaluate(() => T.ribbonTabs.slice());
   check(tabs.length && tabs[tabs.length - 1].tab === 'edit', 'double-tap opens the Edit tab', tabs);
 
-  // long press (no move) → popover
+  // long press (no move) → popover (about the pressed item, even when everything was selected)
   await page.waitForTimeout(450);
+  await page.evaluate(() => T.store.select('item', T.store.project.items.map((i) => i.id)));
   await touch(cdp, 'touchStart', [[it.x + 40, it.cy]]);
-  await sleep(500);
+  await sleep(650);
   const armed = await page.evaluate(() => document.querySelectorAll('.sb-item.is-armed').length);
   await touch(cdp, 'touchEnd', []);
   await page.waitForTimeout(60);
   const pop = await page.evaluate(() => [...document.querySelectorAll('.sb-pop .sb-pop-item')].map((b) => b.textContent));
   check(armed > 0, 'long-press arms the item (visual feedback)');
   check(pop.join() === 'Edit,Trim,Split,Duplicate,Remove', 'long-press without moving shows the action popover', pop);
+  s = await sel(page);
+  check(s.ids.join() === 'item-v1', 'the long-press popover acts on the pressed item only', s);
   await page.screenshot({ path: join(OUT, 'phone-popover.png') });
   await page.touchscreen.tap(10, 300);
   await page.waitForTimeout(50);
@@ -508,7 +638,7 @@ async function phone(browser) {
   await page.waitForTimeout(350);
   const a = await rectOf(page, '.sb-item[data-id="item-v1"]');
   await touch(cdp, 'touchStart', [[a.x + 30, a.cy]]);
-  await sleep(450);
+  await sleep(600);
   for (let i = 1; i <= 15; i++) { await touch(cdp, 'touchMove', [[a.x + 30 + i * 14, a.cy]]); await sleep(16); }
   const mid = await page.evaluate(() => ({ caret: !document.querySelector('.sb-caret').hidden, ghost: !!document.querySelector('.sb-ghost') }));
   await page.screenshot({ path: join(OUT, 'phone-drag.png') });
@@ -570,7 +700,7 @@ async function phone(browser) {
   await page.waitForTimeout(400);
   const cb = await rectOf(page, '.sb-bar[data-id="text-c1"]');
   await touch(cdp, 'touchStart', [[cb.x + 20, cb.cy]]);
-  await sleep(450);
+  await sleep(600);
   for (let i = 1; i <= 8; i++) { await touch(cdp, 'touchMove', [[cb.x + 20 + i * 10, cb.cy]]); await sleep(16); }
   await touch(cdp, 'touchEnd', []);
   await page.waitForTimeout(60);
@@ -591,7 +721,7 @@ async function phone(browser) {
   await page.evaluate(() => { T.store.replaceProject({ ...T.buildProject(), items: [], texts: [], music: [] }); });
   await page.waitForTimeout(80);
   const emp = await page.evaluate(() => { const b = document.querySelector('.sb-empty-btn'); return b && b.textContent; });
-  check(emp && emp.includes('Click here to browse for videos and photos') && !emp.includes('drag them'), 'phone empty state (no drag hint)', emp);
+  check(emp && emp.includes('Tap here to add videos and photos') && !emp.includes('drag them'), 'phone empty state (touch wording, no drag hint)', emp);
   await page.screenshot({ path: join(OUT, 'phone-empty.png') });
 
   check(errors.length === 0, 'no console errors (phone)', errors);

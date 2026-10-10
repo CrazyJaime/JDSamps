@@ -19,6 +19,7 @@
 import { formatTime, ASPECTS } from '../model.js';
 import * as TextMod from '../text.js';
 import * as Icons from './icons.js';
+import { backGuard } from './dom.js';
 
 const LINE_HEIGHT = 1.22;               // keep in sync with js/text.js
 const PHONE_QUERY = '(max-width: 760px), (pointer: coarse) and (max-width: 1024px) and (orientation: portrait), (pointer: coarse) and (orientation: landscape) and (max-height: 520px)';
@@ -26,6 +27,12 @@ const OUTLINE = { none: 0, thin: 0.045, medium: 0.08, thick: 0.13 };
 const DOUBLE_TAP_MS = 320;
 const TAP_MOVE_PX = 12;
 const DEFAULT_TEXTS = new Set(['', 'Enter text here', 'My Movie', 'Title']);
+const IDLE_MS = 2500;                   // full screen: hide the transport after this long without input
+const SPLIT_KEY = 'mm.previewSplit';    // localStorage: desktop preview/storyboard split (percent)
+const SPLIT_MIN_PREVIEW = 280;          // px (matches the grid minimum in css/moviemaker.css)
+const SPLIT_MIN_STORYBOARD = 300;       // px
+const FINE_QUERY = '(hover: hover) and (pointer: fine)';
+const COARSE_QUERY = '(pointer: coarse)';
 
 function clamp(v, a, b) { return v < a ? a : (v > b ? b : v); }
 function num(v, d) { return typeof v === 'number' && Number.isFinite(v) ? v : d; }
@@ -66,6 +73,16 @@ function fontPxFor(style, h) {
   return Math.max(4, (size / 100) * h);
 }
 
+/** CSS text-shadow approximating the canvas outline of a TextStyle (k = editor scale factor). */
+function outlineShadow(style, px, k) {
+  const ow = OUTLINE[style && style.outline] || 0;
+  if (!(ow > 0)) return '0 0 1px rgba(0,0,0,.35)';
+  const d = Math.max(0.75, px * ow) / k;
+  const c = (style && style.outlineColor) || '#000000';
+  return [[d, 0], [-d, 0], [0, d], [0, -d], [d, d], [-d, -d], [d, -d], [-d, d]]
+    .map(([x, y]) => `${c} ${x.toFixed(2)}px ${y.toFixed(2)}px 0`).join(',');
+}
+
 // ---------------------------------------------------------------------------------------------
 // Styles (scoped to .pv-root; complements the shared .pv-* defaults in css/moviemaker.css)
 
@@ -83,6 +100,28 @@ const STYLE = `
 .pv-root .pv-text-sel{position:absolute;z-index:3;pointer-events:none;box-sizing:border-box;border:1px dashed rgba(255,255,255,.95);
   box-shadow:0 0 0 1px rgba(0,0,0,.55),inset 0 0 0 1px rgba(0,0,0,.35);}
 .pv-root .pv-text-sel::after{content:"";position:absolute;right:-4px;bottom:-4px;width:7px;height:7px;background:#fff;border:1px solid #333;box-sizing:border-box;}
+/* Movable text box (when text.js supports style.x/y/w): drag the box to move it, drag the corner
+   handle to change the wrap width (WLMM). */
+.pv-root .pv-text-sel.is-movable::after{display:none;}
+.pv-root .pv-text-handle{position:absolute;right:-6px;bottom:-6px;width:11px;height:11px;box-sizing:border-box;background:#fff;border:1px solid #333;
+  pointer-events:auto;cursor:nwse-resize;touch-action:none;}
+.pv-root .pv-text-handle::before{content:"";position:absolute;left:-9px;top:-9px;right:-9px;bottom:-9px;}
+@media (pointer: coarse){.pv-root .pv-text-handle{width:16px;height:16px;right:-9px;bottom:-9px;border-radius:50%;}.pv-root .pv-text-handle::before{left:-14px;top:-14px;right:-14px;bottom:-14px;}}
+.pv-root .pv-stage.is-moving-text{cursor:move;}
+.pv-root .pv-text-ghost{position:absolute;z-index:4;box-sizing:border-box;margin:0;white-space:pre-wrap;overflow-wrap:break-word;pointer-events:none;
+  outline:1px dashed rgba(255,255,255,.95);box-shadow:0 0 0 1px rgba(0,0,0,.55);}
+/* Phones: finish inline editing explicitly (Return makes a new line there). Placed over the visual
+   viewport so the on-screen keyboard never covers it. */
+.pv-edit-done{position:fixed;z-index:1050;min-width:72px;height:40px;padding:0 16px;border:1px solid #1f5fae;border-radius:20px;
+  background:linear-gradient(#4a91e2,#1e5fb6);color:#fff;font:600 15px/1 var(--font-ui,system-ui,sans-serif);box-shadow:0 2px 8px rgba(0,0,0,.35);
+  touch-action:manipulation;-webkit-tap-highlight-color:transparent;}
+.pv-edit-done.is-leaving{opacity:0;transition:opacity .15s;}
+/* Full screen on desktop: the transport fades out while the movie plays and the mouse rests. */
+.pv-root.is-fullscreen .pv-seekrow,.pv-root.is-fullscreen .pv-transport{transition:opacity .35s;}
+.pv-root.is-fullscreen.is-idle .pv-seekrow,.pv-root.is-fullscreen.is-idle .pv-transport{opacity:0;pointer-events:none;}
+.pv-root.is-fullscreen.is-idle,.pv-root.is-fullscreen.is-idle .pv-stage{cursor:none;}
+.pv-fs-exit{transition:opacity .35s;}
+.pv-fs-exit.is-idle{opacity:0;pointer-events:none;}
 .pv-root textarea.pv-text-editor{position:absolute;z-index:4;box-sizing:border-box;display:block;margin:0;border:0;border-radius:0;
   outline:1px dashed rgba(255,255,255,.95);outline-offset:0;box-shadow:0 0 0 1px rgba(0,0,0,.6);background:transparent;
   resize:none;overflow:hidden;white-space:pre-wrap;overflow-wrap:break-word;word-break:normal;transform-origin:0 0;
@@ -112,11 +151,24 @@ const STYLE = `
   .pv-root .pv-seekrow{display:flex;align-items:center;gap:12px;padding:4px 16px 0 14px;background:#20252c;}
   .pv-root .pv-seekrow .pv-time{flex:none;font-size:12.5px;color:#e3e8ef;}
   .pv-root .pv-seekrow .pv-seekbar{flex:1 1 auto;min-width:80px;}
-  .pv-root .pv-seekbar{height:30px;}
+  .pv-root .pv-seekbar{height:40px;}
   .pv-root .pv-seek-knob{width:20px;height:20px;left:-10px;margin-top:-10px;}
   .pv-root .pv-seek-track{background:linear-gradient(#59636f,#7b8693);border-color:#3b4552;}
 }
-@media (pointer: coarse){.pv-root .pv-seekbar{height:32px;}.pv-root .pv-seek-knob{width:20px;height:20px;left:-10px;margin-top:-10px;}}
+@media (pointer: coarse){.pv-root .pv-seekbar{height:40px;}.pv-root .pv-seek-knob{width:20px;height:20px;left:-10px;margin-top:-10px;}}
+/* Very narrow landscape (e.g. a portrait phone whose on-screen keyboard shrinks the layout viewport
+   to 390x367): the preview column is ~200px wide, so the transport packs tighter and the full
+   screen button never overlaps the frame buttons. */
+@media (pointer: coarse) and (orientation: landscape) and (max-height: 520px) and (max-width: 519px){
+  .pv-root .pv-transport{display:flex;align-items:center;gap:4px;padding:2px 4px;}
+  .pv-root .pv-transport .pv-time-spacer{display:none;}
+  .pv-root .pv-controls{gap:4px;margin:0 auto;}
+  .pv-root .pv-btn{width:34px;height:40px;}
+  .pv-root .pv-play{width:40px;height:40px;}
+  .pv-root .pv-seekrow{gap:6px;padding:0 8px;}
+  .pv-root .pv-seekrow .pv-time{font-size:11px;}
+  .pv-root .pv-seekrow .pv-seekbar{min-width:60px;}
+}
 #app.is-pseudo-fullscreen .pv-root .pv-seekrow,.pv-root:fullscreen .pv-seekrow{background:#111;}
 .pv-root:-webkit-full-screen .pv-seekrow{background:#111;}
 .pv-root:-webkit-full-screen .pv-stage{margin:0;border:0;}
@@ -188,6 +240,9 @@ export class Preview {
     this.placeholder.appendChild(ph);
     this.selBox = el('div', 'pv-text-sel');
     this.selBox.hidden = true;
+    this._selHandle = el('div', 'pv-text-handle', { title: 'Drag to change the width of the text box', 'aria-hidden': 'true' });
+    this._selHandle.hidden = true;
+    this.selBox.appendChild(this._selHandle);
     this.stage.append(this.canvas, this.placeholder, this.selBox);
 
     this.seekRow = el('div', 'pv-seekrow');
@@ -251,7 +306,9 @@ export class Preview {
     this._listen(this.stage, 'pointerdown', (e) => this._onStageDown(e));
     this._listen(this.stage, 'pointermove', (e) => this._onStageMove(e));
     this._listen(this.stage, 'pointerup', (e) => this._onStageUp(e));
-    this._listen(this.stage, 'pointercancel', () => { this._down = null; });
+    this._listen(this.stage, 'pointercancel', () => { this._endBoxDrag(false); this._down = null; });
+    this._listen(this.stage, 'lostpointercapture', (e) => { if (this._down && this._down.box && this._down.box.active && this._down.id === e.pointerId) { this._endBoxDrag(false); this._down = null; } });
+    this._listen(this.stage, 'pointerleave', () => { if (!this._down) this.stage.classList.remove('is-moving-text'); });
     this._listen(this.stage, 'click', (e) => this._onStageClick(e));
     this._listen(this.stage, 'contextmenu', (e) => { if (e.target !== this.editor) e.preventDefault(); });
     this._listen(this.stage, 'dblclick', (e) => { if (e.target !== this.editor) e.preventDefault(); });
@@ -293,6 +350,12 @@ export class Preview {
     this._listen(document, 'visibilitychange', () => {
       if (document.visibilityState === 'visible' && this._isPlaying()) this._wake(true);
     });
+    // Full screen auto-hide: any mouse movement, click or key shows the transport again.
+    const poke = () => this._poke();
+    this._listen(this.root, 'pointermove', (e) => { if (e.pointerType === 'mouse') poke(); });
+    this._listen(this.root, 'pointerdown', poke);
+    this._listen(document, 'keydown', () => { if (this.root.classList.contains('is-fullscreen')) poke(); });
+    this._initSplitter();
   }
 
   _wireRepeat(btn, dir) {
@@ -467,6 +530,7 @@ export class Preview {
       this.playBtn.replaceChild(playing ? this._pauseIcon : this._playIcon, this.playBtn.firstChild);
     }
     this.root.classList.toggle('is-playing', playing);
+    this._poke();
     if (playing) {
       if (this.editingTextId) this.finishEditing(true);
       this.selBox.hidden = true;
@@ -765,19 +829,29 @@ export class Preview {
       this._lastTap = null;
       return;
     }
-    this._down = { id: e.pointerId, x: e.clientX, y: e.clientY, moved: false };
+    this._down = { id: e.pointerId, x: e.clientX, y: e.clientY, moved: false, box: this._boxGrab(e) };
   }
 
   _onStageMove(e) {
     const d = this._down;
-    if (!d || d.id !== e.pointerId) return;
+    if (!d) { if (e.pointerType === 'mouse') this._hoverCursor(e); return; }
+    if (d.id !== e.pointerId) return;
     if (Math.hypot(e.clientX - d.x, e.clientY - d.y) > TAP_MOVE_PX) d.moved = true;
+    const b = d.box;
+    if (!b) return;
+    if (!b.active && (d.moved || (b.mode === 'resize' && Math.abs(e.clientX - d.x) > 2))) this._beginBoxDrag(d, e);
+    if (b.active) this._moveBoxDrag(d, e);
   }
 
   _onStageUp(e) {
     if (this.editor && (e.target === this.editor || this.editor.contains(e.target))) return;
     const d = this._down;
     this._down = null;
+    if (d && d.box && d.box.active && d.id === e.pointerId) {
+      this._moveBoxDrag(d, e);
+      this._endBoxDrag(true, d);
+      return;
+    }
     if (!d || d.moved || d.id !== e.pointerId) return;
     const t = nowMs();
     const playing = this._isPlaying();
@@ -802,6 +876,153 @@ export class Preview {
       return;
     }
     this._lastTap = { t, x: e.clientX, y: e.clientY };
+  }
+
+  // ------------------------------------------------------------------------------- moving / resizing a text box
+
+  /**
+   * True when text.js places text by style.x / style.y (centre, 0..1 of the frame) and wraps at
+   * style.w (fraction of the frame width). Only then can the selected box be dragged; otherwise the
+   * dashed box stays a plain selection marker (align + Position place the text).
+   */
+  _textBoxSupported() {
+    if (this._tbSupport != null) return this._tbSupport;
+    let ok = false;
+    try {
+      const ctx = this._measureCtx();
+      if (ctx && typeof TextMod.measureTextBox === 'function') {
+        const st = { font: 'Arial, sans-serif', size: 8, bold: false, italic: false, color: '#ffffff', outline: 'none', outlineColor: '#000000', align: 'center', valign: 'bottom', opacity: 1, background: null };
+        const a = TextMod.measureTextBox(ctx, { text: 'Mm', style: { ...st, x: 0.25, y: 0.3 }, w: 1000, h: 500 });
+        ok = !!a && a.width > 0 && Math.abs(a.x + a.width / 2 - 250) < 3 && Math.abs(a.y + a.height / 2 - 150) < 3;
+        if (ok) {
+          const text = 'Mm Mm Mm Mm Mm Mm Mm Mm';
+          const narrow = TextMod.measureTextBox(ctx, { text, style: { ...st, x: 0.5, y: 0.5, w: 0.08 }, w: 1000, h: 500 });
+          const wide = TextMod.measureTextBox(ctx, { text, style: { ...st, x: 0.5, y: 0.5 }, w: 1000, h: 500 });
+          this._tbWidth = !!(narrow && wide && narrow.height > wide.height * 1.5);
+        }
+      }
+    } catch (_) { ok = false; }
+    this._tbSupport = ok;
+    return ok;
+  }
+
+  /** The selected text's box under the pointer (to move it) or its corner handle (to resize it). */
+  _boxGrab(e) {
+    if (this._isPlaying() || this.selBox.hidden || !this._textBoxSupported()) return null;
+    const sel = this.store && this.store.selection;
+    if (!sel || !sel.ids || sel.ids.length !== 1) return null;
+    const id = sel.ids[0];
+    const r = this._resolveText(id);
+    if (!r || r.effect === 'scroll' || r.effect === 'ticker') return null;
+    const onHandle = e.target === this._selHandle || this._selHandle.contains(e.target);
+    if (onHandle && !this._tbWidth) return null;
+    if (!onHandle) {
+      const hit = this._hitText(e.clientX, e.clientY);
+      if (!hit || hit.id !== id) return null;
+    }
+    const fr = this._frameRect();
+    if (!fr) return null;
+    const box = this._textBox(r.text, r.style, fr);
+    return { mode: onHandle ? 'resize' : 'move', id, r, fr, box, active: false, x: NaN, y: NaN, w: NaN };
+  }
+
+  _hoverCursor(e) {
+    let cls = false;
+    if (!this._isPlaying() && !this.selBox.hidden && this._textBoxSupported() && e.target !== this._selHandle) {
+      const sel = this.store && this.store.selection;
+      const hit = sel && sel.ids && sel.ids.length === 1 ? this._hitText(e.clientX, e.clientY) : null;
+      cls = !!(hit && hit.id === sel.ids[0]);
+    }
+    this.stage.classList.toggle('is-moving-text', cls);
+  }
+
+  _beginBoxDrag(d, e) {
+    const b = d.box;
+    b.active = true;
+    this._lastTap = null;
+    try { this.stage.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+    this.stage.classList.add('is-moving-text');
+    // Show the text where it will go: hide it in the movie and draw a styled stand-in.
+    this._hideInPlayer(b.id);
+    const g = el('div', 'pv-text-ghost', { 'aria-hidden': 'true' });
+    g.textContent = b.r.text || ' ';
+    this._styleGhost(g, b.r.style || {}, b.fr);
+    this.stage.appendChild(g);
+    b.ghost = g;
+  }
+
+  _moveBoxDrag(d, e) {
+    const b = d.box;
+    if (!b || !b.active || !b.ghost) return;
+    const fr = b.fr, box = b.box;
+    const dx = e.clientX - d.x, dy = e.clientY - d.y;
+    const style = b.r.style || {};
+    const px = fontPxFor(style, fr.h);
+    const padX = px * 0.35;
+    let cx, cy, width = null;
+    if (b.mode === 'resize') {
+      const bw = clamp(box.width + dx, px * 2 + 2 * padX, fr.w - Math.max(0, box.x));
+      width = bw;
+      b.w = clamp((bw - 2 * padX) / fr.w, 0.05, 1);
+      cx = box.x + bw / 2;
+      cy = box.y + box.height / 2;
+    } else {
+      cx = clamp(box.x + box.width / 2 + dx, 0, fr.w);
+      cy = clamp(box.y + box.height / 2 + dy, 0, fr.h);
+      b.w = Number.isFinite(style.w) ? style.w : NaN;
+    }
+    b.x = clamp(cx / fr.w, 0, 1);
+    b.y = clamp(cy / fr.h, 0, 1);
+    const g = b.ghost;
+    const gs = g.style;
+    if (width != null) gs.width = `${width}px`;
+    else if (!gs.width) gs.width = `${box.width + 1}px`;
+    const gw = g.offsetWidth, gh = g.offsetHeight;
+    gs.left = `${fr.x + cx - gw / 2}px`;
+    gs.top = `${fr.y + cy - gh / 2}px`;
+    // The dashed selection follows the stand-in.
+    const sb = this.selBox.style;
+    sb.left = gs.left; sb.top = gs.top; sb.width = `${gw}px`; sb.height = `${gh}px`;
+  }
+
+  /** End a move/resize; commit = save the new placement through textSet (one undo step). */
+  _endBoxDrag(commit, d = this._down) {
+    const b = d && d.box;
+    if (!b || !b.active) return;
+    b.active = false;
+    if (b.ghost && b.ghost.parentNode) b.ghost.parentNode.removeChild(b.ghost);
+    b.ghost = null;
+    this.stage.classList.remove('is-moving-text');
+    if (commit && Number.isFinite(b.x) && Number.isFinite(b.y)) {
+      const round = (v) => Math.round(v * 10000) / 10000;
+      const arg = { x: round(b.x), y: round(b.y) };
+      if (b.mode === 'resize' && Number.isFinite(b.w)) arg.w = round(b.w);
+      const sel = this.store.selection || { ids: [] };
+      if (!(sel.ids && sel.ids.length === 1 && sel.ids[0] === b.id)) { try { this.store.select(b.r.type, [b.id]); } catch (_) { /* ignore */ } }
+      this._run('textSet', arg);
+    }
+    this._unhideInPlayer();
+    this._updateSelBox();
+  }
+
+  /** Style a non-editable stand-in exactly like the drawn text (same metrics as the editor). */
+  _styleGhost(g, style, fr) {
+    const px = fontPxFor(style, fr.h);
+    const lh = px * LINE_HEIGHT;
+    const s = g.style;
+    const align = style.align === 'left' || style.align === 'right' ? style.align : 'center';
+    s.padding = `${px * 0.15}px ${px * 0.35}px`;
+    s.fontSize = `${px}px`;
+    s.lineHeight = `${lh}px`;
+    s.fontFamily = style.font || 'Segoe UI, Arial, sans-serif';
+    s.fontWeight = style.bold ? '700' : '400';
+    s.fontStyle = style.italic ? 'italic' : 'normal';
+    s.textAlign = align;
+    s.color = style.color || '#ffffff';
+    s.background = style.background || 'transparent';
+    s.opacity = String(clamp(num(style.opacity, 1), 0.45, 1));
+    s.maxWidth = `${fr.w}px`;
+    s.textShadow = outlineShadow(style, px, 1);
   }
 
   /** Safety net: if a browser refused focus() during pointerup, a click is always a user gesture. */
@@ -849,6 +1070,9 @@ export class Preview {
     box.style.height = `${h}px`;
     box.hidden = false;
     this.stage.classList.add('is-clickable-text');
+    const movable = r.effect !== 'scroll' && r.effect !== 'ticker' && this._textBoxSupported();
+    box.classList.toggle('is-movable', movable && !!this._tbWidth);
+    this._selHandle.hidden = !(movable && this._tbWidth);
   }
 
   _onStoreChange() {
@@ -885,7 +1109,8 @@ export class Preview {
       try { this.editor.focus({ preventScroll: true }); } catch (_) { this.editor.focus(); }
       return true;
     }
-    if (this.editingTextId) this.finishEditing(true);
+    // Switching straight to another text keeps the one Back entry (no history churn).
+    if (this.editingTextId) this.finishEditing(true, { keepBack: true });
     const store = this.store;
     // Commands like textEdit / textSet act on the selection: make it this text.
     const sel = store.selection || { ids: [] };
@@ -906,9 +1131,14 @@ export class Preview {
     this._editStartedAt = nowMs();
     this._hideInPlayer(id);
 
+    // Return makes a new line on touch screens (soft keyboards have no Shift+Return) and in
+    // credits everywhere; editing then ends with Done, a tap outside or Back.
+    const touch = mqMatches(COARSE_QUERY);
+    this._enterNewline = touch || (r.type === 'text' && r.obj.kind === 'credits');
     const ta = el('textarea', 'pv-text-editor', {
       'aria-label': r.type === 'item' ? 'Title text' : (r.obj.kind === 'credits' ? 'Credits text' : 'Caption text'),
       spellcheck: 'true', autocapitalize: 'sentences', autocomplete: 'off', rows: '1', wrap: 'soft',
+      enterkeyhint: this._enterNewline ? 'enter' : 'done',
     });
     ta.value = r.text;
     this.editor = ta;
@@ -926,6 +1156,14 @@ export class Preview {
       if (e.key === 'Escape' && !e.defaultPrevented && this.editingTextId && document.activeElement !== this.editor) this.finishEditing(true);
     });
     this.selBox.hidden = true;
+    if (touch) this._showDone();
+    // Android Back / iOS swipe-back finishes editing (keeping the text) instead of leaving the app.
+    if (!this._editBack) {
+      this._editBack = backGuard(this.app, () => {
+        this._editBack = null;
+        if (this.editingTextId) this.finishEditing(true, { fromBack: true });
+      });
+    }
     this._layoutEditor();
     try { ta.focus({ preventScroll: true }); } catch (_) { ta.focus(); }
     try {
@@ -943,15 +1181,84 @@ export class Preview {
     try { if (typeof p.renderNow === 'function') { const r = p.renderNow(); if (r && r.catch) r.catch(() => {}); } } catch (_) { /* ignore */ }
   }
 
+  _unhideInPlayer() {
+    const p = this.app.player;
+    if (!p) { this._hiddenSet = null; return; }
+    try { if (p.hideTextIds === this._hiddenSet || !this._hiddenSet) p.hideTextIds = null; } catch (_) { /* ignore */ }
+    this._hiddenSet = null;
+    try { if (typeof p.renderNow === 'function') { const r = p.renderNow(); if (r && r.catch) r.catch(() => {}); } } catch (_) { /* ignore */ }
+  }
+
   _onEditorKey(e) {
     e.stopPropagation();
     if (e.key === 'Escape') {
       e.preventDefault();
       this.finishEditing(false);
-    } else if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
+    } else if (e.key === 'Enter' && !e.isComposing && e.keyCode !== 229) {
+      // Ctrl/Cmd+Enter always finishes; plain Enter finishes single-line editing on desktop and
+      // makes a new line on touch screens and in credits (Shift+Enter is always a new line).
+      if (e.ctrlKey || e.metaKey) { e.preventDefault(); this.finishEditing(true); return; }
+      if (e.shiftKey || this._enterNewline) return;
       e.preventDefault();
       this.finishEditing(true);
     }
+  }
+
+  /** Touch: a Done button over the visual viewport (above the on-screen keyboard). */
+  _showDone() {
+    if (!this._doneBtn) {
+      const b = el('button', 'pv-edit-done', { type: 'button', 'aria-label': 'Done editing text' });
+      b.textContent = 'Done';
+      // Finish on pointerdown (before the textarea's blur can move focus around); click is the
+      // keyboard / assistive-technology path. preventDefault keeps focus where it is meanwhile.
+      b.addEventListener('pointerdown', (e) => { e.preventDefault(); if (this.editingTextId) this.finishEditing(true); });
+      b.addEventListener('click', () => { if (this.editingTextId) this.finishEditing(true); });
+      this._doneBtn = b;
+    }
+    clearTimeout(this._doneTimer);
+    this._doneBtn.disabled = false;
+    this._doneBtn.classList.remove('is-leaving');
+    if (!this._doneBtn.isConnected) document.body.appendChild(this._doneBtn);
+    const vv = typeof window !== 'undefined' ? window.visualViewport : null;
+    if (vv && !this._vvOff) {
+      const fn = () => this._placeDone();
+      vv.addEventListener('resize', fn);
+      vv.addEventListener('scroll', fn);
+      this._vvOff = () => { vv.removeEventListener('resize', fn); vv.removeEventListener('scroll', fn); };
+    }
+    this._placeDone();
+  }
+
+  _placeDone() {
+    const b = this._doneBtn;
+    if (!b || !b.isConnected) return;
+    // Top-right corner of the picture (where phone editors put it), kept inside what is actually
+    // visible: the on-screen keyboard shrinks / scrolls the visual viewport.
+    const r = this.stage.getBoundingClientRect();
+    const vv = window.visualViewport;
+    const vTop = vv && vv.height > 0 ? vv.offsetTop : 0;
+    const vLeft = vv && vv.width > 0 ? vv.offsetLeft : 0;
+    const vH = vv && vv.height > 0 ? vv.height : window.innerHeight;
+    const vW = vv && vv.width > 0 ? vv.width : window.innerWidth;
+    const bw = b.offsetWidth || 72, bh = b.offsetHeight || 40;
+    const top = clamp(r.top + 8, vTop + 8, Math.max(vTop + 8, vTop + vH - bh - 8));
+    const right = clamp(Math.min(r.right, vLeft + vW) - 8, vLeft + bw + 8, vLeft + vW - 8);
+    const s = b.style;
+    s.right = 'auto';
+    s.left = `${Math.round(right - bw)}px`;
+    s.top = `${Math.round(top)}px`;
+  }
+
+  _hideDone() {
+    if (this._vvOff) { this._vvOff(); this._vvOff = null; }
+    const b = this._doneBtn;
+    if (!b || !b.parentNode) return;
+    // Editing ends on pointerdown: keep the (disabled, fading) button under the finger a moment
+    // so the tap's click is swallowed instead of reaching the button behind it (Save movie).
+    b.disabled = true;
+    b.classList.add('is-leaving');
+    clearTimeout(this._doneTimer);
+    this._doneTimer = setTimeout(() => { if (b.disabled && b.parentNode) b.parentNode.removeChild(b); }, 450);
   }
 
   _isRibbonEl(node) {
@@ -962,6 +1269,7 @@ export class Preview {
     const t = e.target;
     if (!this.editingTextId) return;
     if (this.editor && this.editor.contains(t)) return;
+    if (this._doneBtn && this._doneBtn.contains(t)) return; // its own handler finishes
     if (this._isRibbonEl(t)) { this._downInRibbonAt = nowMs(); return; }
     if (this.stage.contains(t)) return; // the stage handler finishes and handles the tap
     this.finishEditing(true);
@@ -1011,7 +1319,7 @@ export class Preview {
   }
 
   /** End inline editing; commit (default) saves the text through the textEdit command. */
-  finishEditing(commit = true) {
+  finishEditing(commit = true, { fromBack = false, keepBack = false } = {}) {
     const id = this.editingTextId;
     if (!id) return;
     const ta = this.editor;
@@ -1020,15 +1328,16 @@ export class Preview {
     this.editingTextId = null;
     this.editor = null;
     if (this._editOffs) { this._editOffs.forEach((f) => { try { f(); } catch (_) { /* ignore */ } }); this._editOffs = null; }
+    if (!keepBack) {
+      const release = this._editBack;
+      this._editBack = null;
+      if (release && !fromBack) release();
+    }
+    this._hideDone();
     const hadFocus = ta && document.activeElement === ta;
     if (ta && ta.parentNode) ta.parentNode.removeChild(ta);
     if (commit) this._commit(id, value);
-    const p = this.app.player;
-    if (p) {
-      try { if (p.hideTextIds === this._hiddenSet || !this._hiddenSet) p.hideTextIds = null; } catch (_) { /* ignore */ }
-      this._hiddenSet = null;
-      try { if (typeof p.renderNow === 'function') { const r = p.renderNow(); if (r && r.catch) r.catch(() => {}); } } catch (_) { /* ignore */ }
-    }
+    this._unhideInPlayer();
     if (hadFocus) { try { ta.blur(); } catch (_) { /* ignore */ } }
     this._updateSelBox();
   }
@@ -1075,15 +1384,8 @@ export class Preview {
     s.background = style.background || 'transparent';
     const op = num(style.opacity, 1);
     s.opacity = String(clamp(op, 0.45, 1));
-    const ow = OUTLINE[style.outline] || 0;
-    if (ow > 0) {
-      const d = Math.max(0.75, px * ow) / k;
-      const c = style.outlineColor || '#000000';
-      s.textShadow = [[d, 0], [-d, 0], [0, d], [0, -d], [d, d], [-d, -d], [d, -d], [-d, d]]
-        .map(([x, y]) => `${c} ${x.toFixed(2)}px ${y.toFixed(2)}px 0`).join(',');
-    } else {
-      s.textShadow = '0 0 1px rgba(0,0,0,.35)';
-    }
+    s.textShadow = outlineShadow(style, px, k);
+    if (this._doneBtn) this._placeDone();
   }
 
   // ------------------------------------------------------------------------------- full screen
@@ -1137,11 +1439,13 @@ export class Preview {
     } catch (_) { /* not supported */ }
   }
 
-  _pseudo(on) {
+  _pseudo(on, fromBack = false) {
     const a = this._appEl();
     if (!a) return;
     a.classList.toggle('is-pseudo-fullscreen', on);
     if (on) {
+      // Back / swipe-back leaves the full screen preview, not the app.
+      if (!this._fsBack) this._fsBack = backGuard(this.app, () => { this._fsBack = null; this._pseudo(false, true); });
       if (!document.querySelector('.pv-fs-exit')) {
         const b = el('button', 'pv-fs-exit', { type: 'button', title: 'Exit full screen', 'aria-label': 'Exit full screen' });
         b.appendChild(iconEl('exit-fullscreen', 22));
@@ -1154,6 +1458,9 @@ export class Preview {
         document.addEventListener('keydown', this._pseudoKey);
       }
     } else {
+      const release = this._fsBack;
+      this._fsBack = null;
+      if (release && !fromBack) release();
       document.querySelectorAll('.pv-fs-exit').forEach((n) => n.remove());
       this._pseudoExit = null;
       if (this._pseudoKey) { document.removeEventListener('keydown', this._pseudoKey); this._pseudoKey = null; }
@@ -1168,6 +1475,7 @@ export class Preview {
   _onFullscreenChange() {
     const on = this.isFullscreen();
     this.root.classList.toggle('is-fullscreen', on);
+    this._poke();
     const label = on ? 'Exit full screen' : 'Full screen preview';
     if (this.fsBtn.getAttribute('aria-label') !== label) {
       this.fsBtn.setAttribute('aria-label', label);
@@ -1181,6 +1489,171 @@ export class Preview {
     requestAnimationFrame(() => this._onResize());
   }
 
+  // ------------------------------------------------------------------------------- full screen auto-hide
+
+  /**
+   * Desktop full screen (WLMM): while the movie plays, the transport fades out after a moment
+   * without mouse or keyboard input and the cursor hides; any input shows them again. Touch
+   * layouts keep the controls (a tap would otherwise be needed just to find them).
+   */
+  _poke() {
+    clearTimeout(this._idleTimer);
+    this._idleTimer = 0;
+    this._setIdle(false);
+    if (!this.root.classList.contains('is-fullscreen') || !this._isPlaying() || !mqMatches(FINE_QUERY)) return;
+    this._idleTimer = setTimeout(() => {
+      this._idleTimer = 0;
+      if (this.root.classList.contains('is-fullscreen') && this._isPlaying()) this._setIdle(true);
+    }, IDLE_MS);
+  }
+
+  _setIdle(on) {
+    if (this.root.classList.contains('is-idle') !== on) this.root.classList.toggle('is-idle', on);
+    const x = this._pseudoExit || document.querySelector('.pv-fs-exit');
+    if (x) x.classList.toggle('is-idle', on);
+  }
+
+  // ------------------------------------------------------------------------------- desktop splitter
+
+  /**
+   * The divider between the preview and the storyboard (desktop): drag to resize the monitor
+   * (WLMM), double-click to go back to the View › Preview size preset, arrow keys nudge it. The
+   * split is kept per browser (localStorage) as a percentage of the main area.
+   */
+  _initSplitter() {
+    const main = this.root.parentElement;
+    if (!main || typeof document === 'undefined') return;
+    let sp = document.getElementById('main-splitter');
+    if (!sp) {
+      sp = el('div', 'main-splitter', { id: 'main-splitter' });
+      const sb = document.getElementById('storyboard-pane');
+      if (sb && sb.parentElement === main) main.insertBefore(sp, sb); else if (this.root.nextSibling) main.insertBefore(sp, this.root.nextSibling); else main.appendChild(sp);
+    }
+    sp.setAttribute('role', 'separator');
+    sp.setAttribute('aria-orientation', 'vertical');
+    sp.setAttribute('aria-label', 'Resize the preview');
+    sp.setAttribute('aria-valuemin', '0');
+    sp.setAttribute('aria-valuemax', '100');
+    sp.setAttribute('tabindex', '0');
+    sp.title = 'Drag to resize the preview (double-click to reset)';
+    this.splitter = sp;
+    this._mainEl = main;
+    let saved = null;
+    try { saved = Number(window.localStorage.getItem(SPLIT_KEY)); } catch (_) { saved = null; }
+    if (saved > 0 && saved < 100) this._applySplit(saved, false);
+    let drag = null;
+    const down = (e) => {
+      if (e.pointerType === 'mouse' && e.button !== 0) return;
+      e.preventDefault();
+      drag = { id: e.pointerId };
+      try { sp.setPointerCapture(e.pointerId); } catch (_) { /* ignore */ }
+      sp.classList.add('is-dragging');
+      document.documentElement.classList.add('mm-col-resizing');
+    };
+    const move = (e) => {
+      if (!drag || drag.id !== e.pointerId) return;
+      const r = main.getBoundingClientRect();
+      if (!(r.width > 0)) return;
+      this._applySplit(((e.clientX - r.left) / r.width) * 100, false);
+    };
+    const up = (e) => {
+      if (!drag || drag.id !== e.pointerId) return;
+      drag = null;
+      sp.classList.remove('is-dragging');
+      document.documentElement.classList.remove('mm-col-resizing');
+      this._saveSplit();
+    };
+    const key = (e) => {
+      const cur = this._splitPct || this._presetPct();
+      let v = null;
+      if (e.key === 'ArrowLeft') v = cur - 2;
+      else if (e.key === 'ArrowRight') v = cur + 2;
+      else if (e.key === 'Home') v = 0;
+      else if (e.key === 'End') v = 100;
+      else if (e.key === 'Enter' || e.key === 'Escape') { if (e.key === 'Enter') { e.preventDefault(); this.setSplitRatio(null); } return; }
+      if (v == null) return;
+      e.preventDefault();
+      e.stopPropagation();
+      this._applySplit(v, false);
+      this._saveSplit();
+    };
+    const dbl = () => this.setSplitRatio(null);
+    const L = (t, type, fn) => this._listen(t, type, fn);
+    L(sp, 'pointerdown', down);
+    L(sp, 'pointermove', move);
+    L(sp, 'pointerup', up);
+    L(sp, 'pointercancel', up);
+    L(sp, 'lostpointercapture', up);
+    L(sp, 'keydown', key);
+    L(sp, 'dblclick', dbl);
+    // View › Preview size (normal / large) presets replace a dragged split.
+    let lastSize = this.store && this.store.view ? this.store.view.previewSize : null;
+    if (this.store) {
+      this._listen(this.store, 'view', () => {
+        const size = this.store.view ? this.store.view.previewSize : null;
+        if (size !== lastSize) { lastSize = size; this.setSplitRatio(null); }
+      });
+    }
+    this._listen(window, 'resize', () => { if (this._splitWant) this._applySplit(this._splitWant, false, true); });
+    this._updateSplitAria();
+  }
+
+  _presetPct() {
+    const a = this._appEl();
+    return a && a.dataset.previewSize === 'large' ? 60 : 40;
+  }
+
+  /** Clamp a split (percent of the main area) so both panes stay usable, and apply it. */
+  _applySplit(pct, save, keepWant = false) {
+    const main = this._mainEl;
+    if (!main || !Number.isFinite(pct)) return;
+    if (!keepWant) this._splitWant = pct; // what the user asked for; re-clamped when the window resizes
+    const W = main.clientWidth;
+    let v = pct;
+    if (W > 0) {
+      const lo = (SPLIT_MIN_PREVIEW / W) * 100;
+      const hi = 100 - (SPLIT_MIN_STORYBOARD / W) * 100;
+      v = hi > lo ? clamp(v, lo, hi) : 50;
+    } else {
+      v = clamp(v, 15, 85);
+    }
+    v = Math.round(v * 10) / 10;
+    this._splitPct = v;
+    main.style.setProperty('--pv-ratio', `${v}%`);
+    this._updateSplitAria();
+    if (save) this._saveSplit();
+    this._onResize();
+  }
+
+  _saveSplit() {
+    try {
+      if (this._splitPct) window.localStorage.setItem(SPLIT_KEY, String(this._splitPct));
+      else window.localStorage.removeItem(SPLIT_KEY);
+    } catch (_) { /* private mode: the split just isn't remembered */ }
+  }
+
+  _updateSplitAria() {
+    const sp = this.splitter;
+    if (!sp) return;
+    const v = Math.round(this._splitPct || this._presetPct());
+    sp.setAttribute('aria-valuenow', String(v));
+    sp.setAttribute('aria-valuetext', `Preview ${v}% wide`);
+  }
+
+  /** Set the desktop preview width as a percentage of the main area; null = the View preset. */
+  setSplitRatio(pct) {
+    if (pct == null || !Number.isFinite(+pct)) {
+      this._splitPct = null;
+      this._splitWant = null;
+      if (this._mainEl) this._mainEl.style.removeProperty('--pv-ratio');
+      this._saveSplit();
+      this._updateSplitAria();
+      requestAnimationFrame(() => this._onResize());
+      return;
+    }
+    this._applySplit(+pct, true);
+  }
+
   // ------------------------------------------------------------------------------- teardown
 
   destroy() {
@@ -1192,11 +1665,18 @@ export class Preview {
     if (this._ro) { try { this._ro.disconnect(); } catch (_) { /* ignore */ } }
     if (this._mo) { try { this._mo.disconnect(); } catch (_) { /* ignore */ } }
     this._wake(false);
+    clearTimeout(this._idleTimer);
+    this._hideDone();
+    clearTimeout(this._doneTimer);
+    if (this._doneBtn && this._doneBtn.parentNode) this._doneBtn.parentNode.removeChild(this._doneBtn);
+    if (this._splitOff) this._splitOff();
     if (this._pseudoKey) document.removeEventListener('keydown', this._pseudoKey);
     this.root.classList.remove('pv-root', 'is-playing', 'is-fullscreen');
   }
 }
 
-function mqMatchesCoarse() {
-  try { return !!(window.matchMedia && window.matchMedia('(pointer: coarse)').matches); } catch (_) { return false; }
+function mqMatches(q) {
+  try { return !!(window.matchMedia && window.matchMedia(q).matches); } catch (_) { return false; }
 }
+
+function mqMatchesCoarse() { return mqMatches(COARSE_QUERY); }

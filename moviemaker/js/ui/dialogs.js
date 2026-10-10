@@ -11,8 +11,13 @@
 //     openAppMenu(); openExport(presetId); openWebcam(); openNarration(); openTrim(itemId);
 //     openAbout(); openProjects(); openOptions(); openHelp()
 //     // project helpers (used by the app menu when a command is missing, by drag & drop, …)
-//     loadProjectById(id), newProject(), saveProject(), saveProjectAs(), importProjectFromFile(file?),
-//     exportProjectFile()
+//     loadProjectById(id), newProject(), saveProject(), saveProjectAs(), renameProject(id?, name?),
+//     importProjectFromFile(file?), exportProjectFile()
+//     // Android Back / iOS swipe-back for transient surfaces (ui/dom.js backGuard uses these)
+//     pushBack(onBack) -> token|null      releaseBack(token)
+//     // Trim tool state for a ribbon Trim tab ('mm-trim' window event: detail = trimState | null)
+//     get trimState -> { itemId, name, start, end, duration } | null
+//     trimSetPoint('start'|'end'), trimSetValue('start'|'end', seconds), trimFinish(save)
 //     get isModalOpen / isMenuOpen / trimActive
 //   }
 //   export function getOption(name) / setOption(name, value)   // 'photoDuration' | 'transitionDuration'
@@ -216,6 +221,21 @@ function isTextField(el) {
   return !['button', 'submit', 'reset', 'checkbox', 'radio', 'range', 'color', 'file', 'image'].includes(t);
 }
 
+/** A field the user types into (brings up the on-screen keyboard): not a select, checkbox, button … */
+function isTypingField(el) {
+  return isTextField(el) && el.tagName !== 'SELECT';
+}
+
+/** Select all of a field's text (setSelectionRange is the reliable form on iOS). */
+function selectAllText(input) {
+  if (!input) return;
+  try { input.select(); } catch (_) { /* ignore */ }
+  try {
+    const n = String(input.value || '').length;
+    if (n && typeof input.setSelectionRange === 'function') input.setSelectionRange(0, n);
+  } catch (_) { /* type=number etc. have no selection */ }
+}
+
 const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), '
   + 'textarea:not([disabled]), video[controls], audio[controls], [tabindex]:not([tabindex="-1"]), [contenteditable="true"]';
 
@@ -242,6 +262,23 @@ function invalidateTimeline(store) {
   if (!store) return;
   if (typeof store.invalidate === 'function') store.invalidate();
   else if ('_timeline' in store) store._timeline = null;
+}
+
+// ---------------------------------------------------------------------------
+// History entries used to catch Android Back / iOS swipe-back (see Dialogs#pushBack).
+
+/** Identifies this page load, so entries left over from an earlier load are never mistaken for ours. */
+const BACK_SID = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+
+function historyUsable() {
+  return typeof history !== 'undefined' && typeof history.pushState === 'function' && typeof history.go === 'function';
+}
+
+/** How many of our back-catching entries sit at/below this history state (0 = the app's own entry). */
+function backDepth(state) {
+  if (!state || typeof state !== 'object' || !state.mmDialog || state.mmSid !== BACK_SID) return 0;
+  const d = Number(state.mmDepth);
+  return Number.isFinite(d) && d > 0 ? Math.floor(d) : 0;
 }
 
 function makeEvent(type, detail) {
@@ -342,12 +379,17 @@ const STYLE = `
 .app-menu-item.is-active{border-color:#e8c46a;background:linear-gradient(#fffbec,#fde8a8)}
 .app-menu-recent.is-current small::after{content:" · open now";color:#3aa52f}
 .app-menu-recent .mmd-recent-name{font-weight:600;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.app-menu-recent.mmd-recent{flex-direction:row;align-items:center;gap:8px;padding-left:5px}
+.mmd-recent-thumb{flex:none;display:flex;align-items:center;justify-content:center;width:48px;height:27px;overflow:hidden;border-radius:2px;background:#1b1f24;color:#c9d6e6}
+.mmd-recent-thumb img{width:100%;height:100%;object-fit:cover}
+.mmd-recent-text{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;gap:1px}
 .mmd-menu-note{margin-right:auto;align-self:center;color:#5e7491;font-size:11px}
 .mmd-menu-head{display:none}
 .mmd-dlg-msg{display:flex;gap:12px;align-items:flex-start}
 .mmd-dlg-msg>svg{flex:none;width:32px;height:32px}
 .mmd-dlg-msg p{margin:0 0 8px;white-space:pre-line}
 .mmd-prompt input{width:100%;box-sizing:border-box}
+.mmd-prompt textarea{width:100%;box-sizing:border-box;resize:vertical;min-height:4.5em;font:inherit;line-height:1.35}
 .mmd-spin{display:inline-block;width:16px;height:16px;border:2px solid rgba(47,120,209,.25);border-top-color:#2f78d1;border-radius:50%;animation:mmd-spin .8s linear infinite;vertical-align:-3px}
 @keyframes mmd-spin{to{transform:rotate(360deg)}}
 .mmd-loading{display:flex;align-items:center;gap:8px;padding:16px 4px;color:#5e7491}
@@ -364,7 +406,8 @@ const STYLE = `
 .mmd-proj-text{min-width:0;display:flex;flex-direction:column;gap:2px}
 .mmd-proj-name{font-weight:600;font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .mmd-proj-meta{color:#5e7491;font-size:11.5px}
-.mmd-proj-del{flex:none;align-self:center;margin-right:6px;min-width:0;width:34px;padding:0}
+.mmd-proj-act{flex:none;align-self:center;min-width:0;width:34px;padding:0}
+.mmd-proj-act:last-child{margin-right:6px}
 .mmd-empty{padding:24px 8px;text-align:center;color:#5e7491}
 /* export */
 .mmd-presets{display:flex;flex-direction:column;gap:2px;margin:0 0 12px}
@@ -382,6 +425,8 @@ const STYLE = `
 .mmd-export-stats{display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;color:#5e7491;font-variant-numeric:tabular-nums}
 .mmd-export-pct{font-size:13px;color:#15283f}
 .mmd-export-msg{min-height:1.4em;color:#8a5a00}
+.mmd-export-warning{color:#8a5a00;font-size:12px}
+.mmd-export-warning svg{vertical-align:-2px}
 .mmd-export-msg:empty{display:none}
 .mmd-saved{display:flex;flex-direction:column;gap:8px}
 .mmd-saved video{width:100%;max-height:46vh;background:#000;border-radius:2px}
@@ -439,6 +484,8 @@ const STYLE = `
 .mmd-trim-head{display:flex;align-items:baseline;gap:10px;flex-wrap:wrap}
 .mmd-trim-head .mmd-trim-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#1e395b;flex:1 1 auto}
 .mmd-trim-len{font-variant-numeric:tabular-nums;color:#5e7491}
+.mmd-trim.has-ribbon-tab .mmd-trim-head{align-items:center}
+.mmd-trim.has-ribbon-tab .mmd-trim-play{flex:none;min-width:0;width:32px;padding:0}
 .mmd-trim-track{position:relative;flex:none;height:64px;margin:8px 24px;touch-action:none;-webkit-user-select:none;user-select:none;cursor:pointer}
 .mmd-trim-strip{position:absolute;inset:0;display:flex;overflow:hidden;border-radius:3px;background:#1b1f24 repeating-linear-gradient(90deg,#26303b 0 40px,#1b1f24 40px 44px)}
 .mmd-trim-strip img{flex:1 1 0;min-width:0;height:100%;object-fit:cover;pointer-events:none;border-right:2px solid #10141a}
@@ -461,11 +508,24 @@ const STYLE = `
 #app.mmd-trim-mode #ribbon,#app.mmd-trim-mode #storyboard-pane,#app.mmd-trim-mode #qat,#app.mmd-trim-mode #app-menu-btn{pointer-events:none}
 #app.mmd-trim-mode #qat,#app.mmd-trim-mode #app-menu-btn{opacity:.5}
 #app.mmd-trim-mode #ribbon,#app.mmd-trim-mode #storyboard-pane{opacity:.55;filter:grayscale(.4)}
+#app.mmd-trim-mode.mmd-trim-ribbon-own #ribbon{pointer-events:auto;opacity:1;filter:none}
+.mmd-trim-ribbon{position:fixed;z-index:905;margin:0;pointer-events:none}
+.mmd-trim-ribbon .rb-tabrow{background:transparent}
+.mmd-trim-ribbon .rb-ctx.mmd-trim-ctx{position:absolute;left:64px;bottom:0;height:100%;margin:0;pointer-events:auto}
+.mmd-trim-ribbon .rb-tab{cursor:default}
+.mmd-trim-ribbon .rb-body{pointer-events:auto;box-shadow:inset 0 1px 0 #fff,0 2px 6px rgba(20,40,70,.18)}
+.mmd-trim-ribbon .rb-field{height:24px}
+.mmd-trim-ribbon .mmd-trim-rb-label{min-width:64px}
+.mmd-trim-ribbon .mmd-trim-num{width:70px;text-align:right;font-variant-numeric:tabular-nums}
+.mmd-trim-ribbon .rb-large{min-width:56px}
+.mmd-trim-ribbon .rb-btn:focus-visible{outline:1px dotted #15283f;outline-offset:-3px}
+#app.mmd-trim-ribbon-on #ribbon .rb-ctx,#app.mmd-trim-ribbon-on #ribbon .rb-body{visibility:hidden}
 @media (max-width:760px),(pointer:coarse) and (max-width:1024px) and (orientation:portrait){
   .mmd-menu-head{display:flex;align-items:center;gap:10px;padding:10px 12px;border-bottom:1px solid #d5dfeb;font-size:17px;font-weight:600;color:#1b3d6b}
   .mmd-menu-head img{width:28px;height:28px}
   .mmd-proj-thumb{width:80px;height:45px}
-  .mmd-proj-del{width:44px;height:44px}
+  .mmd-recent-thumb{width:64px;height:36px}
+  .mmd-proj-act{width:44px;height:44px}
   .mmd-preset{padding:8px;min-height:44px}
   .mmd-cam-stage{max-height:46vh}
   .mmd-trim-track{height:72px;margin:10px 26px}
@@ -520,8 +580,14 @@ export class Dialogs {
     this._menu = null;
     this._trim = null;
     this._inertOn = false;
+    // Back handling (see pushBack): live tokens, the depth of the current history entry, and our
+    // own traversal in flight (if any).
     this._backStack = [];
-    this._ignorePops = 0;
+    this._histDepth = 0;
+    this._histBusy = false;
+    this._histTarget = 0;
+    this._histSyncTimer = 0;
+    this._histBusyTimer = 0;
     this._exportOpen = false;
     this._onKey = this._onKey.bind(this);
     this._onPop = this._onPop.bind(this);
@@ -620,7 +686,15 @@ export class Dialogs {
     const focusTarget = opts.initialFocus
       || (!isCoarse() ? (focusables(body)[0] || handle.primaryBtn || focusables(buttonsEl)[0]) : null)
       || dlg;
-    requestAnimationFrame(() => { if (!handle.closed) focusEl(focusTarget); });
+    // A text field is focused right away: iOS only opens the on-screen keyboard for a focus() made
+    // while the user's tap is being handled (dialogs are built synchronously from the tap). Other
+    // targets wait a frame (the sheet is laid out by then); the frame also retries a refused focus.
+    const typing = isTypingField(focusTarget);
+    if (typing) focusEl(focusTarget);
+    requestAnimationFrame(() => {
+      if (handle.closed || (typing && document.activeElement === focusTarget)) return;
+      focusEl(focusTarget);
+    });
     return handle;
   }
 
@@ -722,31 +796,118 @@ export class Dialogs {
     grip.addEventListener('pointercancel', end);
   }
 
-  // Android back / iOS swipe-back closes the top dialog, menu or trim tool instead of leaving.
+  // ------------------------------------------------------------------ Back button / swipe-back
+  //
+  // Android Back / iOS swipe-back closes the top dialog, menu, trim tool, ribbon sheet, … instead
+  // of leaving the app. Every such surface holds a token on _backStack; the i-th token owns the
+  // history entry at depth i + 1 above the app's own entry (depth 0). Our entries carry
+  // { mmDialog, mmSid, mmDepth }, so where we are is always read from history.state rather than
+  // from a count of expected popstate events.
+  //
+  //  - pushBack() pushes an entry right away (inside the user's tap) when there are fewer entries
+  //    than tokens and none of our own traversals is in flight;
+  //  - releaseBack() only drops the token. History is reconciled after the current task, so a
+  //    surface that closes because the next one opens (menu item → dialog, sheet → dialog) simply
+  //    hands its entry over — no history.back() racing a pushState();
+  //  - _syncHistory() steps back over surplus entries (only when the current entry is really ours)
+  //    and waits for that popstate before pushing anything else;
+  //  - popstate: landing below the expected depth means the user pressed Back — the topmost
+  //    affected surfaces close; landing on a stale entry of ours (Forward) steps back again.
+
+  /** Let Back close a surface: returns a token for releaseBack(), or null (desktop / no history API). */
+  pushBack(fn) { return this._pushBack(fn); }
+
+  /** The surface closed by other means: give its history entry back (no-op after Back fired it). */
+  releaseBack(token) { this._releaseBack(token); }
+
   _pushBack(fn) {
-    if (!isCoarse() || typeof history === 'undefined' || typeof history.pushState !== 'function') return null;
-    try { history.pushState({ mmDialog: Date.now() }, ''); } catch (_) { return null; }
-    const token = { fn, popped: false };
+    if (!isCoarse() || !historyUsable()) return null;
+    const token = { fn: typeof fn === 'function' ? fn : () => {}, popped: false };
     this._backStack.push(token);
+    if (!this._histBusy && this._histDepth < this._backStack.length) {
+      this._fillHistory();
+      if (this._histDepth < this._backStack.length) {
+        // pushState refused (e.g. rate limited): without an entry Back can't be caught.
+        this._backStack.splice(this._backStack.indexOf(token), 1);
+        token.popped = true;
+        return null;
+      }
+    }
     return token;
   }
 
   _releaseBack(token) {
     if (!token || token.popped) return;
+    token.popped = true;
     const i = this._backStack.indexOf(token);
     if (i < 0) return;
     this._backStack.splice(i, 1);
-    token.popped = true;
-    this._ignorePops += 1;
-    try { history.back(); } catch (_) { this._ignorePops -= 1; }
+    this._scheduleHistorySync();
   }
 
-  _onPop() {
-    if (this._ignorePops > 0) { this._ignorePops -= 1; return; }
-    const token = this._backStack.pop();
-    if (!token) return;
-    token.popped = true;
-    try { token.fn(); } catch (err) { console.error(err); }
+  /** Push entries until there is one per live token. */
+  _fillHistory() {
+    while (this._histDepth < this._backStack.length) {
+      const depth = this._histDepth + 1;
+      try { history.pushState({ mmDialog: Date.now(), mmSid: BACK_SID, mmDepth: depth }, ''); } catch (_) { return; }
+      this._histDepth = depth;
+    }
+  }
+
+  _scheduleHistorySync() {
+    if (this._histSyncTimer) return;
+    this._histSyncTimer = setTimeout(() => { this._histSyncTimer = 0; this._syncHistory(); }, 0);
+  }
+
+  _syncHistory() {
+    if (this._histBusy || !historyUsable()) return;
+    const want = this._backStack.length;
+    if (this._histDepth > want) {
+      // Never step back from an entry that isn't ours: that would leave Movie Maker.
+      const actual = backDepth(history.state);
+      if (actual !== this._histDepth) {
+        this._histDepth = actual;
+        if (actual <= want) { this._fillHistory(); return; }
+      }
+      const n = this._histDepth - want;
+      this._histBusy = true;
+      this._histTarget = want;
+      try { history.go(-n); } catch (_) { this._histBusy = false; return; }
+      // Should the traversal never be reported, don't wait forever: trust history.state.
+      clearTimeout(this._histBusyTimer);
+      this._histBusyTimer = setTimeout(() => {
+        if (!this._histBusy) return;
+        this._histBusy = false;
+        this._histDepth = backDepth(history.state);
+        this._syncHistory();
+      }, 2500);
+    } else if (this._histDepth < want) {
+      this._fillHistory();
+      // Tokens that still have no entry (pushState refused) can't be reached by Back.
+      while (this._backStack.length > this._histDepth) { const t = this._backStack.pop(); t.popped = true; }
+    }
+  }
+
+  _onPop(e) {
+    const depth = backDepth(e && 'state' in e ? e.state : history.state);
+    // Where we expected to be: the target of our own step back (anything below it is an extra
+    // Back by the user), else the entry we were on.
+    const from = this._histBusy ? this._histTarget : this._histDepth;
+    if (this._histBusy) { this._histBusy = false; clearTimeout(this._histBusyTimer); }
+    this._histDepth = depth;
+    if (depth < from) {
+      // The entries at depths depth+1 … from were popped: close the surfaces that own them,
+      // topmost first (like pressing Escape repeatedly). A token released a moment ago (its
+      // entry not yet given back) is no longer on the stack, so nothing else closes by mistake.
+      const tokens = this._backStack.splice(depth, from - depth).reverse();
+      for (const token of tokens) {
+        token.popped = true;
+        try { token.fn(); } catch (err) { console.error(err); }
+      }
+    }
+    // Re-push for surfaces still open (busy dialogs, ones opened while we were stepping back), or
+    // step back off a stale entry the user moved forward onto.
+    this._syncHistory();
   }
 
   _onKey(e) {
@@ -812,24 +973,49 @@ export class Dialogs {
     return handle.promise.then((v) => v === true);
   }
 
-  /** Ask for a line of text. Resolves the trimmed text, or null when canceled. */
+  /**
+   * Ask for a line of text. Resolves the trimmed text, or null when canceled.
+   * opts.multiline: a <textarea> where Return adds a new line (titles, captions, credits);
+   * Ctrl/⌘+Enter or OK finishes. Lines keep their inner spaces; only the ends are trimmed.
+   */
   promptText(title, value = '', opts = {}) {
     const inputId = domId('prompt');
-    const input = h('input', {
-      type: 'text', id: inputId, value: value == null ? '' : String(value), autocomplete: 'off',
-      spellcheck: 'false', maxlength: String(opts.maxLength || 120), enterkeyhint: 'done',
-    });
-    const body = h('div', { class: 'mmd-prompt field' },
+    const multiline = !!opts.multiline;
+    const text = value == null ? '' : String(value);
+    const input = multiline
+      ? h('textarea', {
+        id: inputId, rows: String(Math.min(8, Math.max(3, text.split('\n').length + 1))), autocomplete: 'off',
+        spellcheck: 'true', maxlength: String(opts.maxLength || 2000), enterkeyhint: 'enter',
+      })
+      : h('input', {
+        type: 'text', id: inputId, value: text, autocomplete: 'off',
+        spellcheck: 'false', maxlength: String(opts.maxLength || 120), enterkeyhint: 'done',
+      });
+    if (multiline) input.value = text;
+    const body = h('div', { class: ['mmd-prompt field', multiline ? 'mmd-prompt-multi' : ''] },
       h('label', { for: inputId }, opts.label || title || 'Name'), input,
-      opts.hint ? h('div', { class: 'hint' }, opts.hint) : null);
+      opts.hint ? h('div', { class: 'hint' }, opts.hint)
+        : multiline && !isCoarse() ? h('div', { class: 'hint' }, `Press Enter for a new line, ${/Mac|iPhone|iPad/.test(navigator.platform || '') ? '⌘' : 'Ctrl'}+Enter to finish.`) : null);
+    const finish = (hd) => { hd.close(input.value.trim()); };
     const handle = this._create({
       title: title || 'Movie Maker', body, size: 'narrow', initialFocus: input,
       buttons: [
-        { label: opts.okLabel || 'OK', primary: true, onClick: (hd) => { hd.close(input.value.trim()); return false; } },
+        { label: opts.okLabel || 'OK', primary: true, onClick: (hd) => { finish(hd); return false; } },
         { label: 'Cancel', value: null },
       ],
     });
-    requestAnimationFrame(() => { try { input.select(); } catch (_) { /* ignore */ } });
+    if (multiline) {
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter' && (e.ctrlKey || e.metaKey) && !e.isComposing) { e.preventDefault(); finish(handle); }
+      });
+    }
+    // Still inside the caller's tap: select now (see _create), and once more after layout should
+    // the browser have dropped the selection.
+    if (document.activeElement === input) selectAllText(input);
+    requestAnimationFrame(() => {
+      if (handle.closed || document.activeElement !== input) return;
+      if (input.selectionStart === input.selectionEnd) selectAllText(input);
+    });
     return handle.promise.then((v) => (typeof v === 'string' ? v : null));
   }
 
@@ -1030,6 +1216,20 @@ export class Dialogs {
     try { const tl = this.app.store.timeline; return tl && tl.duration > 0 ? tl.duration : 0; } catch (_) { return 0; }
   }
 
+  /**
+   * After an explicit save (Save project, Save project as, a finished Save movie): ask the browser
+   * to keep our data under storage pressure. This is the only place engines that show a permission
+   * prompt for it (Firefox) are asked. Not awaited.
+   */
+  _askPersistentStorage() {
+    const persist = this.app.persist;
+    if (!persist || typeof persist.requestPersistentStorage !== 'function') return;
+    try { Promise.resolve(persist.requestPersistentStorage({ userAction: true })).catch(() => {}); } catch (_) { /* ignore */ }
+  }
+
+  /** Public alias of _offerFile (commands.snapshot's "Save picture" uses it). */
+  offerFile(blob, name, message) { return this._offerFile(blob, name, message); }
+
   /** Offer a generated file: direct download on desktop, a tap-to-save dialog on phones (gesture). */
   async _offerFile(blob, name, message) {
     const dl = exporterMod.downloadBlob;
@@ -1100,6 +1300,7 @@ export class Dialogs {
       await persist.saveProject(store.project, store.media);
       if (typeof persist.setLastProjectId === 'function') await persist.setLastProjectId(store.project.id);
       prog.close();
+      this._askPersistentStorage();
       this.toast('Your project has been saved on this device.', { type: 'success', timeout: 2500 });
       return true;
     } catch (err) {
@@ -1127,12 +1328,76 @@ export class Dialogs {
       await persist.saveProject(copy, store.media);
       store.replaceProject(copy, store.media);
       if (typeof persist.setLastProjectId === 'function') await persist.setLastProjectId(copy.id);
+      this._askPersistentStorage();
       this.toast(`Saved as “${clean}”.`, { type: 'success', timeout: 2500 });
       return true;
     } catch (err) {
       this._reportError(err, 'The project couldn’t be saved.');
       return false;
     }
+  }
+
+  /**
+   * Rename a project: the open one (id omitted), or one saved on this device. Asks for the name
+   * straight away (inside the user's tap, so phones show the keyboard). Resolves true when renamed.
+   */
+  async renameProject(id, knownName) {
+    const { persist, store } = this.app;
+    const cur = store && store.project;
+    const isCur = !id || !!(cur && cur.id === id);
+    if (isCur && !cur) return false;
+    if (isCur && this._trim) { this.toast('Finish trimming first (Save trim or Cancel), then rename the project.'); return false; }
+    const oldName = String((isCur ? cur.name : knownName) || 'My Movie');
+    const next = await this.promptText('Rename project', oldName, { label: 'Project name', okLabel: 'Rename' });
+    if (next === null) return false;
+    const name = next.trim();
+    if (!name || name === oldName) return false;
+    if (isCur) {
+      if (store.project !== cur) return false; // another project was opened meanwhile
+      store.update((p) => { p.name = name; }, { label: 'Rename project' });
+      await this._flushAutosave(); // lists of saved projects show the new name right away
+      return true;
+    }
+    if (!persist || typeof persist.loadProject !== 'function' || typeof persist.saveProject !== 'function') {
+      this.toast('Projects can’t be renamed right now.', { type: 'error' });
+      return false;
+    }
+    let loaded = null;
+    try {
+      loaded = await persist.loadProject(id);
+      loaded.project.name = name;
+      loaded.project.updatedAt = Date.now();
+      await persist.saveProject(loaded.project, loaded.media);
+      return true;
+    } catch (err) {
+      this._reportError(err, 'The project couldn’t be renamed.');
+      return false;
+    } finally {
+      // Loading made object URLs for its media; nothing shows them.
+      if (loaded && loaded.media && typeof loaded.media.values === 'function') {
+        for (const m of loaded.media.values()) {
+          if (m && m.url) { try { URL.revokeObjectURL(m.url); } catch (_) { /* ignore */ } }
+        }
+      }
+    }
+  }
+
+  /**
+   * Safari's storage policy (it may delete stored projects after a while without use): explain it
+   * and offer Export project file. `message` is persist.storageEvictionRisk().message.
+   */
+  async openStorageAdvice(message) {
+    const text = String(message || 'This browser may delete projects stored on this device if you don’t use Movie Maker for a while. Use Export project file to keep a copy.');
+    const v = await this.open({
+      title: 'Keep your projects safe', size: 'narrow',
+      body: h('div', { class: 'mmd-dlg-msg' }, icon('info', 32), h('div', null, h('p', null, text))),
+      buttons: [
+        { label: 'Export project file', value: 'export', primary: true },
+        { label: 'Close', value: null },
+      ],
+    });
+    if (v === 'export') return this.exportProjectFile();
+    return false;
   }
 
   /** Import a .wlmmweb project file (asks for one when no file is given). */
@@ -1222,10 +1487,13 @@ export class Dialogs {
         const thumb = h('span', { class: 'mmd-proj-thumb' }, p.thumb ? h('img', { src: p.thumb, alt: '', loading: 'lazy', decoding: 'async' }) : icon('film', 32));
         const meta = [fmtDate(p.updatedAt) ? `Modified ${fmtDate(p.updatedAt)}` : '', Number.isFinite(p.itemCount) ? `${p.itemCount} item${p.itemCount === 1 ? '' : 's'}` : '', isCur ? 'open now' : '']
           .filter(Boolean).join(' · ');
+        // An exported project file survives the browser clearing this device's storage (Safari).
+        const exported = Number(p.exportedAt) > 0 && fmtDate(p.exportedAt) ? `Last exported ${fmtDate(p.exportedAt)}` : 'Not exported yet';
         const openBtn = h('button', { type: 'button', class: 'mmd-proj-open', 'aria-label': `Open ${p.name}` }, thumb,
-          h('span', { class: 'mmd-proj-text' }, h('span', { class: 'mmd-proj-name' }, p.name || 'My Movie'), h('span', { class: 'mmd-proj-meta' }, meta)));
+          h('span', { class: 'mmd-proj-text' }, h('span', { class: 'mmd-proj-name' }, p.name || 'My Movie'), h('span', { class: 'mmd-proj-meta' }, meta),
+            h('span', { class: 'mmd-proj-meta mmd-proj-export' }, exported)));
         openBtn.addEventListener('click', () => handle.close({ open: p.id }));
-        const del = h('button', { type: 'button', class: 'btn btn-icon mmd-proj-del', 'aria-label': `Delete ${p.name}`, title: 'Delete project' }, icon('trash', 16));
+        const del = h('button', { type: 'button', class: 'btn btn-icon mmd-proj-act mmd-proj-del', 'aria-label': `Delete ${p.name}`, title: 'Delete project' }, icon('trash', 16));
         del.addEventListener('click', async () => {
           const ok = await this.confirm(isCur
             ? `“${p.name}” is open right now. Delete it anyway?\n\nA new, empty project will be started. This can’t be undone.`
@@ -1244,7 +1512,12 @@ export class Dialogs {
           }
           if (!handle.closed) render();
         });
-        list.appendChild(h('div', { class: ['mmd-proj', isCur ? 'is-current' : ''], role: 'listitem' }, openBtn, del));
+        const ren = h('button', { type: 'button', class: 'btn btn-icon mmd-proj-act mmd-proj-ren', 'aria-label': `Rename ${p.name}`, title: 'Rename project' }, icon('edit', 16));
+        ren.addEventListener('click', async () => {
+          const done = await this.renameProject(p.id, p.name);
+          if (done && !handle.closed) render();
+        });
+        list.appendChild(h('div', { class: ['mmd-proj', isCur ? 'is-current' : ''], role: 'listitem' }, openBtn, ren, del));
       }
     };
     render();
@@ -1282,6 +1555,7 @@ export class Dialogs {
       { label: 'Open project', icon: 'folder-open', run: run(() => this.openProjects()) },
       { label: 'Save project', icon: 'save-project', run: run(() => this._cmd('saveProject', undefined, () => this.saveProject())) },
       { label: 'Save project as', icon: 'save-as', run: run(() => this._cmd('saveProjectAs', undefined, () => this.saveProjectAs())) },
+      { label: 'Rename project', icon: 'edit', run: run(() => this.renameProject()) },
       'sep',
       { label: 'Import project file', icon: 'folder-open', run: run(() => this._cmd('importProjectFile', undefined, () => this.importProjectFromFile())) },
       { label: 'Export project file', icon: 'export', run: run(() => this._cmd('exportProjectFile', undefined, () => this.exportProjectFile())) },
@@ -1326,11 +1600,10 @@ export class Dialogs {
     m.movieItem = movieItem;
 
     footer.appendChild(h('span', { class: 'mmd-menu-note' }, 'Your projects are saved on this device.'));
-    const optBtn = h('button', { type: 'button', class: 'btn' }, 'Options');
-    optBtn.addEventListener('click', run(() => this.openOptions()));
+    // (Options is an item in the list above; the footer only closes the menu.)
     const closeBtn = h('button', { type: 'button', class: 'btn' }, 'Close');
     closeBtn.addEventListener('click', () => this._closeMenu());
-    footer.append(optBtn, closeBtn);
+    footer.append(closeBtn);
 
     layer.addEventListener('pointerdown', (e) => { m.downOnLayer = e.target === layer; });
     layer.addEventListener('click', (e) => { if (e.target === layer && m.downOnLayer) this._closeMenu(); });
@@ -1396,8 +1669,13 @@ export class Dialogs {
       const curId = this.app.store && this.app.store.project && this.app.store.project.id;
       if (!list.length) { holder.appendChild(h('div', { class: 'app-menu-empty' }, 'Projects you work on appear here.')); return; }
       for (const p of list.slice(0, 10)) {
-        const b = h('button', { type: 'button', class: ['app-menu-recent', p.id === curId ? 'is-current' : ''], role: 'menuitem' },
-          h('span', { class: 'mmd-recent-name' }, p.name || 'My Movie'), h('small', null, fmtDate(p.updatedAt)));
+        // Picture + name + date + size, so projects that share a name ("My Movie") can be told apart.
+        const meta = [fmtDate(p.updatedAt), Number.isFinite(p.itemCount) && p.itemCount > 0 ? `${p.itemCount} item${p.itemCount === 1 ? '' : 's'}` : '']
+          .filter(Boolean).join(' · ');
+        const thumb = h('span', { class: 'mmd-recent-thumb', 'aria-hidden': 'true' },
+          p.thumb ? h('img', { src: p.thumb, alt: '', decoding: 'async', draggable: 'false' }) : icon('film', 18));
+        const b = h('button', { type: 'button', class: ['app-menu-recent', 'mmd-recent', p.id === curId ? 'is-current' : ''], role: 'menuitem' },
+          thumb, h('span', { class: 'mmd-recent-text' }, h('span', { class: 'mmd-recent-name' }, p.name || 'My Movie'), h('small', null, meta)));
         b.addEventListener('click', () => { this._closeMenu(); this.loadProjectById(p.id); });
         holder.appendChild(b);
       }
@@ -1632,6 +1910,8 @@ export class Dialogs {
 
       const started = now();
       let lastP = 0;
+      let transientMsg = false;
+      let soundWarning = '';
       const onProgress = (p, t, info) => {
         if (handle.closed) return;
         lastP = p;
@@ -1646,8 +1926,19 @@ export class Dialogs {
         elapsedEl.textContent = `Elapsed ${fmtClock(el)}`;
         const tt = Number.isFinite(t) ? t : p * duration;
         remainEl.textContent = state === 'finalizing' || state === 'done' ? 'Almost done' : `Remaining about ${fmtClock(Math.max(0, duration - tt))}`;
-        if (info && info.message) msgEl.textContent = info.message;
-        else if (state === 'resumed' || state === 'recording') { if (state === 'resumed') msgEl.textContent = ''; }
+        const msg = info && typeof info.message === 'string' ? info.message.trim() : '';
+        if (msg) {
+          msgEl.textContent = msg;
+          // "Preparing the sound…" only matters until recording starts; warnings stay up.
+          transientMsg = state === 'preparing';
+          if (state === 'warning') soundWarning = msg;
+        } else if (transientMsg && (state === 'preparing' || state === 'recording')) {
+          // A blank 'preparing' message, or recording starting, clears the preparing note.
+          msgEl.textContent = soundWarning;
+          transientMsg = false;
+        } else if (state === 'resumed') {
+          msgEl.textContent = soundWarning;
+        }
       };
 
       app.exporting = true;
@@ -1672,7 +1963,8 @@ export class Dialogs {
             savedTo = '';
           }
         }
-        showSaved(blob, savedTo ? savedTo : fileName, !!savedTo, size);
+        showSaved(blob, savedTo ? savedTo : fileName, !!savedTo, size, soundWarning);
+        this._askPersistentStorage();
       }, (err) => {
         app.exporting = false;
         if (mirrorRaf) { cancelAnimationFrame(mirrorRaf); mirrorRaf = 0; }
@@ -1688,7 +1980,7 @@ export class Dialogs {
     };
 
     // ---- result views
-    const showSaved = (blob, fileName, writtenToDisk, size) => {
+    const showSaved = (blob, fileName, writtenToDisk, size, warning = '') => {
       handle.setTitle('Movie Maker');
       handle.setDismissible(true);
       handle.onEscape = null;
@@ -1700,6 +1992,7 @@ export class Dialogs {
         h('div', { class: 'mmd-dlg-msg' }, icon('check', 32), h('div', null,
           h('p', null, 'Your movie has been saved.'),
           h('p', { class: 'mmd-file-line' }, `${fileName} · ${size.width} × ${size.height} · ${fmtBytes(blob.size)}`),
+          warning ? h('p', { class: 'mmd-export-warning', role: 'note' }, icon('warning', 14), ' ', warning) : null,
           writtenToDisk ? null : h('p', { class: 'hint' }, isIOS()
             ? 'Tap Save / Share, then choose “Save Video” to keep it in Photos, or “Save to Files”.'
             : phone ? 'Tap Save to device to put the file in your downloads or gallery.' : 'Click Download to put the file on your computer.'))),
@@ -2331,17 +2624,45 @@ export class Dialogs {
     const setEndBtn = h('button', { type: 'button', class: 'btn' }, icon('set-end', 16), h('span', null, 'Set end point'));
     const saveBtn = h('button', { type: 'button', class: 'btn btn-primary mmd-trim-save' }, icon('check', 16), h('span', null, 'Save trim'));
     const cancelBtn = h('button', { type: 'button', class: 'btn mmd-trim-cancel' }, h('span', null, 'Cancel'));
-    const controls = h('div', { class: 'mmd-trim-controls' },
-      h('div', { class: 'mmd-trim-group' }, h('label', { class: 'trim-field', for: startId }, h('span', null, 'Start point'), startIn, h('span', null, 's')), setStartBtn),
-      h('div', { class: 'mmd-trim-group' }, h('label', { class: 'trim-field', for: endId }, h('span', null, 'End point'), endIn, h('span', null, 's')), setEndBtn),
-      h('div', { class: 'trim-actions' }, playBtn, saveBtn, cancelBtn));
+    const startGroup = h('div', { class: 'mmd-trim-group' }, h('label', { class: 'trim-field', for: startId }, h('span', null, 'Start point'), startIn, h('span', null, 's')), setStartBtn);
+    const endGroup = h('div', { class: 'mmd-trim-group' }, h('label', { class: 'trim-field', for: endId }, h('span', null, 'End point'), endIn, h('span', null, 's')), setEndBtn);
+    const actions = h('div', { class: 'trim-actions' }, playBtn, saveBtn, cancelBtn);
+    const controls = h('div', { class: 'mmd-trim-controls' }, startGroup, endGroup, actions);
     panel.append(head, track, controls);
+
+    // Desktop: the "Trim Tool › Trim" contextual ribbon tab of Windows Live Movie Maker (Start point /
+    // End point, Set start point / Set end point, and Exit: Save trim / Cancel), shown over the
+    // ribbon while the filmstrip with the handles stays over the storyboard. Phones keep everything
+    // in the bottom sheet.
+    const rStartId = domId('rts'), rEndId = domId('rte');
+    const rStartIn = h('input', { type: 'number', id: rStartId, class: 'rb-input mmd-trim-num', step: '0.01', min: '0', max: String(D.toFixed(2)), inputmode: 'decimal' });
+    const rEndIn = h('input', { type: 'number', id: rEndId, class: 'rb-input mmd-trim-num', step: '0.01', min: '0', max: String(D.toFixed(2)), inputmode: 'decimal' });
+    const rbBtn = (iconName, label, size, cls, title) => h('button', { type: 'button', class: ['rb-btn', size === 32 ? 'rb-large' : 'rb-small', cls], title: title || label },
+      icon(iconName, size), h('span', { class: 'rb-label' }, label));
+    const rSetStart = rbBtn('set-start', 'Set start point', 16, 'mmd-trim-rb-setstart', 'Set start point (I)');
+    const rSetEnd = rbBtn('set-end', 'Set end point', 16, 'mmd-trim-rb-setend', 'Set end point (O)');
+    const rSave = rbBtn('check', 'Save trim', 32, 'mmd-trim-save', 'Save trim (keep the new start and end points)');
+    const rCancel = rbBtn('close', 'Cancel', 32, 'mmd-trim-cancel', 'Cancel (Esc)');
+    const rGroup = (caption, ...kids) => h('div', { class: 'rb-group', role: 'group', 'aria-label': caption },
+      h('div', { class: 'rb-group-body' }, ...kids), h('div', { class: 'rb-group-caption', 'aria-hidden': 'true' }, caption));
+    const rField = (id, label, input) => h('div', { class: 'rb-field' }, h('label', { class: 'rb-field-label mmd-trim-rb-label', for: id }, label), input, h('span', { 'aria-hidden': 'true' }, 's'));
+    const rTab = h('div', { class: 'rb-ctx rb-ctx-video mmd-trim-ctx', 'data-label': 'Trim Tool' },
+      h('span', { class: 'rb-ctx-label', 'aria-hidden': 'true' }, 'Trim Tool'),
+      h('button', { type: 'button', class: 'rb-tab is-active', role: 'tab', 'aria-selected': 'true', tabindex: '-1' }, 'Trim'));
+    const rTabrow = h('div', { class: 'rb-tabrow' }, h('div', { class: 'rb-tabs', role: 'tablist', 'aria-label': 'Trim Tool' }, rTab));
+    const rBody = h('div', { class: 'rb-body' }, h('div', { class: 'rb-panel', role: 'tabpanel', 'aria-label': 'Trim' },
+      rGroup('Trim',
+        h('div', { class: 'rb-stack' }, rField(rStartId, 'Start point:', rStartIn), rField(rEndId, 'End point:', rEndIn)),
+        h('div', { class: 'rb-stack' }, rSetStart, rSetEnd)),
+      rGroup('Exit', rSave, rCancel)));
+    const ribbonTab = h('div', { class: 'ribbon mmd-trim-ribbon', role: 'region', 'aria-label': 'Trim Tool' }, rTabrow, rBody);
+    let ribbonMode = false;
 
     let resolveFn;
     const promise = new Promise((r) => { resolveFn = r; });
     const st = {
-      itemId, item, orig, origTime, panel, saveBtn, promise, resolve: resolveFn, autosaveWas, persist,
-      offs: [], ro: null, backToken: null, finished: false,
+      itemId, item, orig, origTime, panel, ribbonTab, saveBtn, promise, resolve: resolveFn, autosaveWas, persist,
+      offs: [], ro: null, backToken: null, finished: false, duration: D, name: media.name || 'Video', api: null,
       get start() { return start; }, get end() { return end; },
     };
     this._trim = st;
@@ -2368,11 +2689,12 @@ export class Dialogs {
       hEnd.setAttribute('aria-valuemin', (start + MIN_LEN).toFixed(2));
       hEnd.setAttribute('aria-valuenow', end.toFixed(2));
       hEnd.setAttribute('aria-valuetext', formatTime(end));
-      if (document.activeElement !== startIn) startIn.value = start.toFixed(2);
-      if (document.activeElement !== endIn) endIn.value = end.toFixed(2);
+      for (const inp of [startIn, rStartIn]) if (document.activeElement !== inp) inp.value = start.toFixed(2);
+      for (const inp of [endIn, rEndIn]) if (document.activeElement !== inp) inp.value = end.toFixed(2);
       lenEl.textContent = `Length ${formatTime((end - start) / speed)} of ${formatTime(D / speed)}`;
       lastPosX = -1;
       updatePos();
+      this._trimNotify(st);
     };
     const updatePos = () => {
       const s = clampNum(sOf(player.currentTime), 0, D);
@@ -2392,7 +2714,61 @@ export class Dialogs {
     const setStart = (s, seek = true) => { start = clampNum(s, 0, end - MIN_LEN); render(); applyLoop(); if (seek) seekSource(start); };
     const setEnd = (s, seek = true) => { end = clampNum(s, start + MIN_LEN, D); render(); applyLoop(); if (seek) seekSource(end); };
 
-    // ---- placement: over the storyboard pane (desktop, phone landscape) or a bottom sheet
+    // ---- placement: over the storyboard pane (desktop, phone landscape) or a bottom sheet; on
+    // desktop the trim controls move to the Trim ribbon tab.
+    const appEl = document.getElementById('app');
+    const setRibbonMode = (on) => {
+      if (on === ribbonMode) return;
+      // Keep keyboard focus on the same control when it moves between the two places.
+      const a = document.activeElement;
+      const twin = new Map([[startIn, rStartIn], [endIn, rEndIn], [setStartBtn, rSetStart], [setEndBtn, rSetEnd], [saveBtn, rSave], [cancelBtn, rCancel]]);
+      let refocus = null;
+      for (const [p, r] of twin) { if (a === (on ? p : r)) refocus = on ? r : p; }
+      ribbonMode = on;
+      // The tab is part of the trim panel (fixed over the ribbon); the panel over the storyboard
+      // keeps the filmstrip, its handles and Play.
+      if (on) {
+        panel.insertBefore(ribbonTab, panel.firstChild);
+        if (controls.parentNode) controls.parentNode.removeChild(controls);
+        head.appendChild(playBtn);
+      } else {
+        if (ribbonTab.parentNode) ribbonTab.parentNode.removeChild(ribbonTab);
+        actions.insertBefore(playBtn, actions.firstChild);
+        panel.appendChild(controls);
+      }
+      panel.classList.toggle('has-ribbon-tab', on);
+      if (appEl) appEl.classList.toggle('mmd-trim-ribbon-on', on);
+      if (refocus) focusEl(refocus);
+    };
+    const placeRibbon = () => {
+      const rb = document.getElementById('ribbon');
+      const rr = rb ? rb.getBoundingClientRect() : null;
+      // The ribbon may draw the Trim tab itself (app.ribbon.showsTrimTab, driven by trimState and
+      // the 'mm-trim' event); then the overlay isn't needed.
+      const own = !!(this.app.ribbon && this.app.ribbon.showsTrimTab === true);
+      const on = !own && !isPhoneLayout() && !!rr && rr.width >= 420 && rr.height >= 80;
+      setRibbonMode(on);
+      if (!on) return;
+      ribbonTab.style.left = `${Math.round(rr.left)}px`;
+      ribbonTab.style.top = `${Math.round(rr.top)}px`;
+      ribbonTab.style.width = `${Math.round(rr.width)}px`;
+      // The Trim tab takes the place of the contextual tab the ribbon shows (Video Tools › Edit),
+      // else follows the last tab.
+      let x = 64;
+      const vis = (el) => !!el && el.getClientRects().length > 0 && el.getBoundingClientRect().width > 0;
+      const ctxs = Array.from(rb.querySelectorAll('.rb-ctx')).filter(vis);
+      if (ctxs.length) x = ctxs[0].getBoundingClientRect().left - rr.left;
+      else {
+        const tabs = Array.from(rb.querySelectorAll('.rb-tab')).filter(vis);
+        if (tabs.length) x = tabs[tabs.length - 1].getBoundingClientRect().right - rr.left + 4;
+      }
+      rTab.style.left = `${Math.max(0, Math.round(x))}px`;
+      // Line the tab body up with the ribbon's own (hidden underneath).
+      const realBody = rb.querySelector('.rb-body');
+      const br = vis(realBody) ? realBody.getBoundingClientRect() : null;
+      rTabrow.style.height = br && br.top > rr.top ? `${Math.round(br.top - rr.top)}px` : '';
+      rBody.style.height = br && br.height > 40 ? `${Math.round(br.height)}px` : '';
+    };
     const place = () => {
       const pane = document.getElementById('storyboard-pane');
       const r = pane ? pane.getBoundingClientRect() : null;
@@ -2400,8 +2776,10 @@ export class Dialogs {
       panel.classList.toggle('is-sheet', sheet);
       panel.classList.toggle('is-docked', !sheet);
       if (sheet) {
+        setRibbonMode(false);
         panel.style.left = ''; panel.style.top = ''; panel.style.width = ''; panel.style.maxHeight = '';
       } else {
+        placeRibbon();
         // Docked at the top of the storyboard pane (which is dimmed and locked underneath).
         panel.style.left = `${Math.round(r.left)}px`;
         panel.style.top = `${Math.round(r.top)}px`;
@@ -2482,14 +2860,18 @@ export class Dialogs {
       if (!Number.isFinite(v)) { render(); return; }
       if (which === 'start') setStart(v); else setEnd(v);
     };
-    startIn.addEventListener('change', () => fieldCommit(startIn, 'start'));
-    endIn.addEventListener('change', () => fieldCommit(endIn, 'end'));
-    for (const [inp, which] of [[startIn, 'start'], [endIn, 'end']]) {
+    for (const [inp, which] of [[startIn, 'start'], [endIn, 'end'], [rStartIn, 'start'], [rEndIn, 'end']]) {
+      inp.addEventListener('change', () => fieldCommit(inp, which));
       inp.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); fieldCommit(inp, which); } });
       inp.addEventListener('blur', () => render());
     }
-    setStartBtn.addEventListener('click', () => setStart(sOf(player.currentTime), false));
-    setEndBtn.addEventListener('click', () => setEnd(sOf(player.currentTime), false));
+    // Set start / end point: at the playhead (source time of the frame shown in the preview).
+    const setPoint = (which) => {
+      if (this._trim !== st) return;
+      if (which === 'start') setStart(sOf(player.currentTime), false); else setEnd(sOf(player.currentTime), false);
+    };
+    for (const b of [setStartBtn, rSetStart]) b.addEventListener('click', () => setPoint('start'));
+    for (const b of [setEndBtn, rSetEnd]) b.addEventListener('click', () => setPoint('end'));
     const syncPlay = () => {
       const playing = player.playing;
       clear(playBtn).appendChild(icon(playing ? 'pause' : 'play', 16));
@@ -2504,8 +2886,13 @@ export class Dialogs {
       if (s < start - 0.01 || s >= end - 0.03) player.seek(tOf(start)).then(go, go);
       else go();
     });
-    saveBtn.addEventListener('click', () => this._trimFinish(true));
-    cancelBtn.addEventListener('click', () => this._trimFinish(false));
+    for (const b of [saveBtn, rSave]) b.addEventListener('click', () => this._trimFinish(true));
+    for (const b of [cancelBtn, rCancel]) b.addEventListener('click', () => this._trimFinish(false));
+    st.api = {
+      setPoint,
+      setStart: (v) => setStart(clampNum(v, 0, D)),
+      setEnd: (v) => setEnd(clampNum(v, 0, D)),
+    };
 
     // Small source-time badge on the preview (not exported).
     let badgeCs = -1, badgeText = '';
@@ -2524,9 +2911,13 @@ export class Dialogs {
     });
 
     // ---- wiring
-    const appEl = document.getElementById('app');
+    // A ribbon that draws the Trim tab itself stays usable (it disables its other tabs); otherwise
+    // the ribbon is locked like the storyboard.
+    const ribbonOwnTab = !!(app.ribbon && app.ribbon.showsTrimTab === true);
+    st.locked = TRIM_LOCKED.filter((id) => !(ribbonOwnTab && id === 'ribbon'));
     if (appEl) appEl.classList.add('mmd-trim-mode');
-    for (const id of TRIM_LOCKED) {
+    if (appEl && ribbonOwnTab) appEl.classList.add('mmd-trim-ribbon-own');
+    for (const id of st.locked) {
       const el = document.getElementById(id);
       if (el && 'inert' in HTMLElement.prototype) { st[`inert-${id}`] = el.inert; el.inert = true; }
     }
@@ -2544,6 +2935,8 @@ export class Dialogs {
       const pane = document.getElementById('storyboard-pane');
       st.ro = new ResizeObserver(() => place());
       if (pane) st.ro.observe(pane);
+      const rb = document.getElementById('ribbon');
+      if (rb) st.ro.observe(rb);
       st.ro.observe(track);
     }
     if (typeof dom.watchLayout === 'function') { try { st.offs.push(dom.watchLayout(() => place())); } catch (_) { /* ignore */ } }
@@ -2597,8 +2990,9 @@ export class Dialogs {
     try { player.loopRange = null; } catch (_) { /* ignore */ }
     try { player.setOverlayHook(null); } catch (_) { /* ignore */ }
     const appEl = document.getElementById('app');
-    if (appEl) appEl.classList.remove('mmd-trim-mode');
-    for (const id of TRIM_LOCKED) {
+    if (appEl) appEl.classList.remove('mmd-trim-mode', 'mmd-trim-ribbon-on', 'mmd-trim-ribbon-own');
+    if (st.ribbonTab && st.ribbonTab.parentNode) st.ribbonTab.parentNode.removeChild(st.ribbonTab);
+    for (const id of st.locked || TRIM_LOCKED) {
       const el = document.getElementById(id);
       if (el && 'inert' in HTMLElement.prototype) el.inert = !!st[`inert-${id}`];
     }
@@ -2639,7 +3033,61 @@ export class Dialogs {
     } catch (_) { /* ignore */ }
     if (changed) this.toast('Trim saved.', { type: 'success', timeout: 1800 });
     focusEl(document.getElementById('storyboard-pane'));
+    this._trimNotify(null);
     st.resolve(changed);
+  }
+
+  /**
+   * The Trim tool's state while it is open, else null:
+   * { itemId, name, start, end, duration } — source seconds of the clip being trimmed.
+   * Changes are announced with a window 'mm-trim' event ({ detail: trimState }; detail null when
+   * the tool closes), so a ribbon can show the Trim tab's Start point / End point values.
+   */
+  get trimState() {
+    const st = this._trim;
+    if (!st || st.finished) return null;
+    return { itemId: st.itemId, name: st.name, start: st.start, end: st.end, duration: st.duration };
+  }
+
+  /** Trim tool: Set start point / Set end point ('start' | 'end') at the playhead. */
+  trimSetPoint(which) {
+    const st = this._trim;
+    if (!st || st.finished || !st.api) return false;
+    st.api.setPoint(which === 'end' ? 'end' : 'start');
+    return true;
+  }
+
+  /** Trim tool: type a start or end point ('start' | 'end', source seconds). */
+  trimSetValue(which, seconds) {
+    const st = this._trim;
+    const v = Number(seconds);
+    if (!st || st.finished || !st.api || !Number.isFinite(v)) return false;
+    if (which === 'end') st.api.setEnd(v); else st.api.setStart(v);
+    return true;
+  }
+
+  /** Trim tool: Save trim (true) or Cancel (false). */
+  trimFinish(save) {
+    if (!this._trim) return false;
+    this._trimFinish(!!save);
+    return true;
+  }
+
+  _trimNotify(st) {
+    if (st && (st !== this._trim || st.finished)) return;
+    if (st) {
+      // One event per frame at most while a handle is dragged.
+      if (this._trimEvtRaf) return;
+      const fire = () => { this._trimEvtRaf = 0; if (this._trim === st) this._emitTrim(this.trimState); };
+      this._trimEvtRaf = typeof requestAnimationFrame === 'function' ? requestAnimationFrame(fire) : setTimeout(fire, 16);
+      return;
+    }
+    if (this._trimEvtRaf) { try { cancelAnimationFrame(this._trimEvtRaf); } catch (_) { clearTimeout(this._trimEvtRaf); } this._trimEvtRaf = 0; }
+    this._emitTrim(null);
+  }
+
+  _emitTrim(detail) {
+    try { window.dispatchEvent(makeEvent('mm-trim', detail)); } catch (_) { /* ignore */ }
   }
 
   // ------------------------------------------------------------------ options / about / help
@@ -2652,8 +3100,8 @@ export class Dialogs {
       return { name, input, el: h('div', { class: 'field' }, h('label', { for: id }, label), h('div', { class: 'mmd-opt-row' }, input, h('span', null, 'seconds')), h('div', { class: 'hint' }, hint)) };
     };
     const fields = [
-      mk('photoDuration', 'Photo duration', 0.5, `How long new photos are shown (WLMM default: ${OPTION_DEFAULTS.photoDuration} seconds).`),
-      mk('transitionDuration', 'Transition duration', 0.25, `Length of new transitions (default: ${OPTION_DEFAULTS.transitionDuration} seconds).`),
+      mk('photoDuration', 'Photo duration', 0.5, `How long new photos are shown. Default: ${OPTION_DEFAULTS.photoDuration} seconds.`),
+      mk('transitionDuration', 'Transition duration', 0.25, `Length of new transitions. Default: ${OPTION_DEFAULTS.transitionDuration} seconds.`),
     ];
     const body = h('div', null, h('h3', null, 'Defaults for new items'), ...fields.map((f) => f.el),
       h('p', { class: 'hint' }, 'These settings are kept in this browser and apply to photos and transitions you add from now on.'));
@@ -2727,11 +3175,25 @@ export class Dialogs {
       row(k('Delete'), 'Remove the selected items'),
       row(k(mod, 'A'), 'Select all items'),
       row(k('M'), 'Split the selected item at the playhead'),
+      row(h('td', null, h('kbd', null, 'I'), ' ', h('kbd', null, 'O')), 'Set start point / end point at the playhead (video, music, Trim tool)'),
+      row(h('td', null, h('kbd', null, mod), ' + ', h('kbd', null, 'B'), ' / ', h('kbd', null, 'I')), 'Bold / italic (selected caption, title or credits)'),
       row(k(mod, 'S'), 'Save project'),
       row(k(mod, 'O'), 'Open project'),
       row(k('F1'), 'Help')));
     const phone = isCoarse() || isPhoneLayout();
+    // A phone has no keyboard to speak of: show its gestures instead of the shortcut table.
+    // Tablets (coarse pointer, wide layout) keep the table, they often have a keyboard.
+    const touchPhone = isCoarse() && isPhoneLayout();
     const tap = phone ? 'Tap' : 'Click';
+    const gestures = [
+      'Tap a clip to select it.',
+      'Press and hold a clip for Edit, Trim, Split, Duplicate and Remove.',
+      'Press, hold and drag a clip to move it to another place.',
+      'Pinch the storyboard with two fingers to zoom in or out.',
+      'Scroll the storyboard sideways to move the playhead.',
+      'Double-tap the picture to play or pause.',
+      'Tap a caption or title on the picture to select it, then tap it again to edit the text. Return starts a new line; tap Done when you have finished.',
+    ];
     const tips = [
       `${tap} “Add videos and photos” on the Home tab to start. ${phone ? 'Android users can also share videos and photos to the installed app.' : 'You can also drag files onto the window, or paste a picture.'}`,
       `${tap} an item in the storyboard to select it — the Video Tools, Music Tools and Text Tools tabs appear for what you selected.`,
@@ -2745,15 +3207,17 @@ export class Dialogs {
         ? 'Save movie records your movie in real time: keep the screen on and Movie Maker open until it finishes.'
         : 'Save movie records your movie in real time: keep this tab open and visible until it finishes.',
       isIOS()
-        ? 'Install it: in Safari tap Share, then “Add to Home Screen”. It then opens full screen and works offline.'
+        ? 'Install it: in Safari tap Share, then “Add to Home Screen”. It then opens full screen, works offline, and Safari no longer deletes your projects when you haven’t used it for a while.'
         : 'Install it: open your browser’s menu and choose “Install app” or “Add to Home screen”. It then works offline.',
       'Everything stays on your device. Projects are saved automatically in this browser; use Export project file to move one to another device.',
     ];
     const body = h('div', { class: 'mmd-help' },
       h('h3', null, phone ? 'Tips for phones and tablets' : 'Getting started'),
       h('ul', null, ...tips.map((t) => h('li', null, t))),
-      h('h3', null, 'Keyboard shortcuts'),
-      keysTable,
+      isCoarse() ? h('h3', null, 'Touch gestures') : null,
+      isCoarse() ? h('ul', { class: 'mmd-gestures' }, ...gestures.map((t) => h('li', null, t))) : null,
+      touchPhone ? null : h('h3', null, 'Keyboard shortcuts'),
+      touchPhone ? null : keysTable,
       phone ? null : h('p', { class: 'hint' }, 'Shortcuts don’t apply while you are typing in a text box.'));
     return this.open({ title: 'Movie Maker Help', body, size: 'wide', buttons: [{ label: 'OK', primary: true, value: true }] });
   }

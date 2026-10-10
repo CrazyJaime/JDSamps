@@ -334,6 +334,198 @@ async function runAll() {
     assert(err && err.friendly && /couldn't be found/.test(err.message), 'friendly not-found');
   });
 
+  // A fresh copy of an imported record under a new id (tests must not share media records).
+  const freshCopy = (m) => ({ ...m, id: M.uid('media') });
+  const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+  const nextPersist = (store) => new Promise((resolve) => store.addEventListener('persist', (e) => resolve(e.detail), { once: true }));
+  const withUA = async (ua, fn) => {
+    Object.defineProperty(navigator, 'userAgent', { value: ua, configurable: true });
+    try { return await fn(); } finally { delete navigator.userAgent; }
+  };
+  const IPHONE_UA = 'Mozilla/5.0 (iPhone; CPU iPhone OS 15_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.4 Mobile/15E148 Safari/604.1';
+  const FIREFOX_UA = 'Mozilla/5.0 (X11; Linux x86_64; rv:115.0) Gecko/20100101 Firefox/115.0';
+
+  await test('storage notice: Safari outside the Home Screen is warned once; persist() never asked at start-up', async () => {
+    const sm = navigator.storage;
+    let persistCalls = 0;
+    let persisted = false;
+    sm.persist = async () => { persistCalls++; return false; };
+    sm.persisted = async () => persisted;
+    try {
+      assert(!(await persist.storageEvictionRisk()).atRisk, 'Chromium is not at risk');
+      await withUA(IPHONE_UA, async () => {
+        const r = await persist.storageEvictionRisk();
+        assert(r.atRisk && r.ios && /Home Screen/.test(r.message) && /Export project file/.test(r.message), `iPhone Safari at risk: ${JSON.stringify(r)}`);
+        persisted = true;
+        assert(!(await persist.storageEvictionRisk()).atRisk, 'persistent storage is not at risk');
+        persisted = false;
+        localStorage.removeItem('wlmm-web:storageNoticeShown');
+        const store = new Store();
+        const ctl = persist.enableAutosave(store, 60000);
+        try {
+          store.replaceProject(M.createProject('Notice'));
+          store.update((p) => { p.items.push(M.createVisualItem('title', { text: 'Hi' })); });
+          let ev = nextPersist(store);
+          await ctl.flush();
+          const first = await ev;
+          assert(first.ok && first.notice && first.notice.kind === 'eviction' && /Safari may delete/.test(first.notice.message), `first save carries the notice: ${JSON.stringify(first)}`);
+          ev = nextPersist(store);
+          store.update((p) => { p.name = 'Notice 2'; });
+          await ctl.flush();
+          const second = await ev;
+          assert(second.ok && !second.notice, 'only once');
+          assert(localStorage.getItem('wlmm-web:storageNoticeShown'), 'remembered');
+        } finally {
+          ctl.disable();
+          await persist.deleteProject(store.project.id);
+        }
+      });
+      assert(persistCalls === 0, `enableAutosave never calls persist() (${persistCalls})`);
+      await withUA(FIREFOX_UA, async () => {
+        assert(await persist.requestPersistentStorage() === false && persistCalls === 0, 'Firefox: no prompt without a user action');
+        await persist.requestPersistentStorage({ userAction: true });
+        assert(persistCalls === 1, 'Firefox: asked after an explicit save');
+        await persist.requestPersistentStorage({ userAction: true });
+        assert(persistCalls === 1, 'asked at most once per session');
+      });
+    } finally {
+      delete sm.persist;
+      delete sm.persisted;
+    }
+  });
+
+  await test('autosave flush() waits for a running save and stores edits made during it', async () => {
+    const store = new Store();
+    const ctl = persist.enableAutosave(store, 60000);
+    try {
+      store.replaceProject(M.createProject('Race'));
+      const pic = freshCopy(imported.photo2);
+      store.addMedia(pic);
+      store.update((p) => { p.items.push(M.createVisualItem('image', { mediaId: pic.id })); p.name = 'Edit 1'; });
+      const first = ctl.flush();
+      assert(ctl.saving, 'a save is running');
+      store.update((p) => { p.name = 'Edit 2'; });
+      await ctl.flush();
+      assert((await persist.loadProject(store.project.id)).project.name === 'Edit 2', 'edit made during the save is stored');
+      await first;
+      // disable() keeps edits that were still waiting for the debounce, but nothing after it
+      store.update((p) => { p.name = 'Edit 3'; });
+      assert(ctl.pending, 'edit waiting for the debounce');
+      const ev = nextPersist(store);
+      ctl.disable();
+      store.update((p) => { p.name = 'Edit 4 (after disable)'; });
+      assert((await ev).ok, 'final save');
+      await sleep(50);
+      assert((await persist.loadProject(store.project.id)).project.name === 'Edit 3', 'state at disable() is stored');
+    } finally {
+      ctl.disable();
+      await persist.deleteProject(store.project.id);
+    }
+  });
+
+  await test('removed media leaves storage once undo can no longer bring it back', async () => {
+    const store = new Store();
+    const ctl = persist.enableAutosave(store, 60000);
+    const vid = freshCopy(imported.portrait);
+    const pic = freshCopy(imported.photo2);
+    const attached = async (id) => (await rawIDB('media')).find((r) => r.id === id && (r.projectIds || []).includes(store.project.id));
+    try {
+      store.replaceProject(M.createProject('Leak'));
+      store.addMedia(vid);
+      store.addMedia(pic);
+      store.update((p) => {
+        p.items.push(M.createVisualItem('video', { mediaId: vid.id }));
+        p.items.push(M.createVisualItem('image', { mediaId: pic.id }));
+      });
+      await ctl.flush();
+      assert(await attached(vid.id) && await attached(pic.id), 'both stored');
+      store.update((p) => { p.items = p.items.filter((i) => i.mediaId !== vid.id); }, { label: 'Remove' });
+      await ctl.flush();
+      assert(await attached(vid.id), 'kept while undo can bring it back');
+      const copy = M.createProject('Copy');
+      copy.items = structuredClone(store.project.items);
+      await persist.saveProject(copy, store.media);
+      const copyRec = (await rawIDB('media')).find((r) => r.id === vid.id);
+      assert(!(copyRec.projectIds || []).includes(copy.id), '"Save as" copy does not take unused media along');
+      await persist.deleteProject(copy.id);
+      const loaded = await persist.loadProject(store.project.id);
+      assert(!loaded.media.has(vid.id) && loaded.media.has(pic.id), `only used media is loaded (${[...loaded.media.keys()]})`);
+      store.replaceProject(loaded.project, loaded.media); // reload: no undo history
+      await ctl.flush();
+      assert(!(await rawIDB('media')).some((r) => r.id === vid.id), 'unused media deleted');
+      assert(await attached(pic.id), 'used media kept');
+      // a save that knows nothing about undo drops the photo; undo then writes it back
+      store.update((p) => { p.items = []; p.texts.push(M.createTextItem('caption', { start: 0 })); }, { label: 'Remove' });
+      await ctl.flush();
+      assert(await attached(pic.id), 'kept for undo');
+      await persist.saveProject(store.project, store.media, { keep: [] });
+      assert(!(await rawIDB('media')).some((r) => r.id === pic.id), 'dropped by a plain save');
+      store.undo();
+      await ctl.flush();
+      const back = await persist.loadProject(store.project.id);
+      assert(back.media.has(pic.id) && back.media.get(pic.id).blob.size === pic.blob.size, 'undone removal is stored again');
+    } finally {
+      ctl.disable();
+      await persist.deleteProject(store.project.id);
+    }
+  });
+
+  await test('raw-bytes fallback (Safari Blob bug): one file per transaction, round trip, metadata, detach', async () => {
+    persist.__test.setBlobsAsBytes(true);
+    const p = M.createProject('Bytes');
+    try {
+      const vid = freshCopy(imported.video);
+      const pic = freshCopy(imported.photo1);
+      p.items.push(M.createVisualItem('video', { mediaId: vid.id }));
+      p.items.push(M.createVisualItem('image', { mediaId: pic.id }));
+      const map = new Map([[vid.id, vid], [pic.id, pic]]);
+      await persist.saveProject(p, map);
+      let recs = await rawIDB('media');
+      const rv = recs.find((r) => r.id === vid.id);
+      assert(rv && rv.blob === null && rv.bytes && rv.bytes.byteLength === vid.blob.size, 'video stored as bytes');
+      const loaded = await persist.loadProject(p.id);
+      const lv = loaded.media.get(vid.id);
+      assert(lv && lv.blob.size === vid.blob.size && lv.filmstrip.length === vid.filmstrip.length, 'loaded back');
+      near(await loadVideoMeta(lv.url), 4, 0.2, 'stored video still plays');
+      await persist.saveProject(p, map); // unchanged: no rewrite needed
+      vid.peaks = new Array(7).fill(0.5);
+      await persist.saveProject(p, map);
+      recs = await rawIDB('media');
+      assert(recs.find((r) => r.id === vid.id).peaks.length === 7, 'metadata refreshed');
+      assert(recs.find((r) => r.id === vid.id).bytes.byteLength === vid.blob.size, 'bytes kept');
+      p.items.pop();
+      await persist.saveProject(p, map);
+      recs = await rawIDB('media');
+      assert(!recs.some((r) => r.id === pic.id), 'unused photo removed');
+      assert(recs.some((r) => r.id === vid.id), 'video kept');
+    } finally {
+      persist.__test.setBlobsAsBytes(false);
+      await persist.deleteProject(p.id);
+    }
+  });
+
+  await test('computePeaks: a failed decode clears hasAudio only when no audio track was reported', async () => {
+    const junk = () => new Blob([new Uint8Array(8192).fill(7)], { type: 'video/mp4' });
+    const withTrack = { id: M.uid('media'), type: 'video', blob: junk(), duration: 2, hasAudio: true, hasAudioHint: true, peaks: null };
+    assert(await media.computePeaks(withTrack) === null, 'no peaks');
+    assert(withTrack.hasAudio === true, 'a video with an audio track this engine cannot decode keeps hasAudio');
+    assert(await media.computePeaks(withTrack) === null, 'failure remembered');
+    const unknown = { id: M.uid('media'), type: 'video', blob: junk(), duration: 2, hasAudio: true, hasAudioHint: null, peaks: null };
+    await media.computePeaks(unknown);
+    assert(unknown.hasAudio === false, 'no track reported + undecodable → no soundtrack');
+    // the hint survives a save / load
+    const p = M.createProject('Hint');
+    const rec = { ...freshCopy(imported.photo2), type: 'video', hasAudioHint: true };
+    p.items.push(M.createVisualItem('video', { mediaId: rec.id }));
+    try {
+      await persist.saveProject(p, new Map([[rec.id, rec]]));
+      const back = await persist.loadProject(p.id);
+      assert(back.media.get(rec.id).hasAudioHint === true, 'hasAudioHint persisted');
+    } finally {
+      await persist.deleteProject(p.id);
+    }
+  });
+
   await test('enableAutosave: debounced save via Store, flush, last project id', async () => {
     const store = new Store();
     const events = [];

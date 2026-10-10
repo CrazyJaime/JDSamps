@@ -230,8 +230,11 @@ function installTitle() {
   t.title = 'Rename project';
   t.style.cursor = 'pointer';
   t.style.pointerEvents = 'auto'; // the stylesheet makes the centered desktop title click-through
+  // The name field opens synchronously from the tap (phones only show the keyboard then).
   const rename = async () => {
-    if (app.dialogs.isModalOpen) return;
+    const d = app.dialogs;
+    if (d.isModalOpen) return;
+    if (typeof d.renameProject === 'function') { await d.renameProject(); return; }
     const cur = app.store.project.name || 'My Movie';
     const next = await app.dialogs.promptText('Rename project', cur, { label: 'Project name', okLabel: 'Rename' });
     if (next === null) return;
@@ -314,6 +317,16 @@ function installKeyboard() {
           pasteTimer = setTimeout(() => { pasteTimer = 0; runCommand('paste'); }, 80);
           return;
         case 'a': cmd = 'selectAll'; break;
+        case 'b': case 'i': {
+          // Text Tools › Format: Bold / Italic on the selected caption, credits or title.
+          if (e.shiftKey) return;
+          const style = k === 'b' ? 'bold' : 'italic';
+          const value = textToggleValue(style);
+          if (value === null) return; // no text selected: leave the browser's own shortcut alone
+          cmd = 'textSet';
+          arg = { key: style, value };
+          break;
+        }
         case 's': cmd = e.shiftKey ? 'saveProjectAs' : 'saveProject'; break;
         case 'o': cmd = 'openProject'; break;
         default: return;
@@ -337,6 +350,20 @@ function installKeyboard() {
         case 'Home': cmd = 'goStart'; break;
         case 'End': cmd = 'goEnd'; break;
         case 'm': case 'M': if (e.shiftKey && key === 'M') return; cmd = 'split'; break;
+        case 'i': case 'I': case 'o': case 'O': {
+          // Set start point (I) / Set end point (O) at the playhead, as in Windows Live Movie Maker:
+          // the trim tool's points while it is open, else the selected video or music.
+          if (e.shiftKey && (key === 'I' || key === 'O')) return;
+          const start = key === 'i' || key === 'I';
+          if (trim) {
+            if (d && typeof d.trimSetPoint === 'function') { e.preventDefault(); d.trimSetPoint(start ? 'start' : 'end'); }
+            return;
+          }
+          const sel = app.store && app.store.selection;
+          if (sel && sel.type === 'music') cmd = start ? 'musicSetStartPoint' : 'musicSetEndPoint';
+          else cmd = start ? 'setStartPoint' : 'setEndPoint';
+          break;
+        }
         case 'F1': e.preventDefault(); d && d.openHelp(); return;
         default: return;
       }
@@ -352,6 +379,40 @@ function installKeyboard() {
     if (!commandEnabled(cmd)) return;
     runCommand(cmd, arg);
   });
+  // Ctrl/⌘+B / I also work while a text is being edited on the preview (the inline editor keeps
+  // its keys to itself, so this listens before it).
+  document.addEventListener('keydown', (e) => {
+    if (!(e.ctrlKey || e.metaKey) || e.altKey || e.shiftKey || e.isComposing || e.defaultPrevented) return;
+    const k = typeof e.key === 'string' && e.key.length === 1 ? e.key.toLowerCase() : '';
+    if (k !== 'b' && k !== 'i') return;
+    const pv = app.preview;
+    const id = pv && pv.editingTextId;
+    if (!id || !e.target || !(pv.editor ? e.target === pv.editor : (e.target.closest && e.target.closest('#preview-pane')))) return;
+    const sel = app.store.selection;
+    if (!sel || !Array.isArray(sel.ids) || !sel.ids.includes(id)) return;
+    const style = k === 'b' ? 'bold' : 'italic';
+    const value = textToggleValue(style);
+    if (value === null || !hasCommand('textSet') || !commandEnabled('textSet')) return;
+    e.preventDefault();
+    runCommand('textSet', { key: style, value });
+  }, true);
+}
+
+/**
+ * The value Ctrl+B / Ctrl+I sets for `style` ('bold' | 'italic') on the selected captions /
+ * credits or title items: off when every one of them has it, else on. null when no text is selected.
+ */
+function textToggleValue(style) {
+  const store = app.store;
+  if (!store || !store.selection) return null;
+  const type = store.selection.type;
+  let objs = [];
+  try { objs = typeof store.selectedItems === 'function' ? store.selectedItems() : []; } catch (_) { objs = []; }
+  if (type === 'item') objs = objs.filter((o) => o && o.kind === 'title');
+  else if (type !== 'text') objs = [];
+  objs = objs.filter(Boolean);
+  if (!objs.length) return null;
+  return !objs.every((o) => !!(o.style && o.style[style]));
 }
 
 // ---------------------------------------------------------------------------
@@ -497,29 +558,62 @@ function installInstallPrompt() {
 
 function installPersistReporting() {
   let askedPersistence = false;
+  let noticeShown = false;
   app.store.addEventListener('persist', (e) => {
     const d = e && e.detail;
     if (!d) return;
     if (d.ok) {
       if (!askedPersistence) {
         askedPersistence = true;
-        requestPersistentStorage();
+        // Quietly ask the browser to keep our data once there is something to keep. Without
+        // userAction this does nothing in engines that would show a permission prompt (Firefox);
+        // dialogs.js asks there after an explicit Save project / Save movie.
+        try { persist.requestPersistentStorage().catch(() => {}); } catch (_) { /* ignore */ }
+      }
+      // Safari outside the Home Screen may delete stored projects on its own: persist.js sends this
+      // notice once per browser, with the first successful save.
+      // A short, dismissible note (a long one would cover the storyboard and Play on phones);
+      // "Keep them safe" opens the full advice with Export project file.
+      if (d.notice && d.notice.message && !noticeShown) {
+        noticeShown = true;
+        const full = d.notice.message;
+        app.dialogs.toast('Safari may delete projects you haven’t opened for a while.', {
+          type: 'info',
+          timeout: 0,
+          action: {
+            label: 'Keep them safe',
+            onClick: () => {
+              if (typeof app.dialogs.openStorageAdvice === 'function') app.dialogs.openStorageAdvice(full).catch(reportError);
+              else app.commands.run('exportProjectFile');
+            },
+          },
+        });
       }
       return;
     }
     const msg = d.error && d.error.message ? d.error.message : 'Your project couldn’t be saved on this device.';
     app.dialogs.toast(msg, { type: 'error' });
   });
-}
 
-/** Ask the browser to keep our data under storage pressure — quietly, once there is something to keep. */
-function requestPersistentStorage() {
+  // Sound that can't be decoded in this browser (a video's soundtrack in a codec it can't read,
+  // music that isn't readable, or a file too big to decode on this device): say so once per file,
+  // since every <video> is muted and the movie would otherwise just be silent.
+  const soundWarned = new Set();
   try {
-    const s = navigator.storage;
-    if (!s || typeof s.persist !== 'function') return;
-    const ask = () => s.persist().catch(() => false);
-    if (typeof s.persisted === 'function') s.persisted().then((yes) => { if (!yes) ask(); }, () => {});
-    else ask();
+    app.audio.addEventListener('decodeerror', (e) => {
+      const d = (e && e.detail) || {};
+      if (!d.mediaId || soundWarned.has(d.mediaId)) return;
+      // Only tell about media the open project uses (a removed clip decoding late is not news).
+      const p = app.store.project;
+      const used = (p.items || []).some((it) => it.mediaId === d.mediaId) || (p.music || []).some((m) => m.mediaId === d.mediaId);
+      if (!used) return;
+      soundWarned.add(d.mediaId);
+      const name = d.name ? `“${d.name}”` : 'this file';
+      const msg = d.reason === 'too-large'
+        ? `${name} is too large for its sound to be played on this device.`
+        : `The sound of ${name} can’t be played in this browser.`;
+      app.dialogs.toast(msg, { type: 'info', timeout: 8000 });
+    });
   } catch (_) { /* ignore */ }
 }
 

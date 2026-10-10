@@ -3,6 +3,7 @@
 // and patches the WebM header so the saved file has a duration and is seekable.
 
 import { ASPECTS } from './model.js';
+import { isIOS } from './audio.js';
 
 export const EXPORT_PRESETS = [ // WLMM "Save movie" menu
   { id: 'recommended', name: 'Recommended for this project', height: 720 },
@@ -42,6 +43,8 @@ const MP4_OTHER = [
 const AUDIO_BPS = 128000;
 const TIMESLICE_MS = 1000;
 const STALL_MS = 20000;
+const SOUND_NOTICE_MS = 400;     // say "Preparing the sound…" when decoding takes longer than this
+const SOUND_STALL_MS = 130000;   // give up waiting when no soundtrack finished decoding for this long
 
 function isCoarsePointer() {
   try { return typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches; } catch (_) { return false; }
@@ -361,6 +364,14 @@ export class Exporter extends EventTarget {
         audioWarning = "This browser can't play sound through Web Audio, so the saved movie will be silent.";
       }
 
+      // --- sound: every soundtrack must be decoded before recording starts, or the start of
+      // it (or all of it: a big video on a phone decodes for a while) would be missing.
+      if (dest) {
+        const missing = await this._prepareSound(store, signal, progress);
+        if (signal && signal.aborted) throw abortError();
+        if (missing) audioWarning = missing;
+      }
+
       // --- recorder
       recorder = createRecorder(stream, format.mime, videoBitrate(width, height, rate));
       const chunks = [];
@@ -384,7 +395,14 @@ export class Exporter extends EventTarget {
         failRun(friendly('The browser stopped recording the movie' + (inner && inner.name ? ` (${inner.name})` : '')
           + '. Try a lower resolution or another format.', 'recorder-error', inner));
       };
-      let nextFrameT = 0;
+      // Frames are captured on display ticks. Take frame k on the first tick at or after
+      // k/rate + phase, so the picture sampled is the one at the middle of the frame's interval
+      // rather than right at its start, where a video frame boundary usually sits as well
+      // (sampling there makes neighbouring source frames alternate: repeated/skipped frames).
+      // Each output frame slot is captured once, even when the phase moves.
+      let lastSlot = -Infinity;
+      let tickDt = 1 / 60;
+      let lastTickT = -1;
       let lastProgressAt = now();
       let lastReport = 0;
       let ended = false;
@@ -432,11 +450,14 @@ export class Exporter extends EventTarget {
             if (!(t > resumeAfter + 1e-4)) return;
             resumeAfter = -1;
             resumeRecorder();
-            nextFrameT = 0;
+            lastSlot = -Infinity;
           }
-          if (manualFrames && t + 1e-6 >= nextFrameT) {
+          if (lastTickT >= 0 && t > lastTickT && t - lastTickT < 0.1) tickDt += (t - lastTickT - tickDt) * 0.1;
+          lastTickT = t;
+          const slot = Math.floor((t - Math.max(0, 0.5 / rate - tickDt / 2)) * rate + 1e-6);
+          if (manualFrames && slot > lastSlot) {
             try { videoTrack.requestFrame(); } catch (_) { /* ignore */ }
-            nextFrameT = (Math.floor(t * rate + 1e-6) + 1) / rate;
+            lastSlot = slot;
           }
           const pn = now();
           if (pn - lastReport >= 100) { lastReport = pn; progress(t / duration, t, 'recording'); }
@@ -577,6 +598,58 @@ export class Exporter extends EventTarget {
     }
   }
 
+  /**
+   * Wait until the sound of everything the movie plays is decoded, reporting progress while it
+   * takes a while. Resolves with a warning to show ('' when all the sound is there).
+   */
+  async _prepareSound(store, signal, progress) {
+    const audio = this.audio;
+    const project = store.project;
+    if (!audio) return '';
+    if (typeof audio.whenReady !== 'function') {
+      if (typeof audio.prepare !== 'function') return '';
+      let timer = 0;
+      await Promise.race([
+        Promise.resolve(audio.prepare(project, store)).catch(() => {}),
+        new Promise((r) => { timer = setTimeout(r, SOUND_STALL_MS); }),
+      ]);
+      clearTimeout(timer);
+      return '';
+    }
+    let shown = false;
+    let last = [0, 0];
+    const show = () => {
+      shown = true;
+      const [done, total] = last;
+      progress(0, 0, 'preparing', total > 1 ? `Preparing the sound (${Math.min(done + 1, total)} of ${total})…` : 'Preparing the sound…');
+    };
+    const timer = setTimeout(show, SOUND_NOTICE_MS);
+    let res = null;
+    try {
+      res = await audio.whenReady(project, store, {
+        stallMs: SOUND_STALL_MS,
+        signal,
+        onProgress: (done, total) => { last = [done, total]; if (shown && done < total) show(); },
+      });
+    } catch (_) {
+      res = null;
+    } finally {
+      clearTimeout(timer);
+    }
+    if (shown) progress(0, 0, 'preparing', ' '); // clear the note (a blank message replaces it)
+    if (!res || (signal && signal.aborted)) return '';
+    const names = (list) => {
+      const shownNames = list.slice(0, 3).map((m) => `"${m && m.name ? m.name : 'sound'}"`).join(', ');
+      return list.length > 3 ? `${shownNames} and ${list.length - 3} more` : shownNames;
+    };
+    const parts = [];
+    if (res.pending.length) parts.push(`The sound of ${names(res.pending)} took too long to prepare`);
+    if (res.failed.length) parts.push(`The sound of ${names(res.failed)} couldn't be read`);
+    if (!parts.length) return '';
+    const n = res.pending.length + res.failed.length;
+    return parts.join('. ') + `, so ${n > 1 ? 'they' : 'it'} will be missing from the saved movie.`;
+  }
+
   /** PNG of the frame at time t (default: the playhead) at export resolution (WLMM "Snapshot"). */
   async snapshot(t) {
     if (this._busy) throw friendly('Please wait until the movie has finished saving.', 'busy');
@@ -613,12 +686,6 @@ export class Exporter extends EventTarget {
 
 // ---------------------------------------------------------------------------
 // Saving files
-
-function isIOS() {
-  if (typeof navigator === 'undefined') return false;
-  const ua = navigator.userAgent || '';
-  return /iP(hone|od|ad)/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
-}
 
 /**
  * Save a blob as a file. Resolves 'downloaded' | 'shared' | 'opened' | 'canceled'.

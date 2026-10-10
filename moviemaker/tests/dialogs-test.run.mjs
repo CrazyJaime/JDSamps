@@ -247,11 +247,15 @@ async function desktop(browser) {
   await page.mouse.move(trackBox.x + trackBox.width * 0.25, box.y + box.height / 2, { steps: 6 });
   await page.mouse.up();
   await sleep(300);
-  const startVal = await page.evaluate(() => parseFloat(document.querySelector('.mmd-trim-controls input[type=number]').value));
+  const startVal = await page.evaluate(() => parseFloat(document.querySelector('.mmd-trim input[type=number]').value));
   ok(startVal > 0.7 && startVal < 1.3, `dragging the start handle sets ~1.00s (got ${startVal})`);
   const loop = await page.evaluate(() => window.app.player.loopRange);
   ok(!!loop && Math.abs(loop.start - startVal) < 0.05, `player.loopRange follows the range (${JSON.stringify(loop)})`);
-  await page.fill('.mmd-trim-controls input[type=number] >> nth=1', '3.25');
+  // This page has no ribbon (stand-in shell), so the trim controls stay in the panel.
+  ok(await page.evaluate(() => !document.querySelector('.mmd-trim-ribbon') && !!document.querySelector('.mmd-trim .mmd-trim-controls')), 'desktop without a ribbon: trim controls stay in the panel');
+  const ts = await page.evaluate(() => window.app.dialogs.trimState);
+  ok(ts && Math.abs(ts.start - startVal) < 0.011 && ts.duration > 3, `dialogs.trimState reports the range (${JSON.stringify(ts)})`);
+  await page.fill('.mmd-trim input[type=number] >> nth=1', '3.25');
   await page.keyboard.press('Enter');
   await sleep(200);
   await shot(page, 'desktop-trim');
@@ -262,13 +266,57 @@ async function desktop(browser) {
   ok(Math.abs(after.s - startVal) < 0.011 && Math.abs(after.e - 3.25) < 0.011, `Save trim commits ${after.s}–${after.e}`);
   ok(after.undo === undoBefore + 1 && after.label === 'Trim', `exactly one undo step labelled Trim (${undoBefore} → ${after.undo}, ${after.label})`);
   ok(await page.evaluate(() => !window.app.dialogs.trimActive && window.app.player.loopRange === null && document.getElementById('ribbon').inert === false), 'trim mode cleaned up');
-  // reopen + cancel leaves it untouched
+  // reopen + cancel leaves it untouched — this time with a (stand-in) ribbon on the page: the Start
+  // point / End point fields, Set start/end point and Save trim / Cancel move to the WLMM
+  // "Trim Tool › Trim" contextual tab over the ribbon.
+  await page.evaluate(() => {
+    const rb = document.getElementById('ribbon');
+    rb.innerHTML = '<div class="rb-tabrow"><div class="rb-tabs"><button class="rb-tab is-active">Home</button><button class="rb-tab">Animations</button>'
+      + '<div class="rb-ctx rb-ctx-video" data-label="Video Tools"><span class="rb-ctx-label">Video Tools</span><button class="rb-tab">Edit</button></div></div></div>'
+      + '<div class="rb-body"><div class="rb-panel"></div></div>';
+  });
+  const trimEvents = page.evaluate(() => new Promise((res) => {
+    const seen = [];
+    const on = (e) => { seen.push(e.detail ? 'open' : 'closed'); if (!e.detail) { window.removeEventListener('mm-trim', on); res(seen); } };
+    window.addEventListener('mm-trim', on);
+  }));
   const trim2 = page.evaluate((id) => window.app.dialogs.openTrim(id), vid);
   await page.waitForSelector('.mmd-trim');
-  await sleep(200);
+  await sleep(300);
+  const rt = await page.evaluate(() => {
+    const t = document.querySelector('.mmd-trim .mmd-trim-ribbon');
+    const rb = document.getElementById('ribbon').getBoundingClientRect();
+    const ctx = document.querySelector('#ribbon .rb-ctx').getBoundingClientRect();
+    const r = t && t.getBoundingClientRect();
+    return t && {
+      label: t.querySelector('.rb-ctx-label').textContent, tab: t.querySelector('.rb-tab').textContent,
+      fields: t.querySelectorAll('input[type=number]').length, save: !!t.querySelector('.mmd-trim-save'), cancel: !!t.querySelector('.mmd-trim-cancel'),
+      over: Math.abs(r.top - rb.top) < 2 && Math.abs(r.left - rb.left) < 2,
+      atCtx: Math.abs(t.querySelector('.rb-ctx').getBoundingClientRect().left - ctx.left) < 2,
+      groups: [...t.querySelectorAll('.rb-group-caption')].map((c) => c.textContent).join(','),
+      panelControls: !!document.querySelector('.mmd-trim .mmd-trim-controls'),
+      values: [...t.querySelectorAll('input[type=number]')].map((i) => i.value).join('–'),
+    };
+  });
+  ok(rt && rt.label === 'Trim Tool' && rt.tab === 'Trim' && rt.fields === 2 && rt.save && rt.cancel && rt.over && rt.atCtx && rt.groups === 'Trim,Exit' && !rt.panelControls,
+    `desktop: Trim Tool › Trim ribbon tab over the ribbon (${JSON.stringify(rt)})`);
+  await shot(page, 'desktop-trim-ribbon');
+  // I / O and the ribbon's Set start point act on the trim range at the playhead.
+  const setPt = await page.evaluate(async () => {
+    const d = window.app.dialogs;
+    const st = d.trimState;
+    await window.app.player.seek(window.app.player.currentTime + 0.5);
+    document.querySelector('.mmd-trim-ribbon .mmd-trim-rb-setstart').click();
+    return { before: st.start, after: d.trimState.start };
+  });
+  ok(setPt.after > setPt.before + 0.3, `ribbon › Set start point moves the start to the playhead (${JSON.stringify(setPt)})`);
+  await page.evaluate(() => document.querySelector('.mmd-trim-ribbon .mmd-trim-rb-setstart').focus());
   ok(await page.evaluate((id) => { const it = window.app.store.project.items.find((i) => i.id === id); return it.trimStart === 0 && it.trimEnd === null; }, vid), 'while trimming the whole clip is shown');
   await page.keyboard.press('Escape');
   await trim2;
+  ok(JSON.stringify(await trimEvents).endsWith('"closed"]') && await page.evaluate(() => !document.querySelector('.mmd-trim-ribbon') && !document.getElementById('app').classList.contains('mmd-trim-ribbon-on')),
+    'mm-trim events announce the tool; the Trim tab goes away with it');
+  await page.evaluate(() => { document.getElementById('ribbon').innerHTML = ''; });
   const after2 = await page.evaluate((id) => { const it = window.app.store.project.items.find((i) => i.id === id); return { s: it.trimStart, e: it.trimEnd, undo: window.app.store._undo.length }; }, vid);
   ok(after2.s === after.s && after2.e === after.e && after2.undo === after.undo, 'Cancel (Escape) restores the trim without an undo step');
   await sleep(200);

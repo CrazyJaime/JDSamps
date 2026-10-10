@@ -7,7 +7,8 @@
 // canvas.width/height). Two procedural sample "photos" (a blue-sky landscape and an orange
 // sunset) are painted with gradients once per size and cached. Every tile goes through the
 // real renderer pieces (drawSegment / drawTransition / drawText) so it matches the output.
-// When p is not a number a representative still frame is drawn.
+// When p is not a number a representative still frame is drawn; for AutoMovie themes that is
+// the theme at a glance (its title card, its transition as a strip, its look on a photo).
 
 import { drawTransition } from './transitions.js';
 import { drawSegment } from './renderer.js';
@@ -22,10 +23,6 @@ const BLANK_MID = new Set(['fade-black', 'fade-white', 'flash', 'letterbox', 'fl
 
 function stillP(kind, id) {
   if (kind === 'transition' && BLANK_MID.has(id)) return 0.3;
-  if (kind === 'automovie') {
-    const theme = byId(AUTOMOVIE_THEMES, id);
-    if (theme && BLANK_MID.has(theme.transition)) return 0.3;
-  }
   return DEFAULT_P[kind] != null ? DEFAULT_P[kind] : 0.5;
 }
 
@@ -319,13 +316,77 @@ function thumbAutoMovie(ctx, id, q, w, h) {
   const theme = byId(AUTOMOVIE_THEMES, id) || AUTOMOVIE_THEMES[0];
   const A = _gA.ensure(w, h, true), B = _gB.ensure(w, h, true);
   if (!A || !B) { drawPhoto(ctx, 'A', w, h); return; }
-  // The outgoing clip is near its end, the incoming one just started.
-  segmentInto(A.ctx, 'A', theme.panZoom, theme.effect, 0, D * (0.75 + 0.25 * q), w, h);
-  segmentInto(B.ctx, 'B', theme.panZoom, theme.effect, 1, D * 0.25 * q, w, h);
+  // The theme's title card gives way to a photo in the theme's look, through its transition.
+  drawTitleCard(A.ctx, theme, w, h);
+  segmentInto(B.ctx, 'A', theme.panZoom, theme.effect, 0, D * (0.3 + 0.5 * q), w, h);
   _gw = w; _gh = h;
   _trOpts.from = A.canvas; _trOpts.to = B.canvas;
   drawTransition(ctx, theme.transition || 'crossfade', q, _drawA, _drawB, w, h, _trOpts);
   _trOpts.from = null; _trOpts.to = null;
+}
+
+const _titleStyles = new Map(); // theme id → title TextStyle sized for a tile
+function tileTitleStyle(theme) {
+  let st = _titleStyles.get(theme.id);
+  if (!st) {
+    st = { ...TEXT_STYLE, outline: 'none', outlineColor: '#000000', ...(theme.titleStyle || {}), size: 30, opacity: 1, background: null };
+    _titleStyles.set(theme.id, st);
+  }
+  return st;
+}
+
+/**
+ * A theme's title card: its background colour and a short title in its style and effect,
+ * laid out in the left `tw` pixels (the part of the tile the card shows in).
+ */
+function drawTitleCard(c, theme, w, h, tw = w, text = 'Abc') {
+  c.fillStyle = theme.titleBackground || '#000000';
+  c.fillRect(0, 0, w, h);
+  _textArgs.text = text;
+  _textArgs.style = tileTitleStyle(theme);
+  _textArgs.effect = theme.titleEffect || 'none';
+  _textArgs.localT = D * 0.5; // fully in
+  _textArgs.duration = D;
+  _textArgs.w = tw; _textArgs.h = h;
+  _textArgs.kind = 'caption';
+  drawText(c, _textArgs);
+  _textArgs.text = 'Abc';
+}
+
+// Resting tile: [title card | the transition at ¼, ½, ¾ | the theme's look on a photo].
+const STRIP = [0, 0.44, 0.51, 0.58, 0.65, 1];
+const STRIP_Q = [0, 0.25, 0.5, 0.75, 1];
+
+/** The theme at a glance (static): what tells the themes apart, not a frame mid-transition. */
+function thumbAutoMovieStill(ctx, id, w, h) {
+  const theme = byId(AUTOMOVIE_THEMES, id) || AUTOMOVIE_THEMES[0];
+  const A = _gA.ensure(w, h, true), B = _gB.ensure(w, h, true);
+  if (!A || !B) { drawPhoto(ctx, 'A', w, h); return; }
+  drawTitleCard(A.ctx, theme, w, h, Math.round(STRIP[1] * w), 'Aa');
+  segmentInto(B.ctx, 'A', theme.panZoom, theme.effect, 0, D * 0.8, w, h);
+  _gw = w; _gh = h;
+  _trOpts.from = A.canvas; _trOpts.to = B.canvas;
+  for (let i = 0; i < STRIP_Q.length; i++) {
+    const x0 = Math.round(STRIP[i] * w), x1 = Math.round(STRIP[i + 1] * w);
+    if (x1 <= x0) continue;
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(x0, 0, x1 - x0, h);
+    ctx.clip();
+    const sq = STRIP_Q[i];
+    if (sq <= 0) _drawA(ctx);
+    else if (sq >= 1) _drawB(ctx);
+    else drawTransition(ctx, theme.transition || 'crossfade', sq, _drawA, _drawB, w, h, _trOpts);
+    ctx.restore();
+  }
+  _trOpts.from = null; _trOpts.to = null;
+  // Letterboxed titles mean a letterboxed movie look.
+  if (theme.titleEffect === 'cinematic') {
+    const bh = Math.max(1, Math.round(h * 0.115));
+    ctx.fillStyle = '#000000';
+    ctx.fillRect(0, 0, w, bh);
+    ctx.fillRect(0, h - bh, w, bh);
+  }
 }
 
 /**
@@ -355,7 +416,9 @@ export function renderGalleryThumb(canvas, kind, id, p) {
       case 'panzoom': thumbPanZoom(ctx, id || 'none', q, w, h); break;
       case 'effect': thumbEffect(ctx, id || 'none', q, w, h); break;
       case 'text': thumbText(ctx, id || 'none', q, w, h); break;
-      case 'automovie': thumbAutoMovie(ctx, id, q, w, h); break;
+      case 'automovie':
+        if (typeof p === 'number') thumbAutoMovie(ctx, id, q, w, h); else thumbAutoMovieStill(ctx, id, w, h);
+        break;
       default: drawPhoto(ctx, 'A', w, h); break;
     }
   } catch (err) {

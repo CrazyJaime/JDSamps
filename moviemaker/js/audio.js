@@ -13,14 +13,59 @@ import { FADE_SPEEDS } from './model.js';
 const START_LEAD = 0.08;        // seconds between start() and the moment t = fromTime is heard
 const LATE_LEAD = 0.04;         // lead for sources whose buffer finishes decoding mid-playback
 const DECLICK = 0.015;          // ramp to silence on stop()
+const EDGE_RAMP = 0.006;        // de-click ramp where a sound starts/ends at a hard cut
+const LATE_RAMP = 0.02;         // fade-in for a sound that joins mid-way (decoded late)
 const DECODE_TIMEOUT_MS = 120000;
 const IDLE_SUSPEND_MS = 30000;  // suspend the context when idle so phones can power the audio HW down
+const KEEPER_GRACE_MS = 1500;   // iOS: keep the media session this long after stop() (seeks restart at once)
+const KEEPER_IDLE_MS = 8000;    // … and this long after unlock() when nothing starts playing
 const DUCK_LEVEL = 0.3;         // music level while narration plays ("Emphasize narration")
 const DUCK_RAMP = 0.3;
 const FALLBACK_RATE = 48000;
+// Decoded PCM of media the project no longer uses (removed clips, kept for undo) is only kept up
+// to this much; it is decoded again if the clip comes back.
+const UNREF_BUDGET_PHONE = 8e6;
+const UNREF_BUDGET = 32e6;
+// A decode that fails on the OfflineAudioContext is retried on the main context only for files
+// up to this size: WebKit keeps the first copy alive after a failed decode, and two copies of a
+// big phone video can push the tab over its memory limit.
+const RETRY_MAX_PHONE = 150e6;
+const RETRY_MAX = 600e6;
+const BIG_DECODE = 150e6;       // files this large decode one at a time, even on desktop
 
 function isCoarsePointer() {
   try { return typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches; } catch (_) { return false; }
+}
+
+/** iPhone / iPod / iPad (iPadOS reports a Mac user agent but has touch points). */
+export function isIOS() {
+  if (typeof navigator === 'undefined') return false;
+  const ua = navigator.userAgent || '';
+  return /iP(hone|od|ad)/.test(ua) || (/Macintosh/.test(ua) && navigator.maxTouchPoints > 1);
+}
+
+const _silence = new Map(); // sample rate → data: URI
+/**
+ * Half a second of digital silence as a 16-bit mono WAV data: URI (works offline), at the
+ * context's sample rate so iOS doesn't switch the hardware rate under a running AudioContext.
+ */
+function silentWavUri(rate) {
+  const sr = Math.round(Math.min(96000, Math.max(8000, +rate || 44100)));
+  let uri = _silence.get(sr);
+  if (uri) return uri;
+  const n = Math.round(sr / 2);
+  const bytes = new Uint8Array(44 + n * 2);
+  const dv = new DataView(bytes.buffer);
+  const tag = (o, s) => { for (let i = 0; i < 4; i++) bytes[o + i] = s.charCodeAt(i); };
+  tag(0, 'RIFF'); dv.setUint32(4, 36 + n * 2, true); tag(8, 'WAVE');
+  tag(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true);
+  dv.setUint32(24, sr, true); dv.setUint32(28, sr * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true);
+  tag(36, 'data'); dv.setUint32(40, n * 2, true);
+  let bin = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  uri = 'data:audio/wav;base64,' + btoa(bin);
+  _silence.set(sr, uri);
+  return uri;
 }
 
 function makeEvent(type, detail) {
@@ -182,6 +227,32 @@ function bufferBytes(buf) {
   return buf ? buf.length * buf.numberOfChannels * 4 : 0;
 }
 
+function volumeOf(item) {
+  return Number.isFinite(item.volume) ? clamp(item.volume, 0, 1) : 1;
+}
+
+/**
+ * Segment b plays on from exactly where segment a stops in the same clip (pieces of a split):
+ * their sound is one continuous waveform, so no de-click ramp may go at the joint.
+ */
+function videoContinues(a, b) {
+  if (!a || !b || !(a.duration > 0) || !(b.duration > 0) || b.transitionIn) return false;
+  const x = a.item, y = b.item;
+  if (!x || !y || x.kind !== 'video' || y.kind !== 'video' || !x.mediaId || x.mediaId !== y.mediaId) return false;
+  if ((x.speed > 0 ? x.speed : 1) !== (y.speed > 0 ? y.speed : 1) || volumeOf(x) !== volumeOf(y)) return false;
+  if (fadeSeconds(x.fadeOut) > 0 || fadeSeconds(y.fadeIn) > 0) return false;
+  return Math.abs(a.end - b.start) < 1e-3 && Math.abs((a.sourceOut || 0) - (b.sourceIn || 0)) < 1e-3;
+}
+
+/** Same for two music/narration items placed back to back from one file (Music › Split). */
+function musicContinues(a, b) {
+  const x = a.item, y = b.item;
+  if (!x || !y || !x.mediaId || x.mediaId !== y.mediaId || volumeOf(x) !== volumeOf(y)) return false;
+  if (fadeSeconds(x.fadeOut) > 0 || fadeSeconds(y.fadeIn) > 0) return false;
+  const inA = x.trimStart > 0 ? x.trimStart : 0, inB = y.trimStart > 0 ? y.trimStart : 0;
+  return Math.abs(a.end - b.start) < 1e-3 && Math.abs(inA + (a.end - a.start) - inB) < 1e-3;
+}
+
 // ---------------------------------------------------------------------------
 
 export class AudioEngine extends EventTarget {
@@ -193,10 +264,15 @@ export class AudioEngine extends EventTarget {
     this._ctxFailed = false;
     this._volume = 1;
     this._muted = false;
-    this._cache = new Map();   // mediaId → { blob, buffer, promise, failed, used, bytes }
+    this._cache = new Map();   // mediaId → { blob, buffer, promise, failed, reason, used, bytes }
+    this._reportedDecode = new Set();   // media ids already reported through 'decodeerror'
     this._queue = [];
     this._running = 0;
+    this._bigRunning = false;
     this._concurrency = isCoarsePointer() ? 1 : 2;
+    this._referenced = null;   // media ids the project uses (set by prepare())
+    this._keeper = null;       // iOS < 16.4: silent looping <audio> that selects the 'playback' session
+    this._keeperTimer = 0;
     this._decodeCtxs = new Map(); // sampleRate → OfflineAudioContext
     this._session = null;
     this._sessionSeq = 0;
@@ -287,10 +363,16 @@ export class AudioEngine extends EventTarget {
     this._wantRunning = true;
     this._installAutoResume();
     this._clearIdle();
-    // iOS 16.4+: play through the silent switch like a media app would.
+    // Play through the Ring/Silent switch like a media app would. iOS 16.4+ has an API for it;
+    // older iOS only leaves the 'ambient' session (muted by the switch) while an unmuted media
+    // element plays, so a looping silent <audio> is started inside this gesture.
     try {
-      if (typeof navigator !== 'undefined' && navigator.audioSession && navigator.audioSession.type !== 'playback') {
-        navigator.audioSession.type = 'playback';
+      if (typeof navigator !== 'undefined' && navigator.audioSession) {
+        if (navigator.audioSession.type !== 'playback') navigator.audioSession.type = 'playback';
+      } else if (this.needsSessionKeeper) {
+        this._startKeeper();
+        // Nothing may play after all (empty movie, failed export): don't hold the session.
+        if (!this._session) this._scheduleKeeperPause(KEEPER_IDLE_MS);
       }
     } catch (_) { /* ignore */ }
     // Everything up to here runs synchronously inside the gesture.
@@ -320,6 +402,8 @@ export class AudioEngine extends EventTarget {
   }
 
   _onGesture() {
+    // A tap while sound plays brings back the iOS media session if the page lost it (hidden, interrupted).
+    if (this._session && this._keeper && this._keeper.paused) this._resumeKeeper();
     const ctx = this._ctx;
     if (!ctx || ctx.state === 'running' || ctx.state === 'closed') return;
     // An iOS interruption (phone call, Siri) leaves the context 'interrupted'; a tap brings it back.
@@ -329,7 +413,12 @@ export class AudioEngine extends EventTarget {
   }
 
   _onVisibility() {
-    if (typeof document === 'undefined' || document.hidden) return;
+    if (typeof document === 'undefined') return;
+    if (document.hidden) {
+      // Don't hold the media session (and the lock screen's Now Playing) from the background.
+      this._pauseKeeper();
+      return;
+    }
     const ctx = this._ctx;
     if (ctx && this._wantRunning && (ctx.state === 'suspended' || ctx.state === 'interrupted')) {
       try { const p = ctx.resume(); if (p && p.catch) p.catch(() => {}); } catch (_) { /* ignore */ }
@@ -351,10 +440,75 @@ export class AudioEngine extends EventTarget {
     this._idleTimer = setTimeout(() => {
       this._idleTimer = 0;
       const ctx = this._ctx;
-      if (!ctx || this._session || this._streamDests.size || ctx.state !== 'running') return;
+      if (!ctx || this._session || this._streamDests.size) return;
+      this._pauseKeeper();
+      if (ctx.state !== 'running') return;
       this._wantRunning = false;
       try { const p = ctx.suspend(); if (p && p.catch) p.catch(() => {}); } catch (_) { /* ignore */ }
     }, IDLE_SUSPEND_MS);
+  }
+
+  // ---------- iOS < 16.4: media session keeper ----------
+  // Web Audio alone runs in the 'ambient' audio session, which the Ring/Silent switch mutes
+  // (WebKit bug 237322). An unmuted, playing media element promotes the page to 'playback',
+  // so while the movie plays a silent looping <audio> keeps that session.
+
+  /** Whether this browser needs the keeper (iOS without navigator.audioSession). */
+  get needsSessionKeeper() {
+    return typeof document !== 'undefined' && typeof navigator !== 'undefined' && !navigator.audioSession && isIOS();
+  }
+
+  /** Start (or restart) the keeper; the first call must come from a user gesture. */
+  _startKeeper() {
+    if (!this.needsSessionKeeper) return;
+    let el = this._keeper;
+    if (!el) {
+      try {
+        el = document.createElement('audio');
+        el.setAttribute('x-webkit-airplay', 'deny');
+        el.setAttribute('playsinline', '');
+        el.controls = false;
+        try { el.disableRemotePlayback = true; } catch (_) { /* ignore */ }
+        el.preload = 'auto';
+        el.loop = true;
+        el.muted = false;
+        el.src = silentWavUri(this._ctx ? this._ctx.sampleRate : FALLBACK_RATE);
+      } catch (_) { return; }
+      this._keeper = el;
+    }
+    this._resumeKeeper();
+  }
+
+  _resumeKeeper() {
+    const el = this._keeper;
+    if (!el) return;
+    if (this._keeperTimer) { clearTimeout(this._keeperTimer); this._keeperTimer = 0; }
+    if (!el.paused) return;
+    // A media element started once from a gesture may be resumed later without one; if WebKit
+    // refuses, the next tap (_onGesture) or Play (unlock) starts it again.
+    try { const p = el.play(); if (p && p.catch) p.catch(() => {}); } catch (_) { /* ignore */ }
+  }
+
+  _pauseKeeper() {
+    if (this._keeperTimer) { clearTimeout(this._keeperTimer); this._keeperTimer = 0; }
+    const el = this._keeper;
+    if (el && !el.paused) { try { el.pause(); } catch (_) { /* ignore */ } }
+  }
+
+  /** Let other apps have the audio session back shortly after the movie stops playing. */
+  _scheduleKeeperPause(ms = KEEPER_GRACE_MS) {
+    if (!this._keeper) return;
+    if (this._keeperTimer) clearTimeout(this._keeperTimer);
+    this._keeperTimer = setTimeout(() => {
+      this._keeperTimer = 0;
+      if (!this._session) this._pauseKeeper();
+    }, ms);
+  }
+
+  /** Diagnostics / tests: { active, playing } of the iOS session keeper. */
+  get sessionKeeper() {
+    const el = this._keeper;
+    return { active: !!el, playing: !!el && !el.paused, muted: !!el && el.muted };
   }
 
   // ---------- clocks (used by the Player) ----------
@@ -402,11 +556,13 @@ export class AudioEngine extends EventTarget {
       return entry.buffer;
     }
     if (media.type === 'video' && media.hasAudio === false) {
-      this._cache.set(media.id, { blob: media.blob || null, url: media.url, buffer: null, promise: null, failed: true, used: Date.now(), bytes: 0 });
+      this._cache.set(media.id, {
+        blob: media.blob || null, url: media.url, buffer: null, promise: null, failed: true, reason: 'no-audio', used: Date.now(), bytes: 0,
+      });
       return null;
     }
     if (!media.blob && !media.url) return null;
-    entry = { blob: media.blob || null, url: media.url, buffer: null, promise: null, failed: false, used: Date.now(), bytes: 0 };
+    entry = { blob: media.blob || null, url: media.url, buffer: null, promise: null, failed: false, reason: '', used: Date.now(), bytes: 0 };
     this._cache.set(media.id, entry);
     entry.promise = new Promise((resolve) => {
       const job = { id: media.id, media, entry, resolve };
@@ -428,11 +584,17 @@ export class AudioEngine extends EventTarget {
   }
 
   _pump() {
-    while (this._running < this._concurrency && this._queue.length) {
+    // A big file decodes alone: its bytes plus the decoder's working memory are a lot already.
+    while (this._running < this._concurrency && this._queue.length && !this._bigRunning) {
+      const blob = this._queue[0].media.blob;
+      const big = !!blob && blob.size > BIG_DECODE;
+      if (big && this._running > 0) break;
       const job = this._queue.shift();
       this._running++;
+      if (big) this._bigRunning = true;
       this._runJob(job).finally(() => {
         this._running--;
+        if (big) this._bigRunning = false;
         this._pump();
       });
     }
@@ -449,9 +611,15 @@ export class AudioEngine extends EventTarget {
       reason = (err && err.code) || 'decode-failed';
       buffer = null;
     }
+    // The <video> element reported an audio track, yet no decoder could read it: a codec this
+    // browser can't decode (not a silent clip). Every <video> is muted, so tell the user.
+    if (!buffer && media.type === 'video' && reason === 'decode-failed' && media.hasAudioHint === true && media.hasAudio !== false) {
+      reason = 'video-sound';
+    }
     entry.buffer = buffer;
     entry.bytes = bufferBytes(buffer);
     entry.failed = !buffer;
+    entry.reason = reason;
     entry.promise = null;
     if (this._cache.get(job.id) !== entry) {
       // Media was replaced/evicted while decoding: still hand the result to the waiter.
@@ -460,10 +628,13 @@ export class AudioEngine extends EventTarget {
     }
     // A video without a soundtrack is normal; music that can't be decoded (or anything too
     // big to decode) is worth telling the user about.
-    if (!buffer && (media.type !== 'video' || reason === 'too-large')) {
+    if (!buffer && (media.type !== 'video' || reason === 'too-large' || reason === 'video-sound')
+      && !this._reportedDecode.has(media.id)) {
+      // Once per media id: a re-decode after eviction must not repeat the message.
+      this._reportedDecode.add(media.id);
       this.dispatchEvent(makeEvent('decodeerror', { mediaId: media.id, name: media.name || '', reason }));
     }
-    this._enforceBudget();
+    this._enforceBudget(null, 0, job.id);
     job.resolve(buffer);
   }
 
@@ -474,7 +645,10 @@ export class AudioEngine extends EventTarget {
     const longBytes = this._concurrency === 1 ? 120e6 : 400e6;
     const dur = media.duration > 0 ? media.duration : 0;
     const est = dur * rate * 2 * 4;
-    // Very long recordings, or a cache that is already full, decode at a lower rate so
+    // Make room first by dropping sound the project no longer uses, so removed clips don't
+    // push new ones down to the lower rate.
+    this._enforceBudget(null, est);
+    // Very long recordings, or a cache that is still full, decode at a lower rate so
     // phones don't run out of memory (decoded audio is 32-bit float per sample).
     if (est > longBytes || this._totalBytes() + est > this._budget()) rate = Math.min(rate, 22050);
     if (Offline) {
@@ -490,7 +664,8 @@ export class AudioEngine extends EventTarget {
   }
 
   async _decode(media) {
-    const maxBytes = this._concurrency === 1 ? 400e6 : 1200e6;
+    const phone = this._concurrency === 1;
+    const maxBytes = phone ? 400e6 : 1200e6;
     if (media.blob && media.blob.size > maxBytes) {
       const err = new Error('too large');
       err.code = 'too-large';
@@ -509,16 +684,25 @@ export class AudioEngine extends EventTarget {
     try {
       buf = await withTimeout(decodeWith(ctx, data), DECODE_TIMEOUT_MS);
     } catch (err) {
+      // Let the file's bytes go before anything else: Chrome detaches them on a failed decode,
+      // but WebKit keeps them alive, and a second copy of a big video could crash the tab.
+      data = null;
       // Some engines refuse to decode on an OfflineAudioContext; retry once on the main
       // context if it exists (creating one here, before a user gesture, would be refused).
       const main = this._ctx;
-      if (main && main !== ctx && data.byteLength) {
+      const retryMax = phone ? RETRY_MAX_PHONE : RETRY_MAX;
+      if (main && main !== ctx && media.blob && media.blob.size <= retryMax) {
         try {
-          const again = media.blob ? await readBlob(media.blob) : null;
-          if (again) buf = await withTimeout(decodeWith(main, again), DECODE_TIMEOUT_MS);
+          const again = await readBlob(media.blob);
+          if (again && again.byteLength) buf = await withTimeout(decodeWith(main, again), DECODE_TIMEOUT_MS);
         } catch (_) { buf = null; }
       }
-      if (!buf) return null;
+      if (!buf) {
+        // Every decoder refused the bytes (or stalled): not the same as an empty soundtrack.
+        const e = new Error('decode failed');
+        e.code = 'decode-failed';
+        throw e;
+      }
     }
     if (!buf || !buf.length || !buf.numberOfChannels) return null;
     return buf;
@@ -526,25 +710,56 @@ export class AudioEngine extends EventTarget {
 
   _budget() { return this._concurrency === 1 ? 220e6 : 700e6; }
 
+  _unrefBudget() { return this._concurrency === 1 ? UNREF_BUDGET_PHONE : UNREF_BUDGET; }
+
   _totalBytes() {
     let total = 0;
     for (const e of this._cache.values()) total += e.bytes || 0;
     return total;
   }
 
-  _enforceBudget(referenced) {
+  /**
+   * Keep decoded sound within budget. Sound of media the project doesn't use (removed clips,
+   * kept for undo) is limited to a small budget of its own, most recently used first; then
+   * the least recently used unreferenced sound goes until everything (plus `room` bytes for a
+   * decode about to start) fits. Sound the project uses is never dropped here.
+   */
+  _enforceBudget(referenced, room = 0, keep = null) {
+    const refs = referenced || this._liveRefs();
+    const victims = [];
+    let unref = 0;
+    for (const entry of this._cache.entries()) {
+      const e = entry[1];
+      if (e.promise || !e.buffer || (refs && refs.has(entry[0]))) continue;
+      unref += e.bytes || 0;
+      if (entry[0] === keep) continue; // just decoded on request: its caller gets it first
+      victims.push(entry);
+    }
+    if (!victims.length) return;
+    victims.sort((a, b) => a[1].used - b[1].used);
     const budget = this._budget();
+    const unrefBudget = refs ? this._unrefBudget() : Infinity; // unknown project: nothing to tell apart
     let total = this._totalBytes();
-    if (total <= budget) return;
-    const refs = referenced || this._referenced || new Set();
-    const victims = [...this._cache.entries()]
-      .filter(([id, e]) => !e.promise && e.buffer && !refs.has(id))
-      .sort((a, b) => a[1].used - b[1].used);
     for (const [id, e] of victims) {
-      if (total <= budget) break;
+      if (unref <= unrefBudget && total + room <= budget) break;
+      unref -= e.bytes || 0;
       total -= e.bytes || 0;
       this._cache.delete(id);
     }
+  }
+
+  /** Media ids the current project uses (null before prepare() has seen a store). */
+  _liveRefs() {
+    const p = this._store && this._store.project;
+    return p ? AudioEngine._projectMediaIds(p) : this._referenced;
+  }
+
+  /** Media ids a project uses: video soundtracks and music/narration. */
+  static _projectMediaIds(project) {
+    const ids = new Set();
+    for (const it of project.items || []) if (it && it.kind === 'video' && it.mediaId) ids.add(it.mediaId);
+    for (const m of project.music || []) if (m && m.mediaId) ids.add(m.mediaId);
+    return ids;
   }
 
   /** Pre-decode every media referenced by the project (video soundtracks + music) in the background. */
@@ -552,9 +767,7 @@ export class AudioEngine extends EventTarget {
     if (store) this._store = store;
     const s = store || this._store;
     if (!project) return;
-    const ids = new Set();
-    for (const it of project.items || []) if (it && it.kind === 'video' && it.mediaId) ids.add(it.mediaId);
-    for (const m of project.music || []) if (m && m.mediaId) ids.add(m.mediaId);
+    const ids = AudioEngine._projectMediaIds(project);
     this._referenced = ids;
     // Forget media that no longer exists.
     for (const id of [...this._cache.keys()]) {
@@ -573,6 +786,104 @@ export class AudioEngine extends EventTarget {
     await Promise.all(jobs);
   }
 
+  /** The cache entry holding the decoded sound of `media`, if it is for this very file. */
+  _entryFor(media) {
+    const e = this._cache.get(media.id);
+    return e && e.blob === (media.blob || null) && (e.blob || e.url === media.url) ? e : null;
+  }
+
+  /**
+   * Wait until the sound of everything the movie plays is decoded (or known to be unusable).
+   * options: { stallMs: give up when no decode finishes for this long (default 130 s),
+   *            signal: AbortSignal, onProgress(done, total) }.
+   * Resolves { total, done, pending: Media[], failed: Media[] }: `pending` are still decoding,
+   * `failed` should have had sound but couldn't be decoded (music, narration, files too large).
+   * A video without a soundtrack is neither.
+   */
+  async whenReady(project, store, { stallMs = DECODE_TIMEOUT_MS + 10000, signal = null, onProgress = null } = {}) {
+    const s = store || this._store;
+    const res = { total: 0, done: 0, pending: [], failed: [] };
+    if (!project || !s || typeof s.getMedia !== 'function' || this._ctxFailed) return res;
+    const prep = this.prepare(project, s);
+    if (prep && prep.catch) prep.catch(() => {});
+    const list = [];
+    const seen = new Set();
+    const add = (item) => {
+      if (!item || !item.mediaId || seen.has(item.mediaId) || !(volumeOf(item) > 0)) return;
+      seen.add(item.mediaId);
+      const media = s.getMedia(item.mediaId);
+      if (media && media.type !== 'image') list.push(media);
+    };
+    for (const it of project.items || []) if (it && it.kind === 'video') add(it);
+    for (const m of project.music || []) add(m);
+    res.total = list.length;
+    if (!list.length) return res;
+    const settled = new Set();
+    let poke = null;
+    const report = () => {
+      if (typeof onProgress === 'function') { try { onProgress(settled.size, list.length); } catch (_) { /* ignore */ } }
+    };
+    const all = Promise.all(list.map((m) => Promise.resolve(this.getBuffer(m)).catch(() => null).then(() => {
+      settled.add(m);
+      report();
+      if (poke) poke();
+    })));
+    report();
+    let timer = 0;
+    let onAbort = null;
+    await new Promise((resolve) => {
+      let done = false;
+      const finish = () => { if (!done) { done = true; resolve(); } };
+      const arm = () => { clearTimeout(timer); timer = setTimeout(finish, stallMs); };
+      poke = arm;
+      arm();
+      all.then(finish, finish);
+      if (signal) {
+        if (signal.aborted) finish();
+        else { onAbort = finish; signal.addEventListener('abort', onAbort); }
+      }
+    });
+    clearTimeout(timer);
+    poke = null;
+    if (signal && onAbort) signal.removeEventListener('abort', onAbort);
+    res.done = settled.size;
+    for (const m of list) {
+      if (!settled.has(m)) { res.pending.push(m); continue; }
+      const e = this._entryFor(m);
+      if (e && !e.buffer && !e.promise && (m.type !== 'video' || e.reason === 'too-large' || e.reason === 'video-sound')) res.failed.push(m);
+    }
+    return res;
+  }
+
+  /**
+   * True when every sound heard between timeline times t and t + horizon is decoded (or can't
+   * be); the missing ones are moved to the front of the decode queue. The player polls this
+   * briefly before starting the clock so a movie doesn't begin without its sound.
+   * options: { horizon = 1, getMedia?: (id) => Media }
+   */
+  soundReadyAt(project, timeline, t, { horizon = 1, getMedia = null } = {}) {
+    if (!project || !timeline || this._ctxFailed) return true;
+    const gm = typeof getMedia === 'function' ? getMedia
+      : (this._store && typeof this._store.getMedia === 'function' ? (id) => this._store.getMedia(id) : null);
+    if (!gm) return true;
+    const from = +t || 0, to = from + (horizon > 0 ? horizon : 0);
+    let ready = true;
+    const need = (item, start, end) => {
+      if (!item || !item.mediaId || !(volumeOf(item) > 0) || end <= from + 1e-3 || start > to) return;
+      const media = gm(item.mediaId);
+      if (!media || media.type === 'image') return;
+      const e = this._entryFor(media);
+      if (e && !e.promise) return;
+      ready = false;
+      Promise.resolve(this.getBuffer(media, { priority: true })).catch(() => {});
+    };
+    for (const seg of timeline.segments || []) {
+      if (seg && seg.item && seg.item.kind === 'video' && seg.duration > 0) need(seg.item, seg.start, seg.end);
+    }
+    for (const m of timeline.music || []) if (m) need(m.item, m.start, m.end);
+    return ready;
+  }
+
   // ---------- scheduling ----------
 
   /**
@@ -582,11 +893,12 @@ export class AudioEngine extends EventTarget {
    * Returns the context time at which t = fromTime is played, or null without Web Audio.
    */
   start(project, timeline, fromTime, options = {}) {
-    this.stop();
+    this._endSession();
     const ctx = this.context;
     if (!ctx || !this._master || !project || !timeline) return null;
     this._clearIdle();
     this._wantRunning = true;
+    this._resumeKeeper();
     const opts = options || {};
     const from = Math.max(0, Number.isFinite(+fromTime) ? +fromTime : 0);
     let startAt = ctx.currentTime + START_LEAD;
@@ -644,13 +956,18 @@ export class AudioEngine extends EventTarget {
       const item = seg && seg.item;
       if (!item || item.kind !== 'video' || !item.mediaId) continue;
       if (!(seg.duration > 0) || seg.end <= from + 1e-3) continue;
-      const vol = Number.isFinite(item.volume) ? clamp(item.volume, 0, 1) : 1;
+      const vol = volumeOf(item);
       if (vol <= 0) continue;
       const len = seg.duration;
       const envs = [fadeEnvelope(len, item.fadeIn, item.fadeOut)];
       const next = segs[i + 1];
-      const dIn = seg.transitionIn ? seg.transitionIn.duration : 0;
-      const dOut = next && next.transitionIn ? next.transitionIn.duration : 0;
+      let dIn = seg.transitionIn ? seg.transitionIn.duration : 0;
+      let dOut = next && next.transitionIn ? next.transitionIn.duration : 0;
+      // A hard cut starts/stops the waveform mid-cycle, which clicks: ramp over a few ms,
+      // unless a fade or transition already does, or the neighbour is the same clip playing
+      // straight on (split pieces must stay sample-continuous).
+      if (!(dIn > 0) && !(fadeSeconds(item.fadeIn) > 0) && !videoContinues(segs[i - 1], seg)) dIn = EDGE_RAMP;
+      if (!(dOut > 0) && !(fadeSeconds(item.fadeOut) > 0) && !videoContinues(seg, next)) dOut = EDGE_RAMP;
       const xf = crossfadeEnvelope(len, dIn, dOut);
       if (xf) envs.push(xf);
       specs.push({
@@ -675,10 +992,21 @@ export class AudioEngine extends EventTarget {
     for (const m of music) {
       const item = m && m.item;
       if (!item || !item.mediaId || !(m.end > m.start) || m.end <= from + 1e-3) continue;
-      const vol = Number.isFinite(item.volume) ? clamp(item.volume, 0, 1) : 1;
+      const vol = volumeOf(item);
       if (vol <= 0) continue;
       const len = m.end - m.start;
       const envs = [fadeEnvelope(len, item.fadeIn, item.fadeOut)];
+      // De-click the edges of music trimmed mid-waveform (not between back-to-back split parts).
+      let joinedIn = false, joinedOut = false;
+      for (const o of music) {
+        if (!o || o === m || !o.item || !(o.end > o.start)) continue;
+        if (!joinedIn && musicContinues(o, m)) joinedIn = true;
+        if (!joinedOut && musicContinues(m, o)) joinedOut = true;
+      }
+      const edge = crossfadeEnvelope(len,
+        !joinedIn && !(fadeSeconds(item.fadeIn) > 0) ? EDGE_RAMP : 0,
+        !joinedOut && !(fadeSeconds(item.fadeOut) > 0) ? EDGE_RAMP : 0);
+      if (edge) envs.push(edge);
       if (narr && narr.length && item.kind !== 'narration') {
         const d = duckEnvelope(m.start, len, narr);
         if (d) envs.push(d);
@@ -711,6 +1039,9 @@ export class AudioEngine extends EventTarget {
     if (offset >= buffer.duration - 0.002) return;
     const when = ctxAtTl(tFrom);
     const stopAt = ctxAtTl(spec.end);
+    // A sound decoded too late joins mid-waveform: fade it in briefly instead of clicking.
+    const late = tFrom > session.from + 1e-3 && local > 1e-3;
+    const envs = late ? spec.envs.concat([[local, 0, local + LATE_RAMP, 1]]) : spec.envs;
     let src, gain;
     try {
       src = ctx.createBufferSource();
@@ -719,7 +1050,7 @@ export class AudioEngine extends EventTarget {
         try { src.playbackRate.value = spec.rate; } catch (_) { /* unsupported rate: plays at 1x */ }
       }
       gain = ctx.createGain();
-      scheduleGain(gain.gain, spec.envs, spec.volume, local, spec.end - spec.start,
+      scheduleGain(gain.gain, envs, spec.volume, local, spec.end - spec.start,
         (x) => ctxAtTl(spec.start + x));
       src.connect(gain);
       gain.connect(spec.bus === 'video' ? session.videoBus : session.musicBus);
@@ -760,6 +1091,12 @@ export class AudioEngine extends EventTarget {
 
   /** Stop every scheduled source (with a short de-click ramp). */
   stop() {
+    const had = !!this._session;
+    this._endSession();
+    if (had) this._scheduleKeeperPause();
+  }
+
+  _endSession() {
     const s = this._session;
     this._session = null;
     if (!s) return;
@@ -823,8 +1160,13 @@ export class AudioEngine extends EventTarget {
 
   /** Release everything (tests / teardown). */
   async close() {
-    this.stop();
+    this._endSession();
     this._clearIdle();
+    if (this._keeper) {
+      this._pauseKeeper();
+      try { this._keeper.removeAttribute('src'); this._keeper.load(); } catch (_) { /* ignore */ }
+      this._keeper = null;
+    }
     if (this._autoResumeInstalled && typeof document !== 'undefined') {
       const opts = { capture: true };
       for (const type of ['pointerdown', 'touchend', 'keydown', 'click']) document.removeEventListener(type, this._onGesture, opts);

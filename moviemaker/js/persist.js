@@ -9,6 +9,8 @@ export const DB_VERSION = 1;
 export const PROJECT_FILE_EXT = '.wlmmweb';
 export const PROJECT_FILE_FORMAT = 'wlmmweb';
 const LAST_KEY = 'wlmm-web:lastProjectId';
+const EXPORTED_KEY = 'wlmm-web:exportedAt';            // { projectId: ms } of "Export project file"
+const NOTICE_KEY = 'wlmm-web:storageNoticeShown';      // the Safari eviction notice was shown
 const OPEN_TIMEOUT = 10000;
 const CHUNK = 3 * 512 * 1024;           // export: bytes per base64 chunk (multiple of 3)
 const READ_CHUNK = 2 * 1024 * 1024;     // import: bytes read per step
@@ -139,8 +141,20 @@ function txDone(tx) {
   });
 }
 
-// Safari has had bugs storing Blob/File objects in IndexedDB; fall back to raw bytes.
+// Safari has had bugs storing Blob/File objects in IndexedDB ("UnknownError: Error preparing
+// Blob/File data to be stored"); fall back to raw bytes for the rest of the session.
 let storeBlobsAsBytes = false;
+
+/** Test hooks (tests/core-media.js): engines without that bug can't reach the raw-bytes path. */
+export const __test = Object.freeze({
+  setBlobsAsBytes(on) { storeBlobsAsBytes = !!on; },
+  get blobsAsBytes() { return storeBlobsAsBytes; },
+});
+
+function isBlobProblem(err) {
+  const name = (err && err.name) || '';
+  return name === 'DataCloneError' || name === 'UnknownError' || /blob|file|clone/i.test(String(err && err.message));
+}
 
 function readArrayBuffer(blob) {
   if (blob && typeof blob.arrayBuffer === 'function') return blob.arrayBuffer();
@@ -160,7 +174,7 @@ function recordBlob(rec) {
 }
 
 function mediaMeta(m) {
-  return {
+  const meta = {
     type: m.type,
     name: m.name || '',
     mime: m.mime || (m.blob && m.blob.type) || '',
@@ -172,11 +186,20 @@ function mediaMeta(m) {
     filmstrip: Array.isArray(m.filmstrip) ? m.filmstrip : [],
     peaks: Array.isArray(m.peaks) ? m.peaks : null,
   };
+  // What the <video> element reported about an audio track (media.js); lets a later waveform
+  // decode tell "no soundtrack" from "can't decode it here".
+  if (typeof m.hasAudioHint === 'boolean') meta.hasAudioHint = m.hasAudioHint;
+  return meta;
+}
+
+/** Everything about a media record's metadata that a save may need to write (no project ids). */
+function metaKey(meta) {
+  return [meta.name, meta.duration, meta.width, meta.height, meta.hasAudio ? 1 : 0, meta.thumb.length,
+    meta.filmstrip.length, meta.peaks ? meta.peaks.length : -1].join('|');
 }
 
 function metaSignature(meta, projectIds) {
-  return [meta.name, meta.duration, meta.width, meta.height, meta.hasAudio ? 1 : 0, meta.thumb.length,
-    meta.filmstrip.length, meta.peaks ? meta.peaks.length : -1, projectIds.slice().sort().join(',')].join('|');
+  return `${metaKey(meta)}|${projectIds.slice().sort().join(',')}`;
 }
 
 function referencedMediaIds(project) {
@@ -206,113 +229,270 @@ function plainProject(project) {
   try { return structuredClone(project); } catch (_) { return JSON.parse(JSON.stringify(project)); }
 }
 
-// per-session cache: mediaId -> metadata signature last written
+// Per-session cache of what is stored: mediaId -> { runtime: metaKey of the runtime record last
+// written or checked, projectIds: the record's project ids }. Lets a save skip media that has not
+// changed, which matters when media is stored as raw bytes: reading such a record pulls the whole
+// file into memory.
 const writtenMedia = new Map();
+
+// Stores with autosave on (enableAutosave): their undo/redo history and clipboard decide which
+// media a save of their project keeps (Store.mediaInUse). Value = number of live controllers.
+const liveStores = new Map();
+
+/** Media ids a save of `project` keeps attached: the ones it uses, plus the ones undo may bring back. */
+function keepSet(project, media, opts) {
+  const keep = referencedMediaIds(project);
+  let extra = opts && opts.keep;
+  if (!extra) {
+    for (const s of liveStores.keys()) {
+      if (s && s.project && s.project.id === project.id && typeof s.mediaInUse === 'function') {
+        try { extra = s.mediaInUse(); } catch (_) { extra = null; }
+        break;
+      }
+    }
+  }
+  if (extra && typeof extra[Symbol.iterator] === 'function') {
+    for (const id of extra) if (media.has(id)) keep.add(id);
+  }
+  return keep;
+}
+
+/** Run one transaction; fn(tx) issues the requests and returns a box its callbacks fill in. */
+function runTx(db, stores, mode, fn) {
+  return new Promise((resolve, reject) => {
+    let tx;
+    try { tx = db.transaction(stores, mode); } catch (err) { reject(err); return; }
+    const done = txDone(tx);
+    let box;
+    try {
+      box = fn(tx);
+    } catch (err) {
+      try { tx.abort(); } catch (_) { /* ignore */ }
+      done.catch(() => {});
+      reject(err);
+      return;
+    }
+    done.then(() => resolve(box), reject);
+  });
+}
+
+// Saves run one after another, each writing the state captured when it was requested, so a
+// slower earlier save can never overwrite a newer one.
+let saveChain = Promise.resolve();
 
 /**
  * Save the project and any media it uses. Media blobs are written once; later saves
- * only touch metadata that changed (e.g. waveform peaks computed later).
+ * only touch metadata that changed (e.g. waveform peaks computed later). Media that the project
+ * no longer uses is detached from it (and deleted when no other project uses it); media that
+ * undo/redo or the clipboard may bring back stays while the project's store has autosave on.
+ * opts.keep: extra media ids to keep attached (overrides the store lookup).
+ * The project and media map are captured synchronously, when saveProject is called.
  */
-export async function saveProject(project, mediaMap) {
-  if (!project || !project.id) throw new PersistError('There is no project to save.', { code: 'invalid' });
-  const media = toMap(mediaMap);
-  const keep = new Set(referencedMediaIds(project));
-  for (const id of media.keys()) keep.add(id); // media still in the session (undo may bring it back)
+export function saveProject(project, mediaMap, opts = {}) {
+  if (!project || !project.id) return Promise.reject(new PersistError('There is no project to save.', { code: 'invalid' }));
+  let snapshot;
+  let media;
+  let keep;
+  try {
+    snapshot = plainProject(project);
+    media = new Map(toMap(mediaMap));
+    keep = keepSet(snapshot, media, opts);
+  } catch (err) {
+    return Promise.reject(friendly(err, 'save the project'));
+  }
+  const job = saveChain.then(() => writeProject(snapshot, media, keep));
+  saveChain = job.catch(() => {});
+  return job;
+}
+
+async function writeProject(project, media, keep) {
   const db = await openDB();
-  const projectRecord = {
+  const record = {
     id: project.id,
     name: project.name || 'My Movie',
     updatedAt: project.updatedAt || Date.now(),
     thumb: projectThumb(project, media),
-    project: plainProject(project),
+    project,
   };
-  // Prepare byte fallbacks before the transaction (no awaits allowed inside it).
-  const bytes = new Map();
-  if (storeBlobsAsBytes) {
-    for (const id of keep) {
-      const m = media.get(id);
-      if (m && m.blob && !writtenMedia.has(id)) {
-        try { bytes.set(id, await readArrayBuffer(m.blob)); } catch (err) { throw friendly(err, 'read a media file'); }
+  try {
+    if (storeBlobsAsBytes) await writeBytesMode(db, record, media, keep);
+    else await writeBlobMode(db, record, media, keep);
+  } catch (err) {
+    if (!storeBlobsAsBytes && isBlobProblem(err)) {
+      storeBlobsAsBytes = true;
+      try {
+        await writeBytesMode(db, record, media, keep);
+        return;
+      } catch (err2) {
+        throw friendly(err2, 'save the project');
       }
     }
+    throw friendly(err, 'save the project');
   }
-  const attempt = () => new Promise((resolve, reject) => {
+}
+
+/** Normal path: project + every media record in ONE transaction (Blobs are stored by reference). */
+function writeBlobMode(db, record, media, keep) {
+  const pid = record.id;
+  return new Promise((resolve, reject) => {
     let tx;
     try {
       tx = db.transaction(['projects', 'media'], 'readwrite');
     } catch (err) { reject(err); return; }
     const done = txDone(tx);
-    const ps = tx.objectStore('projects');
     const ms = tx.objectStore('media');
-    const pending = new Map(); // id -> signature, committed to writtenMedia on success
+    const pending = new Map(); // id -> cache entry, committed to writtenMedia on success
+    const dropped = [];
     try {
-      ps.put(projectRecord);
+      tx.objectStore('projects').put(record);
       for (const id of keep) {
         const m = media.get(id);
         if (!m || !m.blob) continue;
         const meta = mediaMeta(m);
+        const runtime = metaKey(meta);
         const get = ms.get(id);
         get.onsuccess = () => {
           const existing = get.result;
           const projectIds = existing && Array.isArray(existing.projectIds) ? existing.projectIds.slice() : [];
-          if (!projectIds.includes(project.id)) projectIds.push(project.id);
+          if (!projectIds.includes(pid)) projectIds.push(pid);
           if (existing) {
             // Never lose data computed earlier (e.g. peaks) when the runtime record lacks it.
             if (!meta.peaks && Array.isArray(existing.peaks)) meta.peaks = existing.peaks;
             if (!meta.thumb && existing.thumb) meta.thumb = existing.thumb;
             if (!meta.filmstrip.length && Array.isArray(existing.filmstrip)) meta.filmstrip = existing.filmstrip;
-          }
-          const sig = metaSignature(meta, projectIds);
-          if (existing) {
             const oldSig = metaSignature(mediaMeta(existing), Array.isArray(existing.projectIds) ? existing.projectIds : []);
-            if (oldSig === sig) { pending.set(id, sig); return; }
             // Keep the stored blob; refresh metadata only.
-            ms.put({ ...existing, ...meta, projectIds });
+            if (oldSig !== metaSignature(meta, projectIds)) ms.put({ ...existing, ...meta, projectIds });
           } else {
-            const rec = { id, projectIds, ...meta, blob: null };
-            if (bytes.has(id)) rec.bytes = bytes.get(id);
-            else rec.blob = m.blob;
-            ms.put(rec);
+            ms.put({ id, projectIds, ...meta, blob: m.blob });
           }
-          pending.set(id, sig);
+          pending.set(id, { runtime, projectIds });
         };
       }
       // Detach media this project no longer uses; delete orphans.
-      const cur = ms.index('projectIds').openCursor(IDBKeyRange.only(project.id));
+      const cur = ms.index('projectIds').openCursor(IDBKeyRange.only(pid));
       cur.onsuccess = () => {
         const c = cur.result;
         if (!c) return;
         const rec = c.value;
         if (!keep.has(rec.id)) {
-          const others = (rec.projectIds || []).filter((p) => p !== project.id);
+          const others = (rec.projectIds || []).filter((p) => p !== pid);
           if (others.length) c.update({ ...rec, projectIds: others });
           else c.delete();
-          writtenMedia.delete(rec.id);
+          dropped.push(rec.id);
         }
         c.continue();
       };
     } catch (err) {
       try { tx.abort(); } catch (_) { /* ignore */ }
+      done.catch(() => {});
       reject(err);
       return;
     }
     done.then(() => {
-      for (const [id, sig] of pending) writtenMedia.set(id, sig);
+      for (const id of dropped) writtenMedia.delete(id);
+      for (const [id, entry] of pending) writtenMedia.set(id, entry);
       resolve();
     }, reject);
   });
-  try {
-    await attempt();
-  } catch (err) {
-    const name = (err && err.name) || '';
-    const blobProblem = !storeBlobsAsBytes && (name === 'DataCloneError' || name === 'UnknownError'
-      || /blob|file|clone/i.test(String(err && err.message)));
-    if (blobProblem) {
-      storeBlobsAsBytes = true;
-      return saveProject(project, mediaMap);
-    }
-    throw friendly(err, 'save the project');
+}
+
+/**
+ * Raw-bytes fallback: one media record per transaction, so at most one file is in memory at a
+ * time (phones kill a tab that holds several videos at once). Media that is stored and unchanged
+ * is skipped without reading it back.
+ */
+async function writeBytesMode(db, record, media, keep) {
+  const pid = record.id;
+  for (const id of keep) {
+    const m = media.get(id);
+    if (!m || !m.blob) continue;
+    const meta = mediaMeta(m);
+    const runtime = metaKey(meta);
+    const cached = writtenMedia.get(id);
+    if (cached && cached.runtime === runtime && cached.projectIds.includes(pid)) continue;
+    await writeMediaBytes(db, id, m, meta, runtime, pid);
   }
+  // The project goes in after its media, so it never points at a file that isn't stored.
+  await runTx(db, ['projects'], 'readwrite', (tx) => { tx.objectStore('projects').put(record); });
+  // Detach media this project no longer uses (keys only: no file is read to find them).
+  const attached = await runTx(db, ['media'], 'readonly', (tx) => {
+    const box = { ids: [] };
+    const idx = tx.objectStore('media').index('projectIds');
+    const range = IDBKeyRange.only(pid);
+    if (typeof idx.getAllKeys === 'function') {
+      const r = idx.getAllKeys(range);
+      r.onsuccess = () => { box.ids = Array.isArray(r.result) ? r.result : []; };
+    } else {
+      const c = idx.openKeyCursor(range);
+      c.onsuccess = () => {
+        const cur = c.result;
+        if (!cur) return;
+        box.ids.push(cur.primaryKey);
+        cur.continue();
+      };
+    }
+    return box;
+  });
+  for (const id of attached.ids) {
+    if (keep.has(id)) continue;
+    await runTx(db, ['media'], 'readwrite', (tx) => {
+      const ms = tx.objectStore('media');
+      const get = ms.get(id);
+      get.onsuccess = () => {
+        const rec = get.result;
+        if (!rec) return;
+        const others = (rec.projectIds || []).filter((p) => p !== pid);
+        if (others.length) ms.put({ ...rec, projectIds: others });
+        else ms.delete(id);
+      };
+    });
+    writtenMedia.delete(id);
+  }
+}
+
+async function writeMediaBytes(db, id, m, meta, runtime, pid) {
+  // Stored already? Ask for the key only, never for the (possibly huge) value.
+  const probe = await runTx(db, ['media'], 'readonly', (tx) => {
+    const box = { found: false };
+    const ms = tx.objectStore('media');
+    const req = typeof ms.getKey === 'function' ? ms.getKey(id) : ms.count(id);
+    req.onsuccess = () => {
+      const r = req.result;
+      box.found = typeof r === 'number' ? r > 0 : r !== undefined && r !== null;
+    };
+    return box;
+  });
+  if (probe.found) {
+    const box = await runTx(db, ['media'], 'readwrite', (tx) => {
+      const out = { entry: null, gone: false };
+      const ms = tx.objectStore('media');
+      const get = ms.get(id);
+      get.onsuccess = () => {
+        const existing = get.result;
+        if (!existing) { out.gone = true; return; }
+        const projectIds = Array.isArray(existing.projectIds) ? existing.projectIds.slice() : [];
+        if (!projectIds.includes(pid)) projectIds.push(pid);
+        const merged = { ...meta };
+        if (!merged.peaks && Array.isArray(existing.peaks)) merged.peaks = existing.peaks;
+        if (!merged.thumb && existing.thumb) merged.thumb = existing.thumb;
+        if (!merged.filmstrip.length && Array.isArray(existing.filmstrip)) merged.filmstrip = existing.filmstrip;
+        const oldSig = metaSignature(mediaMeta(existing), Array.isArray(existing.projectIds) ? existing.projectIds : []);
+        if (oldSig !== metaSignature(merged, projectIds)) ms.put({ ...existing, ...merged, projectIds });
+        out.entry = { runtime, projectIds };
+      };
+      return out;
+    });
+    if (box.entry) { writtenMedia.set(id, box.entry); return; }
+    if (!box.gone) return;
+  }
+  let bytes;
+  try { bytes = await readArrayBuffer(m.blob); } catch (err) { throw friendly(err, 'read a media file'); }
+  await runTx(db, ['media'], 'readwrite', (tx) => {
+    tx.objectStore('media').put({ id, projectIds: [pid], ...meta, blob: null, bytes });
+  });
+  bytes = null;
+  writtenMedia.set(id, { runtime, projectIds: [pid] });
 }
 
 function runtimeMedia(rec) {
@@ -320,7 +500,7 @@ function runtimeMedia(rec) {
   if (!blob) return null;
   let url = '';
   try { url = URL.createObjectURL(blob); } catch (_) { url = ''; }
-  return {
+  const m = {
     id: rec.id,
     type: rec.type,
     name: rec.name || '',
@@ -335,48 +515,66 @@ function runtimeMedia(rec) {
     filmstrip: Array.isArray(rec.filmstrip) ? rec.filmstrip : [],
     peaks: Array.isArray(rec.peaks) ? rec.peaks : null,
   };
+  if (typeof rec.hasAudioHint === 'boolean') m.hasAudioHint = rec.hasAudioHint;
+  return m;
 }
 
-/** Load a project and its media (with fresh object URLs). */
+/** get() that resolves null on failure without aborting the transaction. */
+function getSoft(objectStore, key) {
+  return new Promise((resolve) => {
+    let req;
+    try { req = objectStore.get(key); } catch (_) { resolve(null); return; }
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = (e) => {
+      try { if (e && typeof e.preventDefault === 'function') e.preventDefault(); } catch (_) { /* ignore */ }
+      resolve(null);
+    };
+  });
+}
+
+/**
+ * Load a project and the media it uses (with fresh object URLs). Media that is attached to the
+ * project but no longer used is left behind (the next save detaches it).
+ */
 export async function loadProject(id) {
   let db;
   try { db = await openDB(); } catch (err) { throw friendly(err, 'open the project'); }
   try {
     const tx = db.transaction(['projects', 'media'], 'readonly');
     const done = txDone(tx);
+    done.catch(() => {});
     const rec = await reqP(tx.objectStore('projects').get(id));
     if (!rec || !rec.project) {
       throw new PersistError("That project couldn't be found. It may have been deleted.", { code: 'not-found' });
     }
     const project = normalizeProject(rec.project);
-    const ids = referencedMediaIds(project);
     const ms = tx.objectStore('media');
-    const records = await Promise.all([...ids].map((mid) => reqP(ms.get(mid)).catch(() => null)));
-    // Also bring back media attached to this project but not currently referenced (undo history of the session).
-    const extra = await reqP(ms.index('projectIds').getAll(IDBKeyRange.only(id))).catch(() => []);
-    await done.catch(() => {});
     const media = new Map();
-    for (const r of [...records, ...(extra || [])]) {
-      if (!r || media.has(r.id)) continue;
+    // One record at a time: a file stored as raw bytes becomes a Blob before the next one is read.
+    for (const mid of referencedMediaIds(project)) {
+      const r = await getSoft(ms, mid);
+      if (!r) continue;
       const m = runtimeMedia(r);
       if (m) {
         media.set(m.id, m);
-        writtenMedia.set(m.id, metaSignature(mediaMeta(r), Array.isArray(r.projectIds) ? r.projectIds : []));
+        writtenMedia.set(m.id, { runtime: metaKey(mediaMeta(m)), projectIds: Array.isArray(r.projectIds) ? r.projectIds.slice() : [] });
       }
     }
+    await done.catch(() => {});
     return { project, media };
   } catch (err) {
     throw friendly(err, 'open the project');
   }
 }
 
-/** [{id, name, updatedAt, thumb}] newest first. */
+/** [{id, name, updatedAt, thumb, itemCount, exportedAt}] newest first (exportedAt 0 = never exported). */
 export async function listProjects() {
   let db;
   try { db = await openDB(); } catch (err) { throw friendly(err, 'list your projects'); }
   try {
     const tx = db.transaction('projects', 'readonly');
     const out = [];
+    const exported = readExportTimes();
     await new Promise((resolve, reject) => {
       const req = tx.objectStore('projects').openCursor();
       req.onsuccess = () => {
@@ -390,6 +588,7 @@ export async function listProjects() {
           updatedAt: v.updatedAt || p.updatedAt || 0,
           thumb: v.thumb || '',
           itemCount: Array.isArray(p.items) ? p.items.length : 0,
+          exportedAt: Number(exported[v.id]) || 0,
         });
         c.continue();
       };
@@ -425,34 +624,156 @@ export async function deleteProject(id) {
     try {
       if ((await getLastProjectId()) === id) await setLastProjectId(null);
     } catch (_) { /* ignore */ }
+    forgetExportTime(id);
   } catch (err) {
     throw friendly(err, 'delete the project');
   }
 }
 
+function ls() {
+  try { return typeof localStorage !== 'undefined' && localStorage ? localStorage : null; } catch (_) { return null; }
+}
+
 export async function getLastProjectId() {
   try {
-    return (typeof localStorage !== 'undefined' && localStorage.getItem(LAST_KEY)) || null;
+    const s = ls();
+    return (s && s.getItem(LAST_KEY)) || null;
   } catch (_) { return null; }
 }
 
 export async function setLastProjectId(id) {
   try {
-    if (typeof localStorage === 'undefined') return;
-    if (id) localStorage.setItem(LAST_KEY, String(id));
-    else localStorage.removeItem(LAST_KEY);
+    const s = ls();
+    if (!s) return;
+    if (id) s.setItem(LAST_KEY, String(id));
+    else s.removeItem(LAST_KEY);
   } catch (_) { /* storage blocked: ignore */ }
 }
 
-/** Ask the browser not to evict our data under storage pressure (best effort). */
-export async function requestPersistentStorage() {
+// --- "Export project file" times (shown in the Projects dialog: the copy that survives the
+// browser clearing its storage) -----------------------------------------------------------------
+function readExportTimes() {
   try {
-    if (typeof navigator !== 'undefined' && navigator.storage && typeof navigator.storage.persist === 'function') {
-      if (typeof navigator.storage.persisted === 'function' && await navigator.storage.persisted()) return true;
-      return await navigator.storage.persist();
+    const s = ls();
+    const v = s ? JSON.parse(s.getItem(EXPORTED_KEY) || '{}') : {};
+    return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
+  } catch (_) { return {}; }
+}
+
+function writeExportTimes(map) {
+  try {
+    const s = ls();
+    if (s) s.setItem(EXPORTED_KEY, JSON.stringify(map));
+  } catch (_) { /* storage blocked: ignore */ }
+}
+
+/** Remember that a project file was made for `id` (exportProjectFile does this itself). */
+export function markProjectExported(id, when = Date.now()) {
+  if (!id) return;
+  const map = readExportTimes();
+  map[id] = Number(when) || Date.now();
+  writeExportTimes(map);
+}
+
+/** When a project file was last made for `id` (ms), or 0. */
+export function lastExportedAt(id) {
+  return Number(readExportTimes()[id]) || 0;
+}
+
+function forgetExportTime(id) {
+  const map = readExportTimes();
+  if (!(id in map)) return;
+  delete map[id];
+  writeExportTimes(map);
+}
+
+// --- persistent storage & eviction --------------------------------------------------------------
+let persistAsked = false;
+
+/** Engines that show the user a permission prompt for navigator.storage.persist() (Firefox). */
+function persistPrompts() {
+  try {
+    const ua = String((typeof navigator !== 'undefined' && navigator.userAgent) || '');
+    return /\bFirefox\//.test(ua) && !/\bSeamonkey\//i.test(ua);
+  } catch (_) { return false; }
+}
+
+/**
+ * Ask the browser not to evict our data under storage pressure (best effort, at most once per
+ * session). Firefox asks the user, so there it only happens with { userAction: true }: call it that
+ * way from an explicit save (Save project, Save movie), never at start-up. Chrome and Safari decide
+ * silently, so a plain call is fine there. Resolves true when storage is (now) persistent.
+ */
+export async function requestPersistentStorage({ userAction = false } = {}) {
+  try {
+    const s = typeof navigator !== 'undefined' ? navigator.storage : null;
+    if (!s || typeof s.persist !== 'function') return false;
+    if (typeof s.persisted === 'function' && await s.persisted()) return true;
+    if (!userAction && persistPrompts()) return false;
+    if (persistAsked) return false;
+    persistAsked = true;
+    return !!(await s.persist());
+  } catch (_) { /* ignore */ }
+  return false;
+}
+
+function isStandalone() {
+  try {
+    if (typeof navigator !== 'undefined' && navigator.standalone === true) return true;
+  } catch (_) { /* ignore */ }
+  try {
+    if (typeof matchMedia === 'function') {
+      return ['standalone', 'fullscreen', 'minimal-ui'].some((m) => matchMedia(`(display-mode: ${m})`).matches);
     }
   } catch (_) { /* ignore */ }
   return false;
+}
+
+/**
+ * Does this browser delete script-writable storage (IndexedDB, localStorage, the offline cache) on
+ * its own? WebKit does after 7 days of browser use without a visit to the site (Safari on Mac,
+ * every browser on iPhone / iPad) unless the app runs from the Home Screen / Dock or the storage
+ * is persistent. Resolves { atRisk, ios, message }.
+ */
+export async function storageEvictionRisk() {
+  const none = { atRisk: false, ios: false, message: '' };
+  if (typeof navigator === 'undefined') return none;
+  let ua = '';
+  let vendor = '';
+  let ios = false;
+  try {
+    ua = String(navigator.userAgent || '');
+    vendor = String(navigator.vendor || '');
+    ios = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  } catch (_) { return none; }
+  const macSafari = !ios && vendor.indexOf('Apple') === 0 && /AppleWebKit\//.test(ua) && /Safari\//.test(ua)
+    && !/(Chrome|Chromium|CriOS|Edg|OPR|Firefox|FxiOS)\//.test(ua);
+  if (!ios && !macSafari) return none;
+  if (isStandalone()) return none;
+  try {
+    const s = navigator.storage;
+    if (s && typeof s.persisted === 'function' && await s.persisted()) return none;
+  } catch (_) { /* unknown: assume the default policy */ }
+  const message = ios
+    ? 'Safari may delete projects stored on this device if you don’t use Movie Maker for a while. '
+      + 'Add Movie Maker to your Home Screen (Share › Add to Home Screen), or use Export project file to keep a copy.'
+    : 'Safari may delete projects stored on this Mac if you don’t use Movie Maker for a while. '
+      + 'Use Export project file in the Movie Maker menu to keep a copy, or add Movie Maker to the Dock (File › Add to Dock).';
+  return { atRisk: true, ios, message };
+}
+
+let noticeChecked = false;
+
+/** The eviction notice, once ever per browser (remembered in localStorage), else null. */
+async function storageNoticeOnce() {
+  if (noticeChecked) return null;
+  noticeChecked = true;
+  const s = ls();
+  try { if (s && s.getItem(NOTICE_KEY)) return null; } catch (_) { /* show it */ }
+  const risk = await storageEvictionRisk();
+  if (!risk.atRisk) return null;
+  try { if (s) s.setItem(NOTICE_KEY, String(Date.now())); } catch (_) { /* shown once per session then */ }
+  return { kind: 'eviction', message: risk.message };
 }
 
 /** { usage, quota } in bytes, or null when unknown. */
@@ -480,13 +801,17 @@ function emit(store, type, detail) {
 /**
  * Debounced autosave on store 'change' / 'media'. Also saves immediately when the
  * page is hidden (phones kill background tabs). Emits 'persist' on the store:
- * {detail:{ok:true, projectId, savedAt}} or {detail:{ok:false, error}} (errors are
- * de-duplicated until a save succeeds). Returns a controller.
+ * {detail:{ok:true, projectId, savedAt, notice?}} or {detail:{ok:false, error}} (errors are
+ * de-duplicated until a save succeeds). `notice` ({kind:'eviction', message}) comes with the first
+ * successful save once ever, in browsers that may delete stored projects on their own (Safari
+ * outside the Home Screen): show it to the user. Returns a controller:
+ *   flush()   → Promise, resolves once the project as it is NOW is stored (waits for a running save)
+ *   disable() → stop; edits still waiting for the debounce are saved first
  */
 export function enableAutosave(store, delayMs = 1500) {
   let timer = 0;
-  let saving = null;
-  let dirty = false;
+  let saving = null;   // the running save
+  let queued = null;   // a save that starts as soon as the running one is done
   let disabled = false;
   let lastErrorMsg = '';
   let lastSavedAt = 0;
@@ -494,34 +819,42 @@ export function enableAutosave(store, delayMs = 1500) {
   // is worth saving, emptying it must be saved too. Blank new projects never litter the DB.
   const worthSaving = new Set();
 
-  const run = async () => {
+  const save = (project, keep) => (async () => {
+    try {
+      await saveProject(project, store.media, keep ? { keep } : undefined);
+      await setLastProjectId(project.id);
+      lastSavedAt = Date.now();
+      lastErrorMsg = '';
+      let notice = null;
+      try { notice = await storageNoticeOnce(); } catch (_) { notice = null; }
+      emit(store, 'persist', notice
+        ? { ok: true, projectId: project.id, savedAt: lastSavedAt, notice }
+        : { ok: true, projectId: project.id, savedAt: lastSavedAt });
+    } catch (err) {
+      const e = friendly(err, 'save the project');
+      if (e.message !== lastErrorMsg) {
+        lastErrorMsg = e.message;
+        emit(store, 'persist', { ok: false, error: e });
+        if (typeof console !== 'undefined') console.warn('[autosave]', e.message, err);
+      }
+    }
+  })();
+
+  const run = () => {
     clearTimeout(timer);
     timer = 0;
-    if (disabled) return;
-    if (saving) { dirty = true; return saving; }
+    if (disabled) return Promise.resolve();
+    if (saving) {
+      // The running save holds an older copy of the project: save again right after it, so
+      // whoever waits on this (flush before New / Open project, page hide) gets today's state.
+      if (!queued) queued = saving.then(() => { queued = null; return run(); });
+      return queued;
+    }
     const project = store.project;
     if (!isEmptyProject(project)) worthSaving.add(project.id);
-    if (!worthSaving.has(project.id)) return;
-    dirty = false;
-    saving = (async () => {
-      try {
-        await saveProject(project, store.media);
-        await setLastProjectId(project.id);
-        lastSavedAt = Date.now();
-        lastErrorMsg = '';
-        emit(store, 'persist', { ok: true, projectId: project.id, savedAt: lastSavedAt });
-      } catch (err) {
-        const e = friendly(err, 'save the project');
-        if (e.message !== lastErrorMsg) {
-          lastErrorMsg = e.message;
-          emit(store, 'persist', { ok: false, error: e });
-          if (typeof console !== 'undefined') console.warn('[autosave]', e.message, err);
-        }
-      } finally {
-        saving = null;
-      }
-      if (dirty && !disabled) schedule(Math.min(delayMs, 400));
-    })();
+    if (!worthSaving.has(project.id)) return Promise.resolve();
+    // saveProject captures the project synchronously, so later edits can't leak into this save.
+    saving = save(project).finally(() => { saving = null; });
     return saving;
   };
   const schedule = (ms = delayMs) => {
@@ -542,7 +875,7 @@ export function enableAutosave(store, delayMs = 1500) {
   };
   const onMedia = () => schedule();
   const flushNow = () => {
-    if (timer || dirty) run();
+    if (timer) run();
   };
   const onVisibility = () => { if (document.visibilityState === 'hidden') flushNow(); };
 
@@ -550,20 +883,33 @@ export function enableAutosave(store, delayMs = 1500) {
   store.addEventListener('media', onMedia);
   if (typeof document !== 'undefined') document.addEventListener('visibilitychange', onVisibility);
   if (typeof window !== 'undefined') window.addEventListener('pagehide', flushNow);
-  requestPersistentStorage();
+  liveStores.set(store, (liveStores.get(store) || 0) + 1);
+  // No navigator.storage.persist() here: Firefox would show a permission prompt at every start.
+  // Ask with requestPersistentStorage({ userAction: true }) after an explicit save instead.
 
   return {
     flush: () => run(),
     disable() {
+      if (disabled) return;
+      const unsaved = !!timer || !!queued;
       disabled = true;
       clearTimeout(timer);
+      timer = 0;
       store.removeEventListener('change', onChange);
       store.removeEventListener('media', onMedia);
       if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onVisibility);
       if (typeof window !== 'undefined') window.removeEventListener('pagehide', flushNow);
+      let keep = null;
+      try { keep = typeof store.mediaInUse === 'function' ? store.mediaInUse() : null; } catch (_) { keep = null; }
+      const n = (liveStores.get(store) || 1) - 1;
+      if (n > 0) liveStores.set(store, n); else liveStores.delete(store);
+      // Edits still waiting for the debounce: save the project as it is now (captured right here,
+      // so whatever the caller changes next is not part of it).
+      const project = store.project;
+      if (unsaved && project && (worthSaving.has(project.id) || !isEmptyProject(project))) save(project, keep);
     },
     get saving() { return !!saving; },
-    get pending() { return !!timer || dirty; },
+    get pending() { return !!timer || !!queued; },
     get lastSavedAt() { return lastSavedAt; },
     get lastError() { return lastErrorMsg; },
   };
@@ -649,7 +995,9 @@ export async function exportProjectFile(project, mediaMap, { onProgress } = {}) 
     push('\n]}');
     doneBytes = total;
     report();
-    return new Blob(acc ? [acc, ...parts] : parts, { type: 'application/json' });
+    const file = new Blob(acc ? [acc, ...parts] : parts, { type: 'application/json' });
+    markProjectExported(project.id);
+    return file;
   } catch (err) {
     throw friendly(err, 'export the project');
   }

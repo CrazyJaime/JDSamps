@@ -13,7 +13,7 @@
  */
 'use strict';
 
-const VERSION = '2026-10-10.2';
+const VERSION = '2026-10-10.4';
 const CACHE_PREFIX = 'movie-maker-shell-';
 const CACHE = CACHE_PREFIX + VERSION;
 const SHARE_CACHE = 'movie-maker-share';

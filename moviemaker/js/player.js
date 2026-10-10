@@ -4,20 +4,39 @@
 //   stays in sync with the sound); a performance.now() clock is used when Web Audio is not
 //   running. A requestAnimationFrame loop renders frames through renderer.renderFrame().
 // - One muted, playsinline <video> per video item, parked at 1px in `mediaHost` (iOS only
-//   decodes reliably when the element is in the document). Videos follow the clock with
-//   playbackRate nudging and re-seeks when they drift too far.
+//   decodes reliably when the element is in the document). Pieces of a split that follow each
+//   other share their first piece's element, so playback runs straight across the cut. Videos
+//   follow the clock with occasional playbackRate corrections and re-seeks when they drift too
+//   far; the next clip's element is started a moment before its cut so it is already running.
 // - Paused seeks only draw once the needed videos have finished seeking (with a timeout),
 //   and rapid scrubbing is coalesced: each video has at most one seek in flight and only
 //   the latest requested time is applied after it.
 
 import { renderFrame, sourceTimeAt } from './renderer.js';
-import { ASPECTS } from './model.js';
+import { ASPECTS, computeTimeline } from './model.js';
 
 const FRAME_STEP = 1 / 30;
 const PREROLL = 1.0;            // seconds before a video segment starts to park it at its first frame
 const IMAGE_AHEAD = 2.5;        // seconds of photos to decode ahead
 const DRIFT_RESEEK = 0.25;      // re-seek a playing video when this far off (source seconds)
-const DRIFT_SOFT = 0.03;        // nudge playbackRate beyond this
+const DRIFT_SOFT = 0.012;       // start a playbackRate correction when the (smoothed) drift exceeds this …
+const DRIFT_DONE = 0.003;       // … and end it once the drift is back within this
+const DRIFT_SMOOTH = 0.25;      // smoothing of the measured drift (currentTime moves in display-frame steps)
+// A playing <video> hands drawImage() the frame about to be displayed, about this far ahead of
+// its currentTime (Chrome): elements are kept this much behind the clock so the frame drawn
+// is the one for the clock's time.
+const DRAW_AHEAD = 0.01;
+const TRIM_SMALL = 0.07;        // correction: ±7 % (±15 % for a drift beyond TRIM_BIG_AT)
+const TRIM_BIG = 0.15;
+const TRIM_BIG_AT = 0.08;
+const TRIM_HIDDEN = 0.12;       // correction for an element running ahead of its cut (not on screen yet) …
+const DRIFT_SOFT_HIDDEN = 0.03; // … only for a clear drift: each rate change costs Chrome a ~20 ms stall
+const SETTLE_MS = 150;          // after play(): let the element get going before judging its drift
+const PRESTART_RUNUP = 0.4;     // hidden run-up (timeline s) played before a clip's in-point, when the source has it
+// Paused/pre-roll seeks aim this far inside the wanted frame: containers store frame times
+// rounded to whole ms (frame 59 of a 30 fps WebM is at 1.967 s), so a seek to exactly
+// 59/30 s would still show frame 58.
+const SEEK_BIAS = 0.002;
 const SEEK_TIMEOUT_MS = 1500;   // paused draw happens anyway after this
 const START_WAIT_MS = 1000;     // max wait for videos/audio before the clock starts
 const HOLD_MAX_MS = 400;        // max time to keep the previous frame while a source catches up
@@ -50,6 +69,47 @@ function makeEvent(type, detail) {
 }
 
 function clamp(v, lo, hi) { return v < lo ? lo : v > hi ? hi : v; }
+
+/** Source time to seek a paused <video> to for timeline time t: just inside the wanted frame. */
+function frameTarget(seg, t) {
+  const st = sourceTimeAt(seg, t);
+  const sIn = +seg.sourceIn || 0, sOut = +seg.sourceOut;
+  return sOut > sIn ? Math.min(st + SEEK_BIAS, Math.max(st, sOut - 1e-3)) : st + SEEK_BIAS;
+}
+
+function speedOf(item) { return item.speed > 0 ? +item.speed : 1; }
+
+/** Identifies the in-point still of a segment (see Player._preroll). */
+function stillKeyOf(seg) { return seg.item.id + '@' + (+seg.sourceIn || 0).toFixed(4); }
+
+let _touchCtx;
+/**
+ * Paint a running <video> into a tiny scratch canvas. Chrome only refreshes the frame that
+ * drawImage() returns when something paints the element, so the first draw of an element
+ * that ran unseen (a clip started ahead of its cut) would otherwise show a stale frame.
+ */
+function touchFrame(el) {
+  if (_touchCtx === undefined) {
+    _touchCtx = null;
+    try {
+      const c = document.createElement('canvas');
+      c.width = 2;
+      c.height = 2;
+      _touchCtx = c.getContext('2d');
+    } catch (_) { _touchCtx = null; }
+  }
+  if (_touchCtx && el.readyState >= 2) { try { _touchCtx.drawImage(el, 0, 0, 2, 2); } catch (_) { /* ignore */ } }
+}
+
+/**
+ * Segment b continues segment a in the same clip with no gap (the pieces of a split): one
+ * <video> can play both without a seek, so the cut is seamless.
+ */
+function continues(a, b) {
+  return !!a && !!b && a.item.kind === 'video' && b.item.kind === 'video' && !!a.item.mediaId
+    && a.item.mediaId === b.item.mediaId && speedOf(a.item) === speedOf(b.item) && !b.transitionIn
+    && Math.abs(a.end - b.start) < 1e-4 && Math.abs((+a.sourceOut || 0) - (+b.sourceIn || 0)) < 1e-3;
+}
 
 function ensureHost(host) {
   if (typeof document === 'undefined') return host || null;
@@ -138,8 +198,14 @@ export class Player extends EventTarget {
     this._fitStyle = null;
 
     // sources
-    this._videos = new Map();   // item id → video entry
+    this._videos = new Map();   // element key (see _keyFor) → video entry
     this._pool = [];
+    this._chain = new Map();    // video item id → key of the element that plays it
+    this._chainTl = null;
+    this._override = null;      // live preview of a gallery choice: { ids: Set, patch }
+    this._ovCache = null;
+    this._drawTime = 0;         // timeline time of the frame being drawn
+    this._startLat = this._coarse ? 0.09 : 0.05; // learned: play() → frames moving (s)
     this._images = new Map();   // media id → image entry
     this._act = [null, null];
     this._actN = 0;
@@ -189,7 +255,7 @@ export class Player extends EventTarget {
   }
 
   get duration() {
-    const tl = this.store.timeline;
+    const tl = this._viewTl();
     return tl && tl.duration > 0 ? tl.duration : 0;
   }
 
@@ -230,6 +296,7 @@ export class Player extends EventTarget {
       try { unlockP = Promise.resolve(this.audio.unlock()).catch(() => false); } catch (_) { unlockP = null; }
     }
     this._time = t;
+    this._grabStartStills(t);
     this._playing = true;
     this._clockRunning = false;
     const token = ++this._playToken;
@@ -258,13 +325,20 @@ export class Player extends EventTarget {
     this._clearResync();
     this._clearSeekState();
     if (this.audio) { try { this.audio.stop(); } catch (_) { /* ignore */ } }
-    for (const v of this._pool) {
-      if (!v.el.paused) { try { v.el.pause(); } catch (_) { /* ignore */ } }
-    }
+    this._parkAll();
     this._time = clamp(t, 0, this.duration);
     this._emitTime(this._time);
     this._emit('pause');
     this._invalidate(false); // settle videos on the exact frame and redraw
+  }
+
+  /** Pause every element and free the in-point stills (playback stopped). */
+  _parkAll() {
+    for (const v of this._pool) {
+      if (!v.el.paused) { try { v.el.pause(); } catch (_) { /* ignore */ } }
+      v.preFor = '';
+      this._dropStill(v);
+    }
   }
 
   toggle() {
@@ -302,20 +376,14 @@ export class Player extends EventTarget {
 
   /** Render into another canvas (export); null restores the preview canvas. */
   setOutput(canvas) {
-    const prevExport = !!this._output;
     if (canvas && typeof canvas.getContext === 'function') {
+      // Exports and snapshots show the real movie, never a gallery live preview.
+      if (this._override) { this._override = null; this._ovCache = null; this._reconcileVideos(); }
       this._output = canvas;
       this._outCtx = canvas.getContext('2d', { alpha: false }) || canvas.getContext('2d');
     } else {
       this._output = null;
       this._outCtx = null;
-    }
-    if (prevExport !== !!this._output && this._playing && this._clockRunning && this._mode === 'audio') {
-      // The export clock follows rendered (not heard) audio; keep the timeline position.
-      const t = this._clockFor(prevExport);
-      this._anchorTime = t;
-      this._anchorCtx = this._audioNow();
-      this._lastClock = t;
     }
     if (!this._playing) this._invalidate(false);
   }
@@ -331,6 +399,69 @@ export class Player extends EventTarget {
     if (!this.canvas || this._lay.aspect === this.store.project.aspect) return;
     if (this._sizeMode === 'fit' && this._parentBox) this._fitTo(this._parentBox.w, this._parentBox.h);
     else this._onResize(this._cssW, this._cssH);
+  }
+
+  /**
+   * Live preview of a gallery choice (ribbon hover): draw as if every visual item / text whose id
+   * is in itemIds had `patch` merged in ({ transition: {type, duration} }, { panZoom }, { effect },
+   * { textEffect }). The store is never touched and no undo step is made; null restores. Playback,
+   * the sound schedule and the video elements follow the patched timeline (a transition patch
+   * moves the later pictures). Ignored while exporting.
+   */
+  setPreviewOverride(ov) {
+    let next = null;
+    if (ov && Array.isArray(ov.itemIds) && ov.itemIds.length && ov.patch && typeof ov.patch === 'object' && !this._output) {
+      next = { ids: new Set(ov.itemIds.map(String)), patch: { ...ov.patch } };
+    }
+    if (!next && !this._override) return;
+    this._override = next;
+    this._ovCache = null;
+    this._afterViewChange();
+  }
+
+  /** The live-preview override in effect ({ itemIds, patch }), or null. */
+  get previewOverride() {
+    const o = this._override;
+    return o ? { itemIds: [...o.ids], patch: { ...o.patch } } : null;
+  }
+
+  /** The timeline the player shows: the store's, or the live-preview one while hovering a gallery. */
+  get timeline() { return this._viewTl(); }
+
+  _view() {
+    const tl = this.store.timeline;
+    const ov = this._override;
+    if (!ov) return null;
+    const c = this._ovCache;
+    if (c && c.base === tl && c.project === this.store.project && c.ov === ov) return c;
+    const src = this.store.project;
+    const patchObj = (o) => (o && ov.ids.has(String(o.id)) ? { ...o, ...ov.patch } : o);
+    const project = { ...src, items: (src.items || []).map(patchObj), texts: (src.texts || []).map(patchObj) };
+    let timeline = tl;
+    try { timeline = computeTimeline(project, this.store.media); } catch (err) { warnOnce('preview override', err); timeline = tl; }
+    this._ovCache = { base: tl, project: src, ov, view: { project, timeline } };
+    return this._ovCache;
+  }
+
+  _viewTl() { const v = this._override ? this._view() : null; return v ? v.view.timeline : this.store.timeline; }
+
+  _viewProject() { const v = this._override ? this._view() : null; return v ? v.view.project : this.store.project; }
+
+  /** Redraw / re-sync after the shown timeline changed without a store change. */
+  _afterViewChange() {
+    this._reconcileVideos();
+    const dur = this.duration;
+    if (dur !== this._lastDuration) {
+      this._lastDuration = dur;
+      this._emit('durationchange', { duration: dur });
+    }
+    if (this._playing) {
+      this._audioSig = '';
+      this._onPlayingEdit();
+    } else {
+      if (this._time > dur) { this._time = dur; this._emitTime(dur); }
+      this._invalidate(true);
+    }
   }
 
   /** Extra drawing on top of the preview (not the export), e.g. trim markers: fn(ctx, t, w, h). */
@@ -637,9 +768,10 @@ export class Player extends EventTarget {
   // Drawing
 
   _draw(t) {
+    this._drawTime = t;
     const o = this._renderOpts;
-    o.project = this.store.project;
-    o.timeline = this.store.timeline;
+    o.project = this._viewProject();
+    o.timeline = this._viewTl();
     if (this._output) {
       const c = this._output, ctx = this._outCtx;
       if (!ctx || !(c.width > 0) || !(c.height > 0)) return;
@@ -697,9 +829,12 @@ export class Player extends EventTarget {
     const item = seg && seg.item;
     if (!item) return null;
     if (item.kind === 'video') {
-      const v = this._videos.get(item.id);
+      const key = this._keyFor(seg);
+      const v = this._videos.get(key);
       if (!v || v.mediaId !== item.mediaId) return this.store.getMedia(item.mediaId) ? PENDING : null;
       if (v.error) return null;
+      const still = this._stillFor(v, seg, this._drawTime);
+      if (still) return still;
       return v.el; // renderer keeps black while it has no frame yet
     }
     if (item.kind === 'image') {
@@ -788,16 +923,15 @@ export class Player extends EventTarget {
   // ---------------------------------------------------------------------------
   // Clock
 
-  _audioNow(forExport = !!this._output) {
+  /**
+   * Context time of the sound being heard now. Export follows it too: the recorded sound
+   * reaches MediaRecorder about as late as it reaches the speakers, so pictures drawn on this
+   * clock line up with it in the saved file just as they do in the preview.
+   */
+  _audioNow() {
     const a = this.audio;
     if (!a) return 0;
-    if (forExport) return typeof a.renderTime === 'function' ? a.renderTime() : a.context.currentTime;
     return typeof a.outputTime === 'function' ? a.outputTime() : a.context.currentTime;
-  }
-
-  _clockFor(forExport) {
-    if (this._mode === 'audio') return this._anchorTime + (this._audioNow(forExport) - this._anchorCtx);
-    return this._anchorTime + (now() - this._anchorPerf) / 1000;
   }
 
   _clock() {
@@ -844,7 +978,7 @@ export class Player extends EventTarget {
     const a = this.audio;
     if (a && typeof a.start === 'function') {
       this._audioOpts.at = undefined;
-      try { at = a.start(this.store.project, this.store.timeline, t, this._audioOpts); } catch (err) { warnOnce('audio start', err); at = null; }
+      try { at = a.start(this._viewProject(), this._viewTl(), t, this._audioOpts); } catch (err) { warnOnce('audio start', err); at = null; }
     }
     const ctx = a ? a.contextIfCreated : null;
     if (at != null && Number.isFinite(at) && ctx && ctx.state === 'running') {
@@ -872,8 +1006,8 @@ export class Player extends EventTarget {
     if (this.audio) { try { this.audio.stop(); } catch (_) { /* ignore */ } }
     const n = this._collect(t);
     for (let i = 0; i < n; i++) {
-      const v = this._videos.get(this._act[i].item.id);
-      if (v) v.forceSeek = true;
+      const v = this._videos.get(this._keyFor(this._act[i]));
+      if (v) { v.forceSeek = true; this._dropStill(v); } // a still of where playback was is stale now
     }
     if (!quiet) { this._startClock(t); return; }
     this._mode = 'perf';
@@ -889,6 +1023,11 @@ export class Player extends EventTarget {
   }
 
   _finish(dur) {
+    // The last frame: drawn now if every source is on a frame that belongs to the movie
+    // (checked while still 'playing'), else settled by a paused redraw (exact frame).
+    this._collect(dur);
+    let ready = true;
+    try { ready = this._sourcesReady(); } catch (_) { ready = true; }
     this._playing = false;
     this._clockRunning = false;
     this._playToken++;
@@ -896,15 +1035,14 @@ export class Player extends EventTarget {
     this._clearResync();
     this._clearSeekState();
     if (this.audio) { try { this.audio.stop(); } catch (_) { /* ignore */ } }
-    for (const v of this._pool) {
-      if (!v.el.paused) { try { v.el.pause(); } catch (_) { /* ignore */ } }
-    }
+    this._parkAll();
     this._time = dur;
     this._collect(dur);
-    try { this._draw(dur); } catch (err) { warnOnce('draw', err); }
+    if (ready) { try { this._draw(dur); } catch (err) { warnOnce('draw', err); } }
     this._emitTime(dur);
     this._emit('pause');
     this._emit('ended');
+    this._invalidate(false);
   }
 
   _loopNext() {
@@ -956,7 +1094,7 @@ export class Player extends EventTarget {
       this._syncVideos(t, pn);
       if (pn - this._lastPrefetch > 200) {
         this._lastPrefetch = pn;
-        this._prefetch(t, pn);
+        this._prefetch(t);
       }
       if (this._sourcesReady()) {
         this._holdSince = 0;
@@ -988,7 +1126,7 @@ export class Player extends EventTarget {
   }
 
   _signature() {
-    const p = this.store.project, tl = this.store.timeline;
+    const p = this._viewProject(), tl = this._viewTl();
     const parts = [p.emphasize || '', p.duckMusic ? 1 : 0];
     for (const s of tl.segments) {
       const it = s.item;
@@ -1045,7 +1183,7 @@ export class Player extends EventTarget {
     if (tFrom < 0) tFrom = 0;
     this._audioOpts.at = at;
     let res = null;
-    try { res = a.start(this.store.project, this.store.timeline, tFrom, this._audioOpts); } catch (err) { warnOnce('audio start', err); }
+    try { res = a.start(this._viewProject(), this._viewTl(), tFrom, this._audioOpts); } catch (err) { warnOnce('audio start', err); }
     this._audioOpts.at = undefined;
     if (res != null && Number.isFinite(res)) {
       this._anchorTime = tFrom;
@@ -1057,7 +1195,7 @@ export class Player extends EventTarget {
   // Timeline helpers
 
   _collect(t) {
-    const segs = this.store.timeline.segments;
+    const segs = this._viewTl().segments;
     const act = this._act;
     let n = 0;
     act[0] = null; act[1] = null;
@@ -1083,8 +1221,30 @@ export class Player extends EventTarget {
   }
 
   _isActive(v) {
-    for (let i = 0; i < this._actN; i++) if (this._act[i] && this._act[i].item.id === v.id) return true;
+    for (let i = 0; i < this._actN; i++) if (this._act[i] && this._keyFor(this._act[i]) === v.id) return true;
     return false;
+  }
+
+  /**
+   * Key of the pooled <video> that plays a video segment: the item's own id, or — for a piece
+   * that continues the previous one (a split) — the key of that piece's element.
+   */
+  _keyFor(seg) {
+    const tl = this._viewTl();
+    if (this._chainTl !== tl) {
+      this._chainTl = tl;
+      const map = this._chain;
+      map.clear();
+      let prev = null, prevKey = '';
+      for (const s of tl.segments) {
+        if (s.item.kind !== 'video' || !(s.duration > 0)) { prev = null; continue; }
+        const key = continues(prev, s) ? prevKey : s.item.id;
+        map.set(s.item.id, key);
+        prev = s;
+        prevKey = key;
+      }
+    }
+    return this._chain.get(seg.item.id) || seg.item.id;
   }
 
   /** Ensure every source needed at t exists and is positioned. Returns true when all are drawable. */
@@ -1096,10 +1256,10 @@ export class Player extends EventTarget {
       const seg = this._act[i];
       const item = seg.item;
       if (item.kind === 'video') {
-        const v = this._ensureVideo(item);
+        const v = this._ensureVideo(seg);
         if (!v || v.error) continue;
         v.used = pn;
-        const want = sourceTimeAt(seg, t);
+        const want = frameTarget(seg, t);
         const el = v.el;
         if (el.readyState < 1) { v.target = want; ready = false; continue; }
         if (el.seeking) { v.target = want; ready = false; continue; }
@@ -1122,12 +1282,24 @@ export class Player extends EventTarget {
     for (let i = 0; i < this._actN; i++) {
       const item = this._act[i].item;
       if (item.kind === 'video') {
-        const v = this._videos.get(item.id);
+        const seg = this._act[i];
+        const key = this._keyFor(seg);
+        const v = this._videos.get(key);
         if (!v) {
           if (item.mediaId && this.store.getMedia(item.mediaId)) return false;
           continue;
         }
+        const first = this._playing && !v.error && key === item.id;
+        if (this._stillFor(v, seg, this._time)) continue; // the still stands in
         if (!this._videoReady(v)) return false;
+        // A running element whose picture hasn't reached the clip's first frame yet would show
+        // a frame from before the in-point: keep the previous picture a moment. (Within a
+        // split, the frames before the joint are the previous piece's: fine.)
+        if (first && !v.el.paused && !this._livePast(v, seg)) return false;
+        // Likewise at its end: a running element (they tend to hand out the frame after the
+        // current one) must not show a frame from past the out-point, unless the next piece of
+        // a split plays on from there.
+        if (this._playing && !v.error && !v.el.paused && this._pastOut(v, seg)) return false;
       } else if (item.kind === 'image') {
         if (!item.mediaId) continue;
         const e = this._images.get(item.mediaId);
@@ -1144,42 +1316,275 @@ export class Player extends EventTarget {
         if (token !== this._playToken || this._clockRunning || !this._playing || now() > deadline) { resolve(); return; }
         let ok = true;
         try { ok = this._prepareAt(this._time, 0.15); } catch (_) { ok = true; }
+        // Don't start the clock while the sound of the first moments is still decoding (it
+        // would join late, its beginning lost). Bounded by the deadline like the videos.
+        if (!this._soundReady(this._time)) ok = false;
         if (ok) resolve(); else setTimeout(check, 25);
       };
       check();
     });
   }
 
-  _prefetch(t, pn) {
-    const segs = this.store.timeline.segments;
+  _soundReady(t) {
+    const a = this.audio;
+    if (!a || typeof a.soundReadyAt !== 'function') return true;
+    try {
+      return a.soundReadyAt(this._viewProject(), this._viewTl(), t, { horizon: 1, getMedia: this._getMedia }) !== false;
+    } catch (_) { return true; }
+  }
+
+  _prefetch(t) {
+    const segs = this._viewTl().segments;
     for (let i = 0; i < segs.length; i++) {
       const s = segs[i];
       if (s.start <= t || !(s.duration > 0)) continue;
-      const ahead = s.start - t;
-      if (ahead > IMAGE_AHEAD) break;
+      if (s.start - t > IMAGE_AHEAD) break;
       const item = s.item;
       if (item.kind === 'image') {
         const media = item.mediaId ? this.store.getMedia(item.mediaId) : null;
         if (media) this._ensureImage(media);
-      } else if (item.kind === 'video' && ahead <= PREROLL) {
-        const v = this._ensureVideo(item);
-        if (!v || v.error) continue;
-        v.used = pn;
-        const el = v.el;
-        if (!el.paused || v.blessing) continue;
-        const want = sourceTimeAt(s, s.start);
-        if (el.readyState < 1) v.target = want;
-        else if (!el.seeking && Math.abs(el.currentTime - want) > 0.05) this._seekVideo(v, want);
       }
     }
+  }
+
+  /**
+   * How the element of an upcoming segment is started early: it plays `run` timeline seconds
+   * of the source before the in-point (when the source has them), from source time `from`.
+   */
+  _runup(seg) {
+    const speed = speedOf(seg.item);
+    const sIn = +seg.sourceIn || 0;
+    // Not before the previous segment starts: with very short clips, no more than two
+    // elements decode at a time.
+    const prev = this._viewTl().segments[seg.index - 1];
+    const room = prev ? Math.max(0, seg.start - prev.start) : Infinity;
+    const run = Math.max(0, Math.min(PRESTART_RUNUP, sIn / speed, room));
+    return { run, from: run > 0 ? sIn - run * speed : frameTarget(seg, seg.start) };
+  }
+
+  /**
+   * Get the <video> of each clip that is about to begin (within PREROLL) ready for its cut:
+   *  1. grab its in-point frame as a still (shown at the cut until the running element's
+   *     picture has reached the in-point, so no frame from before it can ever show),
+   *  2. park it where its run-up starts,
+   *  3. start it early, so it is already running in step with the clock at the cut: after
+   *     play() an element takes a while to get its frames moving (Chrome even jumps ahead and
+   *     stalls), which would otherwise show as a frozen first frame and a late picture.
+   */
+  _preroll(t, pn, stamp) {
+    const segs = this._viewTl().segments;
+    const lat = this._startLat;
+    for (let i = 0; i < segs.length; i++) {
+      const s = segs[i];
+      if (!(s.duration > 0) || s.start <= t) continue;
+      if (s.start - t > PREROLL) break;
+      if (s.item.kind !== 'video') continue;
+      if (this._keyFor(s) !== s.item.id) continue; // a later piece of a split: its element is its first piece's
+      const v = this._ensureVideo(s);
+      if (!v || v.error || v.released || v.stamp === stamp) continue; // missing, or on screen right now
+      v.used = pn;
+      const el = v.el;
+      const speed = speedOf(s.item);
+      const sIn = +s.sourceIn || 0;
+      if (v.manual || speed > MAX_RATE) {
+        // Can't run on its own: just show the first frame at the cut.
+        if (el.readyState < 1) v.target = frameTarget(s, s.start);
+        else if (el.paused && !el.seeking && Math.abs(el.currentTime - frameTarget(s, s.start)) > 1e-3) this._seekVideo(v, frameTarget(s, s.start));
+        continue;
+      }
+      const rate = clamp(speed, MIN_RATE, MAX_RATE);
+      const want = sIn + (t - s.start) * speed; // where it belongs now (before sIn: run-up)
+      if (!el.paused && !v.blessing) {
+        if (v.preFor !== s.item.id) continue; // running for something else: gets parked below
+        v.stamp = stamp; // keep it running
+        if (!el.seeking) this._follow(v, el.currentTime - want, rate, speed, pn, want, true);
+        touchFrame(el);
+        continue;
+      }
+      if (el.seeking || v.blessing || v.playReq) continue;
+      if (el.readyState < 1) { v.target = frameTarget(s, s.start); continue; }
+      const { run, from } = this._runup(s);
+      const stillKey = stillKeyOf(s);
+      if (run > 0 && v.stillFor !== stillKey) {
+        // 1. the in-point frame
+        const at = frameTarget(s, s.start);
+        if (Math.abs(el.currentTime - at) > 1e-3) this._seekVideo(v, at);
+        else if (el.readyState >= 2) this._grabStill(v, stillKey, s, sourceTimeAt(s, s.start), s.start + FRAME_STEP * 0.999);
+        continue;
+      }
+      const tGo = s.start - run - lat + DRAW_AHEAD;
+      if (t + FRAME_STEP / 2 < tGo) {
+        // 2. park
+        if (Math.abs(el.currentTime - from) > 0.004) this._seekVideo(v, from);
+        continue;
+      }
+      // 3. go. It should be at `at` when its frames start moving: from its parking spot if
+      // that is close enough, else after a seek that lands there (when there is time for one).
+      if (el.readyState < 2) continue;
+      const at = sIn + (t + lat - DRAW_AHEAD - s.start) * speed;
+      if (Math.abs(el.currentTime - at) > 0.03 * speed) {
+        const lead = lat + Math.min(0.3, v.seekCost / 1000);
+        const to = sIn + (t + lead - DRAW_AHEAD - s.start) * speed;
+        if (to >= 0 && to < from + 1e-3 && s.start - t > lead + 0.03) this._seekVideo(v, to);
+        continue; // otherwise it starts when its segment does
+      }
+      if (Math.abs(el.playbackRate - rate) > 1e-3) this._setRate(v, rate);
+      v.trim = 0;
+      v.stamp = stamp;
+      v.preFor = s.item.id;
+      this._playEl(v, pn);
+    }
+  }
+
+  /**
+   * Copy the element's current frame (source time `src`) into its still canvas, to be shown
+   * for segment `seg` until timeline time `until` and until the running element has reached
+   * that frame (see _stillFor).
+   */
+  _grabStill(v, key, seg, src, until) {
+    const el = v.el;
+    const w = el.videoWidth, h = el.videoHeight;
+    if (!(w > 0 && h > 0) || typeof document === 'undefined') return false;
+    const k = Math.min(1, (this._coarse ? 1280 : 1920) / Math.max(w, h));
+    const c = v.still || document.createElement('canvas');
+    const cw = Math.max(1, Math.round(w * k)), ch = Math.max(1, Math.round(h * k));
+    if (c.width !== cw) c.width = cw;
+    if (c.height !== ch) c.height = ch;
+    let ok = false;
+    try {
+      const cx = c.getContext('2d');
+      if (cx) { cx.drawImage(el, 0, 0, cw, ch); ok = true; }
+    } catch (_) { ok = false; }
+    if (!ok) { this._dropStill(v); v.stillFor = key; return false; } // not drawable: go without one
+    v.still = c;
+    v.stillFor = key;
+    v.stillItem = seg.item.id;
+    v.stillSrc = src;
+    v.stillUntil = until;
+    return true;
+  }
+
+  _dropStill(v) {
+    if (v.still) { v.still.width = 0; v.still.height = 0; }
+    v.still = null;
+    v.stillFor = '';
+    v.stillItem = '';
+  }
+
+  /** The still to draw for a video segment at timeline time t while playing, if any. */
+  _stillFor(v, seg, t) {
+    if (!v.still || !this._playing || v.error || v.stillItem !== seg.item.id) return null;
+    if (v.stillFor !== stillKeyOf(seg) && v.stillFor !== seg.item.id + '@start') { this._dropStill(v); return null; } // trimmed since
+    // Its whole first frame (a running element tends to hand out the frame after the current
+    // one), and until the running element's picture has reached it.
+    if (t < v.stillUntil || !this._livePast(v, seg, v.stillSrc)) return v.still;
+    this._dropStill(v);
+    return null;
+  }
+
+  /**
+   * At play(): keep the frames the paused videos show (positioned exactly by the last paused
+   * draw) as stills for the first frame, so playback — and a saved movie — starts on exactly
+   * that frame even though the elements are started a moment ahead of the clock.
+   */
+  _grabStartStills(t) {
+    const n = this._collect(t);
+    for (let i = 0; i < n; i++) {
+      const seg = this._act[i];
+      if (seg.item.kind !== 'video') continue;
+      const v = this._videos.get(this._keyFor(seg));
+      if (!v || v.error || !v.el.paused || v.el.seeking || v.el.readyState < 2 || v.target != null) continue;
+      const at = frameTarget(seg, t);
+      if (Math.abs(v.el.currentTime - at) > 1e-3) continue;
+      this._grabStill(v, seg.item.id + '@start', seg, sourceTimeAt(seg, t), t + FRAME_STEP * 0.999);
+    }
+  }
+
+  /** True when a playing element's next frame may be from beyond the segment's out-point. */
+  _pastOut(v, seg) {
+    const sOut = +seg.sourceOut;
+    if (!(sOut > (+seg.sourceIn || 0))) return false;
+    const segs = this._viewTl().segments;
+    const next = segs[seg.index + 1];
+    if (next && next.item.kind === 'video' && this._keyFor(next) === this._keyFor(seg)) return false; // a split: plays on
+    const el = v.el;
+    if (el.seeking || el.readyState < 2) return false;
+    const fd = v.frameDur || FRAME_STEP;
+    // drawImage gets the presented frame or the one after it (requestVideoFrameCallback), or
+    // roughly the frame half a frame past currentTime.
+    if (v.shownAt && now() - v.shownAt < 120 && v.shown + fd > sOut - 0.004) return true;
+    return el.currentTime + fd * 0.5 > sOut - 0.002;
+  }
+
+  /**
+   * True once a playing element's picture is at or past the segment's in-point (or it can't be
+   * before it). Under load the decoder trails currentTime; requestVideoFrameCallback (where
+   * available) reports the frame actually presented.
+   */
+  _livePast(v, seg, sIn = +seg.sourceIn || 0) {
+    const el = v.el;
+    if (el.seeking || el.readyState < 2) return false;
+    if (v.from >= sIn - 1e-3) return true; // started (or seeked) at or after the in-point
+    if (el.paused) return false;
+    if (v.shownAt && now() - v.shownAt < 120) return v.shown >= sIn - 0.004;
+    return el.currentTime >= sIn + FRAME_STEP;
+  }
+
+  /**
+   * Keep a playing element in step with the clock. Small drifts are corrected with a fixed
+   * playbackRate offset held until the drift is absorbed (every rate change briefly stalls
+   * Chrome's media clock, so the rate is changed as rarely as possible); big ones re-seek.
+   */
+  _follow(v, drift, rate, speed, pn, want, hidden = false) {
+    const el = v.el;
+    drift += DRAW_AHEAD * speed; // aim a little behind the clock (see DRAW_AHEAD)
+    if (v.forceSeek || Math.abs(drift) > DRIFT_RESEEK * Math.max(1, rate)) {
+      if (v.forceSeek || pn - v.lastSeekAt > 500) {
+        v.forceSeek = false;
+        v.trim = 0;
+        v.goAt = 0;
+        // Land where the clock will be once the seek completes.
+        const ahead = Math.min(0.5, v.seekCost / 1000) * speed;
+        this._seekVideo(v, want + ahead - DRAW_AHEAD * speed);
+        if (Math.abs(el.playbackRate - rate) > 1e-3) this._setRate(v, rate);
+      }
+      return;
+    }
+    if (v.goAt) {
+      // Just started: learn how long play() takes to get frames moving, then judge the drift.
+      if (pn - v.goAt < SETTLE_MS) return;
+      if (Math.abs(el.playbackRate - v.goRate) < 1e-6 && el.currentTime > v.goFrom) {
+        const lat = (pn - v.goAt) / 1000 - (el.currentTime - v.goFrom) / v.goRate;
+        if (lat > -0.05 && lat < 0.5) this._startLat = clamp(this._startLat * 0.7 + lat * 0.3, 0, 0.3);
+      }
+      v.goAt = 0;
+      v.drift = null;
+    }
+    const d = v.drift = v.drift == null ? drift : v.drift + (drift - v.drift) * DRIFT_SMOOTH;
+    let trim = v.trim || 0;
+    if (trim === 0) {
+      // Off screen a speed change can't be seen: catch up faster before the cut.
+      const k = hidden ? TRIM_HIDDEN : Math.abs(d) > TRIM_BIG_AT ? TRIM_BIG : TRIM_SMALL;
+      const soft = hidden ? DRIFT_SOFT_HIDDEN : DRIFT_SOFT;
+      if (d < -soft) trim = k;
+      else if (d > soft) trim = -k;
+    } else if ((trim > 0 && d > -DRIFT_DONE) || (trim < 0 && d < DRIFT_DONE)) {
+      trim = 0;
+    }
+    v.trim = trim;
+    const r = clamp(rate * (1 + trim), MIN_RATE, MAX_RATE);
+    if (Math.abs(el.playbackRate - r) > 1e-3) this._setRate(v, r);
   }
 
   // ---------------------------------------------------------------------------
   // Video pool
 
-  _ensureVideo(item) {
+  /** The pooled <video> for a video segment (created on first use). */
+  _ensureVideo(seg) {
+    const item = seg.item;
     const media = item.mediaId ? this.store.getMedia(item.mediaId) : null;
-    let v = this._videos.get(item.id);
+    const key = this._keyFor(seg);
+    let v = this._videos.get(key);
     if (v && (v.mediaId !== item.mediaId || v.media !== media)) { this._releaseVideo(v); v = null; }
     if (v) return v;
     if (!media || media.type === 'image' || typeof document === 'undefined') return null;
@@ -1205,10 +1610,13 @@ export class Player extends EventTarget {
     el.tabIndex = -1;
     el.style.cssText = 'position:absolute;left:0;top:0;width:1px;height:1px;opacity:0;pointer-events:none;';
     v = {
-      id: item.id, mediaId: item.mediaId, media, el, url, own,
+      id: key, mediaId: item.mediaId, media, el, url, own,
       error: false, released: false, target: null, used: now(), stamp: 0,
       playReq: false, manual: false, blessing: false, warming: false, warmed: false,
       forceSeek: false, lastSeekAt: 0, seekStart: 0, seekCost: 120, handlers: null,
+      trim: 0, drift: null, goAt: 0, goFrom: 0, goRate: 1,
+      shown: -1, shownN: 0, shownAt: 0, frameDur: 0, from: 0, preFor: '',
+      still: null, stillFor: '', stillItem: '', stillSrc: 0, stillUntil: 0,
     };
     const h = {
       loadedmetadata: () => this._onVideoMeta(v),
@@ -1220,9 +1628,27 @@ export class Player extends EventTarget {
     };
     v.handlers = h;
     for (const k of Object.keys(h)) el.addEventListener(k, h[k]);
+    if (typeof el.requestVideoFrameCallback === 'function') {
+      // Track which frame is actually on show (and the source frame rate) — see _livePast.
+      const onFrame = (_t, meta) => {
+        if (v.released) return;
+        const mt = meta ? meta.mediaTime : NaN;
+        if (Number.isFinite(mt)) {
+          const dt = mt - v.shown;
+          if (v.shown >= 0 && dt > 0 && dt < 0.2 && meta.presentedFrames === v.shownN + 1) {
+            v.frameDur = v.frameDur ? v.frameDur + (dt - v.frameDur) * 0.2 : dt;
+          }
+          v.shown = mt;
+          v.shownN = meta.presentedFrames;
+          v.shownAt = now();
+        }
+        try { el.requestVideoFrameCallback(onFrame); } catch (_) { /* ignore */ }
+      };
+      try { el.requestVideoFrameCallback(onFrame); } catch (_) { /* ignore */ }
+    }
     el.src = url;
     if (this.mediaHost) this.mediaHost.appendChild(el);
-    this._videos.set(item.id, v);
+    this._videos.set(key, v);
     this._pool.push(v);
     this._trimPool();
     return v;
@@ -1231,6 +1657,7 @@ export class Player extends EventTarget {
   _releaseVideo(v) {
     if (!v || v.released) return;
     v.released = true;
+    this._dropStill(v);
     const el = v.el;
     if (v.handlers) for (const k of Object.keys(v.handlers)) el.removeEventListener(k, v.handlers[k]);
     try { el.pause(); } catch (_) { /* ignore */ }
@@ -1251,13 +1678,17 @@ export class Player extends EventTarget {
   }
 
   _reconcileVideos() {
-    const items = this.store.project.items;
+    if (!this._pool.length) return;
+    // Keep an element while some video segment still plays through it (same clip, same file).
+    const keep = new Set();
+    for (const s of this._viewTl().segments) {
+      const it = s.item;
+      if (it.kind !== 'video' || !it.mediaId) continue;
+      const v = this._videos.get(this._keyFor(s));
+      if (v && v.mediaId === it.mediaId && v.media === this.store.getMedia(it.mediaId)) keep.add(v);
+    }
     for (let i = this._pool.length - 1; i >= 0; i--) {
-      const v = this._pool[i];
-      let it = null;
-      for (let j = 0; j < items.length; j++) if (items[j].id === v.id) { it = items[j]; break; }
-      const media = it && it.mediaId ? this.store.getMedia(it.mediaId) : null;
-      if (!it || it.kind !== 'video' || it.mediaId !== v.mediaId || media !== v.media) this._releaseVideo(v);
+      if (!keep.has(this._pool[i])) this._releaseVideo(this._pool[i]);
     }
   }
 
@@ -1270,6 +1701,10 @@ export class Player extends EventTarget {
   _seekVideo(v, time) {
     if (v.error || v.released) return;
     const el = v.el;
+    v.goAt = 0; // a seek spoils the start-latency measurement …
+    v.drift = null; // … and the drift history …
+    v.shownAt = 0; // … and what is on show
+    v.from = Math.max(0, time);
     if (el.readyState < 1) { v.target = time; return; }
     const d = el.duration;
     if (Number.isFinite(d) && d > 0 && time > d - 0.01) time = Math.max(0, d - 0.01);
@@ -1353,16 +1788,17 @@ export class Player extends EventTarget {
 
   /** Inside the play() gesture: start the first videos so iOS low-power mode lets them play later. */
   _bless(t, token) {
-    const segs = this.store.timeline.segments;
+    const segs = this._viewTl().segments;
     let count = 0;
     for (let i = 0; i < segs.length && count < 3; i++) {
       const s = segs[i];
       if (!(s.duration > 0) || s.end <= t || s.item.kind !== 'video') continue;
       if (s.start > t + 5) break;
-      const v = this._ensureVideo(s.item);
+      const v = this._ensureVideo(s);
       if (!v || v.error || v.manual) continue;
+      if (!v.el.paused || v.blessing) continue; // already running (another piece of the same split)
       count++;
-      const want = sourceTimeAt(s, Math.max(t, s.start));
+      const want = frameTarget(s, Math.max(t, s.start));
       const el = v.el;
       if (el.readyState < 1) v.target = want;
       else if (!el.seeking && Math.abs(el.currentTime - want) > 0.05) this._seekVideo(v, want);
@@ -1393,9 +1829,13 @@ export class Player extends EventTarget {
     try { v.el.playbackRate = r; } catch (_) { v.manual = true; }
   }
 
-  _playEl(v) {
+  _playEl(v, pn = now()) {
     if (v.playReq) return;
     v.playReq = true;
+    v.goAt = v.el.seeking ? 0 : pn; // measure the start latency (not a seek's)
+    v.goFrom = v.el.currentTime;
+    if (!v.el.seeking) v.from = v.el.currentTime;
+    v.goRate = v.el.playbackRate || 1;
     let p = null;
     try { p = v.el.play(); } catch (_) { p = null; }
     if (p && typeof p.then === 'function') {
@@ -1409,59 +1849,56 @@ export class Player extends EventTarget {
     }
   }
 
+  /** Seconds until the clock starts moving (the sound is scheduled a moment ahead). */
+  _timeToStart() {
+    if (this._mode !== 'audio' || !this.audio || this._lastClock > this._anchorTime + 1e-4) return 0;
+    try { return this._anchorCtx - this._audioNow(); } catch (_) { return 0; }
+  }
+
   _syncVideos(t, pn) {
     const stamp = ++this._syncStamp;
-    const started = t > this._anchorTime + 1e-4; // audio has started (clock moved)
+    // Start paused videos once the clock moves, or a moment before so that their frames start
+    // moving together with it (play() takes a while to get going).
+    const started = t > this._anchorTime + 1e-4 || this._timeToStart() <= this._startLat - DRAW_AHEAD;
     for (let i = 0; i < this._actN; i++) {
       const seg = this._act[i];
       const item = seg.item;
       if (item.kind !== 'video') continue;
-      const v = this._ensureVideo(item);
-      if (!v || v.error) continue;
+      const v = this._ensureVideo(seg);
+      if (!v || v.error || v.stamp === stamp) continue;
       v.used = pn;
       v.stamp = stamp;
       const el = v.el;
       const want = sourceTimeAt(seg, t);
-      if (el.readyState < 1) { v.target = want; continue; }
-      const speed = item.speed > 0 ? item.speed : 1;
+      if (el.readyState < 1) { v.target = frameTarget(seg, t); continue; }
+      const speed = speedOf(item);
       const rate = clamp(speed, MIN_RATE, MAX_RATE);
       if (v.manual || speed > MAX_RATE) {
+        // Can't play (autoplay refused, or faster than the element allows): follow by seeking.
         if (!el.paused && !v.blessing) { try { el.pause(); } catch (_) { /* ignore */ } }
-        if (!el.seeking && Math.abs(el.currentTime - want) > FRAME_STEP) this._seekVideo(v, want);
-        else if (el.seeking) v.target = want;
+        if (!el.seeking && Math.abs(el.currentTime - want) > FRAME_STEP) this._seekVideo(v, frameTarget(seg, t));
+        else if (el.seeking) v.target = frameTarget(seg, t);
         continue;
       }
       if (el.paused || v.blessing) {
-        if (v.forceSeek || Math.abs(el.currentTime - want) > 0.08) {
+        // Parked before the in-point (a run-up that didn't start) or elsewhere: go to the frame.
+        if (v.forceSeek || el.currentTime < (+seg.sourceIn || 0) - 1e-3 || Math.abs(el.currentTime - want) > 0.08) {
           v.forceSeek = false;
-          this._seekVideo(v, want);
+          this._seekVideo(v, frameTarget(seg, t));
         }
+        v.trim = 0;
         if (Math.abs(el.playbackRate - rate) > 1e-3) this._setRate(v, rate);
         // play() on an ended element would restart it from 0: just hold its last frame.
         const atEnd = el.ended || (seg.sourceOut > 0 && want >= seg.sourceOut - 0.02)
           || (Number.isFinite(el.duration) && want >= el.duration - 0.02);
-        if (started && el.paused && !v.blessing && !atEnd) this._playEl(v);
+        if (started && el.paused && !v.blessing && !atEnd) this._playEl(v, pn);
         continue;
       }
       if (el.seeking) continue;
-      const drift = el.currentTime - want; // > 0: video ahead of the clock
-      if (v.forceSeek || Math.abs(drift) > DRIFT_RESEEK * Math.max(1, rate)) {
-        if (v.forceSeek || pn - v.lastSeekAt > 500) {
-          v.forceSeek = false;
-          // Land where the clock will be once the seek completes.
-          const ahead = Math.min(0.5, v.seekCost / 1000) * speed;
-          this._seekVideo(v, want + ahead);
-          if (Math.abs(el.playbackRate - rate) > 1e-3) this._setRate(v, rate);
-        }
-      } else if (Math.abs(drift) > DRIFT_SOFT) {
-        const k = 1 - clamp(drift / Math.max(rate, 0.25), -0.12, 0.12);
-        const r = clamp(rate * k, MIN_RATE, MAX_RATE);
-        if (Math.abs(el.playbackRate - r) > 0.004) this._setRate(v, r);
-      } else if (Math.abs(el.playbackRate - rate) > 0.004) {
-        this._setRate(v, rate);
-      }
+      this._follow(v, el.currentTime - want, rate, speed, pn, want);
     }
-    // Park everything that is not on screen.
+    this._preroll(t, pn, stamp);
+    // Park everything that is not on screen (or about to be).
     for (let i = 0; i < this._pool.length; i++) {
       const v = this._pool[i];
       if (v.stamp !== stamp && !v.blessing && !v.warming && !v.el.paused) {

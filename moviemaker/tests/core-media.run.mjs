@@ -1,6 +1,6 @@
 // Playwright runner for tests/core-media.html.
 // Usage: NODE_PATH=/opt/node22/lib/node_modules node tests/core-media.run.mjs
-// (starts http-server on port 8101 serving the moviemaker directory)
+// (starts http-server on port $CORE_PORT, default 8101, serving the moviemaker directory)
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -11,7 +11,7 @@ const require = createRequire(import.meta.url);
 const { chromium } = require('playwright');
 const here = path.dirname(fileURLToPath(import.meta.url));
 const root = path.resolve(here, '..');
-const PORT = 8101;
+const PORT = Number(process.env.CORE_PORT) || 8101;
 
 const server = spawn('npx', ['http-server', root, '-p', String(PORT), '-c-1', '--silent'], { stdio: 'ignore', detached: true });
 const stop = () => { try { process.kill(-server.pid); } catch (_) { /* ignore */ } };

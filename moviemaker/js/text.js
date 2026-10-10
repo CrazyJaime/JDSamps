@@ -5,7 +5,8 @@
 //   measureTextBox(ctx, { text, style, w, h }) -> { x, y, width, height }
 //
 // Font size = style.size % of the frame height. Lines wrap to the frame width minus a
-// 5% safe margin on each side. Every TEXT_EFFECTS id animates an "in" phase at the start
+// 5% safe margin on each side (or to style.w × the frame width). The block sits by
+// align / valign, or is centred at (style.x, style.y) × the frame when both are set. Every TEXT_EFFECTS id animates an "in" phase at the start
 // and an "out" phase at the end of the item; 'scroll' (credits) and 'ticker' move over the
 // whole duration.
 
@@ -158,20 +159,46 @@ function layoutText(ctx, text, font, maxW) {
 
 // --- geometry -----------------------------------------------------------------------
 
-const _g = { px: 0, lh: 0, blockW: 0, blockH: 0, left: 0, top: 0, af: 0.5, padX: 0, padY: 0, layout: null, font: '' };
+const _g = { px: 0, lh: 0, blockW: 0, blockH: 0, left: 0, top: 0, af: 0.5, padX: 0, padY: 0, layout: null, font: '', free: false, cx: 0 };
 
+/** A finite number in lo..hi from a style key, else NaN (absent / invalid → default placement). */
+function frac(style, key, lo, hi) {
+  const v = style ? style[key] : undefined;
+  if (v === undefined || v === null || v === '' || typeof v === 'boolean') return NaN;
+  const n = +v;
+  return Number.isFinite(n) && n >= lo && n <= hi ? n : NaN;
+}
+
+/** Place a span of size `size` so that its centre is at c, kept inside 0..total when it fits. */
+function placeCentered(c, size, total) {
+  if (size >= total) return (total - size) / 2;
+  return Math.min(Math.max(c - size / 2, 0), total - size);
+}
+
+/**
+ * Text block geometry. Placement: style.x / style.y (block centre as a fraction 0..1 of the frame,
+ * set by dragging the text on the preview) when both are present, else align / valign with a
+ * safe margin. Wrap width: style.w (fraction 0.05..1 of the frame width) when present, else the
+ * frame width minus the margins. Lines are aligned inside the block by `align` either way.
+ */
 function geometry(ctx, text, style, w, h, noWrap) {
   const px = fontPx(style, h);
   const font = fontString(style, px);
   const mx = w * MARGIN_X, my = h * MARGIN_Y;
-  const maxW = noWrap ? 1e7 : Math.max(px, w - 2 * mx);
+  const fw = frac(style, 'w', 0.05, 1);
+  const maxW = noWrap ? 1e7 : Math.max(px, Number.isNaN(fw) ? w - 2 * mx : fw * w);
   const L = layoutText(ctx, text, font, maxW);
   const lh = px * LINE_HEIGHT;
   const blockW = L.blockW, blockH = L.lines.length * lh;
   const align = sv(style, 'align'), valign = sv(style, 'valign');
   const af = align === 'left' ? 0 : align === 'right' ? 1 : 0.5;
-  const left = align === 'left' ? mx : align === 'right' ? w - mx - blockW : (w - blockW) / 2;
-  const top = valign === 'top' ? my : valign === 'bottom' ? h - my - blockH : (h - blockH) / 2;
+  const fx = frac(style, 'x', 0, 1), fy = frac(style, 'y', 0, 1);
+  const free = !Number.isNaN(fx) && !Number.isNaN(fy);
+  const left = free ? placeCentered(fx * w, blockW, w)
+    : align === 'left' ? mx : align === 'right' ? w - mx - blockW : (w - blockW) / 2;
+  const top = free ? placeCentered(fy * h, blockH, h)
+    : valign === 'top' ? my : valign === 'bottom' ? h - my - blockH : (h - blockH) / 2;
+  _g.free = free; _g.cx = free ? fx * w : 0;
   _g.px = px; _g.lh = lh; _g.blockW = blockW; _g.blockH = blockH;
   _g.left = left; _g.top = top; _g.af = af; _g.layout = L; _g.font = font;
   _g.padX = px * 0.35; _g.padY = px * 0.15;
@@ -408,7 +435,8 @@ export function measureTextBox(ctx, args) {
     let left = g.left, bw = g.blockW;
     if (empty) {
       bw = Math.max(bw, w * 0.3);
-      left = g.af === 0 ? w * MARGIN_X : g.af === 1 ? w - w * MARGIN_X - bw : (w - bw) / 2;
+      left = g.free ? placeCentered(g.cx, bw, w)
+        : g.af === 0 ? w * MARGIN_X : g.af === 1 ? w - w * MARGIN_X - bw : (w - bw) / 2;
     }
     out.x = left - g.padX;
     out.y = g.top - g.padY;

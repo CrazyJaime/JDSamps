@@ -1,6 +1,7 @@
 // Headless Chromium run of tests/engine.html (C-engine: audio.js, player.js, exporter.js).
 // Usage: NODE_PATH=/opt/node22/lib/node_modules node tests/engine.test.mjs [outDir]
 //        ENGINE_PROFILE=desktop|phone|fallbacks runs a single profile.
+//        PORT=<n> serves on another port (default 8103); BASE_URL=<url> uses a running server.
 // Waits (up to 20 min) for the modules the engine depends on, serves the project on
 // port 8103, runs both test phases (phase 2 from a real click so audio unlocks the way it
 // does for users), then checks the exported movies with ffprobe/ffmpeg.
@@ -17,8 +18,8 @@ const { chromium } = require('playwright');
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const outDir = path.resolve(process.argv[2] || path.join(os.tmpdir(), 'movie-maker-engine-test'));
 fs.mkdirSync(outDir, { recursive: true });
-const PORT = 8103;
-const base = `http://127.0.0.1:${PORT}`;
+const PORT = +(process.env.PORT || 8103);
+const base = (process.env.BASE_URL || `http://127.0.0.1:${PORT}`).replace(/\/$/, '');
 
 // 1) Wait for the modules written by the other engineers.
 const needed = ['js/model.js', 'js/store.js', 'js/renderer.js', 'js/transitions.js', 'js/effects.js', 'js/text.js'];
@@ -41,6 +42,37 @@ if (!fs.existsSync(syncFixture)) {
     '-map', '[v]', '-map', '[a]', '-c:v', 'libvpx', '-b:v', '300k', '-c:a', 'libopus', '-b:a', '64k', syncFixture]);
 }
 
+// Frame-number fixture: 30 fps, the frame number as 12 vertical bars in the top half (bit k =
+// bar k from the left), a 440 Hz tone throughout. Exported frames can be mapped back to source frames.
+const barsFixture = path.join(root, 'tests', 'engine-bars.webm');
+if (!fs.existsSync(barsFixture)) {
+  execFileSync('ffmpeg', ['-v', 'error', '-y', '-f', 'lavfi', '-i', 'color=c=black:s=320x180:r=30:d=6',
+    '-f', 'lavfi', '-i', 'sine=f=440:sample_rate=48000:d=6', '-filter_complex',
+    "[0:v]format=gray,geq=lum='if(lt(Y,H/2), if(mod(floor(N/pow(2,floor(X*12/W))),2),235,16), 16)',format=yuv420p[v];"
+    + '[1:a]volume=volume=2[a]',
+    '-map', '[v]', '-map', '[a]', '-c:v', 'libvpx', '-b:v', '600k', '-g', '15', '-c:a', 'libopus', '-b:a', '64k', barsFixture]);
+}
+
+/** Source frame numbers (and timestamps) of the frames of a file made from engine-bars.webm. */
+function barFrames(file) {
+  const W = 96, H = 54;
+  const r = spawnSync('ffmpeg', ['-v', 'info', '-i', file, '-vf', `scale=${W}:${H}:flags=area,format=gray,showinfo`,
+    '-fps_mode', 'passthrough', '-an', '-f', 'rawvideo', '-'], { maxBuffer: 1 << 30 });
+  const pts = [...r.stderr.toString().matchAll(/pts_time:\s*([-\d.]+)/g)].map((m) => parseFloat(m[1]));
+  const out = [];
+  for (let i = 0; i < Math.floor(r.stdout.length / (W * H)); i++) {
+    const g = r.stdout.subarray(i * W * H, (i + 1) * W * H);
+    let code = 0, valid = true;
+    for (let k = 0; k < 12; k++) {
+      const v = g[Math.floor(H / 4) * W + Math.floor(((k + 0.5) * W) / 12)];
+      if (v > 100 && v < 150) valid = false; // mid-grey: a blend (transition) or a damaged frame
+      if (v >= 128) code |= 1 << k;
+    }
+    out.push({ t: pts[i], code, valid });
+  }
+  return out;
+}
+
 /** Times of flashes (video) and beeps (audio) in a file, using the streams' own timestamps. */
 function syncEvents(file) {
   const v = spawnSync('ffprobe', ['-v', 'error', '-f', 'lavfi', '-i', `movie=${file},signalstats`, '-show_entries',
@@ -59,8 +91,9 @@ function syncEvents(file) {
 }
 
 // 2) Serve.
-const server = spawn('npx', ['http-server', root, '-p', String(PORT), '-c-1', '--silent'], { stdio: 'ignore' });
-const stopServer = () => { try { server.kill('SIGTERM'); } catch (_) { /* ignore */ } };
+const server = process.env.BASE_URL ? null
+  : spawn('npx', ['http-server', root, '-p', String(PORT), '-c-1', '--silent'], { stdio: 'ignore' });
+const stopServer = () => { try { if (server) server.kill('SIGTERM'); } catch (_) { /* ignore */ } };
 process.on('exit', stopServer);
 for (let i = 0; i < 60; i++) {
   try { const r = await fetch(base + '/tests/engine.html'); if (r.ok) break; } catch (_) { /* not up yet */ }
@@ -104,6 +137,7 @@ try {
     // Inspect exported files.
     const exportsList = await page.evaluate(() => window.__exports.map((e) => ({
       name: e.name, b64: e.b64, expect: e.expect, audio: e.audio !== false, sync: !!e.sync, size: e.size || [426, 240],
+      bars: e.bars || null, soundFrom: Number.isFinite(e.soundFrom) ? e.soundFrom : null,
     })));
     for (const ex of exportsList) {
       const file = path.join(outDir, profile.name + '-' + ex.name);
@@ -138,6 +172,54 @@ try {
         report(`sync ${ex.name}: real-time pacing`, Math.abs(gap - 1.5) < 0.05, `flash gap ${gap.toFixed(3)}s (want 1.5)`);
       }
       if (ex.audio) report(`ffmpeg ${ex.name}: has audible sound`, mean && parseFloat(mean[1]) > -50, mean ? mean[1] + ' dB mean' : 'n/a');
+      if (ex.soundFrom != null) {
+        // The first soundtrack must be heard from its first moment (the export waits for decoding).
+        const head = spawnSync('ffmpeg', ['-v', 'info', '-ss', String(ex.soundFrom), '-i', file, '-t', '0.3', '-vn', '-af', 'volumedetect', '-f', 'null', '-'], { encoding: 'utf8' });
+        const hm = /mean_volume:\s*(-?[\d.]+) dB/.exec(head.stderr || '');
+        report(`ffmpeg ${ex.name}: sound from its very start`, hm && parseFloat(hm[1]) > -40,
+          hm ? `${hm[1]} dB mean in ${ex.soundFrom.toFixed(2)}–${(ex.soundFrom + 0.3).toFixed(2)} s` : 'n/a');
+      }
+      if (ex.bars) {
+        // Clips cut from the frame-number fixture: no frame from outside a clip's trim may show,
+        // each clip starts on its in-point frame, and the pieces of a split play on smoothly.
+        const rows = barFrames(file).filter((r) => r.valid);
+        const leaks = [];
+        const firsts = [];
+        for (const sg of ex.bars.segs) {
+          const inF = Math.round(sg.sIn * 30), outF = Math.round(sg.sOut * 30);
+          const lo = sg.chainedIn ? inF - 1 : inF, hi = sg.chainedOut ? outF : outF - 1;
+          for (const r of rows) {
+            if (r.t > sg.start + 0.05 && r.t < sg.end - 0.05 && (r.code < lo || r.code > hi)) leaks.push(`${r.t.toFixed(3)}:${r.code}∉[${lo},${hi}]`);
+          }
+          if (!sg.chainedIn) {
+            const f = rows.find((r) => r.t >= sg.start - 0.02 && r.code >= inF - 3 && r.code <= outF);
+            firsts.push(`${inF}→${f ? f.code : 'none'}`);
+            // Its in-point frame (or, when a capture tick came late under load, the next one).
+            if (!f || f.code < inF || f.code > inF + 1) leaks.push(`first frame of the clip at ${sg.start.toFixed(2)} s is ${f ? f.code : 'missing'} (in-point ${inF})`);
+          }
+        }
+        report(`bars ${ex.name}: only frames inside each clip's trim, clips start on their in-point`, !leaks.length,
+          leaks.length ? leaks.slice(0, 6).join(' ') : firsts.join(' '));
+        // Repeated/skipped frames within ±120 ms of each split, against the same count around the
+        // middle of the pieces (a 30 fps source recorded at 30 fps aliases a little on its own):
+        // a split may add at most one.
+        const glitches = (times) => {
+          let n = 0;
+          for (const j of times) {
+            for (let i = 1; i < rows.length; i++) {
+              if (Math.abs(rows[i].t - j) > 0.12) continue;
+              const k = rows[i].code - rows[i - 1].code;
+              if (k === 0) n++;
+              if (k > 1) n += k - 1;
+            }
+          }
+          return n;
+        };
+        const atSplits = glitches(ex.bars.splits);
+        const base = glitches(ex.bars.controls) * (ex.bars.splits.length / ex.bars.controls.length);
+        report(`bars ${ex.name}: splits play on smoothly`, atSplits <= Math.ceil(base) + ex.bars.splits.length,
+          `${atSplits} repeated/skipped frames within ±120 ms of ${ex.bars.splits.length} splits (${base.toFixed(1)} expected without a cut)`);
+      }
       const frames = spawnSync('ffprobe', ['-v', 'error', '-count_frames', '-select_streams', 'v:0', '-show_entries', 'stream=nb_read_frames',
         '-of', 'csv=p=0', file], { encoding: 'utf8' });
       const nFrames = parseInt(frames.stdout, 10);

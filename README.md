@@ -71,3 +71,10 @@ messages; the popup is pure UI and only talks to the worker.
   toolbar. WAV files are larger but lossless.
 - Browser audio capture is subject to Chrome's tab-capture rules; the popup must
   be opened (a user gesture) to start a capture.
+
+---
+
+## Also in this repo: Movie Maker (web)
+
+[`moviemaker/`](moviemaker/) is a browser re-creation of Windows Live Movie Maker that also works
+in phone browsers. See [`moviemaker/README.md`](moviemaker/README.md).

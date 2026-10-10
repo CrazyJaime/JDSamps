@@ -72,9 +72,25 @@ export function defaultTextStyle(kind) {
   return { ...base, size: 9 };
 }
 
+/** Optional fraction key: a finite number in lo..hi, else undefined (null / invalid → absent). */
+function optFrac(v, lo, hi) {
+  if (typeof v !== 'number' || !Number.isFinite(v) || v < lo || v > hi) return undefined;
+  return v;
+}
+
 function normalizeStyle(style, kind) {
   const d = defaultTextStyle(kind);
   if (!isObj(style)) return d;
+  const out = normalizeBaseStyle(style, d);
+  // Free placement from dragging on the preview: centre (x, y) and wrap width w, as fractions
+  // of the frame. Absent → align / valign placement and the default wrap width.
+  const x = optFrac(style.x, 0, 1), y = optFrac(style.y, 0, 1), w = optFrac(style.w, 0.05, 1);
+  if (x !== undefined && y !== undefined) { out.x = x; out.y = y; }
+  if (w !== undefined) out.w = w;
+  return out;
+}
+
+function normalizeBaseStyle(style, d) {
   return {
     font: str(style.font, d.font) || d.font,
     size: num(style.size, d.size, 1, 50),
