@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <title>Movie Maker</title>
+  <!-- Original artwork for the Movie Maker web app (fan re-creation): a filmstrip with a play
+       triangle on a glossy blue rounded square. -->
+  <defs>
+    <linearGradient id="mm-bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#63adf2"/>
+      <stop offset="0.55" stop-color="#2f78d1"/>
+      <stop offset="1" stop-color="#1a4f9f"/>
+    </linearGradient>
+    <linearGradient id="mm-gloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff" stop-opacity="0.55"/>
+      <stop offset="1" stop-color="#ffffff" stop-opacity="0.04"/>
+    </linearGradient>
+    <linearGradient id="mm-frame" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#d9eeff"/>
+      <stop offset="1" stop-color="#8cc3f3"/>
+    </linearGradient>
+    <linearGradient id="mm-play" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#ffffff"/>
+      <stop offset="1" stop-color="#e3eefb"/>
+    </linearGradient>
+  </defs>
+  <rect x="0" y="0" width="512" height="512" rx="112" ry="112" fill="url(#mm-bg)"/>
+  <rect x="6" y="6" width="500" height="500" rx="106" ry="106" fill="none" stroke="#ffffff" stroke-opacity="0.35" stroke-width="6"/>
+  <g transform="rotate(-9 256 262)">
+    <rect x="44" y="148" width="424" height="228" rx="20" fill="#1f2d3d"/>
+    <g fill="#eaf3fd">
+      <rect x="66" y="164" width="28" height="22" rx="5"/><rect x="118" y="164" width="28" height="22" rx="5"/>
+      <rect x="170" y="164" width="28" height="22" rx="5"/><rect x="222" y="164" width="28" height="22" rx="5"/>
+      <rect x="274" y="164" width="28" height="22" rx="5"/><rect x="326" y="164" width="28" height="22" rx="5"/>
+      <rect x="378" y="164" width="28" height="22" rx="5"/><rect x="430" y="164" width="28" height="22" rx="5"/>
+      <rect x="66" y="338" width="28" height="22" rx="5"/><rect x="118" y="338" width="28" height="22" rx="5"/>
+      <rect x="170" y="338" width="28" height="22" rx="5"/><rect x="222" y="338" width="28" height="22" rx="5"/>
+      <rect x="274" y="338" width="28" height="22" rx="5"/><rect x="326" y="338" width="28" height="22" rx="5"/>
+      <rect x="378" y="338" width="28" height="22" rx="5"/><rect x="430" y="338" width="28" height="22" rx="5"/>
+    </g>
+    <rect x="62" y="200" width="118" height="124" rx="6" fill="url(#mm-frame)"/>
+    <rect x="196" y="200" width="120" height="124" rx="6" fill="url(#mm-frame)"/>
+    <rect x="332" y="200" width="118" height="124" rx="6" fill="url(#mm-frame)"/>
+    <path d="M62 290 Q100 248 140 280 T180 270 V324 H62 Z" fill="#4fa63a" opacity="0.85"/>
+    <path d="M332 292 Q370 252 410 284 T450 272 V324 H332 Z" fill="#4fa63a" opacity="0.85"/>
+    <circle cx="150" cy="228" r="13" fill="#ffd84a"/>
+  </g>
+  <path d="M0 112 A112 112 0 0 1 112 0 H400 A112 112 0 0 1 512 112 V190 Q256 268 0 214 Z" fill="url(#mm-gloss)" opacity="0.55"/>
+  <g transform="translate(6 10)" opacity="0.28">
+    <path d="M206 168 L352 256 L206 344 Z" fill="#06213f" stroke="#06213f" stroke-width="26" stroke-linejoin="round"/>
+  </g>
+  <path d="M206 168 L352 256 L206 344 Z" fill="url(#mm-play)" stroke="#ffffff" stroke-width="26" stroke-linejoin="round"/>
+  <path d="M222 196 L322 256 L222 316 Z" fill="none" stroke="#2f78d1" stroke-opacity="0.18" stroke-width="6" stroke-linejoin="round"/>
+</svg>

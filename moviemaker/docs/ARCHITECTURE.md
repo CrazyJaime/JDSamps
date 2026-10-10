@@ -86,7 +86,9 @@ Project = {
   items: VisualItem[],       // storyboard order
   texts: TextItem[],         // captions & credits overlays (absolute timeline start)
   music: MusicItem[],        // music & narration (absolute timeline start)
-  createdAt: number, updatedAt: number
+  createdAt: number, updatedAt: number,
+  emphasize?: 'narration'    // optional: "Emphasize narration" — music is ducked to 30% while narration plays
+                             // (set by the `emphasize` command, read by audio.js; kept by normalizeProject)
 }
 VisualItem = {
   id, kind: 'video'|'image'|'title',
@@ -486,3 +488,23 @@ app.storyboard = new Storyboard(document.getElementById('storyboard-pane'), app)
 ```
 So `Preview` must not touch `app.player` / `app.commands` in its constructor — only in `attach()`
 and later event handlers. Every other UI module may use the full `app` in its constructor.
+
+## Integration notes & end-to-end test
+
+- **End-to-end test**: `NODE_PATH=/opt/node22/lib/node_modules node tests/e2e.mjs [--phone|--desktop|--landscape|--profile=a,b] [--no-export]`
+  (starts its own `http-server` unless `BASE_URL` is set; screenshots and exported movies go to `$E2E_OUT`, default
+  `<tmp>/moviemaker-e2e`). It boots the real `index.html` in Chromium as desktop (1366×768), iPhone portrait
+  (390×844, touch, DPR 3) and iPhone landscape (844×390) and drives the UI with real clicks/taps: import through the
+  file chooser, music/title/caption/credits, ribbon galleries, aspect, playback, scrubbing, split, trim tool, drag
+  reorder (touch long-press on phones), undo/redo, AutoMovie, "Save movie › For email" verified with `ffprobe`/`ffmpeg`,
+  and reload-from-IndexedDB. Any console error, page error or failed app request fails the run.
+- **Keyboard (app.js)**: Space plays/pauses after a mouse click or tap anywhere (including storyboard items); only a
+  control reached with **Tab** keeps its own Space behaviour.
+- **Captions follow their clip** for every timeline edit, including the Trim tool's *Save trim* (dialogs.js uses
+  `anchorTexts` / `reanchorTexts` from automovie.js).
+- **Dialogs** toggle `html.mm-modal-open` while a modal or menu is open; on phones the stylesheet then shows toasts at
+  the top so they never cover a bottom sheet's buttons.
+- **Phone storyboard** grows the filmstrip into the pane's free height (up to 96px at medium thumbnail size) and keeps
+  the fixed playhead aligned with it; on desktop, time after the last picture (e.g. end credits) is drawn as a black
+  "Credits" slate in the item track.
+- The service worker precaches every module listed in `sw.js` `SHELL`; bump `VERSION` there whenever shell files change.

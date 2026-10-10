@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Storyboard &amp; preview — real engine</title>
+<link rel="stylesheet" href="../css/moviemaker.css">
+</head>
+<body>
+<script type="module">
+// Integration harness (owner: E): real Store + AudioEngine + Player + media import of the test
+// fixtures, with Preview and Storyboard mounted in the real index.html shell. Commands are a
+// minimal stand-in (the real registry is another module).
+import { Store } from '../js/store.js';
+import { AudioEngine } from '../js/audio.js';
+import { Player } from '../js/player.js';
+import * as media from '../js/media.js';
+import { createVisualItem, createTextItem, createMusicItem } from '../js/model.js';
+import { Preview } from '../js/ui/preview.js';
+import { Storyboard } from '../js/ui/storyboard.js';
+
+const html = await (await fetch('../index.html')).text();
+const doc = new DOMParser().parseFromString(html, 'text/html');
+for (const n of [...doc.body.children]) {
+  if (n.tagName === 'SCRIPT' || n.tagName === 'NOSCRIPT' || n.id === 'boot-splash') continue;
+  document.body.appendChild(document.importNode(n, true));
+}
+const errors = [];
+window.addEventListener('error', (e) => errors.push(String(e.message || e)));
+window.addEventListener('unhandledrejection', (e) => errors.push(String(e.reason && e.reason.message || e.reason)));
+
+const app = {};
+app.store = new Store();
+app.media = media;
+app.audio = new AudioEngine();
+app.dialogs = { toast: (m) => console.log('toast', m) };
+app.preview = new Preview(document.getElementById('preview-pane'), app);
+app.player = new Player({ store: app.store, audio: app.audio, canvas: app.preview.canvas, mediaHost: document.getElementById('media-host') });
+const log = [];
+app.commands = {
+  run(name, arg) {
+    log.push([name, arg]);
+    const s = app.store;
+    if (name === 'togglePlay') return app.player.toggle();
+    if (name === 'prevFrame') return app.player.stepFrame(-1);
+    if (name === 'nextFrame') return app.player.stepFrame(1);
+    if (name === 'moveItem') return s.update((p) => { const f = p.items.findIndex((i) => i.id === arg.id); const [it] = p.items.splice(f, 1); p.items.splice(arg.toIndex, 0, it); }, { label: 'Move' });
+    if (name === 'textEdit' && typeof arg === 'string') { const o = s.selectedItems()[0]; if (o) s.update(() => { o.text = arg; }, { label: 'Edit text' }); }
+    return undefined;
+  },
+  isEnabled: () => true,
+  isChecked: () => false,
+  list: () => ['togglePlay', 'prevFrame', 'nextFrame', 'moveItem', 'textEdit'],
+};
+app.preview.attach();
+app.storyboard = new Storyboard(document.getElementById('storyboard-pane'), app);
+window.app = app;
+
+async function load(name, type) {
+  const r = await fetch(`fixtures/${name}`);
+  const b = await r.blob();
+  return media.importFile(new File([b], name, { type }));
+}
+const [clip, portrait, photo, music] = await Promise.all([
+  load('clip1.webm', 'video/webm'), load('portrait.webm', 'video/webm'), load('photo1.jpg', 'image/jpeg'), load('music.ogg', 'audio/ogg'),
+]);
+for (const m of [clip, portrait, photo, music]) app.store.addMedia(m);
+app.store.update((p) => {
+  p.items.push(
+    createVisualItem('title', { id: 'title-1', text: 'Our Trip', duration: 3 }),
+    createVisualItem('video', { id: 'clip-1', mediaId: clip.id, transition: { type: 'crossfade', duration: 1 } }),
+    createVisualItem('image', { id: 'photo-1', mediaId: photo.id, duration: 4, panZoom: 'zoom-in' }),
+    createVisualItem('video', { id: 'clip-2', mediaId: portrait.id }),
+  );
+  p.texts.push(createTextItem('caption', { id: 'cap-1', text: 'Hello from the beach', start: 4, duration: 3 }));
+  p.music.push(createMusicItem({ id: 'mus-1', mediaId: music.id, start: 1 }));
+}, { label: 'setup' });
+window.T = { app, log, errors, ready: true, ids: { clip: clip.id, music: music.id } };
+</script>
+</body>
+</html>

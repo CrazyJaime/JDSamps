@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light">
+<title>Dialogs test (F)</title>
+<link rel="stylesheet" href="../css/moviemaker.css">
+<style>
+  /* test-only: a stand-in preview canvas and storyboard (E renders the real ones) */
+  #preview-pane .t-canvas { display: block; width: 100%; height: 100%; min-height: 160px; background: #000; }
+  #storyboard-pane .t-sb { padding: 12px; color: #5e7491; font-size: 13px; }
+  #t-buttons { position: fixed; right: 4px; top: 4px; z-index: 5; display: flex; flex-wrap: wrap; gap: 4px; max-width: 360px; opacity: .9; }
+  #t-buttons button { font-size: 11px; }
+  body.t-shots #t-buttons { display: none; }
+</style>
+</head>
+<body>
+<div id="t-buttons"></div>
+<script type="module">
+import { Store } from '../js/store.js';
+import * as persist from '../js/persist.js';
+import * as media from '../js/media.js';
+import { AudioEngine } from '../js/audio.js';
+import { Player } from '../js/player.js';
+import { Exporter } from '../js/exporter.js';
+import { createVisualItem, createTextItem } from '../js/model.js';
+import { Dialogs, getOption, setOption } from '../js/ui/dialogs.js';
+
+// 1) Real shell markup from index.html (minus scripts and the boot splash).
+const html = await (await fetch('../index.html')).text();
+const doc = new DOMParser().parseFromString(html, 'text/html');
+for (const n of [...doc.body.children]) {
+  if (n.tagName === 'SCRIPT' || n.tagName === 'NOSCRIPT' || n.id === 'boot-splash') continue;
+  document.body.appendChild(document.importNode(n, true));
+}
+
+// 2) A stand-in preview canvas + storyboard pane content.
+const canvas = document.createElement('canvas');
+canvas.className = 't-canvas';
+document.getElementById('preview-pane').appendChild(canvas);
+document.getElementById('storyboard-pane').appendChild(Object.assign(document.createElement('div'), { className: 't-sb', textContent: 'Storyboard (stand-in)' }));
+document.getElementById('doc-title').textContent = 'Dialog test - Movie Maker';
+
+// 3) Real store / audio / player / exporter, fake commands that log.
+const app = {};
+app.store = new Store(); app.persist = persist; app.media = media;
+app.audio = new AudioEngine();
+app.dialogs = new Dialogs(app);
+app.player = new Player({ store: app.store, audio: app.audio, canvas, mediaHost: document.getElementById('media-host') });
+app.exporter = new Exporter({ store: app.store, player: app.player, audio: app.audio });
+const log = [];
+const COMMANDS = ['addMedia', 'addMusic', 'snapshot', 'saveMovie', 'about', 'help', 'trimTool'];
+app.commands = {
+  run(name, arg) { log.push([name, arg]); if (name === 'trimTool') return app.dialogs.openTrim(app.store.selection.ids[0]); return undefined; },
+  isEnabled() { return true; },
+  isChecked() { return false; },
+  list() { return COMMANDS.slice(); },
+};
+app.exporting = false;
+window.app = app;
+
+async function fixture(path, type) {
+  const res = await fetch(path);
+  if (!res.ok) throw new Error(`fixture ${path} ${res.status}`);
+  const blob = await res.blob();
+  return new File([blob], path.split('/').pop(), { type: type || blob.type });
+}
+
+async function setupProject() {
+  const v = await media.importFile(await fixture('fixtures/clip1.webm', 'video/webm'));
+  const p = await media.importFile(await fixture('fixtures/photo1.jpg', 'image/jpeg'));
+  app.store.addMedia(v);
+  app.store.addMedia(p);
+  const vid = createVisualItem('video', { mediaId: v.id });
+  const img = createVisualItem('image', { mediaId: p.id, duration: 2, transition: { type: 'crossfade', duration: 0.5 } });
+  const cap = createTextItem('caption', { text: 'Hello', start: 0.5, duration: 2 });
+  app.store.update((pr) => { pr.name = 'Dialog test'; pr.items.push(vid, img); pr.texts.push(cap); }, { label: 'setup' });
+  app.store.select('item', [vid.id]);
+  await app.player.seek(1);
+  return { vid, img, v, p };
+}
+
+window.T = { app, log, setupProject, getOption, setOption, persist, media, ready: false };
+setupProject().then((r) => { window.T.fixture = r; window.T.ready = true; }, (err) => { window.T.error = String(err && err.stack || err); console.error(err); });
+
+// Manual buttons (hidden while screenshotting).
+const bar = document.getElementById('t-buttons');
+const add = (label, fn) => { const b = document.createElement('button'); b.textContent = label; b.onclick = fn; bar.appendChild(b); };
+add('menu', () => app.dialogs.openAppMenu());
+add('export', () => app.dialogs.openExport());
+add('webcam', async () => console.log(await app.dialogs.openWebcam()));
+add('narration', async () => console.log(await app.dialogs.openNarration()));
+add('trim', () => app.dialogs.openTrim(window.T.fixture.vid.id));
+add('projects', () => app.dialogs.openProjects());
+add('about', () => app.dialogs.openAbout());
+add('help', () => app.dialogs.openHelp());
+add('options', () => app.dialogs.openOptions());
+add('confirm', async () => console.log(await app.dialogs.confirm('Delete this?')));
+add('prompt', async () => console.log(await app.dialogs.promptText('Rename project', 'My Movie')));
+add('toasts', () => { app.dialogs.toast('Info toast'); app.dialogs.toast('Saved!', { type: 'success' }); app.dialogs.toast('Something failed', { type: 'error' }); });
+add('progress', () => { const p = app.dialogs.progress('Working', { delay: 0 }); let v = 0; const t = setInterval(() => { v += 0.1; p.set(v, `${Math.round(v * 100)}%`); if (v >= 1) { clearInterval(t); p.close(); } }, 300); });
+</script>
+</body>
+</html>

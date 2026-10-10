@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Render Harness</title>
+<style>
+  :root { --bg: #f3f4f6; --fg: #1f2328; --muted: #5b636b; --card: #ffffff; --line: #d0d4d9; }
+  body { margin: 0; padding: 12px 16px 40px; background: var(--bg); color: var(--fg); font: 13px/1.35 "Segoe UI", Arial, sans-serif; }
+  h1 { font-size: 18px; margin: 4px 0 2px; }
+  h2 { font-size: 15px; margin: 18px 0 6px; border-bottom: 1px solid var(--line); padding-bottom: 3px; }
+  .note { color: var(--muted); margin: 0 0 6px; }
+  .grid { display: flex; flex-wrap: wrap; gap: 8px; }
+  figure { margin: 0; background: var(--card); border: 1px solid var(--line); padding: 4px; border-radius: 4px; }
+  figure canvas { display: block; background: #000; }
+  figcaption { font-size: 11px; color: var(--muted); max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .t { width: 160px; height: 90px; }
+  .big { width: 480px; height: 270px; }
+  #status { font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>Render harness <span id="mode"></span></h1>
+<p class="note" id="status">running…</p>
+
+<h2>Transitions at p = 0.5 (gallery tiles, real drawTransition)</h2>
+<div class="grid" id="g-trans"></div>
+
+<h2>Transitions at p = 0.25 / 0.75 (selected)</h2>
+<div class="grid" id="g-trans2"></div>
+
+<h2>Visual effects on photo1.jpg through drawSegment (localT mid-fade for fades)</h2>
+<div class="grid" id="g-fx"></div>
+
+<h2>Visual effect gallery tiles</h2>
+<div class="grid" id="g-fxt"></div>
+
+<h2>Brightness -60 / +60 and rotations 90 / 180 / 270 on photo2.png</h2>
+<div class="grid" id="g-bri"></div>
+
+<h2>Pan &amp; zoom tiles (p = 0.7)</h2>
+<div class="grid" id="g-pz"></div>
+
+<h2>Text effects (tiles at p = 0.35, then full drawText at 3 times)</h2>
+<div class="grid" id="g-txt"></div>
+<div class="grid" id="g-txt2" style="margin-top:8px"></div>
+
+<h2>AutoMovie theme tiles</h2>
+<div class="grid" id="g-am"></div>
+
+<h2>renderFrame of a fake timeline (480×270 CSS at DPR 2; last one with identity transform + device size)</h2>
+<div class="grid" id="g-frames"></div>
+
+<h2>measureTextBox (red boxes)</h2>
+<div class="grid" id="g-measure"></div>
+
+<script type="module">
+// ?nofilter=1 forces the ctx.filter fallback; ?legacy=1 additionally removes OffscreenCanvas
+// (like iOS Safari 15/16.3) so every scratch layer is a <canvas>.
+const params = new URLSearchParams(location.search);
+const legacy = params.get('legacy') === '1';
+if (legacy) { try { delete window.OffscreenCanvas; } catch (_) { window.OffscreenCanvas = undefined; } }
+const { renderGalleryThumb } = await import('../js/gallery.js');
+const { renderFrame, drawSegment, activeSegmentsAt, sourceTimeAt } = await import('../js/renderer.js');
+const { drawText, measureTextBox } = await import('../js/text.js');
+const { supportsCtxFilter, overrideCtxFilterSupport } = await import('../js/effects.js');
+const { drawTransition } = await import('../js/transitions.js');
+const { TRANSITIONS, EFFECTS, PANZOOM, TEXT_EFFECTS, AUTOMOVIE_THEMES } = await import('../js/catalog.js');
+if (params.get('nofilter') === '1' || legacy) overrideCtxFilterSupport(false);
+document.getElementById('mode').textContent = '— ctx.filter ' + (supportsCtxFilter() ? 'ON' : 'OFF (fallback path)') +
+  (legacy ? ', no OffscreenCanvas' : ', OffscreenCanvas ' + (typeof OffscreenCanvas === 'function' ? 'available' : 'missing'));
+const errors = [];
+window.addEventListener('error', (e) => errors.push(String(e.message)));
+const DPR = 2;
+
+function fig(parentId, label, cssW = 160, cssH = 90, dpr = 1) {
+  const f = document.createElement('figure');
+  const c = document.createElement('canvas');
+  c.width = Math.round(cssW * dpr); c.height = Math.round(cssH * dpr);
+  c.style.width = cssW + 'px'; c.style.height = cssH + 'px';
+  const cap = document.createElement('figcaption');
+  cap.textContent = label;
+  cap.title = label;
+  f.append(c, cap);
+  document.getElementById(parentId).append(f);
+  return c;
+}
+
+function loadImage(src) {
+  return new Promise((res, rej) => { const i = new Image(); i.onload = () => res(i); i.onerror = () => rej(new Error('img ' + src)); i.src = src; });
+}
+function loadVideo(src) {
+  return new Promise((res, rej) => {
+    const v = document.createElement('video');
+    v.muted = true; v.playsInline = true; v.preload = 'auto'; v.src = src;
+    v.addEventListener('loadeddata', () => res(v), { once: true });
+    v.addEventListener('error', () => rej(new Error('video ' + src)), { once: true });
+    v.load();
+  });
+}
+function seek(v, t) {
+  return new Promise((res) => {
+    if (Math.abs(v.currentTime - t) < 1e-3 && v.readyState >= 2) { res(); return; }
+    const done = () => { v.removeEventListener('seeked', done); res(); };
+    v.addEventListener('seeked', done);
+    v.currentTime = t;
+    setTimeout(done, 3000);
+  });
+}
+
+const timings = {};
+function timed(name, fn) { const t0 = performance.now(); fn(); timings[name] = (timings[name] || 0) + performance.now() - t0; }
+
+async function main() {
+  const [photo1, photo2, clip1, portrait] = await Promise.all([
+    loadImage('fixtures/photo1.jpg'), loadImage('fixtures/photo2.png'),
+    loadVideo('fixtures/clip1.webm'), loadVideo('fixtures/portrait.webm'),
+  ]);
+
+  // 1. transitions
+  for (const t of TRANSITIONS) {
+    const c = fig('g-trans', t.id + ' — ' + t.name, 160, 90, 1);
+    timed('transition tiles', () => renderGalleryThumb(c, 'transition', t.id, 0.5));
+  }
+  for (const id of ['page-curl', 'shatter', 'shatter-in', 'filmstrip', 'pixelate', 'blur', 'wipe-left', 'dissolve', 'clock', 'cube', 'diagonal-cross', 'roll']) {
+    for (const p of [0.25, 0.75]) {
+      const c = fig('g-trans2', id + ' @' + p, 160, 90, 1);
+      renderGalleryThumb(c, 'transition', id, p);
+    }
+  }
+
+  // 2. effects on a real photo through drawSegment
+  const photoMedia = { id: 'm1', type: 'image', name: 'photo1.jpg', width: 800, height: 600 };
+  for (const e of EFFECTS) {
+    const c = fig('g-fx', e.id + ' — ' + e.name, 192, 108, 1);
+    const ctx = c.getContext('2d');
+    const dur = 4;
+    let lt = 2;
+    if (e.id.startsWith('fade-in')) lt = 0.75; else if (e.id.startsWith('fade-out')) lt = dur - 0.75;
+    if (e.id === 'spin-360') lt = 1;
+    const seg = { item: { id: 'x', kind: 'image', mediaId: 'm1', panZoom: 'none', effect: e.id, brightness: 0, rotation: 0, duration: dur }, index: 0, start: 0, end: dur, duration: dur, transitionIn: null, sourceIn: 0, sourceOut: dur };
+    timed('effects drawSegment', () => drawSegment(ctx, seg, photo1, lt, c.width, c.height, { quality: 'preview', getMedia: () => photoMedia }));
+  }
+  for (const e of EFFECTS) {
+    const c = fig('g-fxt', e.id, 120, 68, 1);
+    timed('effect tiles', () => renderGalleryThumb(c, 'effect', e.id, 0.5));
+  }
+  // brightness & rotation
+  for (const [label, b, rot, pz] of [['bright -60', -60, 0, 'none'], ['bright +60', 60, 0, 'none'], ['rot 90', 0, 90, 'none'], ['rot 180', 0, 180, 'none'], ['rot 270 + zoom-in-left p=1', 0, 270, 'zoom-in-left'], ['rot 90 bw +40', 40, 90, 'none']]) {
+    const c = fig('g-bri', label, 192, 108, 1);
+    const seg = { item: { id: 'y', kind: 'image', mediaId: 'm2', panZoom: pz, effect: label.includes('bw') ? 'bw' : 'none', brightness: b, rotation: rot, duration: 4 }, index: 0, start: 0, end: 4, duration: 4, transitionIn: null, sourceIn: 0, sourceOut: 4 };
+    drawSegment(c.getContext('2d'), seg, photo2, 4, c.width, c.height, { quality: 'export' });
+  }
+
+  // 3. pan & zoom
+  for (const z of PANZOOM) {
+    const c = fig('g-pz', z.id, 160, 90, 1);
+    renderGalleryThumb(c, 'panzoom', z.id, 0.7);
+  }
+
+  // 4. text effects
+  for (const te of TEXT_EFFECTS) {
+    const c = fig('g-txt', te.id, 120, 68, 1);
+    renderGalleryThumb(c, 'text', te.id, 0.35);
+  }
+  const style = { font: 'Segoe UI, Arial, sans-serif', size: 12, bold: true, italic: false, color: '#ffe066', outline: 'medium', outlineColor: '#202020', align: 'center', valign: 'middle', opacity: 1, background: null };
+  for (const te of ['typewriter', 'swing', 'cinematic', 'scroll', 'wipe', 'stretch', 'bounce', 'ticker']) {
+    for (const lt of [0.3, 2, 3.8]) {
+      const c = fig('g-txt2', te + ' t=' + lt, 192, 108, 1);
+      const ctx = c.getContext('2d');
+      ctx.drawImage(photo1, 0, 0, c.width, c.height);
+      drawText(ctx, { text: 'The End\nThanks for watching', style, effect: te, localT: lt, duration: 4, w: c.width, h: c.height, kind: te === 'scroll' ? 'credits' : 'caption' });
+    }
+  }
+
+  // 5. automovie
+  for (const th of AUTOMOVIE_THEMES) {
+    const c = fig('g-am', th.id + ' — ' + th.name, 160, 90, 1);
+    renderGalleryThumb(c, 'automovie', th.id, 0.5);
+  }
+
+  // 6. full frames
+  const media = new Map([
+    ['v1', { id: 'v1', type: 'video', name: 'clip1.webm', width: 640, height: 360, duration: 4 }],
+    ['p1', { id: 'p1', type: 'image', name: 'photo1.jpg', width: 800, height: 600 }],
+    ['p2', { id: 'p2', type: 'image', name: 'photo2.png', width: 600, height: 800 }],
+    ['v2', { id: 'v2', type: 'video', name: 'portrait.webm', width: 360, height: 640, duration: 3 }],
+  ]);
+  const els = { v1: clip1, p1: photo1, p2: photo2, v2: portrait };
+  const titleStyle = { font: 'Georgia, serif', size: 11, bold: true, italic: false, color: '#ffffff', outline: 'none', outlineColor: '#000', align: 'center', valign: 'middle', opacity: 1, background: null };
+  const items = [
+    { id: 'a', kind: 'video', mediaId: 'v1', trimStart: 0, trimEnd: null, speed: 1, panZoom: 'none', effect: 'none', brightness: 0, rotation: 0, transition: { type: 'none', duration: 0 } },
+    { id: 'b', kind: 'image', mediaId: 'p1', duration: 5, panZoom: 'zoom-in', effect: 'sepia', brightness: 0, rotation: 0, transition: { type: 'crossfade', duration: 1.5 } },
+    { id: 'c', kind: 'title', mediaId: null, duration: 4, background: '#1f3c66', text: 'My Summer\nVacation', style: titleStyle, textEffect: 'fly-left', panZoom: 'none', effect: 'none', brightness: 0, rotation: 0, transition: { type: 'page-curl', duration: 1.5 } },
+    { id: 'd', kind: 'image', mediaId: 'p2', duration: 4, panZoom: 'auto', effect: 'edge', brightness: 0, rotation: 90, transition: { type: 'heart', duration: 1 } },
+    { id: 'e', kind: 'video', mediaId: 'v2', trimStart: 0, trimEnd: null, speed: 1, panZoom: 'pan-up', effect: 'bw-red', brightness: 10, rotation: 0, transition: { type: 'wipe-left', duration: 1 } },
+    { id: 'f', kind: 'image', mediaId: 'missing', duration: 2, panZoom: 'none', effect: 'fade-out-white', brightness: 0, rotation: 0, transition: { type: 'none', duration: 0 } },
+  ];
+  // computeTimeline semantics (model.js is another module; reproduced here for the harness)
+  const segments = [];
+  let prevEnd = 0;
+  items.forEach((it, i) => {
+    const m = media.get(it.mediaId);
+    const dur = it.kind === 'video' ? (m ? m.duration : 0) / (it.speed || 1) : it.duration;
+    let tin = null;
+    if (i > 0 && it.transition.type !== 'none') {
+      const pd = segments[i - 1].duration;
+      tin = { type: it.transition.type, duration: Math.min(it.transition.duration, pd / 2, dur / 2) };
+    }
+    const start = i === 0 ? 0 : prevEnd - (tin ? tin.duration : 0);
+    segments.push({ item: it, index: i, start, end: start + dur, duration: dur, transitionIn: tin, sourceIn: 0, sourceOut: it.kind === 'video' ? m.duration : dur });
+    prevEnd = start + dur;
+  });
+  const capStyle = { font: 'Segoe UI, Arial, sans-serif', size: 6, bold: false, italic: false, color: '#ffffff', outline: 'thin', outlineColor: '#000000', align: 'center', valign: 'bottom', opacity: 1, background: 'rgba(0,0,0,0.45)' };
+  const credStyle = { font: 'Segoe UI, Arial, sans-serif', size: 6, bold: false, italic: false, color: '#ffffff', outline: 'none', outlineColor: '#000000', align: 'center', valign: 'middle', opacity: 1, background: null };
+  const texts = [
+    { item: { id: 'cap1', kind: 'caption', text: 'A caption over the video', start: 1, duration: 3.5, style: capStyle, effect: 'fade' }, start: 1, end: 4.5 },
+    { item: { id: 'cred', kind: 'credits', text: 'CREDITS\nDirector\nJane Doe\nStarring\nThe Dog', start: 13, duration: 4, style: credStyle, effect: 'scroll' }, start: 13, end: 17 },
+    { item: { id: 'hidden', kind: 'caption', text: 'THIS MUST NOT SHOW', start: 0, duration: 20, style: capStyle, effect: 'none' }, start: 0, end: 20 },
+  ];
+  const timeline = { duration: Math.max(prevEnd, 17), segments, texts, music: [] };
+  window.__timeline = timeline;
+  const getSource = (seg) => els[seg.item.mediaId] || null;
+  const getMedia = (id) => media.get(id);
+  const frameTimes = [1.0, 3.25, 5, 6.75, 8, 9.5, 11, 12.5, 14, 16, segments[segments.length - 1].end];
+  for (const t of frameTimes) {
+    for (const seg of activeSegmentsAt(timeline, t)) {
+      if (seg.item.kind === 'video') await seek(els[seg.item.mediaId], sourceTimeAt(seg, t));
+    }
+    const c = fig('g-frames', 't=' + t + ' [' + activeSegmentsAt(timeline, t).map((s) => s.item.id).join(',') + ']', 480, 270, DPR);
+    const ctx = c.getContext('2d');
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+    timed('renderFrame', () => renderFrame(ctx, t, { project: {}, timeline, width: 480, height: 270, getSource, getMedia, quality: 'preview', hideTextIds: new Set(['hidden']) }));
+  }
+  // identity transform + device-sized canvas (auto-scale) at export quality
+  {
+    const t = 3.25;
+    await seek(clip1, sourceTimeAt(segments[0], t));
+    const c = fig('g-frames', 'autoscale export t=' + t, 480, 270, DPR);
+    renderFrame(c.getContext('2d'), t, { project: {}, timeline, width: 480, height: 270, getSource, getMedia, quality: 'export', hideTextIds: new Set(['hidden']) });
+  }
+  // performance: 60 preview frames across a few effects
+  {
+    const c = document.createElement('canvas'); c.width = 1280; c.height = 720;
+    const ctx = c.getContext('2d');
+    // getImageData(1px) after each frame forces the deferred canvas work to complete
+    for (const t of [3.25, 5, 6.75, 8, 9.5, 11, 12.5, 14]) {
+      renderFrame(ctx, t, { project: {}, timeline, width: 1280, height: 720, getSource, getMedia, quality: 'preview' });
+      ctx.getImageData(0, 0, 1, 1);
+      const t0 = performance.now();
+      for (let i = 0; i < 10; i++) {
+        renderFrame(ctx, t + i * 0.01, { project: {}, timeline, width: 1280, height: 720, getSource, getMedia, quality: 'preview' });
+        ctx.getImageData(0, 0, 1, 1);
+      }
+      timings['perf 1280x720 t=' + t + ' [' + activeSegmentsAt(timeline, t).map((s) => s.item.id + ':' + s.item.effect + (s.transitionIn ? '/' + s.transitionIn.type : '')).join(',') + '] ms/frame'] = (performance.now() - t0) / 10;
+    }
+  }
+
+  // 7. measureTextBox
+  for (const [label, st, text] of [
+    ['center/middle', { ...style, align: 'center', valign: 'middle' }, 'Hello world\nsecond line'],
+    ['left/top bg', { ...style, align: 'left', valign: 'top', background: '#1e5aa8' }, 'Left top box'],
+    ['right/bottom', { ...style, align: 'right', valign: 'bottom', size: 9 }, 'A rather long caption that has to wrap onto several lines'],
+    ['empty', { ...style }, ''],
+  ]) {
+    const c = fig('g-measure', label, 240, 135, 1);
+    const ctx = c.getContext('2d');
+    ctx.fillStyle = '#333'; ctx.fillRect(0, 0, c.width, c.height);
+    drawText(ctx, { text, style: st, effect: 'none', localT: 1, duration: 3, w: c.width, h: c.height, kind: 'caption' });
+    const b = measureTextBox(ctx, { text, style: st, w: c.width, h: c.height });
+    ctx.strokeStyle = 'red'; ctx.lineWidth = 1; ctx.strokeRect(b.x, b.y, b.width, b.height);
+  }
+
+  // 8. automated pixel assertions
+  runAssertions();
+
+  const st = document.getElementById('status');
+  st.textContent = 'done; errors: ' + errors.length + '; timings: ' + JSON.stringify(Object.fromEntries(Object.entries(timings).map(([k, v]) => [k, Math.round(v * 10) / 10])));
+  window.__result = { errors, timings, checks, filter: supportsCtxFilter() };
+  window.__done = true;
+}
+function px(ctx, x, y) { const d = ctx.getImageData(x, y, 1, 1).data; return [d[0], d[1], d[2]]; }
+function near(a, b, tol = 40) { return Math.abs(a[0] - b[0]) <= tol && Math.abs(a[1] - b[1]) <= tol && Math.abs(a[2] - b[2]) <= tol; }
+let checks = 0;
+function check(cond, msg) { checks++; if (!cond) errors.push('ASSERT: ' + msg); }
+function solid(color, w = 64, h = 36) {
+  const c = document.createElement('canvas'); c.width = w; c.height = h;
+  const x = c.getContext('2d'); x.fillStyle = color; x.fillRect(0, 0, w, h); return c;
+}
+function seg1(item, dur = 4) { return { item: Object.assign({ id: 's', kind: 'image', mediaId: 'm', panZoom: 'none', effect: 'none', brightness: 0, rotation: 0, duration: dur }, item), index: 0, start: 0, end: dur, duration: dur, transitionIn: null, sourceIn: 0, sourceOut: dur }; }
+
+function runAssertions() {
+  const RED = [255, 0, 0], BLUE = [0, 0, 255], BLACK = [0, 0, 0];
+  // Transitions: p=0 → from, p=1 → to, everywhere.
+  const out = document.createElement('canvas'); out.width = 96; out.height = 54;
+  const o = out.getContext('2d', { willReadFrequently: true });
+  const A = solid('#ff0000', 96, 54), B = solid('#0000ff', 96, 54);
+  const fa = (c) => c.drawImage(A, 0, 0, 96, 54), fb = (c) => c.drawImage(B, 0, 0, 96, 54);
+  const pts = [[2, 2], [48, 27], [93, 51], [10, 45], [85, 8], [47, 1]];
+  for (const t of TRANSITIONS) {
+    for (const [p, want] of [[0, RED], [1, BLUE]]) {
+      o.setTransform(1, 0, 0, 1, 0, 0); o.fillStyle = '#0f0'; o.fillRect(0, 0, 96, 54);
+      drawTransition(o, t.id, p, fa, fb, 96, 54, { from: A, to: B });
+      for (const [x, y] of pts) check(near(px(o, x, y), want), `transition ${t.id} p=${p} at ${x},${y} = ${px(o, x, y)}`);
+    }
+    // mid-point must draw something opaque everywhere (no holes showing the green underlay)
+    o.fillStyle = '#0f0'; o.fillRect(0, 0, 96, 54);
+    drawTransition(o, t.id, 0.5, fa, fb, 96, 54, { from: A, to: B });
+    for (const [x, y] of pts) { const c = px(o, x, y); check(!(c[1] > 200 && c[0] < 60 && c[2] < 60), `transition ${t.id} p=0.5 hole at ${x},${y}`); }
+  }
+  // Rotation: marker in the source's top-left quadrant.
+  const src = document.createElement('canvas'); src.width = 40; src.height = 20;
+  const sx = src.getContext('2d'); sx.fillStyle = '#0000ff'; sx.fillRect(0, 0, 40, 20); sx.fillStyle = '#ff0000'; sx.fillRect(0, 0, 20, 10);
+  const r = document.createElement('canvas'); r.width = 100; r.height = 100;
+  const rc = r.getContext('2d', { willReadFrequently: true });
+  // contain rects: rot 0/180 → 100x50 at y=25 ; rot 90/270 → 50x100 at x=25
+  const expect = { 0: [[30, 35], [70, 65]], 90: [[70, 20], [30, 80]], 180: [[70, 65], [30, 35]], 270: [[30, 80], [70, 20]] };
+  for (const rot of [0, 90, 180, 270]) {
+    drawSegment(rc, seg1({ rotation: rot }), src, 1, 100, 100, { quality: 'export', scale: 1 });
+    const [[rx, ry], [bx, by]] = expect[rot];
+    check(near(px(rc, rx, ry), RED), `rotation ${rot}: expected red at ${rx},${ry} got ${px(rc, rx, ry)}`);
+    check(near(px(rc, bx, by), BLUE), `rotation ${rot}: expected blue at ${bx},${by} got ${px(rc, bx, by)}`);
+    const corner = rot % 180 ? [5, 50] : [50, 5];
+    check(near(px(rc, corner[0], corner[1]), BLACK, 5), `rotation ${rot}: letterbox not black`);
+  }
+  // Pan & zoom at p=1 of zoom-in-left keeps the left edge (red quadrant grows).
+  drawSegment(rc, seg1({ panZoom: 'zoom-in-left' }), src, 4, 100, 100, { quality: 'export', scale: 1 });
+  check(near(px(rc, 60, 30), RED), 'zoom-in-left p=1 should enlarge the top-left quadrant: ' + px(rc, 60, 30));
+  // Effects on red: invert → cyan, bw → gray, brightness -100 → dark; letterbox stays black.
+  const red = solid('#ff0000', 40, 20);
+  const cases = [['invert', 0, [0, 255, 255]], ['bw', 0, [54, 54, 54]], ['none', -100, [38, 0, 0]], ['sepia', 0, [100, 89, 69]], ['bw-red', 0, [178, 178, 178]]];
+  for (const [eff, bri, want] of cases) {
+    drawSegment(rc, seg1({ effect: eff, brightness: bri }), red, 2, 100, 100, { quality: 'export', scale: 1 });
+    check(near(px(rc, 50, 50), want, 30), `effect ${eff} b=${bri}: got ${px(rc, 50, 50)} want ${want}`);
+    check(near(px(rc, 50, 5), BLACK, 6), `effect ${eff}: letterbox changed to ${px(rc, 50, 5)}`);
+  }
+  // Fades: fade-in-black at t=0 is black, fade-out-white at the end is white.
+  drawSegment(rc, seg1({ effect: 'fade-in-black' }), red, 0, 100, 100, { quality: 'export', scale: 1 });
+  check(near(px(rc, 50, 50), BLACK, 6), 'fade-in-black at 0 should be black');
+  drawSegment(rc, seg1({ effect: 'fade-out-white' }), red, 4, 100, 100, { quality: 'export', scale: 1 });
+  check(near(px(rc, 50, 50), [255, 255, 255], 6), 'fade-out-white at end should be white');
+  // Placeholder for a null source draws dark gray, never throws.
+  drawSegment(rc, seg1({ mediaId: 'zzz' }), null, 1, 100, 100, { quality: 'preview', getMedia: () => undefined });
+  check(near(px(rc, 3, 3), [43, 43, 43], 6), 'placeholder background');
+  // Text never throws on odd input.
+  drawText(rc, { text: '', style: null, effect: 'typewriter', localT: 0, duration: 0, w: 100, h: 100 });
+  drawText(rc, { text: 'x'.repeat(300), style: { size: 30, font: '1bad"font' }, effect: 'unknown', localT: 1, duration: 2, w: 100, h: 100 });
+  const box = measureTextBox(rc, { text: 'Hello', style: { size: 10 }, w: 100, h: 100 });
+  check(box.width > 10 && box.height > 5, 'measureTextBox size');
+  // renderFrame with an empty/invalid timeline just paints black.
+  renderFrame(rc, 3, { timeline: { segments: [], texts: [] }, width: 100, height: 100, getSource: () => null });
+  check(near(px(rc, 50, 50), BLACK, 2), 'empty timeline black');
+  renderFrame(rc, NaN, { timeline: null, width: 100, height: 100 });
+}
+
+main().catch((e) => { errors.push(String(e && e.stack || e)); document.getElementById('status').textContent = 'FAILED: ' + e; window.__result = { errors }; window.__done = true; });
+</script>
+</body>
+</html>

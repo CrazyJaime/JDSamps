@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Shell styles</title>
+<link rel="stylesheet" href="../css/moviemaker.css">
+<style>
+  /* Static preview of the shared classes documented at the top of css/moviemaker.css.
+     ?show=dialog | sheet | appmenu | misc  (default: dialog) */
+  body { background: var(--c-workspace); }
+  .demo-row { position: fixed; left: 12px; right: 12px; bottom: 60px; display: flex; flex-direction: column; gap: 12px; }
+</style>
+</head>
+<body>
+<div id="dialog-root"></div>
+<div id="toast-root"></div>
+<script type="module">
+import { h, icon } from '../js/ui/dom.js';
+const show = new URLSearchParams(location.search).get('show') || 'dialog';
+const root = document.getElementById('dialog-root');
+const toasts = document.getElementById('toast-root');
+
+function dialog(sheet) {
+  const body = h('div.dlg-body', null,
+    h('p', null, 'Choose how you want to save your movie. Everything is processed on this device.'),
+    h('div.field-row', null,
+      h('div.field', null, h('label', { for: 'f1' }, 'Movie name'), h('input', { id: 'f1', type: 'text', value: 'Summer Trip' })),
+      h('div.field', null, h('label', { for: 'f2' }, 'Format'), h('select', { id: 'f2' }, h('option', null, 'MP4 (H.264)'), h('option', null, 'WebM')))),
+    h('label.check', null, h('input', { type: 'checkbox', checked: true }), 'Keep the screen on while saving'),
+    h('div.field', null, h('div.progress', { style: '--p: .42' }, h('div.progress-bar')), h('div.progress-text', null, 'Saving… 42% (00:07.40 of 00:17.50)')),
+    h('p.hint', null, 'Tip: you can keep editing while a movie is saved.'));
+  const dlg = h('div.dlg', { class: sheet ? 'dlg-sheet' : '', role: 'dialog', 'aria-modal': 'true' },
+    h('div.dlg-title', null, h('span', null, 'Save movie'), h('button.dlg-close', { type: 'button', 'aria-label': 'Close' }, icon('close', 12))),
+    body,
+    h('div.dlg-buttons', null, h('button.btn', { type: 'button' }, 'Cancel'), h('button.btn.btn-primary', { type: 'button' }, icon('save-movie', 16), 'Save')));
+  root.append(h('div.dlg-backdrop', { class: sheet ? 'is-sheet' : '' }, dlg));
+}
+
+function appMenu() {
+  const item = (ic, label, desc) => h('button.app-menu-item', { type: 'button' }, icon(ic, 32), h('span', null, h('span.app-menu-label', null, label), desc ? h('span.app-menu-desc', null, desc) : null));
+  root.append(h('div.app-menu', { role: 'menu' },
+    h('div.app-menu-items', null,
+      item('new', 'New project'), item('folder-open', 'Open project'), item('save', 'Save project'), item('save-as', 'Save project as'),
+      h('hr.app-menu-sep'),
+      item('download', 'Export project file', 'One file with all media, for another device'),
+      item('save-movie', 'Save movie'),
+      h('hr.app-menu-sep'),
+      item('info', 'About Movie Maker')),
+    h('div.app-menu-side', null,
+      h('div.app-menu-heading', null, 'Recent projects'),
+      h('button.app-menu-recent', { type: 'button' }, 'Summer Trip', h('small', null, 'Today, 10:42')),
+      h('button.app-menu-recent', { type: 'button' }, 'Birthday party', h('small', null, 'Yesterday'))),
+    h('div.app-menu-footer', null, h('button.btn', { type: 'button' }, 'Close'))));
+}
+
+function misc() {
+  const row = h('div.demo-row', null,
+    h('div.trim-panel', null, h('span.trim-title', null, 'Trim'),
+      h('label.trim-field', null, 'Start point', h('input', { type: 'text', value: '00:01.20' })),
+      h('label.trim-field', null, 'End point', h('input', { type: 'text', value: '00:03.80' })),
+      h('span.trim-actions', null, h('button.btn', { type: 'button' }, 'Cancel'), h('button.btn.btn-primary', { type: 'button' }, 'Save trim'))),
+    h('div', null, h('button.btn', { type: 'button' }, 'Normal'), ' ', h('button.btn.btn-primary', { type: 'button' }, 'Primary'), ' ',
+      h('button.btn.btn-danger', { type: 'button' }, 'Delete'), ' ', h('button.btn', { type: 'button', disabled: true }, 'Disabled')));
+  document.body.append(row);
+}
+
+if (show === 'dialog') dialog(false);
+else if (show === 'sheet') dialog(true);
+else if (show === 'appmenu') appMenu();
+else misc();
+toasts.append(
+  h('div.toast.toast-success', null, icon('check', 18), h('span.toast-msg', null, 'Your movie was saved.'), h('button.toast-action', { type: 'button' }, 'Open')),
+  h('div.toast.toast-error', null, icon('error', 18), h('span.toast-msg', null, 'This video format isn’t supported by your browser.')));
+document.body.dataset.ready = '1';
+</script>
+</body>
+</html>

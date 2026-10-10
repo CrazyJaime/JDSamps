@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Core Media Harness</title>
+<style>
+  :root { --bg: #f4f6f9; --fg: #1d2330; --ok: #1d7a2e; --bad: #b3261e; }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --bg: #161a21; --fg: #e6e9ef; --ok: #6fd27f; --bad: #ff8a80; } }
+  :root[data-theme="dark"] { --bg: #161a21; --fg: #e6e9ef; --ok: #6fd27f; --bad: #ff8a80; }
+  body { margin: 0; padding: 16px; background: var(--bg); color: var(--fg); font: 14px/1.4 system-ui, sans-serif; }
+  button { font-size: 16px; min-height: 44px; padding: 0 16px; margin: 0 8px 8px 0; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); }
+  #thumbs img { height: 60px; margin: 2px; background: #000; }
+  pre { white-space: pre-wrap; word-break: break-word; }
+</style>
+</head>
+<body>
+  <h1>Movie Maker — A-core harness</h1>
+  <p>Runs media import and persistence against the fixtures. Use “Pick files” to try the picker on a phone.</p>
+  <button id="run">Run tests</button>
+  <button id="pick">Pick files</button>
+  <button id="pickAudio">Pick music</button>
+  <div id="thumbs"></div>
+  <pre id="log"></pre>
+  <script type="module" src="./core-media.js"></script>
+</body>
+</html>

@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light">
+<meta name="theme-color" content="#c9dcf2">
+<meta name="description" content="Movie Maker — a fan-made, browser-based re-creation of the classic Windows Live Movie Maker. Edit videos, photos, music, titles and captions right in your browser. Everything stays on your device.">
+<meta name="application-name" content="Movie Maker">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="Movie Maker">
+<meta name="format-detection" content="telephone=no">
+<meta name="msapplication-tap-highlight" content="no">
+<title>Movie Maker</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="icons/apple-touch-icon.png">
+<link rel="stylesheet" href="css/moviemaker.css">
+<script type="module" src="js/app.js"></script>
+</head>
+<body>
+<div id="app" class="mm-app" data-preview-size="normal" data-thumb-size="medium" data-aspect="16:9">
+  <header id="titlebar" class="titlebar">
+    <button id="app-menu-btn" class="app-menu-btn" type="button" aria-haspopup="menu" aria-label="Movie Maker menu" title="Movie Maker menu">
+      <svg class="app-menu-btn-film" viewBox="0 0 32 32" width="18" height="18" aria-hidden="true" focusable="false"><rect x="3" y="7" width="26" height="18" rx="2" fill="#fff"/><rect x="5.5" y="12" width="21" height="8" fill="#2f78d1"/><path d="M6 8.5h2.4v2H6zm5 0h2.4v2H11zm5 0h2.4v2H16zm5 0h2.4v2H21zM6 21.5h2.4v2H6zm5 0h2.4v2H11zm5 0h2.4v2H16zm5 0h2.4v2H21z" fill="#2f78d1"/></svg>
+      <svg class="app-menu-btn-arrow" viewBox="0 0 10 10" width="8" height="8" aria-hidden="true" focusable="false"><path d="M1 3h8L5 7.5z" fill="#fff"/></svg>
+    </button>
+    <svg class="titlebar-icon" viewBox="0 0 32 32" width="16" height="16" aria-hidden="true" focusable="false"><rect x="2" y="6" width="28" height="20" rx="2.5" fill="#34495e"/><rect x="4.5" y="11.5" width="23" height="9" fill="#5fa9ef"/><path d="M5 7.6h2.6v2.2H5zm5.5 0h2.6v2.2h-2.6zm5.5 0h2.6v2.2H16zm5.5 0h2.6v2.2h-2.6zM5 22.2h2.6v2.2H5zm5.5 0h2.6v2.2h-2.6zm5.5 0h2.6v2.2H16zm5.5 0h2.6v2.2h-2.6z" fill="#eaf2fc"/><path d="M13 12.6v6.8l6-3.4z" fill="#fff"/></svg>
+    <div id="qat" class="qat" role="toolbar" aria-label="Quick access toolbar"></div>
+    <div id="doc-title" class="doc-title" aria-live="polite">My Movie - Movie Maker</div>
+  </header>
+
+  <nav id="ribbon" class="ribbon" aria-label="Ribbon"></nav>
+
+  <main id="main" class="main">
+    <section id="preview-pane" class="preview-pane" aria-label="Preview"></section>
+    <section id="storyboard-pane" class="storyboard-pane" aria-label="Storyboard"></section>
+  </main>
+
+  <footer id="statusbar" class="statusbar">
+    <span id="status-text" class="status-text" aria-live="polite"></span>
+    <div id="status-controls" class="status-controls"></div>
+  </footer>
+</div>
+
+<div id="media-host" aria-hidden="true"></div>
+<div id="dialog-root"></div>
+<div id="toast-root" aria-live="polite" aria-atomic="false"></div>
+<div id="drop-overlay" hidden>
+  <div class="drop-overlay-box">
+    <svg viewBox="0 0 32 32" width="56" height="56" aria-hidden="true" focusable="false"><rect x="3" y="6" width="26" height="20" rx="2" fill="#34495e"/><rect x="5" y="11" width="22" height="10" fill="#79b4ec"/><circle cx="25" cy="25" r="6.4" fill="#3aa52f" stroke="#fff" stroke-width="1.2"/><path d="M21.6 25h6.8M25 21.6v6.8" stroke="#fff" stroke-width="2.4"/></svg>
+    <p>Drop videos, photos and music here</p>
+  </div>
+</div>
+
+<!-- Loading splash. Removed by the ribbon once the app has started; turns into an error message
+     if the app's JavaScript cannot start (see the inline script below). -->
+<div id="boot-splash" class="boot-splash" role="status">
+  <div class="boot-card">
+    <svg class="boot-logo" viewBox="0 0 32 32" width="64" height="64" aria-hidden="true" focusable="false"><rect x="2" y="6" width="28" height="20" rx="2.5" fill="#34495e"/><rect x="4.5" y="11.5" width="23" height="9" fill="#5fa9ef"/><path d="M5 7.6h2.6v2.2H5zm5.5 0h2.6v2.2h-2.6zm5.5 0h2.6v2.2H16zm5.5 0h2.6v2.2h-2.6zM5 22.2h2.6v2.2H5zm5.5 0h2.6v2.2h-2.6zm5.5 0h2.6v2.2H16zm5.5 0h2.6v2.2h-2.6z" fill="#eaf2fc"/><path d="M13 12.6v6.8l6-3.4z" fill="#fff"/></svg>
+    <div class="boot-name">Movie Maker</div>
+    <div class="boot-msg" id="boot-msg">Loading…</div>
+    <div class="boot-bar"><span></span></div>
+    <button type="button" class="btn btn-primary boot-retry" id="boot-retry" hidden>Try again</button>
+  </div>
+</div>
+
+<noscript>
+  <div class="noscript-msg">
+    <h1>Movie Maker needs JavaScript</h1>
+    <p>Please turn on JavaScript in your browser settings, then reload this page. Your videos and photos never leave your device.</p>
+  </div>
+</noscript>
+
+<script nomodule>
+  // Browsers without ES module support never run js/app.js.
+  (function () {
+    var m = document.getElementById('boot-msg');
+    if (m) m.textContent = 'This browser is too old to run Movie Maker. Please open it in a current version of Chrome, Safari, Edge or Firefox.';
+    var s = document.getElementById('boot-splash');
+    if (s) s.className += ' is-error';
+  })();
+</script>
+<script>
+  // Tiny classic-script watchdog: if the module graph fails to load (network error, syntax error,
+  // unsupported feature) show a friendly message instead of a blank page. The ribbon removes
+  // #boot-splash as soon as the app has started.
+  (function () {
+    var started = false, failed = false;
+    function splash() { return document.getElementById('boot-splash'); }
+    function isUp() {
+      // Note: window.app alone would be the <div id="app"> element (named access), so look for the store.
+      var a = window.app, r = document.getElementById('ribbon');
+      return !!((a && !a.nodeType && a.store) || (r && r.children.length));
+    }
+    function hide() {
+      started = true;
+      var s = splash();
+      if (s && s.parentNode) s.parentNode.removeChild(s);
+    }
+    function fail(detail) {
+      if (started || failed) return;
+      failed = true;
+      var s = splash();
+      if (!s) return;
+      s.className += ' is-error';
+      var m = document.getElementById('boot-msg');
+      if (m) m.textContent = 'Movie Maker couldn’t start. ' + (detail || 'Please check your connection and try again, or update your browser.');
+      var b = document.getElementById('boot-retry');
+      if (b) { b.hidden = false; b.onclick = function () { location.reload(); }; }
+    }
+    window.__mmBootFail = fail;
+    window.__mmBootDone = hide;
+    // A <script type=module> or one of its imports failing to load fires 'error' on the element (capture phase).
+    window.addEventListener('error', function (e) {
+      var t = e && e.target;
+      if (t && t.tagName === 'SCRIPT') { fail('A part of the app failed to load.'); return; }
+      if (!started && e && e.filename && /\/js\//.test(e.filename)) fail('Your browser reported an error: ' + (e.message || 'unknown error') + '.');
+    }, true);
+    function check() { if (isUp()) hide(); else fail(); }
+    window.addEventListener('load', function () {
+      if (isUp()) { hide(); return; }
+      // Modules normally run before 'load'; allow extra time for slow phones.
+      setTimeout(function () { if (!started && isUp()) hide(); }, 1500);
+      setTimeout(check, 12000);
+    });
+    // Remove the splash as soon as the ribbon renders (MutationObserver is everywhere we run modules).
+    if (window.MutationObserver) {
+      document.addEventListener('DOMContentLoaded', function () {
+        var r = document.getElementById('ribbon');
+        if (!r) return;
+        if (r.children.length) { hide(); return; }
+        // If the app manages to render after a non-fatal startup error, show the app anyway.
+        var mo = new MutationObserver(function () { if (r.children.length) { mo.disconnect(); hide(); } });
+        mo.observe(r, { childList: true });
+      });
+    }
+  })();
+</script>
+</body>
+</html>

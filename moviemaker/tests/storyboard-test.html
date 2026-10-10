@@ -1,0 +1,286 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light">
+<title>Storyboard &amp; preview test</title>
+<link rel="stylesheet" href="../css/moviemaker.css">
+<style>
+  #test-log { position: fixed; right: 4px; top: 4px; z-index: 5000; max-width: 300px; font: 10px/1.3 monospace; color: #222;
+    background: rgba(255,255,255,.85); pointer-events: none; white-space: pre; display: none; }
+  body.show-log #test-log { display: block; }
+  #ribbon { min-height: 40px; display: flex; align-items: center; gap: 6px; padding: 4px 8px; }
+  #ribbon .fake-btn { font: 12px sans-serif; padding: 4px 8px; }
+</style>
+</head>
+<body>
+<pre id="test-log"></pre>
+<script type="module">
+import { computeTimeline, createProject, createVisualItem, createTextItem, createMusicItem, formatTime, ASPECTS } from '../js/model.js';
+import { Preview } from '../js/ui/preview.js';
+import { Storyboard } from '../js/ui/storyboard.js';
+
+const params = new URLSearchParams(location.search);
+
+// ---------------------------------------------------------------- page shell (from index.html)
+const html = await (await fetch('../index.html')).text();
+const doc = new DOMParser().parseFromString(html, 'text/html');
+for (const n of [...doc.body.children]) {
+  if (n.tagName === 'SCRIPT' || n.tagName === 'NOSCRIPT' || n.id === 'boot-splash') continue;
+  document.body.appendChild(document.importNode(n, true));
+}
+const ribbon = document.getElementById('ribbon');
+ribbon.innerHTML = '<button class="fake-btn" data-act="textBold">Bold (ribbon)</button><span style="font:12px sans-serif">fake ribbon</span>';
+
+// ---------------------------------------------------------------- generated media
+function frameDataUrl(w, h, hue, label, kind = 'video') {
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  const g = c.getContext('2d');
+  const grd = g.createLinearGradient(0, 0, w, h);
+  grd.addColorStop(0, `hsl(${hue} 70% 55%)`);
+  grd.addColorStop(1, `hsl(${(hue + 40) % 360} 70% 30%)`);
+  g.fillStyle = grd; g.fillRect(0, 0, w, h);
+  g.fillStyle = 'rgba(255,255,255,.85)';
+  g.beginPath(); g.arc(w * 0.75, h * 0.3, h * 0.15, 0, Math.PI * 2); g.fill();
+  g.fillStyle = '#fff'; g.font = `bold ${Math.round(h * 0.38)}px sans-serif`; g.textAlign = 'center'; g.textBaseline = 'middle';
+  g.fillText(label, w / 2, h * 0.58);
+  if (kind === 'image') { g.fillStyle = 'rgba(0,0,0,.3)'; g.beginPath(); g.moveTo(0, h); g.lineTo(w * 0.4, h * 0.5); g.lineTo(w * 0.7, h); g.fill(); }
+  return c.toDataURL('image/jpeg', 0.8);
+}
+function peaks(n, seed) {
+  const out = [];
+  let s = seed;
+  for (let i = 0; i < n; i++) { s = (s * 9301 + 49297) % 233280; out.push(0.25 + 0.7 * Math.abs(Math.sin(i / 7 + seed)) * (s / 233280)); }
+  return out;
+}
+const media = new Map();
+const vFrames = Array.from({ length: 8 }, (_, i) => frameDataUrl(160, 90, 200 + i * 12, String(i + 1)));
+media.set('v1', { id: 'v1', type: 'video', name: 'Beach walk.mp4', mime: 'video/mp4', duration: 8, width: 640, height: 360, hasAudio: true,
+  thumb: vFrames[0], filmstrip: vFrames, peaks: peaks(160, 1), url: '' });
+const p1 = frameDataUrl(160, 120, 30, 'P1', 'image');
+media.set('p1', { id: 'p1', type: 'image', name: 'Sunset.jpg', mime: 'image/jpeg', duration: 0, width: 800, height: 600, thumb: p1, filmstrip: [p1], peaks: null, url: '' });
+const p2 = frameDataUrl(120, 160, 120, 'P2', 'image');
+media.set('p2', { id: 'p2', type: 'image', name: 'Portrait.png', mime: 'image/png', duration: 0, width: 600, height: 800, thumb: p2, filmstrip: [p2], peaks: null, url: '' });
+media.set('a1', { id: 'a1', type: 'audio', name: 'Summer song.ogg', mime: 'audio/ogg', duration: 22, width: 0, height: 0, thumb: '', filmstrip: [], peaks: peaks(440, 3), url: '' });
+media.set('n1', { id: 'n1', type: 'audio', name: 'Narration 1.webm', mime: 'audio/webm', duration: 6, width: 0, height: 0, thumb: '', filmstrip: [], peaks: peaks(120, 5), url: '' });
+
+// ---------------------------------------------------------------- fake store (contract shape)
+class FakeStore extends EventTarget {
+  constructor() {
+    super();
+    this.project = createProject('Test movie');
+    this.media = media;
+    this.selection = { type: null, ids: [] };
+    this.view = { zoom: 40, thumbSize: 'medium', showWaveforms: true, previewSize: 'normal' };
+    this.clipboard = null;
+    this._tl = null;
+    this.changes = 0;
+  }
+  get timeline() { if (!this._tl) this._tl = computeTimeline(this.project, this.media); return this._tl; }
+  update(mutator, { label = '' } = {}) {
+    mutator(this.project);
+    this._tl = null;
+    this.changes++;
+    // prune selection
+    const coll = this._coll(this.selection.type);
+    const kept = this.selection.ids.filter((id) => coll.some((o) => o.id === id));
+    if (kept.length !== this.selection.ids.length) this.selection = kept.length ? { type: this.selection.type, ids: kept } : { type: null, ids: [] };
+    this.dispatchEvent(new CustomEvent('change', { detail: { label } }));
+  }
+  replaceProject(p) { this.project = p; this._tl = null; this.selection = { type: null, ids: [] }; this.dispatchEvent(new CustomEvent('change', { detail: { label: 'load' } })); this.dispatchEvent(new CustomEvent('selection', { detail: this.selection })); }
+  _coll(t) { return t === 'item' ? this.project.items : t === 'text' ? this.project.texts : t === 'music' ? this.project.music : []; }
+  getMedia(id) { return this.media.get(id); }
+  addMedia(m) { this.media.set(m.id, m); this._tl = null; this.dispatchEvent(new CustomEvent('media', { detail: { added: [m.id] } })); }
+  touchMedia(id) { this._tl = null; this.dispatchEvent(new CustomEvent('media', { detail: { updated: [id] } })); }
+  select(type, ids) {
+    let list = ids == null ? [] : Array.isArray(ids) ? ids : [ids];
+    if (!type || !list.length) { type = null; list = []; }
+    if (type === this.selection.type && list.join() === this.selection.ids.join()) return;
+    this.selection = { type, ids: list.slice() };
+    this.dispatchEvent(new CustomEvent('selection', { detail: { type, ids: list.slice() } }));
+  }
+  selectedItems() { const c = this._coll(this.selection.type); return c.filter((o) => this.selection.ids.includes(o.id)); }
+  find(id) {
+    for (const [type, c] of [['item', this.project.items], ['text', this.project.texts], ['music', this.project.music]]) {
+      const i = c.findIndex((o) => o.id === id);
+      if (i >= 0) return { type, obj: c[i], index: i };
+    }
+    return null;
+  }
+  setView(partial) {
+    const next = { ...this.view, ...partial };
+    if ('zoom' in partial) next.zoom = Math.min(400, Math.max(5, +partial.zoom));
+    const changed = Object.keys(next).filter((k) => next[k] !== this.view[k]);
+    if (!changed.length) return;
+    this.view = next;
+    this.dispatchEvent(new CustomEvent('view', { detail: { changed, view: { ...next } } }));
+  }
+}
+
+// ---------------------------------------------------------------- fake player (draws with the real renderer when it loads)
+let renderFrame = null;
+try { ({ renderFrame } = await import('../js/renderer.js')); } catch (err) { console.warn('renderer unavailable, using a simple fallback', err); }
+const imgCache = new Map();
+function imageFor(m) {
+  let im = imgCache.get(m.id);
+  if (!im) { im = new Image(); im.src = m.thumb; imgCache.set(m.id, im); im.onload = () => player.renderNow(); }
+  return im.complete && im.naturalWidth ? im : null;
+}
+const vidCanvas = document.createElement('canvas');
+vidCanvas.width = 320; vidCanvas.height = 180;
+class FakePlayer extends EventTarget {
+  constructor({ store, canvas }) {
+    super();
+    this.store = store; this.canvas = canvas; this._t = 0; this._playing = false; this.hideTextIds = null; this.seeks = 0;
+    this._lay = { x: 0, y: 0, width: 0, height: 0 };
+    store.addEventListener('change', () => { this.renderNow(); this.dispatchEvent(new CustomEvent('durationchange', { detail: { duration: this.duration } })); });
+    if (typeof ResizeObserver === 'function') new ResizeObserver(() => this.renderNow()).observe(canvas);
+  }
+  get currentTime() { return this._t; }
+  get duration() { return this.store.timeline.duration; }
+  get playing() { return this._playing; }
+  get frameRect() { return { ...this._lay }; }
+  _emitTime() { this.dispatchEvent(new CustomEvent('timeupdate', { detail: { time: this._t } })); }
+  async play() {
+    if (this._playing) return;
+    if (this._t >= this.duration - 0.02) this._t = 0;
+    this._playing = true; this.dispatchEvent(new CustomEvent('play'));
+    let last = performance.now();
+    const tick = (now) => {
+      if (!this._playing) return;
+      this._t = Math.min(this.duration, this._t + (now - last) / 1000 * (window.__speed || 1)); last = now;
+      this._draw(); this._emitTime();
+      if (this._t >= this.duration) { this._playing = false; this.dispatchEvent(new CustomEvent('pause')); this.dispatchEvent(new CustomEvent('ended')); return; }
+      requestAnimationFrame(tick);
+    };
+    requestAnimationFrame(tick);
+  }
+  pause() { if (!this._playing) return; this._playing = false; this._emitTime(); this.dispatchEvent(new CustomEvent('pause')); }
+  toggle() { return this._playing ? this.pause() : this.play(); }
+  seek(t) { this.seeks++; this._t = Math.max(0, Math.min(this.duration, +t || 0)); this._emitTime(); this._draw(); return Promise.resolve(); }
+  stepFrame(d) { if (this._playing) this.pause(); return this.seek(Math.round(this._t * 30 + (d < 0 ? -1 : 1)) / 30); }
+  renderNow() { this._draw(); return Promise.resolve(); }
+  _draw() {
+    const c = this.canvas; const cw = c.clientWidth, ch = c.clientHeight;
+    if (!(cw > 0 && ch > 0)) return;
+    const dpr = Math.min(2, window.devicePixelRatio || 1);
+    if (c.width !== Math.round(cw * dpr)) c.width = Math.round(cw * dpr);
+    if (c.height !== Math.round(ch * dpr)) c.height = Math.round(ch * dpr);
+    const aspect = ASPECTS[this.store.project.aspect] || 16 / 9;
+    let fw = cw, fh = cw / aspect; if (fh > ch) { fh = ch; fw = ch * aspect; }
+    this._lay = { x: (cw - fw) / 2, y: (ch - fh) / 2, width: fw, height: fh };
+    const g = c.getContext('2d');
+    g.setTransform(1, 0, 0, 1, 0, 0); g.fillStyle = '#000'; g.fillRect(0, 0, c.width, c.height);
+    g.setTransform(dpr, 0, 0, dpr, this._lay.x * dpr, this._lay.y * dpr);
+    if (renderFrame) {
+      try {
+        renderFrame(g, this._t, {
+          project: this.store.project, timeline: this.store.timeline, width: fw, height: fh, quality: 'preview',
+          hideTextIds: this.hideTextIds,
+          getMedia: (id) => this.store.getMedia(id),
+          getSource: (seg) => {
+            const m = this.store.getMedia(seg.item.mediaId);
+            if (!m) return null;
+            if (m.type === 'image') return imageFor(m);
+            const vg = vidCanvas.getContext('2d');
+            const st = seg.sourceIn + Math.max(0, this._t - seg.start) * (seg.item.speed || 1);
+            vg.fillStyle = `hsl(${(200 + st * 20) % 360} 60% 40%)`; vg.fillRect(0, 0, 320, 180);
+            vg.fillStyle = '#fff'; vg.font = 'bold 40px sans-serif'; vg.textAlign = 'center'; vg.fillText(`${st.toFixed(1)}s`, 160, 105);
+            return vidCanvas;
+          },
+        });
+        return;
+      } catch (err) { console.error('renderFrame failed', err); }
+    }
+    g.fillStyle = '#234'; g.fillRect(0, 0, fw, fh); g.fillStyle = '#fff'; g.font = '20px sans-serif'; g.fillText(formatTime(this._t), 10, 30);
+  }
+}
+
+// ---------------------------------------------------------------- fake commands
+const log = [];
+const logEl = document.getElementById('test-log');
+function cmdLog(name, arg) { log.push([name, arg === undefined ? null : JSON.parse(JSON.stringify(arg))]); logEl.textContent = log.slice(-14).map((l) => `${l[0]} ${JSON.stringify(l[1])}`).join('\n'); }
+const COMMANDS = ['addMedia', 'moveItem', 'moveMusic', 'moveText', 'textEdit', 'togglePlay', 'play', 'pause', 'prevFrame', 'nextFrame', 'seek',
+  'split', 'copy', 'paste', 'remove', 'trimTool', 'musicSplit', 'textSet'];
+const commands = {
+  run(name, arg) {
+    cmdLog(name, arg);
+    const st = store;
+    switch (name) {
+      case 'moveItem': return st.update((p) => { const f = p.items.findIndex((i) => i.id === arg.id); const [it] = p.items.splice(f, 1); p.items.splice(arg.toIndex, 0, it); }, { label: 'Move' });
+      case 'moveMusic': return st.update((p) => { p.music.find((m) => m.id === arg.id).start = arg.start; }, { label: 'Move music' });
+      case 'moveText': return st.update((p) => { p.texts.find((m) => m.id === arg.id).start = arg.start; }, { label: 'Move text' });
+      case 'textEdit': {
+        if (typeof arg !== 'string') { const id = st.selection.ids[0]; return app.preview.editText(id); }
+        const sel = st.selectedItems()[0];
+        if (!sel) return undefined;
+        return st.update(() => { sel.text = arg; }, { label: 'Edit text' });
+      }
+      case 'textSet': return st.update(() => { const sel = st.selectedItems()[0]; if (sel) sel.style[arg.key] = arg.value; }, { label: 'Format' });
+      case 'togglePlay': return player.toggle();
+      case 'play': return player.play();
+      case 'pause': return player.pause();
+      case 'prevFrame': return player.stepFrame(-1);
+      case 'nextFrame': return player.stepFrame(1);
+      case 'seek': return player.seek(arg);
+      case 'remove': return st.update((p) => { const ids = st.selection.ids; for (const k of ['items', 'texts', 'music']) p[k] = p[k].filter((o) => !ids.includes(o.id)); }, { label: 'Remove' });
+      default: return undefined;
+    }
+  },
+  isEnabled(name) { return name !== 'trimTool' || store.selectedItems().some((i) => i.kind === 'video'); },
+  isChecked() { return false; },
+  list() { return COMMANDS.slice(); },
+};
+
+// ---------------------------------------------------------------- project
+function buildProject() {
+  const p = createProject('Test movie');
+  p.items.push(
+    createVisualItem('video', { id: 'item-v1', mediaId: 'v1' }),
+    createVisualItem('image', { id: 'item-p1', mediaId: 'p1', duration: 7, transition: { type: 'crossfade', duration: 1.5 }, panZoom: 'zoom-in' }),
+    createVisualItem('title', { id: 'item-t1', text: 'My Holiday', duration: 5, background: '#1d3f73', transition: { type: 'fade-black', duration: 1 } }),
+    createVisualItem('image', { id: 'item-p2', mediaId: 'p2', duration: 5, rotation: 0 }),
+    createVisualItem('video', { id: 'item-v2', mediaId: 'v1', trimStart: 2, trimEnd: 6, transition: { type: 'wipe-left', duration: 1 } }),
+    createVisualItem('image', { id: 'item-missing', mediaId: 'nope', duration: 3 }),
+  );
+  p.texts.push(
+    createTextItem('caption', { id: 'text-c1', text: 'Hello world', start: 2, duration: 3.5 }),
+    createTextItem('caption', { id: 'text-c2', text: 'Second caption', start: 4, duration: 3 }),
+    createTextItem('credits', { id: 'text-cr', start: 26, duration: 5 }),
+  );
+  p.music.push(
+    createMusicItem({ id: 'music-a1', mediaId: 'a1', start: 0 }),
+    createMusicItem({ id: 'music-n1', mediaId: 'n1', start: 6, kind: 'narration' }),
+  );
+  return p;
+}
+
+const store = new FakeStore();
+store.project = buildProject();
+const app = { store, media: {}, dialogs: { toast: (m, o) => cmdLog('toast', { m, type: o && o.type }) } };
+window.app = app;
+app.preview = new Preview(document.getElementById('preview-pane'), app);
+const player = new FakePlayer({ store, canvas: app.preview.canvas });
+app.player = player;
+app.commands = commands;
+app.preview.attach();
+app.storyboard = new Storyboard(document.getElementById('storyboard-pane'), app);
+
+ribbon.addEventListener('click', (e) => {
+  const b = e.target.closest('[data-act]');
+  if (b && b.dataset.act === 'textBold') commands.run('textSet', { key: 'bold', value: true });
+});
+const ribbonTabs = [];
+window.addEventListener('ribbon-tab', (e) => ribbonTabs.push(e.detail));
+const errors = [];
+window.addEventListener('error', (e) => errors.push(String(e.message || e)));
+window.addEventListener('unhandledrejection', (e) => errors.push(String(e.reason && e.reason.message || e.reason)));
+
+window.T = { store, player, commands, app, log, ribbonTabs, errors, buildProject, media, ready: true };
+if (params.has('log')) document.body.classList.add('show-log');
+player.renderNow();
+</script>
+</body>
+</html>

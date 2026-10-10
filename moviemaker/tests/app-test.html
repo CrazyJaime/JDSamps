@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light">
+<title>App test (F)</title>
+<link rel="manifest" href="../manifest.webmanifest">
+<link rel="stylesheet" href="../css/moviemaker.css">
+<script>
+  // Use the real js/commands.js when it exists; otherwise (or with ?stub) map it to the test stub.
+  // The import map has to be in place before the first module script is processed.
+  (function () {
+    var useStub = /[?&]stub\b/.test(location.search);
+    if (!useStub) {
+      try {
+        var xhr = new XMLHttpRequest();
+        xhr.open('HEAD', '../js/commands.js', false);
+        xhr.send();
+        useStub = xhr.status !== 200;
+      } catch (_) { useStub = true; }
+    }
+    window.__usingStubCommands = useStub;
+    if (!useStub) return;
+    var map = { imports: {} };
+    map.imports[new URL('../js/commands.js', location.href).href] = new URL('app-test-commands.js', location.href).href;
+    var s = document.createElement('script');
+    s.type = 'importmap';
+    s.textContent = JSON.stringify(map);
+    document.currentScript.after(s);
+  })();
+</script>
+</head>
+<body>
+<script type="module">
+// Real shell markup from index.html (minus its scripts and splash), then the real app.js.
+const html = await (await fetch('../index.html')).text();
+const doc = new DOMParser().parseFromString(html, 'text/html');
+for (const n of [...doc.body.children]) {
+  if (n.tagName === 'SCRIPT' || n.tagName === 'NOSCRIPT' || n.id === 'boot-splash') continue;
+  document.body.appendChild(document.importNode(n, true));
+}
+window.__appModule = await import('../js/app.js');
+</script>
+</body>
+</html>

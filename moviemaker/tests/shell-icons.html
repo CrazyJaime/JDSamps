@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Shell icons</title>
+<style>
+  body { margin: 0; padding: 12px; background: #fff; font: 11px "Segoe UI", Arial, sans-serif; color: #1e395b; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(96px, 1fr)); gap: 6px; }
+  .cell { border: 1px solid #dde5ef; border-radius: 3px; padding: 4px; display: flex; flex-direction: column; align-items: center; gap: 3px; background: linear-gradient(#fff, #eaf1fb); }
+  .row { display: flex; gap: 6px; align-items: center; }
+  .name { font-size: 10px; text-align: center; word-break: break-all; }
+</style>
+</head>
+<body>
+<div class="grid" id="g"></div>
+<script type="module">
+import { icon, ICON_NAMES } from '../js/ui/icons.js';
+const g = document.getElementById('g');
+for (const n of ICON_NAMES) {
+  const c = document.createElement('div'); c.className = 'cell';
+  const r = document.createElement('div'); r.className = 'row';
+  r.append(icon(n, 32), icon(n, 16));
+  const l = document.createElement('div'); l.className = 'name'; l.textContent = n;
+  c.append(r, l); g.append(c);
+}
+document.body.dataset.ready = '1';
+</script>
+</body>
+</html>

@@ -1,0 +1,201 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light">
+<title>Shell test</title>
+<link rel="stylesheet" href="../css/moviemaker.css">
+<style>
+  /* test-only mock content for the preview / storyboard panes (E renders the real ones) */
+  .mock-sb-items { display: flex; flex-wrap: wrap; gap: 16px 8px; align-items: flex-start; }
+  .mock-sb-items .sb-item { height: 62px; cursor: default; }
+  .mock-sb-items .sb-thumb { width: 100%; height: 100%; }
+  .mock-col { display: flex; flex-direction: column; gap: 2px; }
+  .mock-lane { position: relative; height: 14px; }
+  #mock-log { position: fixed; right: 4px; bottom: 30px; z-index: 5000; max-width: 260px; font: 10px monospace; color: #333; background: rgba(255,255,255,.85); pointer-events: none; white-space: pre; display: none; }
+  body.show-log #mock-log { display: block; }
+  @media (max-width: 760px), (pointer: coarse) and (max-width: 1024px) and (orientation: portrait) {
+    .mock-sb-items { flex-wrap: nowrap; padding: 0 45vw; }
+  }
+</style>
+</head>
+<body>
+<pre id="mock-log"></pre>
+<script type="module">
+import { Store } from '../js/store.js';
+import { createVisualItem, createTextItem, createMusicItem, formatTime } from '../js/model.js';
+import { Ribbon } from '../js/ui/ribbon.js';
+import { h, icon, isPhone } from '../js/ui/dom.js';
+
+// 1) Pull the real shell markup from index.html (minus scripts and the boot splash).
+const html = await (await fetch('../index.html')).text();
+const doc = new DOMParser().parseFromString(html, 'text/html');
+for (const n of [...doc.body.children]) {
+  if (n.tagName === 'SCRIPT' || n.tagName === 'NOSCRIPT') continue;
+  document.body.appendChild(document.importNode(n, true));
+}
+document.getElementById('boot-splash').remove();
+window.__shellIds = ['app', 'titlebar', 'qat', 'app-menu-btn', 'doc-title', 'ribbon', 'main', 'preview-pane', 'storyboard-pane',
+  'statusbar', 'status-text', 'media-host', 'dialog-root', 'toast-root', 'drop-overlay'].filter((id) => !document.getElementById(id));
+
+// 2) Mock app: real Store, fake commands that log and apply simple mutations.
+const store = new Store();
+const vid = createVisualItem('video', { mediaId: 'm1' });
+const img = createVisualItem('image', { mediaId: 'm2', duration: 7 });
+const ttl = createVisualItem('title', { text: 'My Holiday', duration: 7 });
+const img2 = createVisualItem('image', { mediaId: 'm2', duration: 5, transition: { type: 'crossfade', duration: 1.5 } });
+const cap = createTextItem('caption', { text: 'Hello', start: 2, duration: 3.5 });
+const mus = createMusicItem({ mediaId: 'm3', start: 0, kind: 'music' });
+store.update((p) => { p.items.push(vid, img, ttl, img2); p.texts.push(cap); p.music.push(mus); p.name = 'Summer Trip'; }, { label: 'setup' });
+
+const log = [];
+const logEl = document.getElementById('mock-log');
+const toasts = [];
+const sel = () => store.selectedItems();
+const firstItem = () => (store.selection.type === 'item' ? sel()[0] : null);
+const textObj = () => {
+  if (store.selection.type === 'text') return sel()[0];
+  const it = firstItem();
+  return it && it.kind === 'title' ? it : null;
+};
+const ITEM_CMDS = new Set(['setTransition', 'setTransitionDuration', 'applyTransitionAll', 'setPanZoom', 'applyPanZoomAll', 'setEffect', 'applyEffectAll',
+  'setBrightness', 'rotateLeft', 'rotateRight', 'split']);
+const VIDEO_CMDS = new Set(['setVolume', 'setFadeIn', 'setFadeOut', 'setSpeed', 'trimTool', 'setStartPoint', 'setEndPoint']);
+const MUSIC_CMDS = new Set(['musicVolume', 'musicFadeIn', 'musicFadeOut', 'musicStartTime', 'musicSetStartPoint', 'musicSetEndPoint', 'musicSplit']);
+const TEXT_CMDS = new Set(['textSet', 'textEdit', 'textEffect', 'textDuration']);
+const commands = {
+  run(name, arg) {
+    log.push([name, arg]);
+    logEl.textContent = log.slice(-12).map((l) => `${l[0]} ${JSON.stringify(l[1]) ?? ''}`).join('\n');
+    const items = store.selection.type === 'item' ? store.selection.ids : [];
+    const each = (fn, label, key) => store.update((p) => { for (const it of p.items) if (items.includes(it.id)) fn(it); }, { label, coalesceKey: key });
+    switch (name) {
+      case 'setTransition': return each((it) => { it.transition.type = arg; }, 'Transition');
+      case 'setTransitionDuration': return each((it) => { it.transition.duration = arg; }, 'Transition duration');
+      case 'setPanZoom': return each((it) => { it.panZoom = arg; }, 'Pan and zoom');
+      case 'setEffect': return each((it) => { it.effect = arg; }, 'Effect');
+      case 'setBrightness': return each((it) => { it.brightness = arg; }, 'Brightness', 'bri');
+      case 'setVolume': return each((it) => { it.volume = arg; }, 'Volume', 'vol');
+      case 'setFadeIn': return each((it) => { it.fadeIn = arg; }, 'Fade in');
+      case 'setSpeed': return each((it) => { it.speed = arg; }, 'Speed');
+      case 'setDuration': return each((it) => { it.duration = arg; }, 'Duration');
+      case 'setBackground': return each((it) => { it.background = arg; }, 'Background');
+      case 'setAspect': return store.update((p) => { p.aspect = arg; }, { label: 'Aspect' });
+      case 'setAudioMix': return store.update((p) => { p.audioMix = arg; }, { label: 'Audio mix', coalesceKey: 'mix' });
+      case 'emphasize': return store.update((p) => { p.audioMix = arg === 'video' ? -0.6 : arg === 'music' ? 0.6 : 0; }, { label: 'Emphasize' });
+      case 'zoomIn': return store.setView({ zoom: store.view.zoom * 1.5 });
+      case 'zoomOut': return store.setView({ zoom: store.view.zoom / 1.5 });
+      case 'setThumbSize': return store.setView({ thumbSize: arg });
+      case 'toggleWaveforms': return store.setView({ showWaveforms: !store.view.showWaveforms });
+      case 'setPreviewSize': return store.setView({ previewSize: arg });
+      case 'textSet': {
+        const t = textObj();
+        return store.update(() => { t.style[arg.key] = arg.value; }, { label: 'Text' });
+      }
+      case 'textEffect': {
+        const t = textObj();
+        return store.update(() => { if (t.kind === 'title') t.textEffect = arg; else t.effect = arg; }, { label: 'Text effect' });
+      }
+      case 'musicVolume': return store.update(() => { sel()[0].volume = arg; }, { label: 'Music volume' });
+      case 'musicStartTime': return store.update(() => { sel()[0].start = arg ?? 1.25; }, { label: 'Start' });
+      case 'undo': return store.undo();
+      case 'redo': return store.redo();
+      case 'selectAll': return store.select('item', store.project.items.map((i) => i.id));
+      case 'addMedia': return Promise.reject(new Error('No files were added.'));
+      default: return undefined;
+    }
+  },
+  isEnabled(name) {
+    const t = store.selection.type;
+    const it = firstItem();
+    if (name === 'undo') return store.canUndo;
+    if (name === 'redo') return store.canRedo;
+    if (['cut', 'copy', 'remove'].includes(name)) return !!t;
+    if (name === 'paste') return t !== 'music';
+    if (ITEM_CMDS.has(name)) return t === 'item';
+    if (VIDEO_CMDS.has(name)) return !!it && it.kind === 'video';
+    if (name === 'setDuration') return !!it && it.kind !== 'video';
+    if (name === 'setBackground') return !!it && it.kind === 'title';
+    if (MUSIC_CMDS.has(name)) return t === 'music';
+    if (TEXT_CMDS.has(name)) return !!textObj();
+    if (name === 'textStartTime') return t === 'text';
+    if (name === 'fitToMusic') return store.project.music.length > 0;
+    return true;
+  },
+  isChecked(name, arg) {
+    const it = firstItem();
+    const p = store.project;
+    switch (name) {
+      case 'setTransition': return !!it && it.transition.type === arg;
+      case 'setPanZoom': return !!it && it.panZoom === arg;
+      case 'setEffect': return !!it && it.effect === arg;
+      case 'setAspect': return p.aspect === arg;
+      case 'emphasize': return arg === 'video' ? p.audioMix <= -0.5 : arg === 'music' ? p.audioMix >= 0.5 : false;
+      case 'textEffect': { const t = textObj(); return !!t && (t.kind === 'title' ? t.textEffect : t.effect) === arg; }
+      default: return false;
+    }
+  },
+  list() { return []; },
+};
+const dialogs = {
+  toast(msg, opts = {}) {
+    toasts.push([msg, opts.type]);
+    const el = h('div.toast', { class: `toast-${opts.type || 'info'}` }, icon(opts.type === 'error' ? 'error' : 'info', 18), h('span.toast-msg', null, msg));
+    document.getElementById('toast-root').appendChild(el);
+    setTimeout(() => el.remove(), 2500);
+  },
+  openAppMenu() { log.push(['openAppMenu']); },
+};
+const player = new EventTarget();
+player.currentTime = 0;
+const noCommands = new URLSearchParams(location.search).has('nocommands');
+const app = noCommands ? { store, dialogs, player } : { store, commands, dialogs, player };
+window.mock = { app, log, toasts, store, ids: { vid: vid.id, img: img.id, ttl: ttl.id, img2: img2.id, cap: cap.id, mus: mus.id } };
+
+// 3) Mock preview + storyboard content using the shared .pv-* / .sb-* base classes.
+const pv = document.getElementById('preview-pane');
+const canvas = h('canvas.pv-canvas', { width: 640, height: 360 });
+const g = canvas.getContext('2d');
+const img1 = new Image();
+img1.src = 'fixtures/photo1.jpg';
+img1.onload = () => { g.drawImage(img1, 0, 0, 640, 360); };
+pv.append(
+  h('div.pv-stage', null, canvas),
+  h('div.pv-transport', null,
+    h('span.pv-time', null, `${formatTime(0)}/${formatTime(store.timeline.duration)}`),
+    h('button.pv-btn', { type: 'button', 'aria-label': 'Previous frame' }, icon('prev-frame', 16)),
+    h('button.pv-btn.pv-play', { type: 'button', 'aria-label': 'Play' }, icon('play', 20)),
+    h('button.pv-btn', { type: 'button', 'aria-label': 'Next frame' }, icon('next-frame', 16))));
+const sb = document.getElementById('storyboard-pane');
+const row = h('div.mock-sb-items');
+const widths = [140, 84, 84, 70];
+store.project.items.forEach((it, i) => {
+  const box = h('div.sb-item', { dataset: { id: it.id }, style: { width: `${widths[i]}px` }, onclick: () => store.select('item', it.id) },
+    it.kind === 'title' ? h('div', { style: 'width:100%;height:100%;background:#000;color:#fff;display:flex;align-items:center;justify-content:center;font-size:11px' }, 'My Holiday')
+      : h('img.sb-thumb', { src: 'fixtures/photo1.jpg', alt: '' }),
+    it.transition.type !== 'none' ? h('div.sb-transition') : null);
+  const col = h('div.mock-col', null, box,
+    i === 0 ? h('div.mock-lane', null, h('div.sb-caption', { style: 'left:30px;width:80px', onclick: () => store.select('text', cap.id) }, 'Hello')) : h('div.mock-lane'),
+    h('div.mock-lane', null, h('div.sb-music', { style: `left:0;width:${widths[i] + 8}px`, onclick: () => store.select('music', mus.id) }, i === 0 ? 'Summer song' : '')));
+  row.appendChild(col);
+});
+sb.appendChild(h('div.sb-scroll', null, row));
+store.addEventListener('selection', () => {
+  for (const el of sb.querySelectorAll('.sb-item')) el.classList.toggle('is-selected', store.selection.ids.includes(el.dataset.id));
+});
+
+// 4) Mount the ribbon.
+try {
+  app.ribbon = new Ribbon(document.getElementById('ribbon'), app);
+  window.mock.ribbon = app.ribbon;
+  document.body.dataset.ready = '1';
+} catch (err) {
+  document.body.dataset.ready = 'error';
+  document.body.dataset.error = String(err && err.stack || err);
+  throw err;
+}
+window.mock.isPhone = isPhone;
+</script>
+</body>
+</html>
