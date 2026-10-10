@@ -687,6 +687,37 @@ export class Exporter extends EventTarget {
 // ---------------------------------------------------------------------------
 // Saving files
 
+// When the app is framed by a host page that offers a save capability (a claude.ai artifact
+// viewer exposes window.claude.use('downloads')), sandboxed frames can't download directly,
+// so files go through the host's save prompt. Resolved early so a click doesn't wait on it.
+let hostDownloads = null;
+try {
+  if (typeof window !== 'undefined' && window.top !== window.self
+    && window.claude && typeof window.claude.use === 'function') {
+    hostDownloads = Promise.resolve(window.claude.use('downloads')).catch(() => null);
+  }
+} catch (_) { hostDownloads = null; }
+
+// The host only accepts common extensions; project files are JSON, so they travel as .json.
+const HOST_EXT_RENAMES = [[/\.wlmmweb$/i, '.wlmmweb.json']];
+
+async function saveViaHost(blob, name) {
+  const dl = hostDownloads ? await hostDownloads : null;
+  if (!dl || typeof dl.save !== 'function') return null;
+  let filename = name;
+  for (const [re, ext] of HOST_EXT_RENAMES) filename = filename.replace(re, ext);
+  try {
+    await dl.save({ filename, data: blob });
+    return 'downloaded';
+  } catch (err) {
+    const code = err && err.code;
+    if (code === 'declined') return 'canceled';
+    if (code === 'rate_limited') throw friendly('A save is already waiting for your answer.', 'busy');
+    if (code === 'too_large') throw friendly('This file is too large to save here. Try a smaller movie size.', 'too-large');
+    return null; // unavailable here: fall back to the browser's own ways of saving
+  }
+}
+
 /**
  * Save a blob as a file. Resolves 'downloaded' | 'shared' | 'opened' | 'canceled'.
  * On iOS (and wherever <a download> is unsupported) the share sheet is offered when it can
@@ -695,6 +726,10 @@ export class Exporter extends EventTarget {
 export async function downloadBlob(blob, filename) {
   if (!blob) throw friendly('There is nothing to save.', 'no-data');
   const name = filename || 'movie';
+  if (hostDownloads) {
+    const res = await saveViaHost(blob, name);
+    if (res) return res;
+  }
   const a = document.createElement('a');
   const canDownloadAttr = 'download' in a;
   if ((isIOS() || !canDownloadAttr) && typeof navigator !== 'undefined' && typeof navigator.share === 'function'

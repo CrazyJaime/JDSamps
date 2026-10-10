@@ -19,7 +19,7 @@ const SW_URL = new URL('../sw.js', import.meta.url);
 const SW_SCOPE = new URL('../', import.meta.url);
 const SHARE_CACHE = 'movie-maker-share';
 const AUDIO_EXT = /\.(mp3|m4a|m4b|aac|wav|wave|ogg|oga|opus|flac|weba|wma|aif|aiff|aifc|caf|amr|mka)$/i;
-const PROJECT_EXT = /\.wlmmweb$/i;
+const PROJECT_EXT = /\.wlmmweb(\.json)?$/i;
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -689,6 +689,10 @@ function registerServiceWorker() {
   const host = location.hostname;
   const allowed = location.protocol === 'https:' || host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
   if (!allowed) return;
+  // Embedded in another page (e.g. a hosted preview frame): the host owns caching and updates.
+  let framed = false;
+  try { framed = window.top !== window.self; } catch (_) { framed = true; }
+  if (framed) return;
   const sw = navigator.serviceWorker;
   if (/[?&]nosw\b/.test(location.search)) {
     // Development escape hatch: ?nosw removes the worker and its caches.
