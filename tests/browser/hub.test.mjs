@@ -18,6 +18,10 @@ after(async () => { await h?.close(); await server?.close(); });
 test('commands and context menu are registered', async () => {
   const cmds = await h.sw.evaluate(() => chrome.commands.getAll());
   assert.ok(cmds.some((c) => c.name === 'add-tab'));
+  // contextMenus has no getter: updating an item fails unless it exists. onInstalled creates it.
+  const menu = (id) => h.sw.evaluate((x) => chrome.contextMenus.update(x, {}).then(() => 'ok', (e) => e.message), id);
+  await waitFor(async () => (await menu('jds-add-tab')) === 'ok', 5000);
+  assert.notEqual(await menu('no-such-item'), 'ok');
 });
 
 test('sources list shows the track tab as not yet granted', async () => {
@@ -44,8 +48,18 @@ test('LOAD_TAB captures the tab onto deck 1 (allowlisted test build)', async () 
 });
 
 test('chrome pages and bad ids are refused politely', async () => {
-  const r = await hubCall(deck, { type: 'LOAD_TAB', tabId: 'x' });
+  for (const tabId of ['x', 1.5, null, {}]) {
+    const r = await hubCall(deck, { type: 'LOAD_TAB', tabId });
+    assert.deepEqual([r.ok, r.error], [false, 'Bad tab id.'], JSON.stringify(tabId));
+  }
+  const gone = await hubCall(deck, { type: 'LOAD_TAB', tabId: 2 ** 30 });
+  assert.deepEqual([gone.ok, gone.error], [false, 'That tab is gone.']);
+  const page = await h.context.newPage();
+  await page.goto('chrome://version');
+  const r = await hubCall(deck, { type: 'LOAD_TAB', tabId: await tabIdFor(h, 'chrome://version') });
+  await page.close();
   assert.equal(r.ok, false);
+  assert.match(r.error, /Chrome pages cannot be captured/);
 });
 
 test('messages from content scripts are refused', async () => {
