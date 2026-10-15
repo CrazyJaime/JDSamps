@@ -143,11 +143,19 @@ test('grid shift by half a beat persists through later measurements', () => {
   assert.ok(Math.abs(median - halfBeatMs) < 15, `median ${median} vs ${halfBeatMs}`);
 });
 
-test('OdfCore emits band bytes and is allocation-free per sample', () => {
+test('OdfCore emits band bytes and allocates no typed arrays while it runs', () => {
   const frames = [];
   const odf = new OdfCore(FS, (full, low, t, bl, bm, bh) => frames.push([full, low, t, bl, bm, bh]));
   const { x } = synth({ ...PATTERNS.house, bars: 2 });
-  for (let s = 0; s + 128 <= x.length; s += 128) odf.push(x.subarray(s, s + 128), s);
+  const blocks = [];
+  for (let s = 0; s + 128 <= x.length; s += 128) blocks.push([x.subarray(s, s + 128), s]);
+  // Count typed-array constructions during push() (its buffers are all made in the constructor).
+  // Plain objects and closures cannot be counted this way; the typed arrays are the big ones.
+  const kinds = ['Float32Array', 'Float64Array', 'Uint8Array', 'Uint16Array', 'Int16Array'], orig = {};
+  let made = 0;
+  for (const k of kinds) { orig[k] = globalThis[k]; globalThis[k] = new Proxy(orig[k], { construct(T, args) { made++; return new T(...args); } }); }
+  try { for (const [b, s] of blocks) odf.push(b, s); } finally { Object.assign(globalThis, orig); }
+  assert.equal(made, 0, `${made} typed arrays allocated in push()`);
   assert.equal(odf.spf, odf.H * odf.D);
   assert.ok(frames.length > 100);
   for (const f of frames) for (const b of f.slice(3)) assert.ok(Number.isInteger(b) && b >= 0 && b <= 255);

@@ -382,3 +382,25 @@ for (const chunksFirst of [true, false]) {
     assert.equal(a.page.rate, env.d.assist.sourceRate, 'the page plays what the engine believes');
   });
 }
+
+test('malformed or hostile agent messages change nothing in the engine (Review Focus 5)', async () => {
+  const env = await setup();
+  const a = agent(env, 0);
+  run(env, 3, { src: () => a.page.rate });
+  const snap = () => JSON.stringify([env.d.assist.sourceRate, env.d.assist.sent, env.d.assist.active, env.d.src.steps, env.d.tempo.bpm, env.d.ts.segs.length]);
+  const before = snap(), sent = a.sent.length;
+  assert.ok(env.d.assist.sourceRate > 1, 'engaged');
+  const ok = a.status();
+  for (const m of [
+    'garbage', null, 42, [], { t: 'status' }, { ...ok, rate: NaN }, { ...ok, rate: Infinity }, { ...ok, rate: -1 },
+    { ...ok, rate: 1e9 }, { ...ok, rate: '1.5' }, { ...ok, hasMedia: 'yes' }, { ...ok, playing: 1 },
+    { t: 'external-rate', rate: NaN }, { t: 'external-rate', rate: 0 }, { t: 'external-rate', rate: '2' }, { t: 'external-rate', rate: 1e9 },
+    { t: 'rate', rate: 1.2 }, { t: 'release' }, JSON.parse('{"__proto__":{"t":"status","hasMedia":true,"playing":true,"rate":2}}'),
+  ]) a.deliver(m);
+  assert.equal(snap(), before);
+  assert.equal(a.sent.length, sent, 'no reply to the page');
+  assert.deepEqual(env.engine.events, []);
+  run(env, 1, { src: () => a.page.rate });
+  const st = env.d.state(env.clock.t);
+  assert.ok(st.assist.active && st.assist.sourceRate > 1 && Number.isFinite(st.engineRate) && Number.isFinite(st.reserve), JSON.stringify(st.assist));
+});

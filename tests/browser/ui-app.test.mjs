@@ -16,13 +16,18 @@ const SOURCES = {
   ],
 };
 
+// Every persisted master key, stored with a value the engine does not have, except assist.on
+// (stored equal to the engine's, so it must not be sent).
+const STORED = {
+  'master.limiter': false, 'xfader.curve': 'SHARP', 'rec.format': 'webm', 'bpm.range': '88-175', 'buffer.capSec': 480, 'assist.on': true, 'pitch.defaultRange': 0.16,
+};
 let ui, page;
 const acts = async (filter) => (await ui.sent()).filter((m) => m.t === 'act' && (!filter || filter(m)));
 const sets = async (filter) => (await ui.sent()).filter((m) => m.t === 'set' && (!filter || filter(m)));
 const deckEl = (slot) => page.locator('.deck').nth(slot - 1);
 
 before(async () => {
-  ui = await openUi({ state: threeDecks(), hubReplies: { LIST_SOURCES: SOURCES, LOAD_TAB: { ok: true } }, storage: { 'xfader.curve': 'SHARP' } });
+  ui = await openUi({ state: threeDecks(), hubReplies: { LIST_SOURCES: SOURCES, LOAD_TAB: { ok: true } }, storage: STORED });
   page = ui.page;
   await page.waitForSelector('.deck >> nth=2');
   for (const id of [1, 2, 3]) await ui.push(makeWave(id, 60, id === 2 ? 128 : 124));
@@ -49,7 +54,10 @@ test('hostile page titles render as text', async () => {
 });
 
 test('stored settings are restored into the engine on connect', async () => {
-  assert.ok((await sets((m) => m.deck === null && m.key === 'xfader.curve' && m.value === 'SHARP')).length >= 1);
+  const sent = (await sets((m) => m.deck === null)).filter((m) => m.key in STORED);
+  const differ = Object.fromEntries(Object.entries(STORED).filter(([k]) => k !== 'assist.on'));
+  assert.deepEqual(Object.fromEntries(sent.map((m) => [m.key, m.value])), differ);
+  assert.equal(sent.length, Object.keys(differ).length, JSON.stringify(sent));
 });
 
 test('transport and sync buttons send actions', async () => {

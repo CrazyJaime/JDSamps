@@ -26,6 +26,7 @@ export function prepareExtension({ src = ROOT, dest } = {}) {
 
 export async function launchExtension({ ext, headless = process.env.HEADLESS !== '0', downloadsDir } = {}) {
   const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'jds-profile-'));
+  const ownDownloads = !downloadsDir;
   downloadsDir = downloadsDir || fs.mkdtempSync(path.join(os.tmpdir(), 'jds-dl-'));
   fs.mkdirSync(path.join(userDataDir, 'Default'), { recursive: true });
   fs.writeFileSync(path.join(userDataDir, 'Default', 'Preferences'), JSON.stringify({
@@ -49,7 +50,10 @@ export async function launchExtension({ ext, headless = process.env.HEADLESS !==
   await cdp.send('Browser.setDownloadBehavior', { behavior: 'default' });
   return {
     context, sw, extId: ext.id, userDataDir, downloadsDir,
-    async close() { await context.close(); fs.rmSync(userDataDir, { recursive: true, force: true }); fs.rmSync(ext.dir, { recursive: true, force: true }); },
+    async close() {
+      await context.close();
+      for (const d of [userDataDir, ext.dir, ...(ownDownloads ? [downloadsDir] : [])]) fs.rmSync(d, { recursive: true, force: true });
+    },
   };
 }
 
@@ -77,9 +81,10 @@ const TRACKS = { a: { bpm: 124, kind: 'low' }, b: { bpm: 128, kind: 'high' }, c:
 
 /** /a, /b: <audio loop autoplay> pages (124 BPM low kick, 128 BPM high click).
  *  /c: Web-Audio page (AudioBufferSourceNode) at 120 BPM, plus a muted decorative <audio> that
- *  player assist must not mistake for the source. */
-export async function startTrackServer() {
-  const wavs = Object.fromEntries(Object.entries(TRACKS).map(([k, t]) => [k, makeTrackWav(t)]));
+ *  player assist must not mistake for the source. Tracks are `seconds` long: an <audio> loop
+ *  restart leaves a ~0.1 s gap in the captured audio. */
+export async function startTrackServer({ seconds = 60 } = {}) {
+  const wavs = Object.fromEntries(Object.entries(TRACKS).map(([k, t]) => [k, makeTrackWav({ ...t, seconds })]));
   const media = (k) => `<!doctype html><title>Track ${k.toUpperCase()} ${TRACKS[k].bpm} BPM</title><audio id="a" src="/${k}.wav" loop autoplay></audio>
 <script>window.__media = () => { const a = document.getElementById('a'); return { t: a.currentTime, rate: a.playbackRate, pp: a.preservesPitch, paused: a.paused }; };</script>`;
   const webaudio = `<!doctype html><title>Track C ${TRACKS.c.bpm} BPM (Web Audio)</title><audio id="decor" src="/c.wav" muted loop autoplay></audio><script>
@@ -177,9 +182,13 @@ function bandFilter(x, sr, band) {
   if (band === 'low') {            // 4-pole low-pass at 150 Hz
     const k = a(150); let s1 = 0, s2 = 0, s3 = 0, s4 = 0;
     for (let i = 0; i < x.length; i++) { s1 = (1 - k) * x[i] + k * s1; s2 = (1 - k) * s1 + k * s2; s3 = (1 - k) * s2 + k * s3; s4 = (1 - k) * s3 + k * s4; y[i] = s4; }
-  } else {                         // high: x minus 4-pole low-pass at 1.5 kHz (≈ high-pass)
-    const k = a(1500); let s1 = 0, s2 = 0, s3 = 0, s4 = 0;
-    for (let i = 0; i < x.length; i++) { s1 = (1 - k) * x[i] + k * s1; s2 = (1 - k) * s1 + k * s2; s3 = (1 - k) * s2 + k * s3; s4 = (1 - k) * s3 + k * s4; y[i] = x[i] - s4; }
+  } else {                         // high: 4-pole high-pass at 1.5 kHz (a 100 Hz kick is ~90 dB down)
+    const k = a(1500), s = [0, 0, 0, 0], xp = [0, 0, 0, 0];
+    for (let i = 0; i < x.length; i++) {
+      let v = x[i];
+      for (let j = 0; j < 4; j++) { const o = k * (s[j] + v - xp[j]); xp[j] = v; s[j] = o; v = o; }
+      y[i] = v;
+    }
   }
   return y;
 }
@@ -193,10 +202,10 @@ export function bandRms(mono, sr, band) {
 /** Onset times (s) in one band: 2 ms envelope, rising through 35% of max, 150 ms refractory. */
 export function bandOnsets(mono, sr, band) {
   const y = bandFilter(mono, sr, band);
-  const hop = Math.round(sr * 0.002), env = [];
+  const hop = Math.round(sr * 0.002), dt = hop / sr, env = []; // 88 samples at 44.1 kHz: dt is not 2 ms
   for (let i = 0; i + hop <= y.length; i += hop) { let m = 0; for (let j = 0; j < hop; j++) m = Math.max(m, Math.abs(y[i + j])); env.push(m); }
   const max = Math.max(...env), thr = max * 0.35, out = [];
-  for (let i = 1; i < env.length; i++) if (env[i] >= thr && env[i - 1] < thr && (!out.length || i * 0.002 - out[out.length - 1] > 0.15)) out.push(i * 0.002);
+  for (let i = 1; i < env.length; i++) if (env[i] >= thr && env[i - 1] < thr && (!out.length || i * dt - out[out.length - 1] > 0.15)) out.push(i * dt);
   return out;
 }
 
@@ -205,8 +214,55 @@ export function medianBpm(onsets) {
   return iv.length ? 60 / iv[Math.floor(iv.length / 2)] : null;
 }
 
+/**
+ * Steady beats: onsets split into runs of consecutive beats, each interval within `tol` of the
+ * median one (a capture dropout or a phase bend ends a run), and one beat period fitted by least
+ * squares across every run of at least `minLen` beats, each run with its own phase. The fit uses
+ * every onset, so the 2 ms envelope hop averages out. Returns {T, n (onsets fitted), runs: [[t...]]}.
+ */
+export function steadyBeats(onsets, { tol = 0.008, minLen = 8 } = {}) {
+  const Tm = 60 / medianBpm(onsets), runs = [[onsets[0]]];
+  for (let i = 1; i < onsets.length; i++) {
+    if (Math.abs(onsets[i] - onsets[i - 1] - Tm) <= tol) runs[runs.length - 1].push(onsets[i]); else runs.push([onsets[i]]);
+  }
+  let sxy = 0, sxx = 0, n = 0;
+  for (const r of runs.filter((x) => x.length >= minLen)) {
+    const mk = (r.length - 1) / 2, mt = r.reduce((a, t) => a + t, 0) / r.length;
+    r.forEach((t, k) => { sxy += (k - mk) * (t - mt); sxx += (k - mk) ** 2; });
+    n += r.length;
+  }
+  return { T: sxy / sxx, n, runs };
+}
+
+/** The RIFF/WAVE header fields, as written, plus the file length. */
+export function wavHeader(buf) {
+  return {
+    riff: buf.toString('ascii', 0, 4), riffSize: buf.readUInt32LE(4), wave: buf.toString('ascii', 8, 12),
+    fmt: buf.toString('ascii', 12, 16), fmtSize: buf.readUInt32LE(16), format: buf.readUInt16LE(20), ch: buf.readUInt16LE(22),
+    sr: buf.readUInt32LE(24), byteRate: buf.readUInt32LE(28), blockAlign: buf.readUInt16LE(32), bits: buf.readUInt16LE(34),
+    data: buf.toString('ascii', 36, 40), dataSize: buf.readUInt32LE(40), fileBytes: buf.length,
+  };
+}
+
 // ---------------------------------------------------------------- engine internals (CDP)
 export async function offscreenEval(h, expression) {
+  return withOffscreen(h, async (send) => {
+    const r = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true });
+    if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
+    return r.result.value;
+  });
+}
+
+/** The offscreen engine's JS heap after a full GC: {usedSize, totalSize, backingStorageSize?} in bytes. */
+export function offscreenHeap(h) {
+  return withOffscreen(h, async (send) => {
+    await send('HeapProfiler.collectGarbage');
+    return send('Runtime.getHeapUsage');
+  });
+}
+
+/** Run fn(send) with a CDP session attached to the offscreen engine document. */
+async function withOffscreen(h, fn) {
   const [port, wsPath] = fs.readFileSync(path.join(h.userDataDir, 'DevToolsActivePort'), 'utf8').trim().split('\n');
   const ws = new WebSocket(`ws://127.0.0.1:${port}${wsPath}`);
   await new Promise((res, rej) => { ws.onopen = res; ws.onerror = () => rej(new Error('CDP websocket failed')); });
@@ -221,8 +277,6 @@ export async function offscreenEval(h, expression) {
     const t = targetInfos.find((x) => x.url === `chrome-extension://${h.extId}/offscreen.html`);
     if (!t) throw new Error('offscreen engine not running');
     const { sessionId } = await send('Target.attachToTarget', { targetId: t.targetId, flatten: true });
-    const r = await send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, sessionId);
-    if (r.exceptionDetails) throw new Error(r.exceptionDetails.exception?.description || r.exceptionDetails.text);
-    return r.result.value;
+    return await fn((method, params) => send(method, params, sessionId));
   } finally { ws.close(); }
 }
