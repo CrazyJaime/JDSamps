@@ -1,6 +1,7 @@
 // engine/deck.js — one captured tab as a DJ deck.
 //
-// tab stream ─► MediaStreamSource ─► jds-deck-input ─(chunks)─► Timeshift/stretch node (buffer mode)
+// tab stream ─► MediaStreamSource ─► jds-deck-input ─(chunks, on the audio thread)─► stretch node (buffer mode)
+//                                         ├─(live edge)─► Timeshift (drives the stretch node)
 //                                         └─(ODF)─► DeckTempo ─► GridMap
 // stretch ─► trim ─► EQ ─► FX rack (filter, gate/crush, flanger, echo/reverb sends) ─┬─► fader ─► xfGain ─► master bus
 //                                                                                    └─► recorder (pre-fader, post-FX)
@@ -19,6 +20,11 @@ const fail = (error) => ({ ok: false, error });
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const withTimeout = (p, ms, msg) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
 const CAP_MARGIN = 4; // s of audio always kept behind a playing deck's playhead (covers small backward jumps)
+const NO_TIME_UPDATES = 1e9; // s between the stretcher's 'time' messages: never
+// The live edge is stale when the newest chunk heard of was made longer ago than this (chunks come every
+// ~43 ms): the main thread is working through a backlog, and the reserve it computes is too low.
+const EDGE_STALE = 0.25;
+const DRY_NOTICE_EVERY = 30; // s: at most one 'audio ran dry' notice per deck in this long
 // Player assist: rate match tolerance (steps are 0.25 %), how long the page has to confirm a rate
 // before the ramp holds (a background tab Chrome throttles may answer late), how long before an
 // unconfirmed rate counts as refused, how long assist stays off after the page refused it, and the
@@ -59,6 +65,10 @@ export class Deck {
     this.loop = null;
     this.starved = false;
     this.emergencyUntil = 0;
+    this.edgeAt = null; // context time (s) the input worklet made the newest chunk we have heard of
+    this.dropouts = { runs: 0, seconds: 0 }; // the stretcher read past its buffered audio ('dry')
+    this.dryNoticeAt = -Infinity;
+    this.dryUnnoticed = 0;
     // sourceRate is what the page confirmed (the source model); sent is the last rate commanded,
     // to the frame agent of the one audible element (agent).
     this.assist = {
@@ -85,9 +95,16 @@ export class Deck {
     this.source = ctx.createMediaStreamSource(this.stream);
     this.inputNode = new AudioWorkletNode(ctx, 'jds-deck-input', {
       numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [1], channelCount: 2, channelCountMode: 'explicit', channelInterpretation: 'speakers',
+      processorOptions: { pipeId: this.id },
     });
     this.inputNode.port.onmessage = (ev) => this.onInput(ev.data);
     this.stretch = await e.createStretch();
+    // Timeshift models the playhead itself: the stretcher's 10/s 'time' updates would only wake the main thread.
+    this.stretch.setUpdateInterval(NO_TIME_UPDATES);
+    this.stretch.port.addEventListener('message', (ev) => { if (Array.isArray(ev.data) && ev.data[0] === 'dry') this.onDry(ev.data[1]); });
+    // The input worklet hands its chunks to the stretcher on the audio thread, not through this (shared,
+    // sometimes busy) main thread. Registered before the capture is connected, so every chunk goes that way.
+    await withTimeout(this.stretch.attachInput(this.id), 4000, 'The time-stretcher did not take its input');
     const lat = await withTimeout(this.stretch.latency(), 4000, 'The time-stretcher did not report its latency');
     this.ts = new Timeshift(this.stretch, { sampleRate: this.sr, latency: lat, outLatency: lat / 2, capSec: e.params['buffer.capSec'] });
     this.trimNode = createTrim(ctx);
@@ -123,7 +140,8 @@ export class Deck {
       const [lo, hi] = BPM_RANGES[this.engine.params['bpm.range']] || BPM_RANGES.AUTO;
       this.tempo = new DeckTempo({ sampleRate: this.sr, fps: m.fps, lo, hi });
     } else if (m.t === 'chunk') {
-      this.ts.append(m.L, m.R);
+      if (m.piped) this.ts.extend(m.n); else this.ts.append(m.L, m.R);
+      if (m.at != null) this.edgeAt = m.at / this.sr;
       if (this.firstAudible == null && m.firstAbove >= 0) {
         this.firstAudible = (m.start + m.firstAbove) / this.sr;
         if (this.cueAuto && !this.hasPlayed) this.setCue(this.firstAudible);
@@ -140,6 +158,19 @@ export class Deck {
       this.appendWave(tStart, hop, m.bands);
       this.engine.broadcastWave(this, tStart, hop, m.bands);
     }
+  }
+
+  /** The stretcher read past its buffered audio for `seconds` (its input came too late). Told at most every 30 s. */
+  onDry(seconds) {
+    if (this.disposed || !(seconds > 0)) return;
+    this.dropouts.runs++;
+    this.dropouts.seconds += seconds;
+    this.dryUnnoticed += seconds;
+    const now = this.now();
+    if (now < this.dryNoticeAt + DRY_NOTICE_EVERY) return;
+    this.dryNoticeAt = now;
+    this.engine.event('warn', `Deck ${this.slot}: audio ran dry for ${Math.round(this.dryUnnoticed * 1000)} ms (the browser was busy).`, this.id);
+    this.dryUnnoticed = 0;
   }
 
   appendWave(tStart, hop, bands) {
@@ -497,8 +528,11 @@ export class Deck {
     ts.flush(now);
     const p = ts.posAt(now);
     const res = ts.reserveAt(now);
+    // After a main-thread stall, backlogged ticks run at the current time while the live edge is still
+    // catching up: the reserve looks empty when the stretcher (fed on the audio thread) is fine. Wait.
+    const stale = this.edgeAt != null && now - this.edgeAt > EDGE_STALE;
 
-    if (this.wantPlay) {
+    if (this.wantPlay && !stale) {
       const desired = this.desiredRate(p);
       if (!this.starved && desired > 1 && res < GUARD) {
         this.starved = true;
@@ -514,7 +548,7 @@ export class Deck {
       }
       this.scheduleCrossing(now, p);
       this.reconcileRate(now);
-    } else if (this.starved) {
+    } else if (!this.wantPlay && this.starved) {
       this.starved = false; // re-evaluated on the next PLAY
     }
 

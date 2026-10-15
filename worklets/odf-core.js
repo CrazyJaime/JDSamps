@@ -99,7 +99,7 @@ export class OdfCore {
     const cur = this.cur, prev = this.prev, K = this.K;
     let eL = 0, eM = 0, eH = 0;
     for (let k = 1; k < K; k++) {
-      const mag = this.norm * Math.hypot(re[k], im[k]);
+      const r = re[k], i = im[k], mag = this.norm * Math.sqrt(r * r + i * i); // not Math.hypot: it allocates per call
       cur[k] = Math.log1p(this.gamma * mag);
       const e = mag * mag;
       if (k <= this.bandLowMax) eL += e; else if (k <= this.bandMidMax) eM += e; else eH += e;

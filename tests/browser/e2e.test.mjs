@@ -379,6 +379,28 @@ test('player assist refills the reserve on a media-element page', async () => {
   }, 15000, 300);
 });
 
+test('a 2.5 s stall of the deck page (it shares the engine\'s main thread) leaves no gap in the mix', async () => {
+  // Deck 1 plays synced +3.2 % from a LIVE-sized reserve (about 1 s), deck 2 is the master.
+  const s0 = await state(deck);
+  assert.ok(deckBy(s0, 1).playing && deckBy(s0, 1).reserve < 2.5, JSON.stringify({ reserve: deckBy(s0, 1).reserve }));
+  const known = await downloadIds(h);
+  assert.equal((await act(deck, null, 'mixRecStart')).ok, true);
+  await sleep(2000);
+  const blocked = await deck.evaluate(() => { const t0 = performance.now(); while (performance.now() - t0 < 2500); return performance.now() - t0; });
+  await sleep(3000);
+  await act(deck, null, 'mixRecStop');
+  const wav = parseWav(fs.readFileSync((await waitForDownload(h, known)).filename));
+  const kicks = bandOnsets(wav.mono, wav.sr, 'low'); // deck 1 (track A) is the only low-band source
+  const gaps = kicks.slice(1).map((t, i) => [kicks[i], t - kicks[i]]);
+  const worst = gaps.reduce((m, g) => (g[1] > m[1] ? g : m), [0, 0]);
+  const info = JSON.stringify({ blocked: Math.round(blocked), seconds: wav.seconds, kicks: kicks.length, worst: [+worst[0].toFixed(2), Math.round(worst[1] * 1000)] });
+  assert.ok(kicks.length > 10, info);
+  assert.ok(worst[1] < 0.6, `longest gap between kicks ${Math.round(worst[1] * 1000)} ms (a beat is 469 ms): ${info}`);
+  const ids = s0.decks.map((d) => d.id);
+  const dropouts = await offscreenEval(h, `${JSON.stringify(ids)}.map((id) => globalThis.__jdsEngine.decks.get(id).dropouts)`);
+  assert.deepEqual(dropouts, ids.map(() => ({ runs: 0, seconds: 0 })), `the stretchers read past their audio: ${info}`);
+});
+
 test('a Web-Audio page with a muted decorative <audio> has no assist and the reserve stays protected', async () => {
   tabs.c = await h.context.newPage();
   await tabs.c.goto(server.url('c'));

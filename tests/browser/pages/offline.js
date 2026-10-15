@@ -1,6 +1,7 @@
 import { createIsolator, createTrim } from '../../../engine/eq.js';
 import { createDjFilter, createFxRack } from '../../../engine/fx.js';
 import { createMaster } from '../../../engine/master.js';
+import SignalsmithStretch from '../../../vendor/signalsmith-stretch/SignalsmithStretch.mjs';
 
 const SR = 48000;
 const WORKLETS = ['../../../worklets/beatfx.js', '../../../worklets/master.js'];
@@ -150,6 +151,44 @@ window.tests = {
     m.addDeck(1, g, 'A'); m.setCrossfader(1, 'SMOOTH');
     const out = (await render(ctx)).getChannelData(0);
     return { rms: rms(out, 0.3, 0.9) };
+  },
+  /** Two stretcher processor files render the same buffered input and schedule (trimmed start, jump, loop). */
+  async stretchEquivalence({ files }) {
+    const outs = [];
+    for (const file of files) {
+      const ctx = new OfflineAudioContext(2, SR * 3, SR);
+      await ctx.audioWorklet.addModule(file);
+      SignalsmithStretch.moduleUrl = file;
+      const n = await SignalsmithStretch(ctx, { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2] });
+      n.connect(ctx.destination);
+      seed = 1;
+      const CH = 2048, seconds = 30;
+      for (let k = 0; k < Math.round((seconds * SR) / CH); k++) {
+        const L = new Float32Array(CH), R = new Float32Array(CH);
+        for (let j = 0; j < CH; j++) { L[j] = 0.3 * Math.sin((k * CH + j) * 0.031) + 0.05 * rnd(); R[j] = 0.3 * Math.sin((k * CH + j) * 0.017) + 0.05 * rnd(); }
+        n.addBuffers([L, R], [L.buffer, R.buffer]);
+      }
+      await n.dropBuffers(4.1); // a trimmed history start: the scan starts mid-list
+      await n.schedule({ active: true, input: seconds - 12, output: 0.05, rate: 1.031, semitones: -0.4 });
+      await n.schedule({ active: true, input: seconds - 20, output: 1.3, rate: 0.97, semitones: 0, loopStart: seconds - 20, loopEnd: seconds - 19.6 });
+      // Mid-render, while the loop plays: the live edge grows and the history is trimmed again.
+      ctx.suspend(2).then(async () => {
+        for (let k = 0; k < 20; k++) { const L = new Float32Array(CH).fill(0.1), R = new Float32Array(CH).fill(-0.1); n.addBuffers([L, R], [L.buffer, R.buffer]); }
+        await n.dropBuffers(9);
+        ctx.resume();
+      });
+      const buf = await render(ctx);
+      outs.push([buf.getChannelData(0), buf.getChannelData(1)]);
+    }
+    const [[a0, a1], [b0, b1]] = outs;
+    let differing = 0, maxAbsDiff = 0, energy = 0;
+    for (let i = 0; i < a0.length; i++) {
+      const d = Math.max(Math.abs(a0[i] - b0[i]), Math.abs(a1[i] - b1[i]));
+      if (d > 0) differing++;
+      maxAbsDiff = Math.max(maxAbsDiff, d);
+      energy += a0[i] * a0[i] + a1[i] * a1[i];
+    }
+    return { samples: a0.length, energy, differing, maxAbsDiff };
   },
 };
 window.ready = true;
