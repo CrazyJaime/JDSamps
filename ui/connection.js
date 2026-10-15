@@ -75,9 +75,10 @@ export class EngineConnection {
    * Continuous (numeric) parameters: only the latest value per key is sent, once per animation frame.
    * Discrete ones (booleans, enums) go out at once, after anything queued, so a kill or FX release
    * is never stuck waiting for a frame that a hidden page does not run.
+   * hold: a kill/FX pad pressed and still down; the engine lets go of it if the page goes away first.
    */
-  set(deck, key, value) {
-    const msg = { t: 'set', deck, key, value };
+  set(deck, key, value, hold = false) {
+    const msg = hold ? { t: 'set', deck, key, value, hold: true } : { t: 'set', deck, key, value };
     const spec = (deck === null ? MASTER_PARAMS : DECK_PARAMS)[key];
     if (!spec || spec.type !== 'num') { this.flush(); this.post(msg); return; }
     this.sets.set(`${deck}|${key}`, msg);

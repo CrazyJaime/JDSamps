@@ -224,7 +224,7 @@ export class Fader extends Continuous {
  * One pointer holds a pad at a time; losing pointer capture releases it like pointerup.
  * paint=false: the caller draws the pad's light from engine state (CUE).
  */
-export function bindPad(el, { onDown, onUp, latch = false, paint: painted = true }) {
+export function bindPad(el, { onDown, onUp, onLatch, latch = false, paint: painted = true }) {
   let on = false, downAt = 0, wasOn = false, active = false, pointer = null;
   const press = () => {
     if (active) return;
@@ -239,6 +239,7 @@ export function bindPad(el, { onDown, onUp, latch = false, paint: painted = true
     active = false;
     const held = performance.now() - downAt >= 250;
     if (!latch || held || wasOn) { on = false; onUp && onUp(); }
+    else if (onLatch) onLatch(); // a tap: stays on, no longer held
     paint();
   };
   const paint = () => { if (painted) { el.classList.toggle('on', on); toggleAttr(el, 'aria-pressed', on); } };

@@ -51,7 +51,7 @@ export class DeckStrip {
     document.addEventListener('visibilitychange', this.onVisible);
   }
 
-  set(key, value) { this.conn.set(this.id, key, value); }
+  set(key, value, hold) { this.conn.set(this.id, key, value, hold); }
   async act(a, arg) {
     const r = await this.conn.act(this.id, a, arg);
     if (!r.ok && r.error) this.toast(r.error, 'warn');
@@ -81,10 +81,10 @@ export class DeckStrip {
     });
     for (const band of ['hi', 'mid', 'low']) {
       const el = this.q(`[data-kill="${band}"]`);
-      const pad = bindPad(el, { latch: true, onDown: () => this.set(`kill.${band}`, true), onUp: () => this.set(`kill.${band}`, false) });
+      const pad = bindPad(el, { latch: true, onDown: () => this.set(`kill.${band}`, true, true), onUp: () => this.set(`kill.${band}`, false), onLatch: () => this.set(`kill.${band}`, true) });
       this[`kill_${band}`] = pad;
     }
-    this.fxOn = bindPad(this.q('[data-pad="fx.on"]'), { latch: true, onDown: () => this.set('fx.on', true), onUp: () => this.set('fx.on', false) });
+    this.fxOn = bindPad(this.q('[data-pad="fx.on"]'), { latch: true, onDown: () => this.set('fx.on', true, true), onUp: () => this.set('fx.on', false), onLatch: () => this.set('fx.on', true) });
     this.segs = {
       'fx.type': bindSeg(this.q('[data-seg="fx.type"]'), { onSelect: (v) => this.set('fx.type', v) }),
       'fx.beats': bindSeg(this.q('[data-seg="fx.beats"]'), { onSelect: (v) => this.set('fx.beats', v) }),
