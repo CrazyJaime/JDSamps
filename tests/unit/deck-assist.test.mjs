@@ -264,3 +264,39 @@ test('if the heard element moves to another frame, assist starts again from 1x t
   run(env, 2, { src: () => b.page.rate });
   assert.ok(rates(b).length > 0 && env.d.assist.sourceRate > 1, 're-engaged on the new frame');
 });
+
+// A source tab Chrome throttles in the background may answer late. A late answer that confirms the
+// command is taken; only a contradiction (or external-rate) refuses at once, silence after ~5 s.
+test('a throttled page that confirms 3 s late is taken, not refused', async () => {
+  const env = await setup();
+  const a = agent(env, 0, { delay: 3 });
+  run(env, 14, { src: () => a.page.rate });
+  assert.ok(env.d.assist.sourceRate > 1.005, `engaged at ${env.d.assist.sourceRate}`);
+  assert.ok(!a.sent.some((m) => m.t === 'release'), 'never released');
+  assert.equal(env.d.state(env.clock.t).assist.available, true, 'not refused');
+});
+
+test('a page that never confirms is refused after about 5 s, and the ramp holds while it is overdue', async () => {
+  const env = await setup();
+  const a = agent(env, 0);
+  run(env, 0.1);
+  a.reply = () => {}; // answers nothing from now on
+  let firstAt = null, refusedAt = null;
+  run(env, 10, {
+    src: () => a.page.rate,
+    onTick: (t) => {
+      if (firstAt == null && rates(a).length) firstAt = t;
+      if (refusedAt == null && firstAt != null && a.sent.some((m) => m.t === 'release')) refusedAt = t;
+    },
+  });
+  assert.ok(refusedAt != null, 'refused in the end');
+  assert.ok(refusedAt - firstAt > 4.5 && refusedAt - firstAt < 5.6, `refused ${(refusedAt - firstAt).toFixed(2)} s after the first command`);
+  const before = rates(a).filter((m) => m.at < refusedAt);
+  const steps = new Set(before.map((m) => m.seq)).size;
+  assert.ok(steps <= 9, `${steps} rate steps sent to a page that confirmed none`);
+  let gap = 0;
+  for (let i = 1; i < before.length; i++) gap = Math.max(gap, before[i].at - before[i - 1].at);
+  assert.ok(gap <= 1.3, `kept alive meanwhile (longest silence ${gap.toFixed(2)} s)`);
+  assert.equal(env.d.assist.sourceRate, 1);
+  assert.equal(env.d.state(env.clock.t).assist.available, false);
+});

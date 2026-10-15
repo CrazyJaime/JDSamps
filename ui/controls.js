@@ -21,6 +21,13 @@ function arcPath(r, from, to) {
 }
 const svgEl = (tag, attrs) => { const e = document.createElementNS(SVGNS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; };
 
+// Pads held down and drags in progress end when the window loses focus or the page is hidden:
+// the pointerup or keyup then goes to another window or tab, so it would never arrive here.
+const held = new Set();
+const letGo = () => { for (const end of [...held]) end(); };
+window.addEventListener('blur', letGo);
+document.addEventListener('visibilitychange', () => { if (document.hidden) letGo(); });
+
 class Continuous {
   /** o.wheel = false: no scroll-wheel control; o.reset = false: no double-click reset. */
   constructor(el, o) {
@@ -127,10 +134,13 @@ class Continuous {
     const onMove = (ev) => { if (ev.pointerId === id) move(ev); };
     const up = (ev) => {
       if (ev.pointerId !== id) return;
+      held.delete(end);
       this.dragging = false;
       this.el.classList.remove('active');
       for (const [type, fn] of handlers) target.removeEventListener(type, fn);
     };
+    const end = () => up({ pointerId: id });
+    held.add(end);
     const handlers = [['pointermove', onMove], ['pointerup', up], ['pointercancel', up], ['lostpointercapture', up]];
     for (const [type, fn] of handlers) target.addEventListener(type, fn);
   }
@@ -229,6 +239,7 @@ export function bindPad(el, { onDown, onUp, onLatch, latch = false, paint: paint
   const press = () => {
     if (active) return;
     active = true;
+    held.add(release);
     downAt = performance.now();
     wasOn = on;
     if (!latch || !on) { on = true; onDown && onDown(); }
@@ -237,8 +248,9 @@ export function bindPad(el, { onDown, onUp, onLatch, latch = false, paint: paint
   const release = () => {
     if (!active) return;
     active = false;
-    const held = performance.now() - downAt >= 250;
-    if (!latch || held || wasOn) { on = false; onUp && onUp(); }
+    held.delete(release);
+    const long = performance.now() - downAt >= 250;
+    if (!latch || long || wasOn) { on = false; onUp && onUp(); }
     else if (onLatch) onLatch(); // a tap: stays on, no longer held
     paint();
   };

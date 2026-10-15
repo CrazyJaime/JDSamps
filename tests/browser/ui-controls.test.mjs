@@ -224,6 +224,47 @@ test('stale engine echoes do not overwrite a fresh local commit', async () => {
   assert.equal(await cval(), 0.3);
 });
 
+// Switching away mid-press: the release (pointerup / keyup) goes to another window or tab, so the
+// control lets go when the window loses focus or the page is hidden.
+const hide = () => page.evaluate(() => { Object.defineProperty(document, 'hidden', { value: true, configurable: true }); document.dispatchEvent(new Event('visibilitychange')); });
+const unhide = () => page.evaluate(() => { delete document.hidden; });
+
+test('a held pad lets go when the window loses focus or the page is hidden', async () => {
+  await log();
+  const box = await page.locator('#p').boundingBox();
+  await page.mouse.move(box.x + 5, box.y + 5);
+  await page.mouse.down();
+  await page.waitForTimeout(300); // held: momentary
+  assert.deepEqual(await log(), [['down']]);
+  await page.evaluate(() => window.dispatchEvent(new Event('blur')));
+  assert.deepEqual(await log(), [['up']]);
+  await page.mouse.up();
+  assert.deepEqual(await log(), [], 'let go once');
+  await page.mouse.down();
+  await page.waitForTimeout(300);
+  assert.deepEqual(await log(), [['down']]);
+  await hide();
+  assert.deepEqual(await log(), [['up']]);
+  await unhide();
+  await page.mouse.up();
+  assert.deepEqual(await log(), []);
+  assert.equal(await page.getAttribute('#p', 'aria-pressed'), 'false');
+});
+
+test('a drag ends when the window loses focus, so engine values apply again', async () => {
+  const box = await page.locator('#f').boundingBox();
+  await page.mouse.move(box.x + box.width / 2, box.y + 20);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width / 2, box.y + 60, { steps: 3 });
+  assert.equal(await page.evaluate(() => window.fader.dragging), true);
+  await page.evaluate(() => window.dispatchEvent(new Event('blur')));
+  assert.equal(await page.evaluate(() => window.fader.dragging), false);
+  await page.waitForTimeout(300);
+  await page.evaluate(() => window.fader.set(0.75));
+  assert.equal(await page.evaluate(() => window.fader.value), 0.75);
+  await page.mouse.up();
+});
+
 // ---------------------------------------------------------------- pointer edge cases
 // A second finger is a synthetic pointer here (id 7; the mouse is 1). The page cannot capture a
 // pointer it did not create, so capturing one is made a no-op, as for a real second touch.

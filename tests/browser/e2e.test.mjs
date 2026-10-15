@@ -47,6 +47,13 @@ test('two tabs load as cued decks and start buffering', async () => {
   assert.equal(await deck.locator('.deck').count(), 2);
 });
 
+test('deck tabs are kept from being discarded while they are on a deck', async () => {
+  for (const k of ['a', 'b']) {
+    const t = await h.sw.evaluate((id) => chrome.tabs.get(id), await tabIdFor(h, server.url(k)));
+    assert.equal(t.autoDiscardable, false, `tab ${k}`);
+  }
+});
+
 test('tempo locks on both decks', async () => {
   await waitFor(async () => {
     const s = await state(deck);
@@ -337,6 +344,13 @@ test('stop all ejects everything; no engine errors were reported', async () => {
   await waitFor(async () => (await state(deck)).decks.length === 0, 8000);
   const errs = (await events(deck)).filter((e) => e.level === 'error');
   assert.deepEqual(errs, []);
+});
+
+test('ejected tabs may be discarded again', async () => {
+  for (const k of ['a', 'b', 'c']) {
+    const id = await tabIdFor(h, server.url(k));
+    await waitFor(async () => (await h.sw.evaluate((x) => chrome.tabs.get(x), id)).autoDiscardable === true, 3000);
+  }
 });
 
 test("STOP ALL left every deck's tab silent: players paused at their own rate, the Web-Audio tab muted", async () => {

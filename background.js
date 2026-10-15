@@ -98,7 +98,9 @@ async function capture(tabId) {
         : `Chrome refused to capture that tab: ${err.message}`,
     };
   }
-  return toEngine({ type: ENGINE.START, tabId, streamId, meta: { title: tab.title || '', url: tab.url || '', favIconUrl: tab.favIconUrl || '' }, settings: await savedSettings() });
+  const r = await toEngine({ type: ENGINE.START, tabId, streamId, meta: { title: tab.title || '', url: tab.url || '', favIconUrl: tab.favIconUrl || '' }, settings: await savedSettings() });
+  if (r && r.ok) await keepTab(tabId, 'deck');
+  return r;
 }
 
 /** The DJ's saved settings: a new engine applies them before its first deck (the deck page may not be open yet). */
@@ -114,6 +116,39 @@ function uncapturableReason(url) {
   return `Chrome pages can't be captured. ${where}`;
 }
 
+// ---------------------------------------------------------------- tab discarding
+// Chrome may discard a background tab to save memory: a deck's source tab (its capture would end)
+// or the deck page. The hub sets autoDiscardable:false on both while they are in use and records
+// each one it set (keep:<tabId> → 'deck' | 'page'), so only those are given back: a deck tab once
+// it is on no deck, and a tab the user (or another extension) had already set is never touched.
+// Serialized, so an eject's give-back and a quick reload of the same tab apply in order.
+const keepKey = (tabId) => `keep:${tabId}`;
+let keepQ = Promise.resolve();
+const keeping = (fn) => { const run = keepQ.then(fn).catch(() => {}); keepQ = run; return run; };
+function keepTab(tabId, kind) {
+  return keeping(async () => {
+    const key = keepKey(tabId);
+    if ((await chrome.storage.session.get(key))[key]) return;
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab || tab.autoDiscardable === false) return;
+    await chrome.tabs.update(tabId, { autoDiscardable: false });
+    await chrome.storage.session.set({ [key]: kind });
+  });
+}
+/** Gives back the deck tabs set above that are no longer on a deck. */
+function releaseTabs(decks) {
+  return keeping(async () => {
+    const on = new Set(decks.map((d) => d.tabId));
+    for (const [key, kind] of Object.entries(await chrome.storage.session.get(null))) {
+      const tabId = Number(key.slice(5));
+      if (!key.startsWith('keep:') || kind !== 'deck' || on.has(tabId)) continue;
+      await chrome.storage.session.remove(key);
+      await chrome.tabs.update(tabId, { autoDiscardable: true }).catch(() => {}); // closed meanwhile
+    }
+  });
+}
+chrome.tabs.onRemoved.addListener((tabId) => { chrome.storage.session.remove(keepKey(tabId)).catch(() => {}); });
+
 async function deckTab() {
   const [t] = await chrome.tabs.query({ url: chrome.runtime.getURL(DECK) });
   return t || null;
@@ -122,9 +157,12 @@ async function openDeck(focus = true) {
   const t = await deckTab();
   if (t) {
     if (focus) { await chrome.tabs.update(t.id, { active: true }); await chrome.windows.update(t.windowId, { focused: true }); }
+    await keepTab(t.id, 'page');
     return t;
   }
-  return chrome.tabs.create({ url: chrome.runtime.getURL(DECK), active: true });
+  const created = await chrome.tabs.create({ url: chrome.runtime.getURL(DECK), active: true });
+  await keepTab(created.id, 'page');
+  return created;
 }
 
 async function invoke(tab, { focusDeck }) {
@@ -324,6 +362,7 @@ async function handle(msg) {
       deckIds = decks.map((d) => d.tabId);
       await chrome.storage.session.set({ decks });
       await badge(decks);
+      await releaseTabs(decks); // ejected tabs may be discarded again
       return { ok: true };
     }
     default: return { ok: false, error: `Unknown hub message ${msg.type}` };
