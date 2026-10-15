@@ -1,0 +1,206 @@
+// End-to-end: real extension, real captured tabs, real engine. About 3 minutes.
+import test, { before, after } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import {
+  prepareExtension, launchExtension, startTrackServer, openExtPage, hubCall, tabIdFor, waitFor, installClient,
+  act, set, state, events, downloadIds, waitForDownload, parseWav, bandOnsets, bandRms, medianBpm,
+} from './ext-harness.mjs';
+
+const ART = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'artifacts');
+let h, server, deck, tabs = {};
+const deckBy = (s, slot) => s.decks.find((d) => d.slot === slot);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function record(target, seconds) {
+  const known = await downloadIds(h);
+  const start = target === 'mix' ? await act(deck, null, 'mixRecStart') : await act(deck, target, 'recStart');
+  assert.equal(start.ok, true, JSON.stringify(start));
+  await sleep(seconds * 1000);
+  if (target === 'mix') await act(deck, null, 'mixRecStop'); else await act(deck, target, 'recStop');
+  const dl = await waitForDownload(h, known);
+  return { dl, wav: parseWav(fs.readFileSync(dl.filename)) };
+}
+
+before(async () => {
+  server = await startTrackServer();
+  h = await launchExtension({ ext: prepareExtension() });
+  for (const k of ['a', 'b']) { tabs[k] = await h.context.newPage(); await tabs[k].goto(server.url(k)); }
+  deck = await openExtPage(h, 'deck.html');
+  for (const k of ['a', 'b']) {
+    const r = await hubCall(deck, { type: 'LOAD_TAB', tabId: await tabIdFor(h, server.url(k)) });
+    assert.equal(r.ok, true, JSON.stringify(r));
+  }
+  await installClient(deck);
+});
+after(async () => { await h?.close(); await server?.close(); });
+
+test('two tabs load as cued decks and start buffering', async () => {
+  const s = await state(deck);
+  assert.equal(s.decks.length, 2);
+  for (const d of s.decks) assert.equal(d.playing, false);
+  await sleep(1500);
+  const s2 = await state(deck);
+  for (const d of s2.decks) assert.ok(d.liveEdge > 1 && d.reserve > 0.5, JSON.stringify({ liveEdge: d.liveEdge, reserve: d.reserve }));
+  assert.equal(await deck.locator('.deck').count(), 2);
+});
+
+test('tempo locks on both decks', async () => {
+  await waitFor(async () => {
+    const s = await state(deck);
+    const a = deckBy(s, 1), b = deckBy(s, 2);
+    return a.bpm.state === 'LOCKED' && b.bpm.state === 'LOCKED' && Math.abs(a.bpm.native - 124) < 0.3 && Math.abs(b.bpm.native - 128) < 0.3;
+  }, 25000);
+});
+
+test('SYNC PLAY matches tempo and phase to the master', async () => {
+  assert.equal((await act(deck, 2, 'master')).ok, true);
+  assert.equal((await act(deck, 2, 'play')).ok, true);
+  await sleep(1000);
+  assert.equal((await act(deck, 1, 'sync', { on: true })).ok, true);
+  assert.equal((await act(deck, 1, 'syncPlay')).ok, true);
+  await sleep(6000);
+  const s = await state(deck);
+  const a = deckBy(s, 1);
+  assert.equal(s.clock.mode, 'deck');
+  assert.ok(Math.abs(a.params.pitch - (128 / 124 - 1)) < 0.0025, `pitch ${a.params.pitch}`);
+  assert.ok(Math.abs(a.bpm.out - s.clock.bpm) < 0.02, `out ${a.bpm.out} vs clock ${s.clock.bpm}`);
+  assert.ok(Math.abs(a.bpm.out - 128) < 0.3, `out ${a.bpm.out}`);
+  const ph = [];
+  for (let i = 0; i < 10; i++) { const d = deckBy(await state(deck), 1); if (d.sync.phaseMs != null) ph.push(Math.abs(d.sync.phaseMs)); await sleep(200); }
+  ph.sort((x, y) => x - y);
+  assert.ok(ph.length && ph[Math.floor(ph.length / 2)] < 15, `phase ${JSON.stringify(ph)}`);
+});
+
+test('the mix recording has both decks at 128 BPM with aligned beats', async () => {
+  const { wav } = await record('mix', 8);
+  assert.ok(wav.seconds > 7 && wav.sr > 0);
+  const lo = bandOnsets(wav.mono, wav.sr, 'low'), hi = bandOnsets(wav.mono, wav.sr, 'high');
+  assert.ok(Math.abs(medianBpm(lo) - 128) < 1, `low ${medianBpm(lo)}`);
+  assert.ok(Math.abs(medianBpm(hi) - 128) < 1, `high ${medianBpm(hi)}`);
+  const offs = lo.map((t) => Math.min(...hi.map((u) => Math.abs(u - t)))).sort((x, y) => x - y);
+  const med = offs[Math.floor(offs.length / 2)] * 1000;
+  assert.ok(med < 25, `median beat offset ${med.toFixed(1)} ms`);
+});
+
+test('crossfader isolates A from B', async () => {
+  set(deck, 1, 'xf', 'A'); set(deck, 2, 'xf', 'B'); set(deck, null, 'xfader.pos', 0.5);
+  await sleep(300);
+  const both = await record('mix', 3);
+  set(deck, null, 'xfader.pos', 1);
+  await sleep(300);
+  const onlyB = await record('mix', 3);
+  const drop = 20 * Math.log10(bandRms(onlyB.wav.mono, onlyB.wav.sr, 'low') / bandRms(both.wav.mono, both.wav.sr, 'low'));
+  assert.ok(drop < -30, `A drop ${drop.toFixed(1)} dB`);
+  set(deck, null, 'xfader.pos', 0.5); set(deck, 1, 'xf', 'THRU'); set(deck, 2, 'xf', 'THRU');
+});
+
+test('low kill removes the kick from the deck recording', async () => {
+  const on = await record(1, 3);
+  set(deck, 1, 'kill.low', true);
+  await sleep(200);
+  const killed = await record(1, 3);
+  set(deck, 1, 'kill.low', false);
+  const drop = 20 * Math.log10(bandRms(killed.wav.mono, killed.wav.sr, 'low') / bandRms(on.wav.mono, on.wav.sr, 'low'));
+  assert.ok(drop < -25, `low drop ${drop.toFixed(1)} dB`);
+  assert.match(path.basename(on.dl.filename), /^JDSamps-D1-Track A 124 BPM-\d{8}-\d{6}.*\.wav$/);
+});
+
+test('the limiter holds the master under -1 dBFS with +12 dB trims', async () => {
+  set(deck, 1, 'trim', 1); set(deck, 2, 'trim', 1);
+  await sleep(500);
+  const { wav } = await record('mix', 3); // the mix tap is after the limiter: check every sample
+  set(deck, 1, 'trim', 0.5); set(deck, 2, 'trim', 0.5);
+  let peak = 0;
+  for (const x of wav.mono) peak = Math.max(peak, Math.abs(x));
+  assert.ok(peak <= 10 ** (-1 / 20) + 2 / 32768, `peak ${peak}`);
+  assert.ok(peak > 0.8, `peak ${peak} (limiting engaged)`);
+  const gr = Math.min(...(await Promise.all([0, 1, 2, 3, 4].map(() => state(deck)))).map((s) => s.master.gr));
+  assert.ok(gr <= 0, `gr ${gr}`);
+});
+
+test('player assist refills the reserve on a media-element page', async () => {
+  // LIVE leaves ~0.6 s of reserve; deck 1 must run +3.2 %, so assist has to keep it fed.
+  assert.equal((await act(deck, 1, 'live')).ok, true);
+  await waitFor(async () => (await tabs.a.evaluate(() => window.__media())).rate > 1.01, 15000, 250);
+  const m = await tabs.a.evaluate(() => window.__media());
+  assert.equal(m.pp, false);
+  await sleep(1500); // the LIVE jump lands ~0.15 s after the call; let it settle
+  const d0 = deckBy(await state(deck), 1);
+  assert.equal(d0.assist.active, true);
+  assert.ok(d0.reserve < 3, `reserve after LIVE ${d0.reserve}`);
+  await sleep(6000);
+  const d1 = deckBy(await state(deck), 1);
+  assert.ok(d1.reserve > d0.reserve, `reserve ${d0.reserve} -> ${d1.reserve}`);
+  assert.equal(d1.starved, false);
+  assert.ok(Math.abs(d1.bpm.out - 128) < 0.4, `out ${d1.bpm.out}`);
+  assert.ok(Math.abs(d1.bpm.native - 124) < 0.4, `native ${d1.bpm.native}`);
+  // Phase lock is regained after the LIVE jump while assist runs: median of 5 readings < 15 ms.
+  const recent = [];
+  await waitFor(async () => {
+    const p = deckBy(await state(deck), 1).sync.phaseMs;
+    if (p != null) recent.push(Math.abs(p));
+    const last = recent.slice(-5).sort((x, y) => x - y);
+    return last.length === 5 && last[2] < 15;
+  }, 15000, 300);
+});
+
+test('a Web-Audio-only page has no assist and the reserve stays protected', async () => {
+  tabs.c = await h.context.newPage();
+  await tabs.c.goto(server.url('c'));
+  await sleep(500);
+  assert.equal((await hubCall(deck, { type: 'LOAD_TAB', tabId: await tabIdFor(h, server.url('c')) })).ok, true);
+  const early = await act(deck, 3, 'sync', { on: true }); // the tracker needs >= 4 s of audio first
+  assert.equal(early.ok, false);
+  assert.match(early.error, /No BPM yet/);
+  await waitFor(async () => { const d = deckBy(await state(deck), 3); return d && d.bpm.state === 'LOCKED'; }, 25000);
+  await act(deck, 3, 'live');
+  assert.equal((await act(deck, 3, 'sync', { on: true })).ok, true);
+  assert.equal((await act(deck, 3, 'play')).ok, true);
+  // Needs +6.7 % with no player to drive: the small LIVE reserve drains, then the deck is held at 1×.
+  await waitFor(async () => deckBy(await state(deck), 3).starved, 20000, 250);
+  await sleep(600); // the 1x clamp is scheduled ~0.15 s ahead and reported at the heard time
+  for (let i = 0; i < 10; i++) {
+    const d = deckBy(await state(deck), 3);
+    assert.equal(d.assist.available, false);
+    assert.equal(d.playing, true);
+    assert.equal(d.starved, true);
+    assert.ok(d.reserve >= 0 && d.engineRate <= 1.0001, JSON.stringify({ reserve: d.reserve, rate: d.engineRate }));
+    await sleep(200);
+  }
+});
+
+test('reloading the deck page keeps the engine playing', async () => {
+  const before = deckBy(await state(deck), 2).playhead;
+  const t0 = Date.now();
+  await deck.reload();
+  await deck.waitForSelector('.deck >> nth=2', { timeout: 10000 });
+  await installClient(deck);
+  const after = deckBy(await state(deck), 2).playhead;
+  assert.ok(after - before > (Date.now() - t0) / 1000 - 0.8, `playhead ${before} -> ${after}`);
+  fs.mkdirSync(ART, { recursive: true });
+  await sleep(500);
+  await deck.screenshot({ path: path.join(ART, 'e2e-deck.png') });
+});
+
+test('closing a recording tab saves its recording and frees the master clock', async () => {
+  const known = await downloadIds(h);
+  assert.equal((await act(deck, 2, 'recStart')).ok, true);
+  await sleep(2000);
+  await tabs.b.close();
+  const dl = await waitForDownload(h, known, 15000);
+  assert.match(path.basename(dl.filename), /^JDSamps-D2-/);
+  const wav = parseWav(fs.readFileSync(dl.filename));
+  assert.ok(wav.seconds > 1.5, `seconds ${wav.seconds}`);
+  await waitFor(async () => (await state(deck)).decks.length === 2, 8000);
+  assert.equal((await state(deck)).clock.mode, 'free');
+});
+
+test('stop all ejects everything; no engine errors were reported', async () => {
+  assert.equal((await act(deck, null, 'stopAll')).ok, true);
+  await waitFor(async () => (await state(deck)).decks.length === 0, 8000);
+  const errs = (await events(deck)).filter((e) => e.level === 'error');
+  assert.deepEqual(errs, []);
+});
