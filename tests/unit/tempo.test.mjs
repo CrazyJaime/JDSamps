@@ -270,3 +270,34 @@ test('changing the BPM range refolds the tempo and keeps the grid, the taps and 
   assert.ok(Math.abs(t.get().grid.t0 - tg.grid.t0) < 1e-9 && Math.abs(t.get().grid.T - 2 * tg.grid.T) < 1e-9);
   assert.equal(t.taps.length, 8, 'taps kept');
 });
+
+/** x with `ms` of audio dropped at input second `at`, as a capture under load does: the beats after it come `ms` early. */
+function dropAt(x, at, ms) {
+  const i = Math.round(at * FS), n = Math.round((ms / 1000) * FS);
+  return concat(x.subarray(0, i), x.subarray(i + n));
+}
+
+test('a capture gap keeps the old beat phase for the audio before it', () => {
+  // A steady 128 BPM track whose capture drops 15 ms at X: the live edge's grid re-phases there,
+  // while the playhead, seconds behind, still plays the audio from before the gap. (Without a gap
+  // the grid of this track wobbles by up to 1.5 ms; the tempo re-fitted across a gap adds a little.)
+  const A = synth({ ...PATTERNS.noisy128, bars: 40 });
+  const X = 30.2, gap = 0.015, T = 60 / 128;
+  const truthPost = A.truth.map((t) => t - gap);
+  const grids = new GridMap();
+  const worst = { pre: 0, post: 0 };
+  let checks = 0;
+  run(dropAt(A.x, X, gap * 1000), {}, {
+    onEval: (t, d) => {
+      const g = d.get();
+      grids.update(g.grid, g.track);
+      if (t < X + 4 || t > X + 20) return;
+      checks++;
+      for (let p = X - 4; p <= X - T; p += 0.37) worst.pre = Math.max(worst.pre, Math.abs(gridErrMs(grids.at(p), p, A.truth)));
+      for (let p = X + T; p <= t - 0.5; p += 0.37) worst.post = Math.max(worst.post, Math.abs(gridErrMs(grids.at(p), p, truthPost)));
+    },
+  });
+  assert.ok(checks > 20, `checked ${checks} times`);
+  assert.ok(worst.pre < 2, `before the gap the grid is ${worst.pre.toFixed(1)} ms off the beats there`);
+  assert.ok(worst.post < 3, `after the gap the grid is ${worst.post.toFixed(1)} ms off the shifted beats`);
+});
