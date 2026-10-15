@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   prepareExtension, launchExtension, startTrackServer, openExtPage, hubCall, tabIdFor, waitFor, installClient,
-  act, set, state, events, downloadIds, waitForDownload, parseWav, bandOnsets, bandRms, medianBpm,
+  act, set, state, events, downloadIds, waitForDownload, parseWav, bandOnsets, bandRms, medianBpm, offscreenEval,
 } from './ext-harness.mjs';
 
 const ART = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'artifacts');
@@ -170,6 +170,26 @@ test('a Web-Audio-only page has no assist and the reserve stays protected', asyn
     assert.ok(d.reserve >= 0 && d.engineRate <= 1.0001, JSON.stringify({ reserve: d.reserve, rate: d.engineRate }));
     await sleep(200);
   }
+});
+
+test('recordings stopped together are all saved, reported and released', async () => {
+  const rounds = 4, known = await downloadIds(h), ev0 = (await events(deck)).length;
+  const completed = () => h.sw.evaluate((k) => chrome.downloads.search({ state: 'complete' }).then((xs) => xs.filter((d) => !k.includes(d.id)).length), known);
+  for (let i = 0; i < rounds; i++) {
+    assert.equal((await act(deck, 1, 'recStart')).ok, true);
+    assert.equal((await act(deck, null, 'mixRecStart')).ok, true);
+    await sleep(700);
+    await Promise.all([act(deck, 1, 'recStop'), act(deck, null, 'mixRecStop')]); // as STOP ALL or a closing tab does
+    await waitFor(async () => (await completed()) === 2 * (i + 1), 15000, 200);
+  }
+  const notices = async () => (await events(deck)).slice(ev0).filter((e) => /^Sav(ed|ing) /.test(e.text));
+  await waitFor(async () => (await notices()).length >= 2 * rounds, 5000).catch(() => {});
+  const n = await notices();
+  assert.equal(n.filter((e) => e.level === 'info').length, 2 * rounds, JSON.stringify(n.map((e) => e.text)));
+  assert.equal(n.length, 2 * rounds);
+  assert.deepEqual(await offscreenEval(h, '[...globalThis.__jdsEngine.downloads.values()].map((x) => x.filename)'), []);
+  const s = await h.sw.evaluate(() => chrome.storage.session.get(null));
+  assert.deepEqual(Object.entries(s).flatMap(([k, v]) => (k === 'dl' ? Object.keys(v) : k.startsWith('dl:') ? [k] : [])), []);
 });
 
 test('reloading the deck page keeps the engine playing', async () => {

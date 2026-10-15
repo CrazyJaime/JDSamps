@@ -16,6 +16,17 @@ SignalsmithStretch.moduleUrl = STRETCH_URL;
 const workletUrl = (f) => new URL(`../worklets/${f}`, import.meta.url).href;
 const withTimeout = (p, ms, msg) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
 
+// Trust: the relay content script runs in every frame of every site, so any renderer can speak
+// as it. Only extension contexts (the service worker, the deck page) may command the engine.
+const EXT = chrome.runtime.getURL('');
+const DECK_URL = chrome.runtime.getURL('deck.html');
+const isExtUrl = (u) => typeof u === 'string' && u.startsWith(EXT);
+const fromExtension = (s) => !!s && s.id === chrome.runtime.id && isExtUrl(s.url);
+/** 'jds-ui': an extension page, either tabless or in the deck tab. */
+const uiSender = (s) => fromExtension(s) && (!s.tab || (s.tab.url || '').split(/[?#]/)[0] === DECK_URL);
+/** 'jds-agent': our content script in a web page's frame. */
+const agentSender = (s) => !!s && s.id === chrome.runtime.id && !!s.tab && typeof s.url === 'string' && !isExtUrl(s.url);
+
 class Engine {
   constructor() {
     this.ctx = new AudioContext({ latencyHint: 'interactive' });
@@ -26,6 +37,7 @@ class Engine {
     this.ui = new Set();
     this.serialQ = Promise.resolve();
     this.downloads = new Map();
+    this.downloadsSettled = new Set(); // blob URLs already reported: the hub may send DOWNLOAD_DONE twice
     this.clipUntil = { L: 0, R: 0 };
     this.mm = { peakL: 0, peakR: 0, rmsL: 0, rmsR: 0, gr: 0 };
     this.nextPhase = 0;
@@ -79,18 +91,21 @@ class Engine {
   // ------------------------------------------------------------------ messaging
   listen() {
     chrome.runtime.onConnect.addListener((port) => {
+      const refuse = () => { try { port.disconnect(); } catch (_) {} };
       if (port.name === PORT_UI) {
+        if (!uiSender(port.sender)) { refuse(); return; }
         this.ui.add(port);
         port.onMessage.addListener((m) => { this.onUi(port, m); });
         port.onDisconnect.addListener(() => { void chrome.runtime.lastError; this.ui.delete(port); });
       } else if (port.name === PORT_AGENT) {
-        const d = this.deckByTab(port.sender && port.sender.tab ? port.sender.tab.id : -1);
-        if (!d) { try { port.disconnect(); } catch (_) {} return; }
+        const d = agentSender(port.sender) ? this.deckByTab(port.sender.tab.id) : null;
+        if (!d) { refuse(); return; }
         d.attachAgent(port, port.sender.frameId || 0);
       }
     });
     chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (!msg || msg.target !== TARGET.ENGINE) return false;
+      if (!fromExtension(sender)) { sendResponse({ ok: false, error: 'forbidden' }); return false; }
       this.onHub(msg).then(sendResponse, (err) => sendResponse({ ok: false, error: err.message }));
       return true;
     });
@@ -164,6 +179,8 @@ class Engine {
       case ENGINE.META: { const d = this.deckByTab(msg.tabId); if (d) Object.assign(d.meta, msg.meta || {}); return { ok: true }; }
       case ENGINE.PING: return { ok: true, decks: [...this.decks.values()].map((d) => ({ tabId: d.tabId, slot: d.slot })) };
       case ENGINE.DOWNLOAD_DONE: {
+        if (this.downloadsSettled.has(msg.url)) return { ok: true };
+        this.downloadsSettled.add(msg.url);
         const t = this.downloads.get(msg.url);
         if (t) { clearTimeout(t.timer); this.downloads.delete(msg.url); URL.revokeObjectURL(msg.url); }
         if (msg.ok) this.event('info', `Saved ${t ? t.filename : 'recording'}.`);

@@ -1,8 +1,10 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { prepareExtension, launchExtension, startTrackServer, openExtPage, hubCall, tabIdFor, waitFor } from './ext-harness.mjs';
+import {
+  prepareExtension, launchExtension, startTrackServer, openExtPage, hubCall, tabIdFor, waitFor, installClient, events, offscreenEval,
+} from './ext-harness.mjs';
 
-let h, server, deck, track;
+let h, server, deck, track, other;
 before(async () => {
   server = await startTrackServer();
   h = await launchExtension({ ext: prepareExtension() });
@@ -52,6 +54,70 @@ test('messages from content scripts are refused', async () => {
     return res.result;
   }, server.origin);
   assert.deepEqual(r, { ok: false, error: 'forbidden' });
+});
+
+// The relay content script runs in every frame of every site, so a compromised renderer can
+// speak as it. The engine must not hand it the snapshot or take commands from it.
+async function attackerTab() {
+  if (!other) { other = await h.context.newPage(); await other.goto(server.url('b')); }
+  return tabIdFor(h, server.url('b'));
+}
+
+test('the engine refuses a UI port from a content script', async () => {
+  const tabId = await attackerTab();
+  const vol = await offscreenEval(h, 'globalThis.__jdsEngine.params["master.volume"]');
+  assert.notEqual(vol, 0);
+  const r = await h.sw.evaluate(async (tabId) => {
+    const [res] = await chrome.scripting.executeScript({ target: { tabId }, func: () => new Promise((resolve) => {
+      const out = { got: [], disconnected: false };
+      const p = chrome.runtime.connect({ name: 'jds-ui' });
+      p.onMessage.addListener((m) => out.got.push(m.t));
+      p.onDisconnect.addListener(() => { void chrome.runtime.lastError; out.disconnected = true; });
+      try {
+        p.postMessage({ t: 'hello' });
+        p.postMessage({ t: 'set', deck: null, key: 'master.volume', value: 0, id: 1 });
+      } catch (_) { /* already disconnected */ }
+      setTimeout(() => resolve(out), 1000);
+    }) });
+    return res.result;
+  }, tabId);
+  assert.deepEqual(r, { got: [], disconnected: true });
+  assert.equal(await offscreenEval(h, 'globalThis.__jdsEngine.params["master.volume"]'), vol);
+});
+
+test('the engine refuses runtime messages from a content script', async () => {
+  const tabId = await attackerTab();
+  await installClient(deck);
+  const titles = () => offscreenEval(h, '[...globalThis.__jdsEngine.decks.values()].map((d) => d.meta.title)');
+  const before = await titles();
+  assert.equal(before.length, 1);
+  const r = await h.sw.evaluate(async ([attacker, victim]) => {
+    const [res] = await chrome.scripting.executeScript({ target: { tabId: attacker }, args: [victim], func: (tabId) => Promise.all([
+      chrome.runtime.sendMessage({ target: 'engine', type: 'PING' }),
+      chrome.runtime.sendMessage({ target: 'engine', type: 'NOTIFY', level: 'error', text: 'spoofed toast' }),
+      chrome.runtime.sendMessage({ target: 'engine', type: 'META', tabId, meta: { title: 'spoofed' } }),
+    ]) });
+    return res.result;
+  }, [tabId, await tabIdFor(h, server.url('a'))]);
+  assert.deepEqual(r, [0, 1, 2].map(() => ({ ok: false, error: 'forbidden' })));
+  await new Promise((res) => setTimeout(res, 300));
+  assert.deepEqual(await titles(), before);
+  assert.ok(!(await events(deck)).some((e) => /spoofed/.test(e.text)));
+});
+
+test('a repeated DOWNLOAD_DONE is reported once', async () => {
+  await installClient(deck);
+  const url = await offscreenEval(h, `(() => {
+    const e = globalThis.__jdsEngine, url = URL.createObjectURL(new Blob(['x']));
+    e.downloads.set(url, { timer: setTimeout(() => {}, 60000), filename: 'twice.wav' });
+    return url;
+  })()`);
+  await h.sw.evaluate(async (u) => {
+    for (let i = 0; i < 2; i++) await chrome.runtime.sendMessage({ target: 'engine', type: 'DOWNLOAD_DONE', url: u, ok: true });
+  }, url);
+  await new Promise((res) => setTimeout(res, 300));
+  assert.deepEqual((await events(deck)).filter((e) => /Sav(ed|ing)/.test(e.text)).map((e) => e.text), ['Saved twice.wav.']);
+  assert.equal(await offscreenEval(h, 'globalThis.__jdsEngine.downloads.size'), 0);
 });
 
 test('closing the tab ejects its deck', async () => {
