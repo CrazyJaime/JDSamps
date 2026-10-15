@@ -43,6 +43,32 @@ test('LOAD_TAB captures the tab onto deck 1 (allowlisted test build)', async () 
   assert.equal(await h.sw.evaluate(() => chrome.action.getBadgeText({})), '1');
 });
 
+// tabs.onUpdated takes no filter in Chrome: every tab's title, favicon and loading changes wake the
+// service worker. A tab that is not a deck must cost no storage read and no hub work.
+test('30 title changes in a tab that is not a deck: no storage read, no hub work', async () => {
+  const chat = await h.context.newPage();
+  try {
+    await chat.goto(server.url('b'));
+    await sleep(500);
+    await h.sw.evaluate(() => {
+      const n = { updates: 0, titles: 0, reads: 0, work: 0 };
+      globalThis.__upd = n;
+      chrome.tabs.onUpdated.addListener((id, info) => { n.updates++; if (info.title) n.titles++; });
+      const wrap = (obj, k, key) => { const f = obj[k].bind(obj); obj[k] = (...a) => { n[key]++; return f(...a); }; };
+      wrap(chrome.storage.session, 'get', 'reads');
+      wrap(chrome.storage.local, 'get', 'reads');
+      wrap(chrome.runtime, 'sendMessage', 'work');
+      wrap(chrome.tabs, 'sendMessage', 'work');
+      wrap(chrome.scripting, 'executeScript', 'work');
+    });
+    for (let i = 0; i < 30; i++) { await chat.evaluate((k) => { document.title = `chat (${k})`; }, i); await sleep(40); }
+    await sleep(500);
+    const n = await h.sw.evaluate(() => globalThis.__upd);
+    assert.ok(n.titles >= 25, `title updates seen: ${n.titles}`);
+    assert.deepEqual([n.reads, n.work], [0, 0], `storage reads, hub work over ${n.updates} updates`);
+  } finally { await chat.close(); }
+});
+
 test('chrome pages and bad ids are refused politely', async () => {
   const r = await hubCall(deck, { type: 'LOAD_TAB', tabId: 'x' });
   assert.equal(r.ok, false);
