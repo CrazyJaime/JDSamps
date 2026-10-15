@@ -256,6 +256,23 @@ test('empty state is shown with no decks', async () => {
   } finally { await u2.close(); }
 });
 
+test('settings are restored again when the engine is re-created while the page stays open', async () => {
+  const st = (engineId) => ({ ...makeState({ decks: [], clock: { mode: 'none', deckId: null, bpm: null } }), engineId });
+  const u = await openUi({ state: st('e1'), storage: { 'pitch.defaultRange': 0.16 } });
+  try {
+    const restores = async () => (await u.sent()).filter((m) => m.t === 'set' && m.deck === null && m.key === 'pitch.defaultRange' && m.value === 0.16).length;
+    await u.page.waitForFunction(() => window.__fake.sent.some((m) => m.t === 'set' && m.key === 'pitch.defaultRange'));
+    assert.equal(await restores(), 1);
+    await u.push({ t: 'state', s: st('e1') });
+    await u.page.waitForTimeout(80);
+    assert.equal(await restores(), 1, 'same engine: restored once');
+    await u.push({ t: 'state', s: st('e2') }); // a new engine instance, back at its defaults
+    await u.page.waitForTimeout(80);
+    assert.equal(await restores(), 2, 'new engine: restored again');
+    assert.deepEqual(u.errors, []);
+  } finally { await u.close(); }
+});
+
 // A fake engine with a real round trip: a message is applied 2 ms after it is posted, the engine
 // snapshots every 32 ms and each snapshot lands 3 ms later, so the UI always sees slightly old state.
 describe('with a lagging engine', () => {

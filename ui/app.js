@@ -11,6 +11,7 @@ const strips = new Map();
 let snap = null;
 let selected = null;
 let restored = false;
+let engineId; // snapshot.engineId of the engine the settings were restored into
 let wakeLock = null;
 let wakeLockPending = false;
 
@@ -71,6 +72,7 @@ async function restoreSettings(s) {
 
 function onState(s) {
   snap = s;
+  if (s.engineId !== engineId) { engineId = s.engineId; restored = false; } // a re-created engine starts from defaults
   if (!restored) restoreSettings(s);
   const ids = new Set(s.decks.map((d) => d.id));
   for (const [id, st] of strips) if (!ids.has(id)) { st.destroy(); strips.delete(id); }

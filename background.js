@@ -6,13 +6,14 @@
 //   badge, tab lifecycle, player-assist injection, and stopping a tab's playback on eject.
 // * Registers NO runtime.onConnect listener: a receiver that disconnects a port tears it down
 //   for every receiver. UI and agent ports go straight to the offscreen engine.
-import { TARGET, HUB, ENGINE, validateAgentMessage } from './shared/protocol.js';
+import { TARGET, HUB, ENGINE, PERSISTED_MASTER_KEYS, validateAgentMessage } from './shared/protocol.js';
 
 const OFFSCREEN = 'offscreen.html';
 const DECK = 'deck.html';
 const MENU_ID = 'jds-add-tab';
 const EXT = chrome.runtime.getURL('');
-const capturable = (url) => /^https?:\/\//i.test(url || '');
+const WEBSTORE = /^https:\/\/(chromewebstore\.google\.com|chrome\.google\.com\/webstore)([/?#]|$)/i; // Chrome refuses to capture it
+const capturable = (url) => /^https?:\/\//i.test(url || '') && !WEBSTORE.test(url);
 const originOf = (u) => { try { return new URL(u).origin; } catch (_) { return ''; } };
 const fromExtensionPage = (sender) => !!sender && typeof sender.url === 'string' && sender.url.startsWith(EXT);
 
@@ -97,7 +98,20 @@ async function capture(tabId) {
         : `Chrome refused to capture that tab: ${err.message}`,
     };
   }
-  return toEngine({ type: ENGINE.START, tabId, streamId, meta: { title: tab.title || '', url: tab.url || '', favIconUrl: tab.favIconUrl || '' } });
+  return toEngine({ type: ENGINE.START, tabId, streamId, meta: { title: tab.title || '', url: tab.url || '', favIconUrl: tab.favIconUrl || '' }, settings: await savedSettings() });
+}
+
+/** The DJ's saved settings: a new engine applies them before its first deck (the deck page may not be open yet). */
+async function savedSettings() {
+  try { return await chrome.storage.local.get([...PERSISTED_MASTER_KEYS]); } catch (_) { return {}; }
+}
+
+/** Why the icon or command cannot load this tab (spec 3.1: errors are actionable). */
+function uncapturableReason(url) {
+  const where = 'Open a web page (http/https) and click the JD Samps icon there.';
+  if (WEBSTORE.test(url || '')) return `The Chrome Web Store can't be captured. ${where}`;
+  if (/^file:/i.test(url || '')) return `Local files can't be captured. ${where}`;
+  return `Chrome pages can't be captured. ${where}`;
 }
 
 async function deckTab() {
@@ -119,6 +133,8 @@ async function invoke(tab, { focusDeck }) {
     await grant(tab);
     const r = await capture(tab.id);
     if (!r.ok) await notify('warn', r.error);
+  } else if (tab && !(tab.url || '').startsWith(EXT)) {
+    await notify('warn', uncapturableReason(tab.url)); // the engine holds it until the deck page connects
   }
   await openDeck(focusDeck || !deckOpen);
 }
@@ -247,7 +263,15 @@ async function stopTab(tabId) {
 }
 
 // ---------------------------------------------------------------- tab lifecycle
-async function deckTabIds() { return ((await chrome.storage.session.get('decks')).decks || []).map((d) => d.tabId); }
+// Deck tab ids live in memory (tab updates are frequent); storage.session restores them after a restart.
+let deckIds = null;
+async function deckTabIds() {
+  if (!deckIds) {
+    const ids = ((await chrome.storage.session.get('decks')).decks || []).map((d) => d.tabId);
+    if (!deckIds) deckIds = ids; // DECKS_CHANGED may have landed meanwhile
+  }
+  return deckIds;
+}
 chrome.tabs.onRemoved.addListener(async (tabId) => {
   chrome.storage.session.remove(muteKey(tabId)).catch(() => {});
   await revoke(tabId);
@@ -262,7 +286,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
     toEngine({ type: ENGINE.META, tabId, meta: { title: tab.title || '', url: tab.url || '', favIconUrl: tab.favIconUrl || '' } }).catch(() => {});
   }
   if (info.status === 'complete') connectAgent(tabId);
-});
+}); // Chrome takes no filter here ('This event does not support filters'): the handler stays cheap instead
 
 async function badge(decks) {
   await chrome.action.setBadgeBackgroundColor({ color: '#22c55e' });
@@ -293,6 +317,7 @@ async function handle(msg) {
     }
     case HUB.DECKS_CHANGED: {
       const decks = Array.isArray(msg.decks) ? msg.decks.filter((d) => Number.isInteger(d.tabId) && Number.isInteger(d.slot)) : [];
+      deckIds = decks.map((d) => d.tabId);
       await chrome.storage.session.set({ decks });
       await badge(decks);
       return { ok: true };

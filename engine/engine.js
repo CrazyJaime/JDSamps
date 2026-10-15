@@ -4,7 +4,7 @@
 import SignalsmithStretch from '../vendor/signalsmith-stretch/SignalsmithStretch.mjs';
 import {
   PORT_UI, PORT_AGENT, MAX_DECKS, TARGET, HUB, ENGINE, DECK_PARAMS, MASTER_PARAMS, BPM_RANGES,
-  defaults, validateUiMessage,
+  PERSISTED_MASTER_KEYS, defaults, validateUiMessage, validateValue,
 } from '../shared/protocol.js';
 import { createMaster } from './master.js';
 import { Recorder } from './recorder.js';
@@ -16,6 +16,8 @@ SignalsmithStretch.moduleUrl = STRETCH_URL;
 const workletUrl = (f) => new URL(`../worklets/${f}`, import.meta.url).href;
 const withTimeout = (p, ms, msg) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
 const STOP_TAB_MS = 400; // an eject waits at most this long for its tab to stop playing
+const INSTANCE = crypto.randomUUID(); // snapshot.engineId: the UI restores its settings into each new engine
+const NOTE_TTL = 60000; // a hub notice raised with no deck page open waits this long for one
 
 // Trust: the relay content script runs in every frame of every site, so any renderer can speak
 // as it. Only extension contexts (the service worker, the deck page) may command the engine.
@@ -38,6 +40,7 @@ class Engine {
     this.clock = new MasterClock();
     this.ui = new Set();
     this.holds = new Set(); // 'deckId|key': kills/FX held down in the UI (set with hold:true)
+    this.notes = []; // hub notices waiting for a deck page
     this.serialQ = Promise.resolve();
     this.downloads = new Map();
     this.downloadsSettled = new Set(); // blob URLs already reported: the hub may send DOWNLOAD_DONE twice
@@ -127,6 +130,7 @@ class Engine {
     if (m.t === 'hello') {
       this.post(port, { t: 'state', s: this.snapshot(this.ctx.currentTime) });
       for (const d of this.decks.values()) { const w = d.waveBacklog(); if (w) this.post(port, w); }
+      this.flushNotes(port);
       return;
     }
     if (m.t === 'set') {
@@ -193,7 +197,7 @@ class Engine {
   async onHub(msg) {
     await this.ready;
     switch (msg.type) {
-      case ENGINE.START: return this.serial(() => this.startDeck(msg.tabId, msg.streamId, msg.meta || {}));
+      case ENGINE.START: return this.serial(() => { this.applySaved(msg.settings); return this.startDeck(msg.tabId, msg.streamId, msg.meta || {}); });
       case ENGINE.EJECT: { const d = this.deckByTab(msg.tabId); if (d) await this.eject(d.id, msg.reason); return { ok: true }; }
       case ENGINE.META: { const d = this.deckByTab(msg.tabId); if (d) Object.assign(d.meta, msg.meta || {}); return { ok: true }; }
       case ENGINE.PING: return { ok: true, decks: [...this.decks.values()].map((d) => ({ tabId: d.tabId, slot: d.slot })) };
@@ -206,8 +210,30 @@ class Engine {
         else this.event('error', `Saving ${t ? t.filename : 'the recording'} failed: ${msg.error || 'download interrupted'}.`);
         return { ok: true };
       }
-      case ENGINE.NOTIFY: this.event(msg.level === 'error' || msg.level === 'warn' ? msg.level : 'info', String(msg.text || '').slice(0, 300)); return { ok: true };
+      case ENGINE.NOTIFY: this.notify(msg.level === 'error' || msg.level === 'warn' ? msg.level : 'info', String(msg.text || '').slice(0, 300)); return { ok: true };
       default: return { ok: false, error: `Unknown engine message ${msg.type}` };
+    }
+  }
+
+  /** A hub notice (a capture error from the toolbar) waits for the deck page when none is connected. */
+  notify(level, text) {
+    if (this.ui.size) { this.event(level, text); return; }
+    this.notes.push({ level, text, at: Date.now() });
+    if (this.notes.length > 5) this.notes.shift();
+  }
+  flushNotes(port) {
+    const notes = this.notes;
+    this.notes = [];
+    for (const n of notes) if (Date.now() - n.at < NOTE_TTL) this.post(port, { t: 'event', level: n.level, text: n.text });
+  }
+
+  /** The DJ's saved settings, from the hub's first START: a new engine takes them before its first deck. */
+  applySaved(saved) {
+    if (this.savedApplied || !saved || typeof saved !== 'object') return;
+    this.savedApplied = true; // once per engine; afterwards the deck page owns these settings
+    for (const k of PERSISTED_MASTER_KEYS) {
+      const v = k in saved ? validateValue(MASTER_PARAMS[k], saved[k]) : null;
+      if (v && v.ok && v.value !== this.params[k]) this.setMasterParam(k, v.value);
     }
   }
 
@@ -307,6 +333,7 @@ class Engine {
     const decks = [...this.decks.values()].sort((a, b) => a.slot - b.slot).map((d) => d.state(stamp.ctxTime));
     const cs = this.clock.state();
     return {
+      engineId: INSTANCE,
       ctxTime: stamp.ctxTime, wallMs: stamp.wallMs, sampleRate: this.ctx.sampleRate, engineState: this.ctx.state,
       outputLatency: this.ctx.outputLatency || 0, clock: cs,
       master: {

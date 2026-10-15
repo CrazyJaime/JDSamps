@@ -152,3 +152,31 @@ test('closing the tab ejects its deck', async () => {
   await track.close();
   await waitFor(async () => (await hubCall(deck, { type: 'LIST_SOURCES' })).ok && (await h.sw.evaluate(() => chrome.action.getBadgeText({}))) === '', 8000);
 });
+
+test('a capture warning raised while the deck page is closed is shown when it opens', async () => {
+  await deck.close();
+  await h.sw.evaluate(() => chrome.runtime.sendMessage({ target: 'engine', type: 'NOTIFY', level: 'warn', text: 'Chrome pages can\'t be captured (raised while closed).' }));
+  deck = await openExtPage(h, 'deck.html');
+  await waitFor(async () => (await deck.locator('.toast').allTextContents()).some((t) => /raised while closed/.test(t)), 5000);
+});
+
+test('a new engine applies the saved settings that come with its first START, before making the deck', async () => {
+  await deck.close(); // no deck page: only the hub's START can carry the settings
+  const t = await h.context.newPage();
+  await t.goto(server.url('a'));
+  const tabId = await tabIdFor(h, server.url('a'));
+  const r = await h.sw.evaluate(async (id) => {
+    await chrome.offscreen.closeDocument();
+    await chrome.offscreen.createDocument({ url: 'offscreen.html', reasons: ['USER_MEDIA'], justification: 'test' });
+    const streamId = await new Promise((res, rej) => chrome.tabCapture.getMediaStreamId({ targetTabId: id }, (s) => (chrome.runtime.lastError ? rej(new Error(chrome.runtime.lastError.message)) : res(s))));
+    const settings = { 'pitch.defaultRange': 0.16, 'bpm.range': '78-155', 'rec.format': 'webm', 'master.volume': 0, 'buffer.capSec': 7 };
+    const msg = { target: 'engine', type: 'START', tabId: id, streamId, meta: { title: 'A' }, settings };
+    for (let i = 0; ; i++) {
+      try { return await chrome.runtime.sendMessage(msg); } catch (e) { if (i > 30) throw e; await new Promise((res) => setTimeout(res, 100)); }
+    }
+  }, tabId);
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const got = await offscreenEval(h, `(() => { const e = globalThis.__jdsEngine, d = [...e.decks.values()][0];
+    return { range: d.params.range, bpm: e.params['bpm.range'], rec: e.params['rec.format'], vol: e.params['master.volume'], cap: e.params['buffer.capSec'] }; })()`);
+  assert.deepEqual(got, { range: 0.16, bpm: '78-155', rec: 'webm', vol: 0.5, cap: 240 }, 'persisted keys only, validated');
+});
