@@ -2,9 +2,14 @@
 
 - Package: `signalsmith-stretch@1.3.2` from npm (JS/WASM release by Geraint Luff, MIT licence).
 - `SignalsmithStretch.js` (UMD; also the AudioWorklet module) and `SignalsmithStretch.mjs`
-  (ES module factory) are the npm files **plus one fix** applied by `patch.mjs`: buffer-streaming
-  mode read the wrong samples (or threw and killed the node) whenever its read window spanned
-  two `addBuffers()` chunks. Upstream HEAD a670068 (2026-09-25) still has the bug.
+  (ES module factory) are the npm files **plus two patches** applied by `patch.mjs` (each line is
+  marked `PATCHED (JD Samps)`):
+  1. Fix: buffer-streaming mode read the wrong samples (or threw and killed the node) whenever its
+     read window spanned two `addBuffers()` chunks. Upstream HEAD a670068 (2026-09-25) still has the bug.
+  2. Addition: a `destroy()` remote method. It releases the buffered audio and makes `process()` return
+     false. Upstream `process()` always returns true, and Chrome keeps running a disconnected
+     AudioWorkletNode whose `process()` returns true (measured: ≈375 calls/s at 48 kHz after
+     `disconnect()` + GC), holding up to 240 s of float32 stereo. `Deck.dispose()` calls it on eject.
 - Behaviour notes the engine relies on (measured in Chromium 141):
   - `schedule()` resolves to the stored segment; `p(t) = input + rate·(t − output)` is the audible position.
   - A new `schedule()` drops every change scheduled at/after `currentTime` (README says "after this one").

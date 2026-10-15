@@ -17,6 +17,9 @@ class DeckInput extends AudioWorkletProcessor {
     this.newChunk(0);
     this.odf = new OdfCore(sampleRate, (full, low, t, bl, bm, bh) => this.onOdf(full, low, t, bl, bm, bh));
     this.newOdfBatch();
+    this.disposed = false;
+    // Chrome keeps calling process() on a disconnected node until it returns false.
+    this.port.onmessage = (e) => { if (e.data && e.data.t === 'dispose') this.disposed = true; };
     this.port.postMessage({ t: 'init', fps: this.odf.fps, spf: this.odf.spf, chunk: CHUNK });
   }
 
@@ -55,6 +58,7 @@ class DeckInput extends AudioWorkletProcessor {
   }
 
   process(inputs) {
+    if (this.disposed) return false;
     const input = inputs[0];
     const l = input && input.length ? input[0] : null;
     const r = input && input.length > 1 ? input[1] : l;

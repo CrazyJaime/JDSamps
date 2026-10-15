@@ -163,6 +163,7 @@ export class Recorder {
       try { this.source.disconnect(this.node); } catch (_) {}
       try { this.node.disconnect(); } catch (_) {}
       this.node.port.onmessage = null;
+      this.node.port.postMessage({ t: 'dispose' }); // else Chrome keeps running the disconnected processor
       this.node.port.close();
       this.node = null;
     }

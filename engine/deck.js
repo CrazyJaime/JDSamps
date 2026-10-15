@@ -604,10 +604,20 @@ export class Deck {
       const t0 = Date.now();
       while (this.recorder.state !== 'idle' && Date.now() - t0 < 8000) await new Promise((r) => setTimeout(r, 50));
     }
+    if (this.recorder) this.recorder.teardown(); // no-op when idle; a stuck finalize must not leave its processor running
     for (const t of this.stream.getTracks()) t.stop();
-    const nodes = [this.source, this.inputNode, this.stretch, this.fader, this.xfGain, this.analyser];
+    // Chrome keeps calling process() on a disconnected AudioWorkletNode for as long as it returns true,
+    // so every processor is told to stop. The stretcher first goes silent and lets go of its buffer.
+    try { this.inputNode && this.inputNode.port.postMessage({ t: 'dispose' }); } catch (_) {}
+    const st = this.stretch;
+    if (st && st.dropBuffers) {
+      const calls = [st.schedule({ active: false, output: this.now() }), st.dropBuffers()];
+      if (st.destroy) calls.push(st.destroy());
+      await withTimeout(Promise.all(calls), 1500, 'The time-stretcher did not stop').catch(() => {});
+    }
+    const nodes = [this.source, this.inputNode, st, this.fader, this.xfGain, this.analyser];
     for (const n of nodes) { try { n && n.disconnect(); } catch (_) {} }
-    try { this.inputNode && this.inputNode.port.close(); } catch (_) {}
+    for (const n of [this.inputNode, st]) { try { n && n.port.close(); } catch (_) {} }
     for (const m of [this.trimNode, this.eq, this.rack]) { try { m && m.dispose(); } catch (_) {} }
     this.engine.master.removeDeck(this.id);
   }

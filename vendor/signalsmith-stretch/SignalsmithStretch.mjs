@@ -155,6 +155,7 @@ function registerWorkletProcessor(Module, audioNodeKey) {
 						transfer: transfer
 					};
 				},
+				destroy: () => { this.destroyed = true; this.audioBuffers = []; }, // PATCHED (JD Samps): ends the processor
 				addBuffers: sampleBuffers => {
 					sampleBuffers = [].concat(sampleBuffers);
 					this.audioBuffers.push(sampleBuffers);
@@ -233,6 +234,7 @@ function registerWorkletProcessor(Module, audioNodeKey) {
 		}
 
 		process(inputList, outputList, parameters) {
+			if (this.destroyed) return false; // PATCHED (JD Samps): see destroy()
 			if (!this.wasmReady) {
 				outputList.forEach(output => {
 					output.forEach(channel => {
