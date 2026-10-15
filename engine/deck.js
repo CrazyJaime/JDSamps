@@ -221,6 +221,8 @@ export class Deck {
         this.startAt(T, this.alignForStart(this.ts.posAt(T), T));
         return OK;
       }
+      // Decided here, not from the UI's snapshot; PLAY during a CUE preview keeps playing.
+      case 'playToggle': return this.act(this.wantPlay && !this.previewing ? 'pause' : 'play');
       case 'pause':
         if (!this.wantPlay) return OK;
         this.ts.change(now, T, { active: false });
