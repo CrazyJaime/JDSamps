@@ -181,6 +181,7 @@ function registerWorkletProcessor(Module, audioNodeKey) {
 					let messageId = data.shift();
 					let method = data.shift();
 					let result = remoteMethods[method](...data);
+					if (messageId === null) return; // PATCHED (JD Samps): a one-way call (addBuffers) gets no reply
 					if (result?.transfer) {
 						this.port.postMessage([messageId, result.value], result.transfer);
 					} else {
@@ -463,6 +464,7 @@ SignalsmithStretch = ((Module, audioNodeKey) => {
 						if (args.length > argCount) {
 							transfer = args.pop();
 						}
+						if (key == 'addBuffers') return void audioNode.port.postMessage([null, key].concat(args), transfer); // PATCHED (JD Samps): one-way, no reply per chunk
 						return post(transfer, key, ...args);
 					}
 				});

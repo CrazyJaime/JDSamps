@@ -17,6 +17,9 @@
      changes), copies with plain loops, and caches its views of the WASM buffers (`views()`, rebuilt when the
      memory grows). The output is bit-identical: `tests/unit/stretch-process.test.mjs` and the
      OfflineAudioContext check in `tests/browser/offline.test.mjs` compare against the file without this patch.
+  4. One-way `addBuffers()` (`one-way` hunks): the node posts it with a `null` message id and the processor
+     does not answer a `null` id, so it returns `undefined`, not a Promise. Upstream answered every chunk
+     (~22/s per deck), each answer a main-thread wakeup nobody read.
 - Behaviour notes the engine relies on (measured in Chromium 141):
   - `schedule()` resolves to the stored segment; `p(t) = input + rate·(t − output)` is the audible position.
   - A new `schedule()` drops every change scheduled at/after `currentTime` (README says "after this one").

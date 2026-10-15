@@ -19,6 +19,7 @@ const fail = (error) => ({ ok: false, error });
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const withTimeout = (p, ms, msg) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
 const CAP_MARGIN = 4; // s of audio always kept behind a playing deck's playhead (covers small backward jumps)
+const NO_TIME_UPDATES = 1e9; // s between the stretcher's 'time' messages: never
 // Player assist: rate match tolerance (steps are 0.25 %), how long the page has to confirm a rate
 // before the ramp holds (a background tab Chrome throttles may answer late), how long before an
 // unconfirmed rate counts as refused, how long assist stays off after the page refused it, and the
@@ -88,7 +89,9 @@ export class Deck {
     });
     this.inputNode.port.onmessage = (ev) => this.onInput(ev.data);
     this.stretch = await e.createStretch();
-    const lat = await withTimeout(this.stretch.latency(), 4000, 'The time-stretcher did not report its latency');
+    // Timeshift models the playhead itself: the stretcher's 10/s 'time' updates would only wake the main thread.
+    this.stretch.setUpdateInterval(NO_TIME_UPDATES);
+    const lat =await withTimeout(this.stretch.latency(), 4000, 'The time-stretcher did not report its latency');
     this.ts = new Timeshift(this.stretch, { sampleRate: this.sr, latency: lat, outLatency: lat / 2, capSec: e.params['buffer.capSec'] });
     this.trimNode = createTrim(ctx);
     this.eq = createIsolator(ctx);

@@ -139,3 +139,15 @@ test('stretcher process(): output is bit-identical without the process-cost patc
   for (let i = 0; i < a.L.length; i++) if (a.L[i] !== b.L[i] || a.R[i] !== b.R[i]) { differ++; if (first < 0) first = i; }
   assert.equal(differ, 0, `${differ} samples differ, first at block ${Math.floor(first / 128)}`);
 });
+
+test('stretcher RPC: addBuffers sent one-way (null id) is applied without a reply; numbered calls are still answered', async () => {
+  assert.ok(PATCHES.some((p) => p.id === 'one-way'), 'patch.mjs has the one-way hunks');
+  const p = await processor();
+  const before = p.port.posted.length;
+  for (let k = 0; k < 10; k++) p.port.deliver([null, 'addBuffers', chunk(k)]);
+  assert.equal(p.audioBuffersEnd, 10 * CH);
+  assert.equal(p.port.posted.length, before, 'no reply to a one-way call');
+  p.port.deliver([77, 'addBuffers', chunk(10)]);
+  assert.deepEqual(p.port.posted.slice(before).map((x) => x.msg), [[77, (11 * CH) / SR]]);
+  call(p, 'destroy');
+});

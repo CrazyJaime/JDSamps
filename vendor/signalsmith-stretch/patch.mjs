@@ -13,6 +13,8 @@
 //    starts over whenever the front of the chunk list changes, copies with plain loops, and keeps its views
 //    until the WASM memory grows. The output is bit-identical (tests/unit/stretch-process.test.mjs and the
 //    OfflineAudioContext check in tests/browser/offline.test.mjs).
+// 4. one-way (id 'one-way'): addBuffers() is posted with a null message id and the processor does not
+//    answer a null id. Upstream answered every chunk (~22/s per deck), waking the main thread for nothing.
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -20,7 +22,7 @@ import { fileURLToPath } from 'node:url';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 /** Multi-line hunks are written with two spaces per indent level; upstream indents with tabs. */
 const T = (s) => s.replace(/^(?: {2})+/gm, (m) => '\t'.repeat(m.length / 2));
-const COST = 'process-cost';
+const COST = 'process-cost', ONE_WAY = 'one-way';
 export const PATCHES = [
   {
     old: '\t\t\t\t\t\taudioSamples += count;\n\t\t\t\t\t\tblockSamples += count;',
@@ -153,6 +155,16 @@ export const PATCHES = [
     new: T(`      let outViews = this.views(memory, outputBlockSize).output; // PATCHED (JD Samps): cached views, a loop not a closure
       for (let c = 0; c < outputList[0].length; ++c) outputList[0][c].set(outViews[c]);
 `),
+  },
+  {
+    id: ONE_WAY,
+    old: '\t\t\t\t\tlet result = remoteMethods[method](...data);\n',
+    new: '\t\t\t\t\tlet result = remoteMethods[method](...data);\n\t\t\t\t\tif (messageId === null) return; // PATCHED (JD Samps): a one-way call (addBuffers) gets no reply\n',
+  },
+  {
+    id: ONE_WAY,
+    old: '\t\t\t\t\t\treturn post(transfer, key, ...args);\n',
+    new: '\t\t\t\t\t\tif (key == \'addBuffers\') return void audioNode.port.postMessage([null, key].concat(args), transfer); // PATCHED (JD Samps): one-way, no reply per chunk\n\t\t\t\t\t\treturn post(transfer, key, ...args);\n',
   },
 ];
 
