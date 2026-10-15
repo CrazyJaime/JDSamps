@@ -158,6 +158,18 @@ export class Deck {
     return { t: 'wave', deck: this.id, tStart: w.tStart + from * w.hop, hop: w.hop, data: Array.from(w.data.subarray(from * 3, w.n * 3)) };
   }
 
+  /** Forget the waveform before input time t (audio no longer buffered). */
+  compactWave(t) {
+    const w = this.wave;
+    if (w.tStart == null) return;
+    const k = Math.min(w.n, Math.floor((t - w.tStart) / w.hop));
+    if (k <= 0) return;
+    w.data.copyWithin(0, k * 3, w.n * 3);
+    w.data.fill(0, (w.n - k) * 3, w.n * 3);
+    w.tStart += k * w.hop;
+    w.n -= k;
+  }
+
   // ------------------------------------------------------------------ tempo
   /** Bring the grid map up to date with the tracker (live grid, track changes). */
   followTempo() {
@@ -593,6 +605,7 @@ export class Deck {
     const hs = this.ts.historyStart;
     this.grids.prune(hs);
     this.src.prune(hs);
+    this.compactWave(hs);
     if (this.cue < hs) {
       const g = this.grids.at(hs + 0.05);
       this.cue = g && this.canBeat() ? g.t0 + Math.ceil((hs + 0.05 - g.t0) / g.T) * g.T : hs + 0.05;
