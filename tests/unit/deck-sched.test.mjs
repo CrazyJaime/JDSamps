@@ -2,18 +2,34 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { Timeshift } from '../../engine/timeshift.js';
-import { makeEngine, makeDeck, freeMaster, run, FakeNode } from './fixtures/deck-harness.mjs';
+import { makeEngine, makeDeck, run, FakeNode } from './fixtures/deck-harness.mjs';
 
 const near = (a, b, eps) => Math.abs(a - b) <= eps;
+const TICK = 1536 / 48000;
+/** The node's playhead and playback rate at output time t (from its own schedule map). */
+const nodePos = (node, t) => { const s = node.segAt(t); return s.active ? s.input + s.rate * (t - s.output) : s.input; };
+const nodeRate = (node, t) => { const s = node.segAt(t); return s.active ? s.rate : 0; };
+
+/** A free-running master clock at `bpm` (beats at t0 + k·60/bpm), assigned to an absent deck 1. */
+function freeMaster(engine, { bpm = 128, t0 = 100 } = {}) {
+  const m = { bpm, t0 };
+  engine.clock.follow(1);
+  engine.updateClock = (now) => {
+    const P = 60 / m.bpm;
+    engine.clock.update(now, { playing: true, bpm: m.bpm, lastBeat: m.t0 + Math.floor((now - m.t0) / P) * P, period: P });
+  };
+  return m;
+}
 
 function setup({ pitch = 0, liveEdge = 30, cue = 2, bpm = 124, master = null, syncMode = 'BEAT' } = {}) {
   const clock = { t: 100 };
   const engine = makeEngine(clock);
   const m = master ? freeMaster(engine, master) : null;
   engine.updateClock(clock.t);
-  const d = makeDeck(engine, clock, { pitch, liveEdge, bpm, syncMode });
+  const d = makeDeck(engine, clock, { pitch, liveEdge, bpm });
+  d.params.syncMode = syncMode;
   d.setCue(cue);
-  const go = (s) => run(engine, clock, s);
+  const go = (s) => run(engine, clock, s, (t) => engine.updateClock(t));
   go(0.2);
   return { clock, engine, d, m, go };
 }
@@ -23,9 +39,9 @@ function assertPlaying(d, t, rate) {
   const s = d.state(t);
   assert.equal(s.playing, true, 'deck shows PLAYING');
   assert.ok(d.node.segAt(t).active, `node segment inactive at +${t}`);
-  assert.ok(near(d.node.rateAt(t), rate, 1e-6), `node rate ${d.node.rateAt(t)} != ${rate}`);
+  assert.ok(near(nodeRate(d.node, t), rate, 1e-6), `node rate ${nodeRate(d.node, t)} != ${rate}`);
   assert.ok(near(s.engineRate, rate, 1e-6), `engineRate ${s.engineRate} != ${rate}`);
-  assert.ok(near(d.node.posAt(t), d.ts.posAt(t), 1e-6), `node playhead ${d.node.posAt(t)} != model ${d.ts.posAt(t)}`);
+  assert.ok(near(nodePos(d.node, t), d.ts.posAt(t), 1e-6), `node playhead ${nodePos(d.node, t)} != model ${d.ts.posAt(t)}`);
 }
 
 // ---------------------------------------------------------------- F2: a pending start is never dropped
@@ -45,7 +61,7 @@ test('a pending PLAY survives a tempo-fader move and still starts at its planned
   d.setParam('pitch', 0.02);
   go(1);
   assertPlaying(d, clock.t, 1.02);
-  assert.ok(near(d.node.posAt(clock.t), 2 + 1.02 * (clock.t - T0), 1e-6), 'start kept at its original output time');
+  assert.ok(near(nodePos(d.node, clock.t), 2 + 1.02 * (clock.t - T0), 1e-6), 'start kept at its original output time');
 });
 
 test('a starve flip inside the start window still starts the deck, clamped to 1x', async () => {
@@ -113,7 +129,7 @@ test('a roll pad pressed inside the start window still starts the deck, looping'
   assert.equal((await d.act('rollStart', { beats: 1 })).ok, true);
   go(1);
   const seg = d.node.segAt(clock.t);
-  assert.ok(seg.active && near(d.node.rateAt(clock.t), 1, 1e-9), 'node plays');
+  assert.ok(seg.active && near(nodeRate(d.node, clock.t), 1, 1e-9), 'node plays');
   assert.ok(near(seg.loopStart, d.loop.start, 1e-9) && near(seg.loopEnd, d.loop.end, 1e-9), 'node loops the roll');
   assert.ok(d.state(clock.t).engineRate > 0);
 });
@@ -125,9 +141,9 @@ test('pausing while a start is pending cancels the start', async () => {
   await d.act('pause');
   go(1);
   assert.equal(d.state(clock.t).playing, false);
-  assert.equal(d.node.rateAt(clock.t), 0);
+  assert.equal(nodeRate(d.node, clock.t), 0);
   assert.equal(d.ts.playingAt(clock.t), false);
-  assert.ok(near(d.node.posAt(clock.t), d.ts.posAt(clock.t), 1e-6));
+  assert.ok(near(nodePos(d.node, clock.t), d.ts.posAt(clock.t), 1e-6));
   assert.ok(near(d.ts.posAt(clock.t), 2, 1e-6), 'never moved off the cue');
 });
 
@@ -137,9 +153,9 @@ test('pausing during the SYNC-PLAY beat wait cancels the start and leaves the de
   go(0.1);
   await d.act('pause');
   go(1);
-  assert.equal(d.node.rateAt(clock.t), 0);
+  assert.equal(nodeRate(d.node, clock.t), 0);
   assert.equal(d.ts.playingAt(clock.t), false);
-  assert.ok(near(d.ts.posAt(clock.t), d.cue, 1e-9) && near(d.node.posAt(clock.t), d.cue, 1e-9), `playhead ${d.ts.posAt(clock.t)}, cue ${d.cue}`);
+  assert.ok(near(d.ts.posAt(clock.t), d.cue, 1e-9) && near(nodePos(d.node, clock.t), d.cue, 1e-9), `playhead ${d.ts.posAt(clock.t)}, cue ${d.cue}`);
 });
 
 // ---------------------------------------------------------------- F3: the node's rate follows the deck's
@@ -224,13 +240,13 @@ test('Timeshift.change folds a later change into a pending start instead of drop
   assert.equal(node.map.filter((s) => s.output >= clock.t).length, 1, 'still one pending change in the node');
   for (const at of [0.6, 1.5]) {
     assert.ok(ts.playingAt(at) && node.segAt(at).active);
-    assert.ok(near(ts.posAt(at), 3 + 1.02 * (at - 0.5), 1e-12) && near(node.posAt(at), ts.posAt(at), 1e-12));
+    assert.ok(near(ts.posAt(at), 3 + 1.02 * (at - 0.5), 1e-12) && near(nodePos(node, at), ts.posAt(at), 1e-12));
   }
   clock.t = 0.3;
   ts.change(0.3, 0.45, { active: false }); // PAUSE cancels the start: the deck stays where it was cued
   assert.equal(ts.playingAt(1), false);
   assert.equal(node.segAt(1).active, false);
-  assert.ok(near(ts.posAt(1), 2.9, 1e-12) && near(node.posAt(1), 2.9, 1e-12));
+  assert.ok(near(ts.posAt(1), 2.9, 1e-12) && near(nodePos(node, 1), 2.9, 1e-12));
 });
 
 // ---------------------------------------------------------------- I5: SYNC PLAY resumes in place
@@ -301,7 +317,7 @@ test('vinyl mode: a phase bend moves the pitch with the speed, key lock keeps it
     const want = 128 / 124;
     m.t0 += 0.02;           // the master's beats move 20 ms: the phase loop bends
     let bent = null;
-    for (let i = 0; i < 200 && !bent; i++) { go(1536 / 48000); const r = d.node.rateAt(clock.t); if (Math.abs(r - want) > 1e-6) bent = d.node.segAt(clock.t); }
+    for (let i = 0; i < 200 && !bent; i++) { go(TICK); const r = nodeRate(d.node, clock.t); if (Math.abs(r - want) > 1e-6) bent = d.node.segAt(clock.t); }
     assert.ok(bent, 'a bend happened');
     const semis = keyLock ? 0 : 12 * Math.log2(bent.rate);
     assert.ok(near(bent.semitones, semis, 1e-9), `keyLock=${keyLock}: bent rate ${bent.rate}, semitones ${bent.semitones}`);
