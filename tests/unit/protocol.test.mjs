@@ -65,7 +65,11 @@ test('action arguments are validated and normalised', () => {
 
 test('validateAgentMessage rejects hostile payloads', () => {
   assert.deepEqual(validateAgentMessage({ t: 'status', hasMedia: true, playing: false, rate: 1.03, preservesPitch: false, count: 2 }),
-    { t: 'status', hasMedia: true, playing: false, rate: 1.03, preservesPitch: false, count: 2 });
+    { t: 'status', hasMedia: true, playing: false, rate: 1.03, preservesPitch: false, count: 2, muted: false, volume: 1, audible: 0, seq: -1 });
+  assert.deepEqual(validateAgentMessage({ t: 'status', hasMedia: true, playing: true, rate: 1, count: 1, muted: true, volume: 0.5, audible: 1, seq: 7 }),
+    { t: 'status', hasMedia: true, playing: true, rate: 1, preservesPitch: false, count: 1, muted: true, volume: 0.5, audible: 1, seq: 7 });
+  const junk = validateAgentMessage({ t: 'status', hasMedia: true, playing: true, rate: 1, muted: 'yes', volume: 9, audible: -1, seq: 1.5 });
+  assert.deepEqual([junk.muted, junk.volume, junk.audible, junk.seq], [false, 1, 0, -1]);
   for (const bad of [
     null, 'x', {}, { t: 'status' }, { t: 'status', hasMedia: 'yes', playing: true, rate: 1 },
     { t: 'status', hasMedia: true, playing: true, rate: NaN }, { t: 'status', hasMedia: true, playing: true, rate: 1e9 },

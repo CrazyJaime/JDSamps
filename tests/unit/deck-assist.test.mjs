@@ -1,0 +1,238 @@
+// Player assist in the real Deck: what the engine commits to its source model, and when.
+// The Deck runs on a fake clock with a fake stretch node; agents are fake ports that act like
+// agent-main.js behind agent-relay.js (they answer commands with a status a little later).
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import { Deck } from '../../engine/deck.js';
+import { Timeshift } from '../../engine/timeshift.js';
+import { MasterClock } from '../../engine/sync.js';
+
+globalThis.chrome = globalThis.chrome || { runtime: {} };
+const DT = 1536 / 48000;
+
+class FakeNode {
+  constructor(clock) { this.clock = clock; this.map = [{ active: false, input: 0, output: 0, rate: 1, loopStart: 0, loopEnd: 0 }]; }
+  addBuffers() { return 0; }
+  schedule(obj) {
+    const wNow = this.clock.t + 0.003;
+    while (this.map.length && this.map[this.map.length - 1].output >= wNow) this.map.pop();
+    this.map.push({ ...(this.map[this.map.length - 1] || {}), ...obj });
+    return Promise.resolve();
+  }
+  dropBuffers(t) { return Promise.resolve({ start: t, end: 0 }); }
+}
+
+function fakeTempo(bpm) {
+  return {
+    bpm, grid: { t0: 0, T: 60 / bpm, bar1: null },
+    get() { return { state: 'LOCKED', inBpm: this.bpm, conf: 0.9, mult: 1, tapped: false, grid: this.grid, canBeat: true }; },
+    sourceRateChanged(ratio) { this.bpm *= ratio; this.grid = { ...this.grid, T: this.grid.T / ratio }; },
+    pushBatch() {}, tap() {}, multiply() {}, shiftGrid() {}, setBar1() {},
+  };
+}
+
+/** A playing deck at +6 % with ~4 s of reserve: assist wants to engage. */
+async function setup({ pitch = 0.06 } = {}) {
+  const clock = { t: 1 };
+  const engine = {
+    ctx: { get currentTime() { return clock.t; }, sampleRate: 48000 },
+    params: { 'buffer.capSec': 240, 'assist.on': true, 'bpm.range': 'AUTO', 'rec.format': 'wav' },
+    clock: new MasterClock(), decks: new Map(), events: [],
+    master: { setAssign() {}, removeDeck() {} },
+    event(level, text) { this.events.push({ level, text }); },
+    broadcast() {}, updateClock() {}, wallNow: () => clock.t * 1000, ctxTimeAtWall: (w) => w / 1000, heardTime: () => clock.t,
+  };
+  const d = new Deck(engine, {
+    id: 1, slot: 1, tabId: 10, stream: { getTracks: () => [], getAudioTracks: () => [] }, meta: { title: 't' },
+    params: { pitch, range: 0.1, keyLock: true, syncMode: 'BEAT', fader: 1, xf: 'THRU', 'fx.type': 'ECHO', 'fx.beats': 0.5, 'fx.level': 0.5, 'fx.on': false },
+  });
+  d.ts = new Timeshift(new FakeNode(clock), { sampleRate: 48000, latency: 0.12, outLatency: 0.06, capSec: 240 });
+  d.ts.liveEdge = 30;
+  d.tempo = fakeTempo(124);
+  d.grids.update(d.tempo.get().grid);
+  d.analyser = { getFloatTimeDomainData() {} };
+  d.meterBuf = new Float32Array(16);
+  d.rack = { setClock() {}, tick() {}, setFx() {}, setFilter() {} };
+  d.xfGain = { gain: { value: 1 } };
+  d.recorder = { state: 'idle' };
+  engine.decks.set(1, d);
+  d.startAt(d.ts.soon(clock.t), d.ts.liveEdge - d.ts.lat - 4);
+  return { clock, engine, d, agents: [] };
+}
+
+/**
+ * A frame's agent. `page` is the media element the page plays: `obey` = it takes the rates the
+ * agent sets; `audible` = whether the tab's captured sound comes from it.
+ */
+function agent(env, frameId, { audible = true, obey = true, rate = 1, delay = 0.05 } = {}) {
+  const page = { rate, base: rate, seq: 0, obey };
+  const q = [];
+  const port = {
+    sent: [], listeners: [], dropListeners: [],
+    onMessage: { addListener: (f) => port.listeners.push(f) },
+    onDisconnect: { addListener: (f) => port.dropListeners.push(f) },
+    postMessage(m) {
+      port.sent.push({ at: env.clock.t, ...m });
+      if (Number.isSafeInteger(m.seq)) page.seq = m.seq;
+      if (m.t === 'rate' && page.obey) page.rate = m.rate;
+      if (m.t === 'release') page.rate = page.base;
+      port.reply(delay);
+    },
+    disconnect() {},
+    status: () => ({
+      t: 'status', hasMedia: true, playing: true, rate: page.rate, preservesPitch: page.rate === page.base,
+      muted: !audible, volume: 1, audible: audible ? 1 : 0, count: 1, seq: page.seq,
+    }),
+    reply(after = delay, m = null) { q.push({ at: env.clock.t + after, m }); },
+    pump(t) { while (q.length && q[0].at <= t) { const { m } = q.shift(); port.deliver(m || port.status()); } },
+    deliver(m) { for (const f of port.listeners) f(m); },
+    drop() { for (const f of port.dropListeners) f(); },
+    page,
+  };
+  env.d.attachAgent(port, frameId);
+  port.reply(0.01);
+  env.agents.push(port);
+  return port;
+}
+
+/** Advance in render-quantum batches. `src` = the playback rate the captured audio really has. */
+function run(env, seconds, { src = () => 1, onTick } = {}) {
+  const end = env.clock.t + seconds;
+  while (env.clock.t < end - 1e-9) {
+    env.clock.t += DT;
+    env.d.ts.liveEdge += DT * src();
+    for (const a of env.agents) a.pump(env.clock.t);
+    if (onTick) onTick(env.clock.t);
+    env.d.tick(env.clock.t);
+  }
+}
+const rates = (port) => port.sent.filter((m) => m.t === 'rate');
+
+test('assist does not engage on a muted or unrelated media element', async () => {
+  const env = await setup();
+  const decor = agent(env, 0, { audible: false }); // <audio muted loop autoplay>; the music is Web Audio
+  run(env, 12); // the captured audio never speeds up
+  assert.deepEqual(rates(decor), [], 'no rate commands');
+  assert.equal(env.d.assist.sourceRate, 1);
+  assert.equal(env.d.src.rateAt(Infinity), 1);
+  assert.equal(env.d.tempo.bpm, 124, 'tempo model untouched');
+  assert.equal(env.d.state(env.clock.t).assist.available, false);
+});
+
+test('assist does not engage when the page already plays at its own speed', async () => {
+  const env = await setup();
+  const yt = agent(env, 0, { rate: 1.25 }); // the site remembered 1.25x
+  run(env, 6, { src: () => yt.page.rate });
+  assert.deepEqual(rates(yt), []);
+  assert.equal(env.d.assist.sourceRate, 1);
+  assert.equal(env.d.state(env.clock.t).assist.available, false);
+});
+
+test('a source-rate step is committed only when the page confirms it, at the confirmation time', async () => {
+  const env = await setup();
+  const a = agent(env, 0, { delay: 0.3 });
+  let sentAt = null, edgeAtSend = null, confirmedAt = null, edgeAtConfirm = null;
+  run(env, 3, {
+    src: () => a.page.rate,
+    onTick: (t) => {
+      if (sentAt == null && rates(a).length) { sentAt = t; edgeAtSend = env.d.ts.liveEdge; }
+      if (sentAt != null && confirmedAt == null) {
+        if (env.d.assist.sourceRate !== 1) { confirmedAt = t; edgeAtConfirm = env.d.ts.liveEdge; }
+      }
+    },
+  });
+  assert.ok(sentAt != null, 'assist engaged');
+  assert.ok(confirmedAt != null, 'the step was committed');
+  assert.ok(confirmedAt - sentAt >= 0.25, `committed ${(confirmedAt - sentAt).toFixed(3)} s after sending, before the page confirmed`);
+  const step = env.d.src.steps.find((s) => s.inPos > 0);
+  assert.ok(Math.abs(step.inPos - edgeAtConfirm) < 0.05, `step at ${step.inPos.toFixed(3)}; live edge at send ${edgeAtSend.toFixed(3)}, at confirm ${edgeAtConfirm.toFixed(3)}`);
+});
+
+test('a page that ignores the rate gets no source-model change, a release, and ASSIST n/a', async () => {
+  const env = await setup();
+  const a = agent(env, 0, { obey: false }); // e.g. the rate lands on an element that is not the one heard
+  run(env, 8, { src: () => a.page.rate });
+  assert.ok(rates(a).length > 0, 'assist tried');
+  assert.equal(env.d.assist.sourceRate, 1, 'nothing committed');
+  assert.equal(env.d.src.rateAt(Infinity), 1);
+  assert.equal(env.d.tempo.bpm, 124);
+  assert.equal(a.sent.at(-1).t, 'release');
+  assert.equal(env.d.state(env.clock.t).assist.available, false);
+  const n = rates(a).length;
+  run(env, 10, { src: () => a.page.rate });
+  assert.equal(rates(a).length, n, 'assist stays off for a while');
+});
+
+test('external-rate from the page rolls assist back at the live edge and keeps it off for a while', async () => {
+  const env = await setup();
+  const a = agent(env, 0);
+  run(env, 8, { src: () => a.page.rate });
+  const engaged = env.d.assist.sourceRate;
+  assert.ok(engaged > 1.01, `engaged at ${engaged}`);
+  // The player insists on 1x: agent-main gives up and says so.
+  a.page.obey = false; a.page.rate = 1;
+  a.deliver({ t: 'external-rate', rate: 1 });
+  const edge = env.d.ts.liveEdge;
+  assert.equal(a.sent.at(-1).t, 'release');
+  assert.equal(env.d.assist.sourceRate, 1);
+  assert.equal(env.d.src.rateAt(edge + 0.01), 1);
+  assert.ok(env.d.src.rateAt(edge - 0.5) > 1, 'audio already buffered keeps its rate');
+  assert.ok(Math.abs(env.d.tempo.bpm - 124) < 1e-6, `tempo ${env.d.tempo.bpm}`);
+  assert.equal(env.d.state(env.clock.t).assist.available, false);
+  const n = rates(a).length;
+  run(env, 20, { src: () => a.page.rate });
+  assert.equal(rates(a).length, n, 'no new rate commands');
+});
+
+test('while engaged the engine re-sends the rate at least every second', async () => {
+  const env = await setup();
+  const a = agent(env, 0);
+  run(env, 16, { src: () => a.page.rate });
+  const on = a.sent.filter((m) => m.t === 'rate');
+  assert.ok(on.length > 10);
+  let gap = 0;
+  for (let i = 1; i < on.length; i++) gap = Math.max(gap, on[i].at - on[i - 1].at);
+  gap = Math.max(gap, env.clock.t - on.at(-1).at);
+  assert.ok(env.d.assist.sourceRate > 1, 'still engaged');
+  assert.ok(gap <= 1.3, `longest silence ${gap.toFixed(2)} s`);
+});
+
+test("an old port's disconnect does not drop the frame's new agent", async () => {
+  const env = await setup();
+  const old = agent(env, 0);
+  const fresh = agent(env, 0); // same frame reconnected (navigation or bfcache)
+  old.drop();
+  assert.equal(env.d.agents.get(0)?.port, fresh);
+});
+
+test('assist ramps back down through confirmed steps and ends with a confirmed release', async () => {
+  const env = await setup();
+  const a = agent(env, 0);
+  run(env, 4, { src: () => a.page.rate });
+  assert.ok(env.d.assist.sourceRate > 1.005);
+  env.d.setParam('pitch', 0);
+  run(env, 8, { src: () => a.page.rate });
+  assert.equal(a.sent.at(-1).t, 'release');
+  assert.equal(a.page.rate, 1);
+  assert.equal(env.d.assist.sourceRate, 1);
+  assert.equal(env.d.assist.active, false);
+  assert.ok(Math.abs(env.d.tempo.bpm - 124) < 1e-6);
+  assert.equal(env.d.state(env.clock.t).assist.available, true, 'nothing was refused');
+});
+
+test('if the heard element stops, assist lets go at once and comes back when it plays again', async () => {
+  const env = await setup();
+  const a = agent(env, 0);
+  run(env, 4, { src: () => a.page.rate });
+  assert.ok(env.d.assist.sourceRate > 1.005);
+  const silent = a.status;
+  a.status = () => ({ ...silent(), playing: false, audible: 0 }); // e.g. the player changes track
+  a.reply(0);
+  run(env, 0.5, { src: () => 1 });
+  assert.equal(a.sent.at(-1).t, 'release');
+  assert.equal(env.d.assist.sourceRate, 1);
+  a.status = silent;
+  a.reply(0);
+  run(env, 2, { src: () => a.page.rate });
+  assert.ok(env.d.assist.sourceRate > 1, 're-engaged without a penalty');
+});
