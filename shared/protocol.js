@@ -163,7 +163,12 @@ export function validateAgentMessage(m) {
     const audible = Number.isInteger(m.audible) && m.audible >= 0 && m.audible < 1000 ? m.audible : 0;
     const volume = typeof m.volume === 'number' && m.volume >= 0 && m.volume <= 1 ? m.volume : 1;
     const seq = Number.isSafeInteger(m.seq) && m.seq >= 0 ? m.seq : -1;
-    return { t: 'status', hasMedia: m.hasMedia, playing: m.playing, rate, preservesPitch: m.preservesPitch === true, count, muted: m.muted === true, volume, audible, seq };
+    const s = { t: 'status', hasMedia: m.hasMedia, playing: m.playing, rate, preservesPitch: m.preservesPitch === true, count, muted: m.muted === true, volume, audible, seq };
+    // The agent let go of the page by itself (no command for a long while) at wall-clock ms releasedAt.
+    if (m.selfReleased === true && typeof m.releasedAt === 'number' && Number.isFinite(m.releasedAt) && m.releasedAt > 0) {
+      s.selfReleased = true; s.releasedAt = m.releasedAt;
+    }
+    return s;
   }
   if (m.t === 'external-rate') {
     if (typeof m.rate !== 'number' || !Number.isFinite(m.rate) || m.rate <= 0 || m.rate > 16) return null;

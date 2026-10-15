@@ -13,8 +13,9 @@
   // made itself, and whether the agent gave the element back to a page that insists on its rate.
   const info = new WeakMap();
   let refs = [], pruneAt = 256;
-  // cmdAt: when the last rate command came (the agent lets go 3 s after it).
-  const st = { active: false, enforcing: false, target: 1, seq: 0, dog: 0, cmdAt: 0 };
+  // cmdAt: when the last rate command came (the agent lets go LET_GO ms after it); letGo: when
+  // (wall-clock ms) it last let go by itself, until the next command.
+  const st = { active: false, enforcing: false, target: 1, seq: 0, dog: 0, cmdAt: 0, letGo: 0 };
   // Statuses up: the last one sent and when, and whether a newer one is waiting.
   const out = { last: '', at: -1e9, dirty: false, timer: 0, queued: false };
 
@@ -33,6 +34,7 @@
     return {
       t: 'status', hasMedia: els.length > 0, playing, rate: main ? main.playbackRate : 1, preservesPitch: main ? main.preservesPitch !== false : true,
       muted: main ? main.muted : false, volume: main ? main.volume : 1, audible, count: els.length, seq: st.seq,
+      ...(st.letGo ? { selfReleased: true, releasedAt: st.letGo } : {}),
     };
   }
 
@@ -60,16 +62,19 @@
     pump();
   }
 
-  // The engine re-sends the rate at least every second while it needs it: 3 s without it, let go.
-  // Checked on every event and command, so a throttled timer can only make the release late, and
-  // the timer itself re-checks the clock, so a stale one never lets go of a rate still in use.
+  // The engine re-sends the rate at least every second while it needs it: LET_GO without it, let
+  // go, and say so (selfReleased), so the engine starts again from 1x instead of taking it for a
+  // refusal. LET_GO rides out an engine whose main thread stalls for seconds; a dead engine is let
+  // go of at once (the relay's port drops). Checked on every event and command, so a throttled
+  // timer can only make the release late, and the timer itself re-checks the clock, so a stale
+  // one never lets go of a rate still in use.
+  const LET_GO = 10000;
   function watchdog() {
     if (!st.enforcing) return;
-    const left = st.cmdAt + 3000 - performance.now();
-    if (left <= 0) release();
+    const left = st.cmdAt + LET_GO - performance.now();
+    if (left <= 0) { st.letGo = performance.timeOrigin + performance.now(); release(); }
     else if (!st.dog) st.dog = setTimeout(() => { st.dog = 0; watchdog(); }, left);
   }
-  const onEvent = () => { watchdog(); pump(); };
 
   function apply(el) {
     const x = info.get(el);
@@ -107,17 +112,35 @@
     report();
   }
 
+  // Media events matter only once a deck talks to the page (statuses, enforcing, the watchdog):
+  // until the first command the agent adds no listener to any element, and from then on one
+  // handler serves every event of every element. Per-element listeners and closures cost about
+  // 400 B of heap per element a page ever plays, and pages that are never decked are almost all.
+  const EVENTS = ['play', 'playing', 'pause', 'emptied', 'loadedmetadata', 'volumechange', 'timeupdate'];
+  function onMedia(e) {
+    watchdog();
+    if (e.type === 'timeupdate') { pump(); return; } // about 4 a second while playing, timers or not
+    if (st.enforcing && (e.type === 'playing' || e.type === 'loadedmetadata')) apply(e.currentTarget);
+    report();
+  }
+  function wire(el) {
+    el.addEventListener('ratechange', onRate);
+    for (const ev of EVENTS) el.addEventListener(ev, onMedia);
+  }
+  function activate() {
+    if (st.active) return;
+    st.active = true;
+    for (const el of live()) wire(el);
+  }
+
   function register(el) {
     if (!(el instanceof HTMLMediaElement) || info.has(el)) return;
     info.set(el, { base: null, ext: [], off: false });
     refs.push(new WeakRef(el));
     // Pages that are never decked never call live(): drop collected elements here as well.
     if (refs.length >= pruneAt) { refs = refs.filter((r) => r.deref() !== undefined); pruneAt = Math.max(256, 2 * refs.length); }
-    el.addEventListener('ratechange', onRate);
-    for (const ev of ['play', 'playing', 'pause', 'emptied', 'loadedmetadata', 'volumechange']) {
-      el.addEventListener(ev, () => { watchdog(); if (st.enforcing && (ev === 'playing' || ev === 'loadedmetadata')) apply(el); report(); });
-    }
-    el.addEventListener('timeupdate', onEvent); // about 4 a second while playing, timers or not
+    if (!st.active) return;
+    wire(el);
     watchdog();
     if (st.enforcing) apply(el);
     report();
@@ -189,14 +212,20 @@
     if (m.t === 'query') {
       // Always answered, and at once.
       watchdog();
-      st.active = true; scan();
+      activate(); scan();
       out.last = '';
       send();
     } else if (m.t === 'rate') {
       if (typeof m.rate !== 'number' || !Number.isFinite(m.rate) || m.rate < 0.5 || m.rate > 2) return;
+      activate();
+      // After letting go by itself the agent takes the page again only on a new command: a
+      // keep-alive of the old one (an engine back from a stall) is answered with the status that
+      // says it let go, and the engine starts again from 1x.
+      if (st.letGo && seq != null && seq === st.seq) { send(); return; }
+      st.letGo = 0;
       // A new command takes back elements the agent gave up on; a keep-alive (same rate and seq) does not.
       const fresh = m.rate !== st.target || (seq != null && seq !== st.seq);
-      st.active = true; st.target = m.rate; st.enforcing = true;
+      st.target = m.rate; st.enforcing = true;
       if (seq != null) st.seq = seq;
       st.cmdAt = performance.now();
       watchdog();
@@ -209,6 +238,7 @@
       send(); // the confirmation (it echoes seq), from this event: no timer can hold it back
     } else if (m.t === 'release') {
       if (seq != null) st.seq = seq;
+      st.letGo = 0;
       release();
       send();
     } else if (m.t === 'stop') {
@@ -216,6 +246,7 @@
       // Give the page its own rate back, pause every player, and say how many of them were heard
       // (0: nothing to pause here, so the tab gets muted instead).
       if (seq != null) st.seq = seq;
+      st.letGo = 0;
       release();
       scan();
       let count = 0;
