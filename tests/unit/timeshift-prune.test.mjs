@@ -59,6 +59,44 @@ test('posAt/rateAt/segAt at now and ahead read O(1) segments, however many are p
   assert.ok(Math.abs(s.rate - (1 + 100 * 1e-5)) < 1e-12, `rate ${s.rate}`);
 });
 
+/** A deck synced to a wandering master for `minutes`; per-tick cost sampled at 1 min and at the end. */
+async function syncedDeck(minutes, { prune = true } = {}) {
+  const clock = { t: 100 };
+  const engine = makeEngine(clock);
+  engine.clock.follow(1);
+  let bpm = 128, k = 0;
+  engine.updateClock = (now) => { const P = 60 / bpm; engine.clock.update(now, { playing: true, bpm, lastBeat: 100 + Math.floor((now - 100) / P) * P, period: P }); };
+  engine.updateClock(clock.t);
+  const d = makeDeck(engine, clock, { liveEdge: 30, bpm: 124 });
+  if (!prune) d.ts.cut = function (now) { this.segs = this.segs.filter((s) => s.output <= now); }; // the history-keeping reference
+  d.setCue(2);
+  run(engine, clock, 0.2);
+  await d.act('sync', { on: true });
+  await d.act('syncPlay');
+  const hook = (now) => { if (++k % 16 === 0) bpm = 128 * (1 + 2e-4 * Math.sin(k / 50)); engine.updateClock(now); };
+  /** Best of 8 batches of 100 ticks, in µs per tick. */
+  const tickUs = () => { let best = Infinity; for (let b = 0; b < 8; b++) { const a = performance.now(); run(engine, clock, 100 * TICK, hook); best = Math.min(best, (performance.now() - a) * 10); } return best; };
+  let maxSegs = 0, at1 = 0;
+  for (let sec = 1; sec <= minutes * 60; sec++) {
+    run(engine, clock, 1, hook);
+    maxSegs = Math.max(maxSegs, d.ts.segs.length);
+    if (sec === 60) at1 = tickUs();
+  }
+  return { d, log: d.node.log, maxSegs, at1, atEnd: tickUs() };
+}
+const TICK = 1536 / 48000;
+
+test('30 minutes synced: segs stay under 20, the schedule is what the history-keeping model sends, tick time stays flat', async () => {
+  const a = await syncedDeck(30);
+  assert.ok(a.log.length > 3000, `only ${a.log.length} changes were scheduled`);
+  assert.ok(a.maxSegs < 20, `segs grew to ${a.maxSegs}`);
+  assert.ok(a.atEnd < 2 * a.at1, `tick ${a.atEnd.toFixed(1)} µs at 30 min vs ${a.at1.toFixed(1)} µs at 1 min`);
+  const ref = await syncedDeck(30, { prune: false });
+  assert.ok(ref.maxSegs > 2000, `reference kept ${ref.maxSegs} segs`);
+  assert.equal(a.log.length, ref.log.length);
+  assert.deepEqual(a.log, ref.log, 'identical schedule() calls');
+});
+
 test('a synced deck playing for 3 minutes keeps its schedule history bounded', async () => {
   const clock = { t: 100 };
   const engine = makeEngine(clock);
