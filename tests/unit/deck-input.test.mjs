@@ -1,7 +1,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { Session } from 'node:inspector/promises';
 import { loadWorklet, runBlocks } from './worklet-shim.mjs';
 import { DeckTempo } from '../../engine/tempo.js';
+import { OdfCore } from '../../worklets/odf-core.js';
 import { synth, PATTERNS, FS } from './fixtures/synth.mjs';
 
 const reg = await loadWorklet('worklets/deck-input.js', { sampleRate: FS });
@@ -77,6 +79,30 @@ test('ODF batches are evenly stamped and drive tempo detection', () => {
   const g = d.get();
   assert.equal(g.state, 'LOCKED');
   assert.ok(Math.abs(g.inBpm - 124) < 0.15, String(g.inBpm));
+});
+
+test('the ODF core allocates nothing per block (it runs on the realtime audio thread for every deck)', async () => {
+  const { x } = synth({ ...PATTERNS.house, bars: 4 });
+  const blocks = [];
+  for (let s = 0; s + 128 <= x.length; s += 128) blocks.push(x.slice(s, s + 128));
+  let frames = 0;
+  const odf = new OdfCore(FS, () => { frames++; });
+  const run = (n) => { for (let b = 0; b < n; b++) odf.push(blocks[b % blocks.length], b * 128); };
+  run(4000); // warm up (JIT)
+  const session = new Session();
+  session.connect();
+  try {
+    await session.post('HeapProfiler.enable');
+    await session.post('HeapProfiler.startSampling', { samplingInterval: 256, includeObjectsCollectedByMajorGC: true, includeObjectsCollectedByMinorGC: true });
+    const N = 4000;
+    run(N);
+    const { profile } = await session.post('HeapProfiler.stopSampling');
+    const perBlock = profile.samples.reduce((a, s) => a + s.size, 0) / N;
+    assert.ok(frames > 1000);
+    assert.ok(perBlock < 64, `${perBlock.toFixed(0)} bytes allocated per 128-frame block`);
+  } finally {
+    session.disconnect();
+  }
 });
 
 // The deck's stretcher runs in the same AudioWorkletGlobalScope and thread. Its attachInput(id) registers
