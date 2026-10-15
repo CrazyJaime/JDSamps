@@ -1,0 +1,224 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>JD Samps — Deck</title>
+  <link rel="icon" href="icons/icon48.png" />
+  <link rel="stylesheet" href="deck.css" />
+</head>
+<body>
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.5v15l13-7.5z" fill="currentColor"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><path d="M6 4h4.5v16H6zM13.5 4H18v16h-4.5z" fill="currentColor"/></symbol>
+    <symbol id="i-eject" viewBox="0 0 24 24"><path d="M12 5l7.5 9h-15zM4.5 16.5h15V19h-15z" fill="currentColor"/></symbol>
+    <symbol id="i-left" viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-right" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24"><path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7zm8.4 4.6l1.9 1.5-2 3.4-2.3-.8a7.6 7.6 0 0 1-1.7 1l-.4 2.4h-3.8l-.4-2.4a7.6 7.6 0 0 1-1.7-1l-2.3.8-2-3.4 1.9-1.5a7.7 7.7 0 0 1 0-2.2L1.7 9.4l2-3.4 2.3.8a7.6 7.6 0 0 1 1.7-1l.4-2.4h3.8l.4 2.4a7.6 7.6 0 0 1 1.7 1l2.3-.8 2 3.4-1.9 1.5a7.7 7.7 0 0 1 0 2.2z" fill="currentColor"/></symbol>
+    <symbol id="i-help" viewBox="0 0 24 24"><path d="M9.2 9a2.9 2.9 0 1 1 4.3 2.5c-.9.5-1.5 1.1-1.5 2.1v.6M12 17.6v.4" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></symbol>
+    <symbol id="i-list" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></symbol>
+    <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></symbol>
+    <symbol id="i-sound" viewBox="0 0 24 24"><path d="M4 9.5h3.5L12 5v14l-4.5-4.5H4z" fill="currentColor"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18 6a8.5 8.5 0 0 1 0 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
+    <symbol id="i-dot" viewBox="0 0 24 24"><circle cx="12" cy="12" r="6" fill="currentColor"/></symbol>
+  </svg>
+
+  <header class="topbar">
+    <div class="brand">
+      <img src="icons/icon48.png" alt="" class="logo" width="28" height="28" />
+      <div class="brand-text"><h1>JD Samps</h1><span class="tag">made by godspee</span></div>
+    </div>
+    <button id="sourcesBtn" class="btn" aria-haspopup="dialog" aria-controls="sources"><svg class="ic"><use href="#i-list"/></svg><span>Sources</span></button>
+    <div class="clock" aria-label="Master clock">
+      <span class="clock-label">MASTER CLOCK</span>
+      <span class="clock-bpm mono" id="clockBpm">—</span>
+      <span class="clock-mode" id="clockMode">no master</span>
+    </div>
+    <div class="spacer"></div>
+    <button id="mixRecBtn" class="btn rec" aria-pressed="false"><svg class="ic"><use href="#i-dot"/></svg><span>REC MIX</span><span class="mono rec-time" id="mixRecTime"></span></button>
+    <button id="settingsBtn" class="btn ghost icon" aria-label="Settings" aria-haspopup="dialog" aria-controls="settings"><svg class="ic"><use href="#i-gear"/></svg></button>
+    <button id="helpBtn" class="btn ghost icon" aria-label="Keyboard shortcuts" aria-haspopup="dialog" aria-controls="help"><svg class="ic"><use href="#i-help"/></svg></button>
+    <button id="stopAllBtn" class="btn danger">STOP ALL</button>
+    <div class="engine" id="engineStatus" data-status="connecting"><span class="led"></span><span id="engineText">Connecting…</span></div>
+  </header>
+
+  <div id="banner" class="banner" role="status" hidden>Reconnecting to the audio engine… your decks keep playing.</div>
+
+  <section class="waves" id="waves" aria-label="Waveforms"></section>
+
+  <main class="board">
+    <div class="decks" id="decks">
+      <div class="empty" id="empty">
+        <h2>Load a tab onto a deck</h2>
+        <ol>
+          <li>Open a track on YouTube, SoundCloud, Bandcamp or Mixcloud.</li>
+          <li>Click the <strong>JD Samps</strong> icon on that tab, press <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd>, or right-click → <em>Add this tab to JD Samps</em>.</li>
+          <li>The deck loads <strong>cued</strong> and starts buffering. Press <strong>PLAY</strong> when you're ready.</li>
+        </ol>
+        <button class="btn" id="emptySourcesBtn"><svg class="ic"><use href="#i-list"/></svg><span>Open sources</span></button>
+      </div>
+    </div>
+    <aside class="master" id="master" aria-label="Master">
+      <h2 class="strip-title">MASTER</h2>
+      <div class="master-meters">
+        <canvas class="vmeter tall" id="masterMeter" aria-label="Master level"></canvas>
+        <div class="gr"><span class="label">GR</span><canvas class="vmeter gr-meter" id="grMeter" aria-label="Limiter gain reduction"></canvas><span class="mono" id="grText">0.0</span></div>
+      </div>
+      <div class="clips"><button class="clip" id="clipL" aria-label="Clear left clip light">L</button><button class="clip" id="clipR" aria-label="Clear right clip light">R</button></div>
+      <div class="knob lg" id="masterVol" data-label="VOLUME"></div>
+      <button class="btn toggle" id="limiterBtn" aria-pressed="true">LIMITER</button>
+    </aside>
+  </main>
+
+  <footer class="xfader-bar">
+    <span class="xf-side">A</span>
+    <div class="hslider xf" id="crossfader"></div>
+    <span class="xf-side">B</span>
+    <div class="seg small" id="xfCurve" role="group" aria-label="Crossfader curve"><button data-v="SMOOTH">SMOOTH</button><button data-v="SHARP">SHARP</button></div>
+  </footer>
+
+  <aside class="drawer" id="sources" role="dialog" aria-modal="false" aria-labelledby="sourcesTitle" hidden>
+    <header class="drawer-head"><h2 id="sourcesTitle">Sources</h2><button class="btn ghost icon" data-close aria-label="Close"><svg class="ic"><use href="#i-x"/></svg></button></header>
+    <p class="hint">Chrome only lets an extension capture a tab after you invoke it there. Use <strong>Go to tab</strong>, then click the JD Samps icon or press <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd>.</p>
+    <ul class="source-list" id="sourceList"></ul>
+  </aside>
+
+  <aside class="drawer" id="settings" role="dialog" aria-modal="false" aria-labelledby="settingsTitle" hidden>
+    <header class="drawer-head"><h2 id="settingsTitle">Settings</h2><button class="btn ghost icon" data-close aria-label="Close"><svg class="ic"><use href="#i-x"/></svg></button></header>
+    <div class="setting"><span>Recording format</span><div class="seg" data-setting="rec.format"><button data-v="wav">WAV</button><button data-v="webm">WebM</button></div></div>
+    <div class="setting"><span>Default pitch range</span><div class="seg" data-setting="pitch.defaultRange"><button data-v="0.06">±6%</button><button data-v="0.1">±10%</button><button data-v="0.16">±16%</button><button data-v="0.5">WIDE</button></div></div>
+    <div class="setting"><span>BPM range</span><div class="seg wrap" data-setting="bpm.range"><button data-v="AUTO">AUTO</button><button data-v="55-115">55–115</button><button data-v="68-135">68–135</button><button data-v="78-155">78–155</button><button data-v="88-175">88–175</button><button data-v="98-195">98–195</button></div></div>
+    <div class="setting"><span>Deck buffer</span><div class="seg" data-setting="buffer.capSec"><button data-v="120">2 min</button><button data-v="240">4 min</button><button data-v="480">8 min</button></div></div>
+    <div class="setting"><span>Player assist</span><div class="seg" data-setting="assist.on"><button data-v="true">ON</button><button data-v="false">OFF</button></div></div>
+    <p class="hint">Player assist briefly speeds up a tab's own player to refill a deck's reserve while it plays faster than the original. Sync itself always works on the audio.</p>
+  </aside>
+
+  <div class="overlay" id="help" role="dialog" aria-modal="true" aria-labelledby="helpTitle" hidden>
+    <div class="overlay-card">
+      <header class="drawer-head"><h2 id="helpTitle">Keyboard shortcuts</h2><button class="btn ghost icon" data-close aria-label="Close"><svg class="ic"><use href="#i-x"/></svg></button></header>
+      <table class="keys">
+        <tbody>
+          <tr><td><kbd>1</kbd>–<kbd>6</kbd></td><td>Select deck</td><td><kbd>Space</kbd></td><td>Play / pause</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>Space</kbd></td><td>Play on next master beat</td><td><kbd>C</kbd></td><td>Cue (hold to preview)</td></tr>
+          <tr><td><kbd>S</kbd></td><td>Sync</td><td><kbd>Shift</kbd>+<kbd>S</kbd></td><td>Master</td></tr>
+          <tr><td><kbd>K</kbd></td><td>Key lock</td><td><kbd>T</kbd></td><td>Tap tempo</td></tr>
+          <tr><td><kbd>Q</kbd> <kbd>A</kbd> <kbd>Z</kbd></td><td>Kill high / mid / low</td><td><kbd>←</kbd> <kbd>→</kbd></td><td>Nudge (hold)</td></tr>
+          <tr><td><kbd>↑</kbd> <kbd>↓</kbd></td><td>Tempo ±0.1%</td><td><kbd>F</kbd></td><td>FX on (hold = momentary)</td></tr>
+          <tr><td><kbd>V</kbd> <kbd>B</kbd> <kbd>N</kbd> <kbd>M</kbd></td><td>Roll 1/8, 1/4, 1/2, 1 (hold)</td><td><kbd>[</kbd> <kbd>]</kbd> <kbd>\</kbd></td><td>Crossfader left / right / centre</td></tr>
+          <tr><td><kbd>R</kbd></td><td>Record deck</td><td><kbd>Shift</kbd>+<kbd>R</kbd></td><td>Record mix</td></tr>
+          <tr><td><kbd>Shift</kbd>+<kbd>T</kbd></td><td>Mark beat 1 (downbeat)</td><td>Shift-click GRID</td><td>Shift the grid by 10 ms</td></tr>
+          <tr><td><kbd>?</kbd></td><td>This help</td><td><kbd>Esc</kbd></td><td>Close panels</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <div class="toasts" id="toasts" role="status" aria-live="polite"></div>
+
+  <template id="tpl-wave-row">
+    <div class="wave-row">
+      <div class="wave-gutter"><span class="slot" data-slot></span><span class="mono wave-bpm" data-wbpm>—</span></div>
+      <canvas class="wave" data-wave></canvas>
+    </div>
+  </template>
+
+  <template id="tpl-source-row">
+    <li class="source">
+      <img class="fav" data-fav alt="" width="16" height="16" />
+      <div class="source-text"><span class="title" data-title></span><span class="host" data-host></span></div>
+      <svg class="ic audible" data-audible aria-label="Playing audio" hidden><use href="#i-sound"/></svg>
+      <span class="badge" data-ondeck hidden></span>
+      <button class="btn sm" data-load hidden>Load</button>
+      <button class="btn sm ghost" data-goto hidden>Go to tab</button>
+    </li>
+  </template>
+
+  <template id="tpl-deck">
+    <section class="deck" aria-label="Deck">
+      <header class="deck-head">
+        <span class="slot" data-slot></span>
+        <img class="fav" data-fav alt="" width="16" height="16" />
+        <span class="title" data-title></span>
+        <button class="btn ghost icon sm" data-act="eject" aria-label="Eject deck"><svg class="ic"><use href="#i-eject"/></svg></button>
+      </header>
+      <div class="deck-tempo">
+        <div class="bpm"><span class="bpm-val mono" data-bpm>—</span><span class="bpm-unit">BPM</span></div>
+        <div class="tempo-meta">
+          <span class="badge" data-tstate>SEARCH</span>
+          <span class="mono pitch" data-pitch>+0.00%</span>
+          <span class="mono native" data-native></span>
+        </div>
+        <div class="leds" data-leds aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+      </div>
+      <div class="deck-status">
+        <div class="reserve" title="Buffered audio ahead of the playhead (lets the deck play faster than the source)">
+          <span class="label">RESERVE</span>
+          <span class="reserve-bar"><span data-reserve-fill></span></span>
+          <span class="mono" data-reserve-text>0.0s</span>
+        </div>
+        <span class="badge" data-assist hidden>ASSIST</span>
+        <span class="badge warn" data-starved hidden>RESERVE EMPTY</span>
+        <div class="phase" data-phase hidden title="Phase offset to the master clock"><span data-phase-dot></span></div>
+      </div>
+      <div class="transport">
+        <button class="btn cue big" data-hold="cue">CUE</button>
+        <button class="btn play big" data-act="playToggle" aria-label="Play" aria-pressed="false"><svg class="ic" data-play-icon><use href="#i-play"/></svg></button>
+        <button class="btn sync big" data-act="sync" aria-pressed="false">SYNC</button>
+        <button class="btn master big" data-act="master" aria-pressed="false">MASTER</button>
+      </div>
+      <div class="tools">
+        <button class="btn sm" data-act="syncPlay" title="Start exactly on the next master beat">SYNC PLAY</button>
+        <button class="btn sm" data-act="live" title="Jump to the live edge (lowest latency)">LIVE</button>
+        <button class="btn sm" data-act="half" title="Halve the detected tempo">½×</button>
+        <button class="btn sm" data-act="double" title="Double the detected tempo">2×</button>
+        <button class="btn sm" data-act="tap" title="Tap tempo (Shift-click: mark beat 1)">TAP</button>
+        <button class="btn sm" data-act="gridBack" title="Shift the beat grid back half a beat (Shift-click: 10 ms)">GRID −½</button>
+        <button class="btn sm" data-act="gridFwd" title="Shift the beat grid forward half a beat (Shift-click: 10 ms)">GRID +½</button>
+        <button class="btn sm toggle" data-act="keyLock" aria-pressed="true" title="Key lock: keep the original key when the tempo changes">KEY</button>
+        <button class="btn sm toggle" data-act="syncMode" title="BEAT: lock tempo and phase. TEMPO: lock tempo only.">BEAT</button>
+      </div>
+      <div class="tempo-row">
+        <button class="btn sm icon" data-hold="nudge-" aria-label="Nudge back (hold)"><svg class="ic"><use href="#i-left"/></svg></button>
+        <div class="hslider pitch" data-ctl="pitch"></div>
+        <button class="btn sm icon" data-hold="nudge+" aria-label="Nudge forward (hold)"><svg class="ic"><use href="#i-right"/></svg></button>
+        <button class="btn sm range" data-act="range" title="Pitch range">±10</button>
+      </div>
+      <div class="mixer">
+        <div class="knobgrid">
+          <div class="knob" data-ctl="trim" data-label="GAIN"></div>
+          <div class="knob" data-ctl="filter" data-label="FILTER"></div>
+          <div class="eqcol"><div class="knob" data-ctl="eq.hi" data-label="HI"></div><button class="kill" data-kill="hi">KILL</button></div>
+          <div class="eqcol"><div class="knob" data-ctl="eq.mid" data-label="MID"></div><button class="kill" data-kill="mid">KILL</button></div>
+          <div class="eqcol"><div class="knob" data-ctl="eq.low" data-label="LOW"></div><button class="kill" data-kill="low">KILL</button></div>
+        </div>
+        <div class="channel">
+          <canvas class="vmeter" data-meter aria-label="Channel level"></canvas>
+          <div class="vfader" data-ctl="fader"></div>
+        </div>
+      </div>
+      <div class="fx">
+        <div class="seg fxtype" data-seg="fx.type" role="group" aria-label="Beat FX">
+          <button data-v="ECHO">ECHO</button><button data-v="REVERB">VERB</button><button data-v="GATE">GATE</button><button data-v="FLANGER">FLNG</button><button data-v="CRUSH">CRSH</button>
+        </div>
+        <div class="fx-row">
+          <div class="seg beats" data-seg="fx.beats" role="group" aria-label="FX beat length">
+            <button data-v="0.0625">1/16</button><button data-v="0.125">1/8</button><button data-v="0.25">1/4</button><button data-v="0.5">1/2</button><button data-v="0.75">3/4</button><button data-v="1">1</button><button data-v="2">2</button><button data-v="4">4</button>
+          </div>
+        </div>
+        <div class="fx-row">
+          <div class="knob sm" data-ctl="fx.level" data-label="LEVEL"></div>
+          <button class="pad fxon" data-pad="fx.on" aria-pressed="false">FX ON</button>
+        </div>
+      </div>
+      <div class="rolls" role="group" aria-label="Roll (hold)">
+        <button class="pad" data-roll="0.125">1/8</button><button class="pad" data-roll="0.25">1/4</button><button class="pad" data-roll="0.5">1/2</button><button class="pad" data-roll="1">1</button>
+      </div>
+      <footer class="deck-foot">
+        <div class="seg xf" data-seg="xf" role="group" aria-label="Crossfader assign"><button data-v="A">A</button><button data-v="THRU">THRU</button><button data-v="B">B</button></div>
+        <button class="btn rec" data-act="rec" aria-pressed="false"><svg class="ic"><use href="#i-dot"/></svg><span>REC</span><span class="mono rec-time" data-rec-time></span></button>
+      </footer>
+    </section>
+  </template>
+
+  <script type="module" src="ui/app.js"></script>
+</body>
+</html>
