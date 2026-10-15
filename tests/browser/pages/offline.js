@@ -143,6 +143,36 @@ window.tests = {
     await settle();
     return { peak: peakAbs(out, 0.1, 1.1), inRms: rms(s.buffer.getChannelData(0), 0.2, 1.0), outRms: rms(out, 0.2, 1.0), minGr: Math.min(...meters.map((x) => x.gr)), ticks: meters.length, frames: meters.map((x) => x.frame) };
   },
+  /** A deck's post-fader meter from jds-master (its input = the deck slot) against an AnalyserNode
+   *  (fftSize 2048, what Deck.meterTick used to read) on the same fader, read at the same frames. */
+  async deckMeter() {
+    const ctx = await offline(2);
+    const s = source(ctx, (t, c) => (c ? 0.3 * Math.sin(2 * Math.PI * 440 * t + 0.4) : 0.5 * Math.sin(2 * Math.PI * 440 * t)) + 0.05 * Math.sin(2 * Math.PI * 61 * t));
+    const fader = ctx.createGain();
+    fader.gain.setValueAtTime(0.9, 0); fader.gain.setValueAtTime(0.4, 1);
+    const an = ctx.createAnalyser(); an.fftSize = 2048;
+    const m = createMaster(ctx);
+    s.connect(fader); fader.connect(an); m.meterIn(3, fader);
+    const meters = []; m.onMeter((x) => meters.push(x));
+    const reads = [], buf = new Float32Array(2048);
+    for (let k = 4; k * 1536 < 2 * SR; k += 3) {
+      const F = k * 1536;
+      if (F > SR && F - 2048 < SR) continue; // a window across the fader move: the two windows differ in length
+      ctx.suspend(F / SR).then(() => {
+        an.getFloatTimeDomainData(buf);
+        let pk = 0, sq = 0;
+        for (const x of buf) { pk = Math.max(pk, Math.abs(x)); sq += x * x; }
+        reads.push({ frame: F, peak: pk, rms: Math.sqrt(sq / buf.length) });
+        ctx.resume();
+      });
+    }
+    await render(ctx);
+    await settle(); await settle();
+    return reads.map((r) => {
+      const x = meters.find((y) => y.frame === r.frame);
+      return { ...r, worklet: x ? { peak: x.decks[6], rms: x.decks[7], clip: x.decks[8], others: [...x.decks.slice(0, 6), ...x.decks.slice(9)] } : null };
+    });
+  },
   async xfader() {
     const ctx = await offline(1); const s = source(ctx, sine(440, 0.5));
     const m = createMaster(ctx); const g = ctx.createGain();

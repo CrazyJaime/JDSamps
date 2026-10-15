@@ -67,7 +67,7 @@ export class Deck {
       inLag: Infinity,
     };
     this.agents = new Map();
-    this.meter = { peak: 0, rms: 0, clipUntil: 0 };
+    this.meter = { peak: 0, rms: 0, clipUntil: 0, clipFrame: Math.round(engine.ctx.currentTime * this.sr) }; // clips before this deck are not its own
     this.error = null;
     this.nextTrim = 0;
     this.capNotice = null; // latched buffer-cap notice: null | 'near' | 'full'
@@ -97,15 +97,12 @@ export class Deck {
     this.rack = createFxRack(ctx);
     this.fader = ctx.createGain();
     this.xfGain = ctx.createGain();
-    this.analyser = ctx.createAnalyser();
-    this.analyser.fftSize = 2048;
-    this.meterBuf = new Float32Array(this.analyser.fftSize);
     this.stretch.connect(this.trimNode.input);
     this.trimNode.output.connect(this.eq.input);
     this.eq.output.connect(this.rack.input);
     this.rack.output.connect(this.fader);
     this.fader.connect(this.xfGain);
-    this.fader.connect(this.analyser);
+    e.master.meterIn(this.slot, this.fader);
     this.xfGain.connect(e.master.bus);
     this.recorder = new Recorder(ctx, this.rack.output, {
       format: e.params['rec.format'], who: `D${this.slot}`, title: () => this.meta.title || `Tab ${this.tabId}`, sink: e.silentSink,
@@ -532,15 +529,19 @@ export class Deck {
     if (now >= this.nextTrim) { this.nextTrim = now + 2; this.trim(now, p); }
   }
 
-  /** Post-fader meter over the last 2048 frames; only measured for a state a UI will be sent. */
+  /**
+   * Post-fader meter over the latest engine tick, measured in the master worklet (this deck's
+   * input there is its slot); read only for a state a UI will be sent. The worklet keeps the
+   * latest clip's frame, so a clip between two reads (a hidden page reads twice a second) still
+   * lights the clip light for 2 s from the clip.
+   */
   meterTick(now) {
     if (!this.ts || this.disposed) return;
-    this.analyser.getFloatTimeDomainData(this.meterBuf);
-    let pk = 0, sq = 0;
-    for (let i = 0; i < this.meterBuf.length; i++) { const x = this.meterBuf[i], a = x < 0 ? -x : x; if (a > pk) pk = a; sq += x * x; }
-    this.meter.peak = pk;
-    this.meter.rms = Math.sqrt(sq / this.meterBuf.length);
-    if (pk >= 0.999) this.meter.clipUntil = now + 2;
+    const m = this.engine.master.deckMeter(this.slot), mt = this.meter;
+    if (!m) return;
+    mt.peak = m.peak;
+    mt.rms = m.rms;
+    if (m.clipFrame > mt.clipFrame) { mt.clipFrame = m.clipFrame; mt.clipUntil = Math.max(mt.clipUntil, m.clipFrame / this.sr + 2); }
   }
 
   /** When the playhead reaches an input position where the source rate changed, change the engine rate exactly there. */
@@ -853,7 +854,7 @@ export class Deck {
       if (st.destroy) calls.push(st.destroy());
       await withTimeout(Promise.all(calls), 1500, 'The time-stretcher did not stop').catch(() => {});
     }
-    const nodes = [this.source, this.inputNode, st, this.fader, this.xfGain, this.analyser];
+    const nodes = [this.source, this.inputNode, st, this.fader, this.xfGain];
     for (const n of nodes) { try { n && n.disconnect(); } catch (_) {} }
     for (const n of [this.inputNode, st]) { try { n && n.port.close(); } catch (_) {} }
     for (const m of [this.trimNode, this.eq, this.rack]) { try { m && m.dispose(); } catch (_) {} }
