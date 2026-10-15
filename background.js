@@ -54,8 +54,18 @@ const notify = (level, text) => toEngine({ type: ENGINE.NOTIFY, level, text }).c
 
 // ---------------------------------------------------------------- grants
 async function getGrants() { return (await chrome.storage.session.get('grants')).grants || {}; }
-async function grant(tab) { const g = await getGrants(); g[tab.id] = originOf(tab.url); await chrome.storage.session.set({ grants: g }); }
-async function revoke(tabId) { const g = await getGrants(); if (tabId in g) { delete g[tabId]; await chrome.storage.session.set({ grants: g }); } }
+// Grants share one stored object: serialize read-modify-write so concurrent edits don't drop each other.
+let grantsQ = Promise.resolve();
+function editGrants(fn) {
+  const run = grantsQ.then(async () => { const g = await getGrants(); if (fn(g)) await chrome.storage.session.set({ grants: g }); });
+  grantsQ = run.catch(() => {});
+  return run;
+}
+async function grant(tab) { await editGrants((g) => { g[tab.id] = originOf(tab.url); return true; }); }
+/** Drops a tab's grant, unless it is for `keepOrigin`. */
+async function revoke(tabId, keepOrigin) {
+  await editGrants((g) => { if (!(tabId in g) || (keepOrigin && g[tabId] === keepOrigin)) return false; delete g[tabId]; return true; });
+}
 
 // ---------------------------------------------------------------- capture
 function streamIdFor(tabId) {
@@ -133,27 +143,34 @@ async function listSources() {
 }
 
 // ---------------------------------------------------------------- downloads
+// One storage key per download ('dl:<id>' → blob URL), so concurrent downloads never overwrite
+// each other's entry.
+const dlKey = (id) => `dl:${id}`;
+const settledState = (s) => s === 'complete' || s === 'interrupted';
 async function download(url, filename) {
   if (typeof url !== 'string' || !url.startsWith(`blob:${EXT.slice(0, -1)}`)) return { ok: false, error: 'Bad download url.' };
   if (typeof filename !== 'string' || !/^[\w .()-]{1,120}\.(wav|webm)$/.test(filename)) return { ok: false, error: 'Bad file name.' };
   try {
     const id = await chrome.downloads.download({ url, filename, saveAs: false, conflictAction: 'uniquify' });
-    const dl = (await chrome.storage.session.get('dl')).dl || {};
-    dl[id] = url;
-    await chrome.storage.session.set({ dl });
+    await chrome.storage.session.set({ [dlKey(id)]: url });
+    // A small blob can finish before its entry is stored, when onChanged finds nothing to report.
+    const [item] = await chrome.downloads.search({ id }).catch(() => []);
+    if (item && settledState(item.state)) downloadDone(id, item.state, item.error);
     return { ok: true, downloadId: id };
   } catch (err) {
     return { ok: false, error: err.message };
   }
 }
-chrome.downloads.onChanged.addListener(async (d) => {
-  if (!d.state || (d.state.current !== 'complete' && d.state.current !== 'interrupted')) return;
-  const dl = (await chrome.storage.session.get('dl')).dl || {};
-  const url = dl[d.id];
+/** Reports a finished download to the engine once its entry is found (the engine ignores repeats). */
+async function downloadDone(id, state, error) {
+  const key = dlKey(id);
+  const url = (await chrome.storage.session.get(key))[key];
   if (!url) return;
-  delete dl[d.id];
-  await chrome.storage.session.set({ dl });
-  toEngine({ type: ENGINE.DOWNLOAD_DONE, url, ok: d.state.current === 'complete', error: d.error ? d.error.current : undefined }).catch(() => {});
+  await chrome.storage.session.remove(key);
+  toEngine({ type: ENGINE.DOWNLOAD_DONE, url, ok: state === 'complete', error: error || undefined }).catch(() => {});
+}
+chrome.downloads.onChanged.addListener((d) => {
+  if (d.state && settledState(d.state.current)) downloadDone(d.id, d.state.current, d.error ? d.error.current : undefined);
 });
 
 // ---------------------------------------------------------------- player-assist agent
@@ -179,7 +196,7 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
   }
 });
 chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
-  if (info.url) { const g = await getGrants(); if (g[tabId] && g[tabId] !== originOf(info.url)) await revoke(tabId); }
+  if (info.url) await revoke(tabId, originOf(info.url));
   if (!(await deckTabIds()).includes(tabId)) return;
   if (info.title || info.favIconUrl || info.url) {
     toEngine({ type: ENGINE.META, tabId, meta: { title: tab.title || '', url: tab.url || '', favIconUrl: tab.favIconUrl || '' } }).catch(() => {});

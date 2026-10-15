@@ -37,6 +37,7 @@ class Engine {
     this.ui = new Set();
     this.serialQ = Promise.resolve();
     this.downloads = new Map();
+    this.downloadsSettled = new Set(); // blob URLs already reported: the hub may send DOWNLOAD_DONE twice
     this.clipUntil = { L: 0, R: 0 };
     this.mm = { peakL: 0, peakR: 0, rmsL: 0, rmsR: 0, gr: 0 };
     this.nextPhase = 0;
@@ -178,6 +179,8 @@ class Engine {
       case ENGINE.META: { const d = this.deckByTab(msg.tabId); if (d) Object.assign(d.meta, msg.meta || {}); return { ok: true }; }
       case ENGINE.PING: return { ok: true, decks: [...this.decks.values()].map((d) => ({ tabId: d.tabId, slot: d.slot })) };
       case ENGINE.DOWNLOAD_DONE: {
+        if (this.downloadsSettled.has(msg.url)) return { ok: true };
+        this.downloadsSettled.add(msg.url);
         const t = this.downloads.get(msg.url);
         if (t) { clearTimeout(t.timer); this.downloads.delete(msg.url); URL.revokeObjectURL(msg.url); }
         if (msg.ok) this.event('info', `Saved ${t ? t.filename : 'recording'}.`);

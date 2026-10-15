@@ -105,6 +105,21 @@ test('the engine refuses runtime messages from a content script', async () => {
   assert.ok(!(await events(deck)).some((e) => /spoofed/.test(e.text)));
 });
 
+test('a repeated DOWNLOAD_DONE is reported once', async () => {
+  await installClient(deck);
+  const url = await offscreenEval(h, `(() => {
+    const e = globalThis.__jdsEngine, url = URL.createObjectURL(new Blob(['x']));
+    e.downloads.set(url, { timer: setTimeout(() => {}, 60000), filename: 'twice.wav' });
+    return url;
+  })()`);
+  await h.sw.evaluate(async (u) => {
+    for (let i = 0; i < 2; i++) await chrome.runtime.sendMessage({ target: 'engine', type: 'DOWNLOAD_DONE', url: u, ok: true });
+  }, url);
+  await new Promise((res) => setTimeout(res, 300));
+  assert.deepEqual((await events(deck)).filter((e) => /Sav(ed|ing)/.test(e.text)).map((e) => e.text), ['Saved twice.wav.']);
+  assert.equal(await offscreenEval(h, 'globalThis.__jdsEngine.downloads.size'), 0);
+});
+
 test('closing the tab ejects its deck', async () => {
   await track.close();
   await waitFor(async () => (await hubCall(deck, { type: 'LIST_SOURCES' })).ok && (await h.sw.evaluate(() => chrome.action.getBadgeText({}))) === '', 8000);
