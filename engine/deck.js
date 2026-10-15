@@ -49,6 +49,7 @@ export class Deck {
     this.syncOn = false;
     this.outOfRange = false;
     this.phaseMs = null;
+    this.beatLostNoted = false; // a BEAT-synced deck lost its grid: said once per SYNC press
     this.settleUntil = 0;
     this.nudge = 0;
     this.nudgeFactor = 1;
@@ -327,20 +328,23 @@ export class Deck {
     if (this.isMaster()) return fail('This deck is the master. Make another deck master to sync this one.');
     if (!this.tempoInfo().native) return fail('No BPM yet. Wait for the deck to lock, or TAP the tempo.');
     const clock = this.engine.clock;
+    let pick = null;
     if (clock.state().mode === 'none') {
       const others = [...this.engine.decks.values()].filter((d) => d !== this).map((d) => ({
         id: d.id, playing: d.wantPlay && !!d.tempoInfo().native, canBeat: d.canBeat(), conf: d.tempo ? d.tempo.get().conf : 0, since: d.playingSince,
       }));
-      const pick = pickAutoMaster(others);
+      pick = pickAutoMaster(others);
       if (pick == null) {
         clock.follow(this.id);
         this.engine.event('info', `Deck ${this.slot} is now the tempo master.`);
         return OK;
       }
-      clock.follow(pick);
-      this.engine.updateClock(now);
     }
+    // No false SYNC: BEAT mode locks phase, which needs this deck's own confident beat grid.
+    if (this.params.syncMode === 'BEAT' && !this.canBeat()) return fail('Beat grid not confident yet: TAP the beat, or switch SYNC to TEMPO.');
+    if (pick != null) { clock.follow(pick); this.engine.updateClock(now); }
     this.syncOn = true;
+    this.beatLostNoted = false;
     this.settleUntil = 0;
     this.syncTick(now);
     return OK;
@@ -619,8 +623,14 @@ export class Deck {
   /** Phase lock for a BEAT-synced playing deck (every 0.5 s). */
   phaseTick(now) {
     this.phaseMs = null;
+    if (!this.syncOn) this.beatLostNoted = false;
     if (!this.syncOn || this.params.syncMode !== 'BEAT' || this.outOfRange || !this.wantPlay || this.previewing) return;
-    if (this.isMaster() || !this.canBeat() || this.nudge || this.roll) return;
+    if (this.isMaster() || this.nudge || this.roll) return;
+    if (!this.canBeat()) {
+      // Tempo stays synced; phase lock waits for a confident grid. Said once per SYNC press.
+      if (!this.beatLostNoted) { this.beatLostNoted = true; this.engine.event('warn', `Deck ${this.slot}: beat grid not confident, phase lock paused (tempo still synced). TAP the beat to re-lock.`, this.id); }
+      return;
+    }
     const starved = this.starved;
     const T = this.ts.soon(now) + 0.02;
     const mb = this.engine.clock.beat(T);

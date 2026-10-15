@@ -97,7 +97,8 @@ Chrome 119 or newer is required.
     out plays at the source's speed and shows **RESERVE EMPTY** until the reserve refills.
     Pause or cue a deck to build reserve.
 - **Real-world tempo.** BPM detection is tuned for music with a steady beat. Rubato or live
-  recordings may stay **UNSURE**; use TAP and GRID.
+  recordings may stay **UNSURE**; use TAP and GRID. Until the beat grid is confident (or
+  TAPped), SYNC in BEAT mode is refused with a reason; TEMPO mode still matches tempo.
 - **Resources.** Each deck keeps up to 4 minutes of audio (Settings → Deck buffer), about
   21 MB per minute, and uses roughly 4–5 % of one CPU core for time-stretching.
 - **Site access.** JD Samps asks for access to all sites only to drive tab players for

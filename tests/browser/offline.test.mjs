@@ -55,10 +55,11 @@ test('echo repeats one beat-fraction later', async () => {
   assert.ok(r.best > 0.05);
 });
 
-test('gate opens and closes on the beat grid', async () => {
+test('gate opens and closes on the beat grid, following its 16-step pattern', async () => {
   const r = await run('gate');
-  assert.ok(r.open > 0.3, JSON.stringify(r));
+  assert.ok(r.open > 0.3 && r.open2 > 0.3, JSON.stringify(r));
   assert.ok(r.closed < 0.01, JSON.stringify(r));
+  assert.ok(r.rest < 0.01, JSON.stringify(r));
 });
 
 test('crush reduces bit depth', async () => {
@@ -69,6 +70,19 @@ test('crush reduces bit depth', async () => {
 test('flanger colours the signal', async () => {
   const r = await run('flanger');
   assert.ok(r.corr < 0.95, JSON.stringify(r));
+});
+
+test('flanger sweep spans its period in beats and starts on a beat of the deck clock', async () => {
+  const anchor = 0.13, beat = 0.5, beats = 0.25, sweep = 2 * beat; // FX length 1/4 → a 2-beat sweep
+  const r = await run('flangerSweep', { anchor, beats });
+  const info = JSON.stringify(r);
+  assert.ok(r.minMs > 0.5 && r.minMs < 1.5 && r.maxMs > 4.5 && r.maxMs < 5.5, info);
+  assert.ok(r.bottoms.length >= 2, info);
+  for (let j = 1; j < r.bottoms.length; j++) assert.ok(Math.abs(r.bottoms[j] - r.bottoms[j - 1] - sweep) < 0.003, `period: ${info}`);
+  for (const b of r.bottoms) {
+    const off = (b - anchor) / beat;
+    assert.ok(Math.abs(off - Math.round(off)) * beat < 0.003, `sweep start ${b.toFixed(4)} s is not on a beat: ${info}`);
+  }
 });
 
 test('reverb leaves a tail', async () => {

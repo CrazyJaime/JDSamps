@@ -4,6 +4,7 @@
 //                                                                               ├─ ECHO send/return ─┼─► out
 //                                                                               └─ REVERB send/return ┘
 // ECHO and REVERB are send/return so switching them off lets their tails ring out.
+// The beatfx worklet's second output is the FLANGER's LFO, locked to the deck's beat clock.
 import { djFilterParams } from './sync.js';
 import { glide, ramp } from './params.js';
 
@@ -114,37 +115,38 @@ function createReverb(ctx, t60) {
   return { input, output, t60, dispose() { for (const n of [input, hp, pre, conv, output]) n.disconnect(); } };
 }
 
+/** FLANGER sweep length in beats for an FX beat length (effect-dependent: 1/2 beat → 4 beats). */
+const flangerBeats = (beats) => clamp(beats * 8, 1, 32);
+
+// The LFO (a -1..1 triangle) comes from the beatfx worklet's output 1, computed from the deck's beat
+// clock, so each sweep starts on a beat. Connect it to `lfo`.
 function createFlanger(ctx) {
   const input = ctx.createGain(), output = ctx.createGain();
   const delay = ctx.createDelay(0.05); delay.delayTime.value = 0.003;
   const wet = ctx.createGain(); wet.gain.value = 0;
-  const lfo = ctx.createOscillator(); lfo.type = 'triangle'; lfo.frequency.value = 0.25;
   const depth = ctx.createGain(); depth.gain.value = 0.002;
-  lfo.connect(depth).connect(delay.delayTime);
-  lfo.start();
+  depth.connect(delay.delayTime);
   input.connect(output);
   input.connect(delay).connect(wet).connect(output);
   return {
     input,
     output,
-    set({ on, level, bpm, beats }) {
-      const periodBeats = clamp(beats * 8, 1, 32);
-      glide(ctx, lfo.frequency, bpm / 60 / periodBeats, 0.05);
-      ramp(ctx, wet.gain, on ? level : 0, 0.01);
-    },
-    dispose() { try { lfo.stop(); } catch (_) {} for (const n of [input, output, delay, wet, lfo, depth]) n.disconnect(); },
+    lfo: depth,
+    set({ on, level }) { ramp(ctx, wet.gain, on ? level : 0, 0.01); },
+    dispose() { for (const n of [input, output, delay, wet, depth]) n.disconnect(); },
   };
 }
 
 export function createFxRack(ctx) {
   const filter = createDjFilter(ctx);
   const beatfx = new AudioWorkletNode(ctx, 'jds-beatfx', {
-    numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2], channelCount: 2, channelCountMode: 'explicit',
+    numberOfInputs: 1, numberOfOutputs: 2, outputChannelCount: [2, 1], channelCount: 2, channelCountMode: 'explicit',
   });
   const flanger = createFlanger(ctx);
   const echo = createEcho(ctx);
   const post = ctx.createGain(), output = ctx.createGain();
   filter.output.connect(beatfx).connect(flanger.input);
+  beatfx.connect(flanger.lfo, 1);
   flanger.output.connect(post);
   post.connect(output);
   post.connect(echo.input);
@@ -173,7 +175,8 @@ export function createFxRack(ctx) {
   function apply() {
     const on = (t) => s.on && s.type === t;
     echo.set({ on: on('ECHO'), level: s.level, bpm: s.bpm, beats: s.beats }, first);
-    flanger.set({ on: on('FLANGER'), level: s.level, bpm: s.bpm, beats: s.beats });
+    flanger.set({ on: on('FLANGER'), level: s.level });
+    beatfx.port.postMessage({ t: 'flanger', on: on('FLANGER'), periodBeats: flangerBeats(s.beats), bpm: s.bpm });
     beatfx.port.postMessage({ t: 'gate', depth: s.level, stepBeats: s.beats });
     beatfx.port.postMessage({ t: 'crush', amount: s.level });
     beatfx.port.postMessage({ t: 'mode', mode: on('GATE') ? 'gate' : on('CRUSH') ? 'crush' : 'off' });

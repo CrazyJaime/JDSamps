@@ -76,7 +76,8 @@ window.tests = {
     rack.setFx({ type: 'GATE', beats: 0.25, level: 1, on: true, bpm: 120 });
     s.connect(rack.input); rack.output.connect(ctx.destination);
     const out = (await render(ctx)).getChannelData(0);
-    return { open: rms(out, 0.135, 0.18), closed: rms(out, 0.2, 0.245) };
+    // 1/4-beat steps of 0.125 s from the beat at 0: step 0 opens for its first half, step 1 is a rest.
+    return { open: rms(out, 0.01, 0.055), closed: rms(out, 0.075, 0.12), rest: rms(out, 0.135, 0.18), open2: rms(out, 0.26, 0.305) };
   },
   async crush() {
     const ctx = await offline(1); const s = source(ctx, sine(220, 0.8));
@@ -93,6 +94,30 @@ window.tests = {
     const out = (await render(ctx)).getChannelData(0); const inp = s.buffer.getChannelData(0);
     let xy = 0, xx = 0, yy = 0; for (let i = idx(0.5); i < idx(1.4); i++) { xy += inp[i] * out[i]; xx += inp[i] ** 2; yy += out[i] ** 2; }
     return { corr: xy / Math.sqrt(xx * yy) };
+  },
+  /** Clicks every 10 ms: the wet copy's offset from each click traces the flanger delay over time. */
+  async flangerSweep({ anchor, beats }) {
+    const ctx = await offline(3.2), every = idx(0.01);
+    const s = source(ctx, (t, c, i) => (i % every === 0 ? 1 : 0));
+    const rack = createFxRack(ctx);
+    rack.setClock(idx(anchor), SR * 0.5); // 120 BPM grid with a beat at `anchor`
+    rack.setFx({ type: 'FLANGER', beats, level: 1, on: true, bpm: 120 });
+    s.connect(rack.input); rack.output.connect(ctx.destination);
+    const out = (await render(ctx)).getChannelData(0);
+    const t = [], d = [];
+    for (let i0 = idx(0.05); i0 + every <= out.length; i0 += every) {
+      let w = 0, m = 0;
+      for (let k = 12; k < every - 12; k++) { const a = Math.abs(out[i0 + k]); w += a; m += a * k; }
+      if (w > 0.2) { t.push(i0 / SR); d.push(m / w / SR); }
+    }
+    // Sweep bottoms: midway between a falling and the next rising crossing of the mid delay.
+    const mid = (Math.min(...d) + Math.max(...d)) / 2, cross = [];
+    for (let j = 1; j < d.length; j++) {
+      if ((d[j - 1] - mid) * (d[j] - mid) < 0) cross.push({ at: t[j - 1] + ((mid - d[j - 1]) / (d[j] - d[j - 1])) * (t[j] - t[j - 1]), up: d[j] > d[j - 1] });
+    }
+    const bottoms = [];
+    for (let j = 1; j < cross.length; j++) if (!cross[j - 1].up && cross[j].up) bottoms.push((cross[j - 1].at + cross[j].at) / 2);
+    return { bottoms, minMs: Math.min(...d) * 1000, maxMs: Math.max(...d) * 1000 };
   },
   async reverb() {
     const ctx = await offline(1.5); const s = source(ctx, (t, c, i) => (i === idx(0.05) ? 1 : 0));
