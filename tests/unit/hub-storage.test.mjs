@@ -49,9 +49,15 @@ const chrome = {
         t.mutedInfo = { muted: props.muted, reason: 'extension', extensionId: chrome.runtime.id };
         ops.push(`muted:${props.muted}`);
       }
+      if ('autoDiscardable' in props) {
+        const t = tabs.find((x) => x.id === id);
+        if (!t) throw new Error(`No tab with id: ${id}.`);
+        t.autoDiscardable = props.autoDiscardable;
+        ops.push(`discardable:${id}:${props.autoDiscardable}`);
+      }
       return { id, windowId: 1 };
     },
-    create: async (o) => { await turn(); return { id: 99, windowId: 1, ...o }; },
+    create: async (o) => { await turn(); const t = { id: 99, windowId: 1, ...o }; tabs.push(t); return t; },
     sendMessage: async () => { await turn(); return { ok: true }; },
     onRemoved: event(), onUpdated: event(),
   },
@@ -235,4 +241,71 @@ test('a LOAD_TAB that races a STOP_TAB of the same tab waits for it, so the capt
   await Promise.all([stop, load]);
   assert.equal(tabs[0].mutedInfo.muted, false);
   assert.ok(ops.lastIndexOf('muted:false') < ops.indexOf('START'), ops.join());
+});
+
+// ---------------------------------------------------------------- tab discarding
+// Chrome may discard a background tab to save memory: a deck's source (its capture would end) or
+// the deck page. The hub keeps both with autoDiscardable:false, and gives back only what it set.
+const discards = () => ops.filter((o) => o.startsWith('discardable:'));
+const decksAre = (...ids) => hub({ type: 'DECKS_CHANGED', decks: ids.map((tabId, i) => ({ tabId, slot: i + 1 })) });
+
+test('a tab loaded on a deck is kept from being discarded, and given back when its deck goes', async () => {
+  assert.equal((await hub({ type: 'LOAD_TAB', tabId: 11 })).ok, true);
+  await decksAre(11);
+  assert.equal(tabs[0].autoDiscardable, false);
+  await decksAre(); // ejected
+  await settle();
+  assert.equal(tabs[0].autoDiscardable, true);
+  assert.deepEqual(discards(), ['discardable:11:false', 'discardable:11:true']);
+  await decksAre();
+  await settle();
+  assert.equal(discards().length, 2, 'given back once');
+});
+
+test('two tabs loaded at once are both kept, and each is given back with its own deck', async () => {
+  const [a, b] = await Promise.all([hub({ type: 'LOAD_TAB', tabId: 11 }), hub({ type: 'LOAD_TAB', tabId: 12 })]);
+  assert.equal(a.ok && b.ok, true);
+  await decksAre(11, 12);
+  assert.deepEqual([tabs[0].autoDiscardable, tabs[1].autoDiscardable], [false, false]);
+  await decksAre(12);
+  await settle();
+  assert.deepEqual([tabs[0].autoDiscardable, tabs[1].autoDiscardable], [true, false]);
+  await decksAre();
+  await settle();
+  assert.deepEqual([tabs[0].autoDiscardable, tabs[1].autoDiscardable], [true, true]);
+});
+
+test('a tab already kept from discarding (by the user or another extension) is left alone', async () => {
+  tabs[0].autoDiscardable = false;
+  assert.equal((await hub({ type: 'LOAD_TAB', tabId: 11 })).ok, true);
+  await decksAre();
+  await settle();
+  assert.deepEqual(discards(), []);
+  assert.equal(tabs[0].autoDiscardable, false);
+});
+
+test('a closed deck tab is forgotten, not given back', async () => {
+  assert.equal((await hub({ type: 'LOAD_TAB', tabId: 11 })).ok, true);
+  tabs = tabs.filter((t) => t.id !== 11);
+  chrome.tabs.onRemoved.fire(11);
+  await settle();
+  await decksAre();
+  await settle();
+  assert.deepEqual(discards(), ['discardable:11:false']);
+  assert.deepEqual(Object.keys(store).filter((k) => k.includes('11') && !k.startsWith('decks')), []);
+});
+
+test('the deck page is kept from being discarded when it opens or is focused, and ejects leave it so', async () => {
+  chrome.action.onClicked.fire({ id: 5, windowId: 1, url: 'chrome://newtab/' }); // nothing to capture: just opens the deck
+  await settle();
+  const deck = tabs.find((t) => t.url === `${EXT}deck.html`);
+  assert.ok(deck, 'deck page opened');
+  assert.equal(deck.autoDiscardable, false);
+  await decksAre();
+  await settle();
+  assert.equal(deck.autoDiscardable, false, 'not given back on an eject');
+  // Focused again later (toolbar icon on another tab): still kept, and not set twice.
+  chrome.action.onClicked.fire({ id: 6, windowId: 1, url: 'chrome://newtab/' });
+  await settle();
+  assert.deepEqual(discards(), [`discardable:${deck.id}:false`]);
 });
