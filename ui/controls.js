@@ -2,7 +2,7 @@
 // vertical drag (Shift = fine), wheel, double-click = default, arrow keys when focused.
 // External updates are ignored while the user is dragging and for HOLD_MS after any local change
 // (unless the echo matches what was sent), so stale engine snapshots never fight the hand.
-import { clamp } from './util.js';
+import { clamp, toggleAttr } from './util.js';
 
 const SVGNS = 'http://www.w3.org/2000/svg';
 const ARC = 270;
@@ -34,7 +34,7 @@ class Continuous {
     this.wheelAt = 0;
     el.setAttribute('role', 'slider');
     el.tabIndex = 0;
-    el.setAttribute('aria-label', this.o.label || '');
+    el.setAttribute('aria-label', this.o.name || this.o.label || ''); // o.name: the accessible name, when not the visible label
     el.setAttribute('aria-valuemin', String(this.o.min));
     el.setAttribute('aria-valuemax', String(this.o.max));
     // Double-click resets only when both presses were still clicks: a tap followed by a quick
@@ -113,32 +113,39 @@ class Continuous {
     this.el.setAttribute('aria-valuetext', this.o.format(this.value));
   }
 
+  /**
+   * One pointer drags a control at a time: other pointers are ignored, and losing pointer capture
+   * ends the drag like pointerup (else `dragging` stays set and engine values are ignored for good).
+   */
+  drag(target, e, move) {
+    if (e.button !== 0 || this.dragging) return;
+    e.preventDefault();
+    target.setPointerCapture(e.pointerId);
+    this.dragging = true;
+    this.el.classList.add('active');
+    const id = e.pointerId;
+    const onMove = (ev) => { if (ev.pointerId === id) move(ev); };
+    const up = (ev) => {
+      if (ev.pointerId !== id) return;
+      this.dragging = false;
+      this.el.classList.remove('active');
+      for (const [type, fn] of handlers) target.removeEventListener(type, fn);
+    };
+    const handlers = [['pointermove', onMove], ['pointerup', up], ['pointercancel', up], ['lostpointercapture', up]];
+    for (const [type, fn] of handlers) target.addEventListener(type, fn);
+  }
+
   /** Pointer drag along an axis: pixelsForRange = drag distance for the full range. */
   bindDrag(target, axis, pixelsForRange) {
     target.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      target.setPointerCapture(e.pointerId);
-      this.dragging = true;
-      this.el.classList.add('active');
       let last = axis === 'y' ? e.clientY : e.clientX;
-      const move = (ev) => {
+      this.drag(target, e, (ev) => {
         const pos = axis === 'y' ? ev.clientY : ev.clientX;
         const px = axis === 'y' ? last - pos : pos - last;
         last = pos;
         const range = this.o.max - this.o.min;
         this.commit(this.value + (px / pixelsForRange) * range * (ev.shiftKey ? 0.15 : 1));
-      };
-      const up = () => {
-        this.dragging = false;
-        this.el.classList.remove('active');
-        target.removeEventListener('pointermove', move);
-        target.removeEventListener('pointerup', up);
-        target.removeEventListener('pointercancel', up);
-      };
-      target.addEventListener('pointermove', move);
-      target.addEventListener('pointerup', up);
-      target.addEventListener('pointercancel', up);
+      });
     });
   }
 }
@@ -191,29 +198,14 @@ export class Fader extends Continuous {
     el.setAttribute('aria-orientation', this.o.orientation);
     const vertical = this.o.orientation === 'vertical';
     el.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0) return;
-      e.preventDefault();
-      el.setPointerCapture(e.pointerId);
-      this.dragging = true;
-      el.classList.add('active');
       const span = Math.max(40, (vertical ? el.clientHeight : el.clientWidth) - 24);
       let last = vertical ? e.clientY : e.clientX;
-      const move = (ev) => {
+      this.drag(el, e, (ev) => {
         const pos = vertical ? ev.clientY : ev.clientX;
         const px = vertical ? last - pos : pos - last;
         last = pos;
         this.commit(this.value + (px / span) * (this.o.max - this.o.min) * (ev.shiftKey ? 0.15 : 1));
-      };
-      const up = () => {
-        this.dragging = false;
-        el.classList.remove('active');
-        el.removeEventListener('pointermove', move);
-        el.removeEventListener('pointerup', up);
-        el.removeEventListener('pointercancel', up);
-      };
-      el.addEventListener('pointermove', move);
-      el.addEventListener('pointerup', up);
-      el.addEventListener('pointercancel', up);
+      });
     });
     this.render();
   }
@@ -229,9 +221,11 @@ export class Fader extends Continuous {
 /**
  * Pad / hold button. latch=true: a tap (<250 ms) toggles, a hold is momentary.
  * latch=false: momentary only (down → on, up → off). Keyboard Space/Enter act like the pointer.
+ * One pointer holds a pad at a time; losing pointer capture releases it like pointerup.
+ * paint=false: the caller draws the pad's light from engine state (CUE).
  */
-export function bindPad(el, { onDown, onUp, latch = false }) {
-  let on = false, downAt = 0, wasOn = false, active = false;
+export function bindPad(el, { onDown, onUp, latch = false, paint: painted = true }) {
+  let on = false, downAt = 0, wasOn = false, active = false, pointer = null;
   const press = () => {
     if (active) return;
     active = true;
@@ -247,10 +241,18 @@ export function bindPad(el, { onDown, onUp, latch = false }) {
     if (!latch || held || wasOn) { on = false; onUp && onUp(); }
     paint();
   };
-  const paint = () => { el.classList.toggle('on', on); el.setAttribute('aria-pressed', on ? 'true' : 'false'); };
-  el.addEventListener('pointerdown', (e) => { if (e.button !== 0) return; e.preventDefault(); el.setPointerCapture(e.pointerId); press(); });
-  el.addEventListener('pointerup', release);
-  el.addEventListener('pointercancel', release);
+  const paint = () => { if (painted) { el.classList.toggle('on', on); toggleAttr(el, 'aria-pressed', on); } };
+  el.addEventListener('pointerdown', (e) => {
+    if (e.button !== 0 || active) return;
+    e.preventDefault();
+    el.setPointerCapture(e.pointerId);
+    pointer = e.pointerId;
+    press();
+  });
+  const up = (e) => { if (e.pointerId === pointer) { pointer = null; release(); } };
+  el.addEventListener('pointerup', up);
+  el.addEventListener('pointercancel', up);
+  el.addEventListener('lostpointercapture', up);
   el.addEventListener('keydown', (e) => { if ((e.key === ' ' || e.key === 'Enter') && !e.repeat) { e.preventDefault(); e.stopPropagation(); press(); } });
   el.addEventListener('keyup', (e) => { if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); e.stopPropagation(); release(); } });
   return {

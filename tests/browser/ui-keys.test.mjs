@@ -83,6 +83,32 @@ test("'?' opens help on any layout and never rolls (AZERTY: Shift+KeyM)", async 
   assert.equal(await page.locator('#help').isHidden(), true);
 });
 
+test('the help dialog takes focus, keeps Tab inside, closes on Escape and gives focus back', async () => {
+  const inside = () => page.evaluate(() => document.getElementById('help').contains(document.activeElement));
+  const helpBtn = page.locator('#helpBtn');
+  await helpBtn.focus();
+  await page.keyboard.press('Enter');
+  await page.waitForFunction(() => !document.getElementById('help').hidden);
+  assert.equal(await inside(), true, 'focus moved into the dialog');
+  for (const k of ['Tab', 'Tab', 'Shift+Tab', 'Shift+Tab', 'Shift+Tab']) {
+    await page.keyboard.press(k);
+    assert.equal(await inside(), true, `focus stays inside after ${k}`);
+  }
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('#help').isHidden(), true);
+  assert.equal(await helpBtn.evaluate((el) => document.activeElement === el), true, 'focus back on the help button');
+  // Opened with '?' from a deck control: focus returns there.
+  const gain = deckEl(1).locator('[data-ctl="trim"]');
+  await gain.focus();
+  await page.keyboard.press('Shift+Slash');
+  await page.waitForFunction(() => !document.getElementById('help').hidden);
+  assert.equal(await inside(), true);
+  await page.locator('#help [data-close]').click();
+  assert.equal(await page.locator('#help').isHidden(), true);
+  assert.equal(await gain.evaluate((el) => document.activeElement === el), true, 'focus back on the knob');
+  await blur();
+});
+
 test('releasing one roll falls back to the newest roll still held (keys and pads)', async () => {
   await blur();
   await page.keyboard.press('Digit1');

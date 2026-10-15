@@ -60,8 +60,8 @@
     <aside class="master" id="master" aria-label="Master">
       <h2 class="strip-title">MASTER</h2>
       <div class="master-meters">
-        <canvas class="vmeter tall" id="masterMeter" aria-label="Master level"></canvas>
-        <div class="gr"><span class="label">GR</span><canvas class="vmeter gr-meter" id="grMeter" aria-label="Limiter gain reduction"></canvas><span class="mono" id="grText">0.0</span></div>
+        <canvas class="vmeter tall" id="masterMeter" role="img" aria-label="Master level"></canvas>
+        <div class="gr"><span class="label">GR</span><canvas class="vmeter gr-meter" id="grMeter" role="img" aria-label="Limiter gain reduction"></canvas><span class="mono" id="grText">0.0</span></div>
       </div>
       <div class="clips"><button class="clip" id="clipL" aria-label="Clear left clip light">L</button><button class="clip" id="clipR" aria-label="Clear right clip light">R</button></div>
       <div class="knob lg" id="masterVol" data-label="VOLUME"></div>
@@ -191,9 +191,9 @@
           <div class="knob" data-ctl="trim" data-label="GAIN"></div>
           <div class="knob" data-ctl="filter" data-label="FILTER"></div>
           <div class="knob" data-ctl="filter.res" data-label="RES"></div>
-          <div class="eqcol"><div class="knob" data-ctl="eq.hi" data-label="HI"></div><button class="kill" data-kill="hi">KILL</button></div>
-          <div class="eqcol"><div class="knob" data-ctl="eq.mid" data-label="MID"></div><button class="kill" data-kill="mid">KILL</button></div>
-          <div class="eqcol"><div class="knob" data-ctl="eq.low" data-label="LOW"></div><button class="kill" data-kill="low">KILL</button></div>
+          <div class="eqcol"><div class="knob" data-ctl="eq.hi" data-label="HI"></div><button class="kill" data-kill="hi" aria-label="Kill high">KILL</button></div>
+          <div class="eqcol"><div class="knob" data-ctl="eq.mid" data-label="MID"></div><button class="kill" data-kill="mid" aria-label="Kill mid">KILL</button></div>
+          <div class="eqcol"><div class="knob" data-ctl="eq.low" data-label="LOW"></div><button class="kill" data-kill="low" aria-label="Kill low">KILL</button></div>
         </div>
         <div class="channel">
           <button class="meter-btn" data-act="clipReset" aria-label="Channel level: click to clear the clip light" title="Click to clear the clip light"><canvas class="vmeter" data-meter></canvas></button>
