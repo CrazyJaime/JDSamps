@@ -76,12 +76,13 @@ export function makeTrackWav({ bpm, seconds = 60, kind = 'low', sr = 48000 }) {
 const TRACKS = { a: { bpm: 124, kind: 'low' }, b: { bpm: 128, kind: 'high' }, c: { bpm: 120, kind: 'mid' } };
 
 /** /a, /b: <audio loop autoplay> pages (124 BPM low kick, 128 BPM high click).
- *  /c: Web-Audio-only page (AudioBufferSourceNode, no media element) at 120 BPM. */
+ *  /c: Web-Audio page (AudioBufferSourceNode) at 120 BPM, plus a muted decorative <audio> that
+ *  player assist must not mistake for the source. */
 export async function startTrackServer() {
   const wavs = Object.fromEntries(Object.entries(TRACKS).map(([k, t]) => [k, makeTrackWav(t)]));
   const media = (k) => `<!doctype html><title>Track ${k.toUpperCase()} ${TRACKS[k].bpm} BPM</title><audio id="a" src="/${k}.wav" loop autoplay></audio>
 <script>window.__media = () => { const a = document.getElementById('a'); return { t: a.currentTime, rate: a.playbackRate, pp: a.preservesPitch, paused: a.paused }; };</script>`;
-  const webaudio = `<!doctype html><title>Track C ${TRACKS.c.bpm} BPM (Web Audio)</title><script>
+  const webaudio = `<!doctype html><title>Track C ${TRACKS.c.bpm} BPM (Web Audio)</title><audio id="decor" src="/c.wav" muted loop autoplay></audio><script>
   (async () => { const ctx = new AudioContext(); const buf = await ctx.decodeAudioData(await (await fetch('/c.wav')).arrayBuffer());
     const s = ctx.createBufferSource(); s.buffer = buf; s.loop = true; s.connect(ctx.destination); s.start(); window.__ctx = ctx; })();
   </script>`;

@@ -236,3 +236,31 @@ test('if the heard element stops, assist lets go at once and comes back when it 
   run(env, 2, { src: () => a.page.rate });
   assert.ok(env.d.assist.sourceRate > 1, 're-engaged without a penalty');
 });
+
+test("rates go to the heard element's frame only; other frames cannot switch assist off", async () => {
+  const env = await setup();
+  const ad = agent(env, 7, { audible: false }); // muted ad video in an iframe
+  const a = agent(env, 0);
+  run(env, 3, { src: () => a.page.rate });
+  assert.ok(env.d.assist.sourceRate > 1);
+  assert.deepEqual(rates(ad), []);
+  ad.deliver({ t: 'external-rate', rate: 1 });
+  assert.ok(env.d.assist.sourceRate > 1, 'still engaged');
+  assert.equal(env.d.state(env.clock.t).assist.available, true);
+});
+
+test('if the heard element moves to another frame, assist starts again from 1x there', async () => {
+  const env = await setup();
+  const a = agent(env, 0);
+  run(env, 3, { src: () => a.page.rate });
+  assert.ok(env.d.assist.sourceRate > 1);
+  const quiet = a.status;
+  a.status = () => ({ ...quiet(), playing: false, audible: 0 });
+  a.reply(0);
+  const b = agent(env, 3); // the player now lives in an iframe
+  run(env, 0.3, { src: () => 1 });
+  assert.equal(env.d.assist.sourceRate, 1);
+  assert.equal(a.sent.at(-1).t, 'release');
+  run(env, 2, { src: () => b.page.rate });
+  assert.ok(rates(b).length > 0 && env.d.assist.sourceRate > 1, 're-engaged on the new frame');
+});
