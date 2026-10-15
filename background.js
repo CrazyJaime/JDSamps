@@ -197,7 +197,7 @@ async function connectAgent(tabId) {
 // the engine asks for STOP_TAB: every frame's agent pauses its page's players, or, when nothing
 // heard could be paused in time, the tab is muted. Mutes made here are recorded per tab and undone
 // when the tab is loaded again; a mute the user made is never touched.
-const STOP_MS = 250; // the engine waits about 400 ms for the whole STOP_TAB
+const STOP_MS = 250; // pause budget before muting; the engine waits up to 2.5 s for the whole STOP_TAB
 const muteKey = (tabId) => `muted:${tabId}`;
 const stopping = new Map(); // tabId → STOP_TAB in flight (never rejects)
 
