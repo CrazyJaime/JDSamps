@@ -16,6 +16,7 @@ SignalsmithStretch.moduleUrl = STRETCH_URL;
 const workletUrl = (f) => new URL(`../worklets/${f}`, import.meta.url).href;
 const withTimeout = (p, ms, msg) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
 const HIDDEN_STATE_SEC = 0.5; // state period for a UI page that is hidden (no waveform at all)
+const TICK_FRAMES = 1536;     // the master worklet's meter (tick) period
 // An eject waits at most this long for its tab to stop playing. The hub bounds its own work (pause
 // for 250 ms, else mute), so this only guards against a hub that never answers; on a busy machine
 // a tighter limit would release the capture while the tab is still playing.
@@ -339,7 +340,9 @@ class Engine {
     this.updateClock(now);
     for (const d of this.decks.values()) d.syncTick(now);
     if (now >= this.nextPhase) { this.nextPhase = now + 0.5; for (const d of this.decks.values()) d.phaseTick(now); }
-    this.broadcastState(now);
+    // After a main-thread stall the meter ticks queue up and run back to back: a tick whose
+    // successor is already waiting sends no state, so only the newest of them builds one.
+    if (!(now * this.ctx.sampleRate - m.frame > TICK_FRAMES)) this.broadcastState(now);
     this.idleTick();
   }
 

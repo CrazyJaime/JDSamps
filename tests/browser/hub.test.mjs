@@ -215,6 +215,26 @@ test('a hidden UI page gets no waveform and state at most twice a second; shown 
   } finally { await rawClose(deck); }
 });
 
+test('meter ticks that queued up behind a stall run the decks but send one state, for the newest', async () => {
+  const r = await offscreenEval(h, `(() => {
+    const E = __jdsEngine, sr = E.ctx.sampleRate, ds = [...E.decks.values()];
+    let posts = 0, ticks = 0;
+    const post = E.post, dt = ds.map((d) => d.tick);
+    E.post = function (p, m) { if (m && m.t === 'state') posts++; return post.call(this, p, m); };
+    ds.forEach((d, i) => { d.tick = function (now) { ticks++; return dt[i].call(this, now); }; });
+    try {
+      const at = (lag) => ({ ...E.mm, t: 'meter', frame: Math.round(E.ctx.currentTime * sr) - lag });
+      E.tick(at(300));
+      const one = posts; posts = 0; ticks = 0;
+      for (let k = 4; k >= 0; k--) E.tick(at(768 + k * 1536)); // five ticks, all but the last already overtaken
+      return { one, posts, ticks, decks: ds.length };
+    } finally { E.post = post; ds.forEach((d, i) => { d.tick = dt[i]; }); }
+  })()`);
+  assert.ok(r.decks >= 1 && r.one >= 1, JSON.stringify(r));
+  assert.equal(r.ticks, 5 * r.decks, 'every queued tick runs the decks');
+  assert.equal(r.posts, r.one, 'one state broadcast for the five');
+});
+
 test('closing the deck page mid-press ends held rolls, nudges, kills and FX, but not latched ones', async () => {
   await installClient(deck);
   const id = (await state(deck)).decks[0].id;
