@@ -426,14 +426,16 @@ test('six decks: an unchanged snapshot writes nothing to the deck or master DOM'
   try {
     await u.page.waitForSelector('.deck >> nth=5');
     await u.page.waitForTimeout(100);
-    const r = await u.page.evaluate((s) => {
+    const r = await u.page.evaluate(async (s) => {
+      const frame = () => new Promise((res) => requestAnimationFrame(() => res()));
       const mo = new MutationObserver(() => {});
       for (const el of document.querySelectorAll('.deck, .wave-row, #master, .xfader-bar, #mixRecBtn, .clock')) mo.observe(el, { subtree: true, attributes: true, childList: true, characterData: true });
       window.__fake.push({ t: 'state', s });
+      await frame(); // the DOM follows once per frame
       mo.takeRecords();
       const N = 10;
-      for (let i = 0; i < N; i++) window.__fake.push({ t: 'state', s });
-      const recs = mo.takeRecords();
+      const recs = [];
+      for (let i = 0; i < N; i++) { window.__fake.push({ t: 'state', s }); await frame(); recs.push(...mo.takeRecords()); }
       mo.disconnect();
       const what = [...new Set(recs.map((m) => `${m.type} ${m.target.nodeName}.${m.target.getAttribute ? m.target.getAttribute('class') || '' : ''} ${m.attributeName || ''}`))];
       return { perSnapshot: recs.length / N, what };

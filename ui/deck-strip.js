@@ -166,11 +166,14 @@ export class DeckStrip {
     if (r) this.pitch.commit(this.pitch.value + delta / r);
   }
 
-  /** Every snapshot is stored; the DOM follows only while the page is visible (and catches up when it shows). */
+  /**
+   * Every snapshot is stored; the DOM follows once per animation frame (frame()), with the latest
+   * one, so snapshots a busy main thread delivers back to back cost one render. Hidden pages get
+   * no frames: they catch up when they show.
+   */
   update(d, s) {
     this.d = d;
-    if (pageHidden()) { this.stale = true; return; }
-    this.render();
+    this.stale = true;
   }
 
   /** Writes only what changed (spec §3.9): at 30 Hz per deck, same-value attribute writes add up. */
@@ -247,6 +250,7 @@ export class DeckStrip {
   setSelected(on) { this.el.classList.toggle('selected', on); this.waveRow.classList.toggle('selected', on); }
 
   frame(nowCtx) {
+    if (this.stale && !pageHidden()) this.render();
     const d = this.d;
     const dt = Math.max(0, Math.min(0.25, nowCtx - this.snapCtx));
     let playhead = d.playing ? d.playhead + d.engineRate * dt : d.playhead;

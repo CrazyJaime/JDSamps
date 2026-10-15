@@ -119,6 +119,46 @@ function spyWaveText() {
   };
 }
 
+// A busy main thread delivers several snapshots back to back (31 Hz from the engine): only the
+// latest one reaches the DOM, once per frame.
+test('snapshots that arrive within one frame are rendered once, the latest', async () => {
+  const b = await openBoard({ state: threeDecks() });
+  const { page } = b;
+  try {
+    await page.waitForSelector('.deck >> nth=2');
+    await page.waitForTimeout(100);
+    const r = await page.evaluate(async (s0) => {
+      const frame = () => new Promise((res) => requestAnimationFrame(() => res()));
+      await frame();
+      const title = document.querySelector('.deck [data-title]'), vol = document.getElementById('masterVol'), clock = document.getElementById('clockBpm');
+      const recs = [];
+      const mo = new MutationObserver((rs) => recs.push(...rs));
+      for (const el of [title, vol, clock]) mo.observe(el, { subtree: true, attributes: true, childList: true, characterData: true });
+      for (let i = 0; i < 10; i++) {
+        const s = structuredClone(s0);
+        s.decks[0].title = `Burst ${i}`;
+        s.master.params['master.volume'] = i / 10;
+        s.clock = { ...s.clock, bpm: 120 + i };
+        window.__fake.push({ t: 'state', s });
+      }
+      recs.push(...mo.takeRecords());
+      const during = recs.length;
+      await frame();
+      await frame();
+      recs.push(...mo.takeRecords());
+      mo.disconnect();
+      // Text writes (childList) on the title and the clock, value writes on the volume knob.
+      const n = (el, attr) => recs.filter((m) => (m.target === el || el.contains(m.target)) && (attr ? m.attributeName === attr : m.type !== 'attributes')).length;
+      return {
+        during, titleWrites: n(title), volWrites: n(vol, 'aria-valuenow'), clockWrites: n(clock),
+        shown: [title.textContent, vol.getAttribute('aria-valuenow'), clock.textContent],
+      };
+    }, threeDecks());
+    assert.deepEqual(r, { during: 0, titleWrites: 1, volWrites: 1, clockWrites: 1, shown: ['Burst 9', '0.900', '129.0'] });
+    assert.deepEqual(b.errors, []);
+  } finally { await b.close(); }
+});
+
 test('waveform draws bar numbers at bar lines once bar 1 is known', async () => {
   const T = 60 / 124;
   const state = makeState({
