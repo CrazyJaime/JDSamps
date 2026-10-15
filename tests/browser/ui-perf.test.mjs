@@ -106,6 +106,36 @@ test('wake lock: one lock survives repeated tab switches and is released with no
   } finally { await b.close(); }
 });
 
+test('the deck page tells the engine when it is hidden or shown, again after a reconnect, and applies the state it gets back', async () => {
+  const b = await openBoard({ state: threeDecks(), init: [fakeWakeLock] });
+  const { page } = b;
+  const vis = () => page.evaluate(() => window.__fake.sent.filter((m) => m.t === 'vis').map((m) => m.hidden));
+  try {
+    await page.waitForSelector('.deck >> nth=2');
+    assert.deepEqual(await vis(), [], 'a shown page has nothing to report');
+    await page.evaluate(() => window.__hide());
+    assert.deepEqual(await vis(), [true]);
+    await page.evaluate(() => window.__show());
+    assert.deepEqual(await vis(), [true, false]);
+    // A new port starts out shown: a page hidden across a reconnect says so again after its hello.
+    await page.evaluate(() => window.__hide());
+    await page.evaluate(() => window.__fake.disconnect());
+    await page.waitForFunction(() => window.__fake.sent.filter((m) => m.t === 'hello').length >= 2, null, { timeout: 4000 });
+    await page.waitForFunction(() => document.getElementById('engineStatus').dataset.status === 'up', null, { timeout: 2000 });
+    await page.waitForTimeout(50);
+    const sent = await page.evaluate(() => window.__fake.sent.map((m) => m.t === 'vis' ? `vis:${m.hidden}` : m.t).filter((t) => t === 'hello' || t.startsWith('vis')));
+    assert.deepEqual(sent.slice(-2), ['hello', 'vis:true'], JSON.stringify(sent));
+    // Shown again, the engine sends a full state: the page applies it.
+    await page.evaluate(() => window.__show());
+    const s = threeDecks();
+    s.decks[0].title = 'Back from another tab';
+    await b.push({ t: 'state', s });
+    await page.waitForFunction(() => document.querySelector('.deck [data-title]').textContent.trim() === 'Back from another tab', null, { timeout: 1000 });
+    assert.deepEqual((await vis()).slice(-1), [false]);
+    assert.deepEqual(b.errors, []);
+  } finally { await b.close(); }
+});
+
 // ---------------------------------------------------------------- waveform
 
 /** Records fillText calls made on the waveform canvases: [{row, text, x, y}]. */

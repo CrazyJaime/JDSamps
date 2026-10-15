@@ -56,7 +56,11 @@ function select(id) {
   for (const [k, st] of strips) st.setSelected(k === id);
 }
 
+/** The engine streams per-tick state and waveforms only to a page that is shown (a hidden one gets state at ~2 Hz). */
+const reportVisibility = () => conn.post({ t: 'vis', hidden: document.visibilityState !== 'visible' });
+
 function onStatus(status) {
+  if (status === 'up' && document.visibilityState !== 'visible') reportVisibility(); // a new port starts out shown
   $('#engineStatus').dataset.status = status;
   $('#banner').hidden = status !== 'down';
   if (status === 'down') setText($('#engineText'), 'Engine offline');
@@ -150,6 +154,7 @@ window.addEventListener('beforeunload', (e) => {
   if (snap && snap.decks.length) { e.preventDefault(); e.returnValue = ''; }
 });
 document.addEventListener('visibilitychange', syncWakeLock);
+document.addEventListener('visibilitychange', reportVisibility);
 
 conn.start();
 requestAnimationFrame(frame);

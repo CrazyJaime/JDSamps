@@ -133,6 +133,8 @@ function validateActArg(a, arg) {
 export function validateUiMessage(m) {
   if (!m || typeof m !== 'object') return { ok: false, error: 'not an object' };
   if (m.t === 'hello') return { ok: true };
+  // {t:'vis', hidden}: the page is hidden (no per-tick state or waveform needed) or shown again.
+  if (m.t === 'vis') return typeof m.hidden === 'boolean' ? { ok: true } : { ok: false, error: 'vis.hidden must be a boolean' };
   if (m.t === 'set') {
     if (!isDeckRef(m.deck)) return { ok: false, error: 'bad deck id' };
     const table = m.deck === null ? MASTER_PARAMS : DECK_PARAMS;

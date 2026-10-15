@@ -32,7 +32,7 @@ async function boot() {
     createStretch: () => SignalsmithStretch(ctx, { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2] }),
     deliver: (blob, name) => env.delivered.push({ name, size: blob.size }),
     event: (level, text) => { if (level === 'error') env.errors.push(text); },
-    eject() {}, broadcast() {},
+    eject() {}, broadcast() {}, broadcastWave() {},
   };
   return env;
 }
