@@ -209,8 +209,10 @@ test('60 s deck recordings: valid WAV headers, no lost frames, durations within 
 /**
  * Beats in the two 60 s recordings, between the marker pulses (0.5 s clear of each), on one
  * timeline: seconds after the first pulse, less the detector's own lateness on each sound. When
- * the box is busy, tab capture now and then drops or repeats 10-20 ms, so a recording is a series
- * of steady runs with small jumps; `bpm` counts beats over the whole window, jumps included.
+ * the box is busy the audio clock and the tab captures drift apart and the capture drops or
+ * repeats 10-20 ms now and then, so a recording is a series of steady runs with small jumps.
+ * `fit` is the tempo of the steady runs (the music as played); `bpm` counts beats over the whole
+ * window, jumps included (diagnostic only).
  */
 function beats() {
   if (long.beats) return long.beats;
@@ -252,13 +254,13 @@ test('60 s deck recordings: the synced deck matches the master within 0.2 % temp
   assert.ok(st.p90 <= 20, `settled beat offsets: ${f(st)}`);
 });
 
-test('60 s deck recordings: each BPM readout is within ±0.2 of the beats per minute in its recording', async (t) => {
+test('60 s deck recordings: each BPM readout is within ±0.2 of the tempo in its recording', async (t) => {
   assert.ok(long, 'needs the 60 s recording test');
   const b = beats();
   for (const k of [1, 2]) {
-    const out = median(long.samples.map((s) => s[`d${k}`].bpm.out));
-    t.diagnostic(`deck ${k}: readout ${out.toFixed(3)} BPM (median), recording ${b[k].bpm.toFixed(3)} BPM over ${b[k].on.length} beats`);
-    assert.ok(Math.abs(out - b[k].bpm) <= 0.2, `deck ${k}: readout ${out} vs ${b[k].bpm} BPM recorded`);
+    const out = median(long.samples.map((s) => s[`d${k}`].bpm.out)), rec = 60 / b[k].fit.T;
+    t.diagnostic(`deck ${k}: readout ${out.toFixed(3)} BPM (median); recording ${rec.toFixed(3)} BPM steady, ${b[k].bpm.toFixed(3)} counting jumps`);
+    assert.ok(Math.abs(out - rec) <= 0.2, `deck ${k}: readout ${out} vs ${rec} BPM recorded`);
   }
 });
 
