@@ -1,7 +1,7 @@
 // ui/deck-strip.js — one deck: its column in the board and its row in the waveform stack.
 // All page-derived text goes through textContent; favicons are only set after isSafeIconUrl().
 import { DECK_COLORS, PITCH_RANGES, isSafeIconUrl } from '../shared/protocol.js';
-import { $, $$, clone, setText, toggleAttr, setAttr, setHidden, setClass, setStyle, pageHidden, fmtBpm, fmtPct, fmtClock } from './util.js';
+import { $, $$, clone, setText, toggleAttr, setAttr, setHidden, setClass, setStyle, pageHidden, cssSize, forgetSize, fmtBpm, fmtPct, fmtClock } from './util.js';
 import { Knob, Fader, bindPad, bindSeg } from './controls.js';
 import { WaveStore, drawWave, beatIndex } from './waveform.js';
 import { VMeter } from './meters.js';
@@ -259,8 +259,8 @@ export class DeckStrip {
     if (lp && lp.end > lp.start && playhead >= lp.end && d.playhead >= lp.start && d.playhead <= lp.end) {
       playhead = lp.start + ((playhead - lp.start) % (lp.end - lp.start));
     }
-    const c = this.refs.wave, dpr = window.devicePixelRatio || 1;
-    const W = Math.max(1, Math.round(c.clientWidth * dpr)), H = Math.max(1, Math.round(c.clientHeight * dpr));
+    const c = this.refs.wave, dpr = window.devicePixelRatio || 1, size = cssSize(c); // no layout read per frame
+    const W = Math.max(1, Math.round(size.w * dpr)), H = Math.max(1, Math.round(size.h * dpr));
     if (c.width !== W || c.height !== H) { c.width = W; c.height = H; }
     drawWave(this.waveCtx, {
       w: W, h: H, store: this.store, playhead, grid: d.grid, cue: d.cue, liveEdge: d.liveEdge, historyStart: d.historyStart,
@@ -280,5 +280,9 @@ export class DeckStrip {
 
   setSnapshotTime(ctxTime) { this.snapCtx = ctxTime; }
 
-  destroy() { document.removeEventListener('visibilitychange', this.onVisible); this.el.remove(); this.waveRow.remove(); }
+  destroy() {
+    document.removeEventListener('visibilitychange', this.onVisible);
+    forgetSize(this.refs.wave); forgetSize(this.meter.c);
+    this.el.remove(); this.waveRow.remove();
+  }
 }

@@ -42,6 +42,25 @@ export function setStyle(el, prop, value) {
   el.style.setProperty(prop, value);
 }
 
+// CSS sizes of the canvases drawn every frame, kept by one ResizeObserver: reading clientWidth in
+// a frame forces a layout whenever anything changed since the last one.
+const sizes = new WeakMap();
+let sizer = null;
+/** The element's CSS content size {w, h}, kept current: read from layout only the first time. */
+export function cssSize(el) {
+  let s = sizes.get(el);
+  if (s) return s;
+  s = { w: el.clientWidth, h: el.clientHeight };
+  sizes.set(el, s);
+  sizer = sizer || new ResizeObserver((entries) => {
+    for (const e of entries) { const x = sizes.get(e.target); if (x) { x.w = e.contentRect.width; x.h = e.contentRect.height; } }
+  });
+  sizer.observe(el);
+  return s;
+}
+/** Stop tracking an element going away (the observer would keep it alive). */
+export function forgetSize(el) { if (sizes.delete(el)) sizer.unobserve(el); }
+
 /** While the page is hidden the UI only stores snapshots; strips apply the latest one when it shows. */
 export const pageHidden = () => document.visibilityState === 'hidden';
 
