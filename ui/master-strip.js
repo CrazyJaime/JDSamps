@@ -2,6 +2,7 @@
 import { $, $$, setText, toggleAttr, fmtBpm, fmtClock } from './util.js';
 import { Knob, Fader, bindSeg } from './controls.js';
 import { VMeter } from './meters.js';
+import { bindHold } from './hold.js';
 
 export class MasterStrip {
   constructor({ conn, toast, persist }) {
@@ -20,7 +21,15 @@ export class MasterStrip {
     this.meter = new VMeter($('#masterMeter'), { channels: 2 });
     this.gr = new VMeter($('#grMeter'), { mode: 'gr' });
     for (const id of ['#clipL', '#clipR']) $(id).addEventListener('click', () => conn.act(null, 'clipReset'));
-    $('#mixRecBtn').addEventListener('click', () => this.toggleMixRec());
+    // REC MIX starts on one press; stopping needs a 600 ms hold so a slip never splits the set.
+    this.recLabel = $('#mixRecBtn span');
+    this.recHold = bindHold($('#mixRecBtn'), {
+      ms: 600,
+      needsHold: () => this.rec.state === 'recording',
+      onPress: () => (this.rec.state === 'finalizing' ? toast('Still saving the last mix recording.', 'info') : this.mixRec('mixRecStart')),
+      onHold: () => this.mixRec('mixRecStop'),
+      onShort: () => toast('Hold REC MIX (or Shift+R) to stop the mix recording.', 'info'),
+    });
   }
 
   setPersisted(key, value) {
@@ -28,8 +37,8 @@ export class MasterStrip {
     this.persist(key, value);
   }
 
-  async toggleMixRec() {
-    const r = await this.conn.act(null, this.rec.state === 'recording' ? 'mixRecStop' : 'mixRecStart');
+  async mixRec(a) {
+    const r = await this.conn.act(null, a);
     if (!r.ok && r.error) this.toast(r.error, 'warn');
   }
 
@@ -47,6 +56,9 @@ export class MasterStrip {
     for (const st of this.settings) st.seg.set(p[st.key]);
     const recBtn = $('#mixRecBtn');
     toggleAttr(recBtn, 'aria-pressed', m.rec.state === 'recording');
+    const saving = m.rec.state === 'finalizing';
+    if (recBtn.disabled !== saving) recBtn.disabled = saving;
+    setText(this.recLabel, saving ? 'SAVING' : 'REC MIX');
     setText($('#mixRecTime'), m.rec.state === 'idle' ? '' : fmtClock(m.rec.seconds));
     $('#clipL').classList.toggle('on', m.clipL);
     $('#clipR').classList.toggle('on', m.clipR);

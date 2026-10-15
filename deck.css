@@ -75,6 +75,10 @@ kbd { font: 0.8rem var(--mono); padding: 0.05rem 0.35rem; border: 1px solid var(
 .btn.rec[aria-pressed="true"] { background: var(--rec); color: #fff; border-color: var(--rec); animation: recpulse 1s steps(2, start) infinite; }
 .btn.rec[aria-pressed="true"] .ic { color: #fff; }
 @keyframes recpulse { 50% { box-shadow: 0 0 1.1rem rgb(239 68 68 / 0.75); } }
+/* hold-to-confirm (eject, stop recording): a bar fills over --hold while the button is held */
+.btn.holding { position: relative; overflow: hidden; border-color: var(--rec); }
+.btn.holding::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: currentColor; transform-origin: left; animation: holdfill var(--hold, 500ms) linear forwards; }
+@keyframes holdfill { from { transform: scaleX(0); } to { transform: scaleX(1); } }
 .btn.toggle[aria-pressed="true"] { color: var(--deck); border-color: var(--deck); background: color-mix(in srgb, var(--deck) 16%, transparent); }
 
 .pad {
