@@ -35,6 +35,7 @@ class Engine {
     this.nextId = 1;
     this.clock = new MasterClock();
     this.ui = new Set();
+    this.holds = new Set(); // 'deckId|key': kills/FX held down in the UI (set with hold:true)
     this.serialQ = Promise.resolve();
     this.downloads = new Map();
     this.downloadsSettled = new Set(); // blob URLs already reported: the hub may send DOWNLOAD_DONE twice
@@ -96,7 +97,7 @@ class Engine {
         if (!uiSender(port.sender)) { refuse(); return; }
         this.ui.add(port);
         port.onMessage.addListener((m) => { this.onUi(port, m); });
-        port.onDisconnect.addListener(() => { void chrome.runtime.lastError; this.ui.delete(port); });
+        port.onDisconnect.addListener(() => { void chrome.runtime.lastError; this.ui.delete(port); if (!this.ui.size) this.releaseHolds(); });
       } else if (port.name === PORT_AGENT) {
         const d = agentSender(port.sender) ? this.deckByTab(port.sender.tab.id) : null;
         if (!d) { refuse(); return; }
@@ -128,7 +129,7 @@ class Engine {
     }
     if (m.t === 'set') {
       if (m.deck === null) this.setMasterParam(m.key, v.value);
-      else { const d = this.decks.get(m.deck); if (d) d.setParam(m.key, v.value); else { reply(false, 'That deck is gone.'); return; } }
+      else { const d = this.decks.get(m.deck); if (d) { d.setParam(m.key, v.value); this.noteHold(m, v.value); } else { reply(false, 'That deck is gone.'); return; } }
       reply(true);
       return;
     }
@@ -136,6 +137,22 @@ class Engine {
     if (m.deck === null) r = await this.masterAct(m.a);
     else { const d = this.decks.get(m.deck); r = d ? await d.act(m.a, v.arg) : { ok: false, error: 'That deck is gone.' }; }
     reply(r.ok, r.error);
+  }
+
+  /** A kill/FX pad held down is sent with hold:true; the next set of that key (release or latch) clears it. */
+  noteHold(m, value) {
+    const k = `${m.deck}|${m.key}`;
+    if (m.hold === true && value === true) this.holds.add(k); else this.holds.delete(k);
+  }
+
+  /** The last deck page went away (reload, close) mid-press: let go of everything held. */
+  releaseHolds() {
+    for (const k of this.holds) {
+      const [id, key] = k.split('|'), d = this.decks.get(Number(id));
+      if (d) d.setParam(key, false);
+    }
+    this.holds.clear();
+    for (const d of this.decks.values()) d.releaseHolds().catch(() => {});
   }
 
   setMasterParam(k, v) {

@@ -373,6 +373,14 @@ export class Deck {
     return OK;
   }
 
+  /** The deck page went away mid-press: end what only lasts while held (roll, nudge, CUE preview). */
+  async releaseHolds() {
+    if (!this.ts || this.disposed) return;
+    if (this.rollFrom) await this.act('rollEnd');
+    if (this.nudge) await this.act('nudge', { dir: 0 });
+    if (this.previewing) await this.act('cueUp');
+  }
+
   // ------------------------------------------------------------------ manual grid tools
   // A correction acts on what the DJ hears: every grid segment of the track at the heard position
   // (assist steps split a track's grid), plus the tracker when it is still on that track. A track

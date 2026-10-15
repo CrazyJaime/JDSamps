@@ -230,7 +230,7 @@ export class Fader extends Continuous {
  * Pad / hold button. latch=true: a tap (<250 ms) toggles, a hold is momentary.
  * latch=false: momentary only (down → on, up → off). Keyboard Space/Enter act like the pointer.
  */
-export function bindPad(el, { onDown, onUp, latch = false }) {
+export function bindPad(el, { onDown, onUp, onLatch, latch = false }) {
   let on = false, downAt = 0, wasOn = false, active = false;
   const press = () => {
     if (active) return;
@@ -245,6 +245,7 @@ export function bindPad(el, { onDown, onUp, latch = false }) {
     active = false;
     const held = performance.now() - downAt >= 250;
     if (!latch || held || wasOn) { on = false; onUp && onUp(); }
+    else if (onLatch) onLatch(); // a tap: stays on, no longer held
     paint();
   };
   const paint = () => { el.classList.toggle('on', on); el.setAttribute('aria-pressed', on ? 'true' : 'false'); };

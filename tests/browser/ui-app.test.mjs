@@ -126,6 +126,42 @@ test('keyboard shortcuts drive the selected deck and the mixer', async () => {
   assert.ok(s.some((m) => m.deck === null && m.key === 'xfader.pos' && Math.abs(m.value - 0.45) < 1e-9));
 });
 
+// The engine lets go of a press tagged hold:true if the page goes away before its release.
+test('kill and FX pads tag a press as held until its release decides (off, or latched on)', async () => {
+  const at = async (sel, slot) => { const b = await deckEl(slot).locator(sel).boundingBox(); await page.mouse.move(b.x + 5, b.y + 5); };
+  const press = async (ms) => { await page.mouse.down(); await page.waitForTimeout(ms); await page.mouse.up(); await page.waitForTimeout(30); };
+  const got = async (slot, key) => (await sets((m) => m.deck === slot && m.key === key)).map((m) => [m.value, m.hold === true]);
+  await at('[data-kill="mid"]', 1);
+  await ui.clearSent();
+  await press(350); // held: momentary
+  assert.deepEqual(await got(1, 'kill.mid'), [[true, true], [false, false]]);
+  await ui.clearSent();
+  await press(40); // tapped: latched on, no longer held
+  assert.deepEqual(await got(1, 'kill.mid'), [[true, true], [true, false]]);
+  await ui.clearSent();
+  await press(40); // tapped again: off
+  assert.deepEqual(await got(1, 'kill.mid'), [[false, false]]);
+  await at('[data-pad="fx.on"]', 3);
+  await ui.clearSent();
+  await press(40);
+  assert.deepEqual(await got(3, 'fx.on'), [[true, true], [true, false]]);
+  await at('[data-kill="low"]', 3); // already latched on: a press holds nothing new
+  await ui.clearSent();
+  await press(350);
+  assert.deepEqual(await got(3, 'kill.low'), [[false, false]]);
+});
+
+test('kill and FX keys tag a press as held until its release decides', async () => {
+  await page.locator('body').click({ position: { x: 5, y: 300 } });
+  await page.keyboard.press('Digit1');
+  await ui.clearSent();
+  await page.keyboard.down('KeyZ'); await page.waitForTimeout(300); await page.keyboard.up('KeyZ');
+  await page.keyboard.down('KeyF'); await page.waitForTimeout(30); await page.keyboard.up('KeyF');
+  await page.waitForTimeout(30);
+  const got = (await sets((m) => m.deck === 1)).map((m) => [m.key, m.value, m.hold === true]);
+  assert.deepEqual(got, [['kill.low', true, true], ['kill.low', false, false], ['fx.on', true, true], ['fx.on', true, false]]);
+});
+
 test('channel faders and the crossfader ignore the wheel and double-click; the tempo fader still wheels', async () => {
   const at = async (loc) => { const b = await loc.boundingBox(); await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2); };
   await ui.clearSent();
