@@ -181,9 +181,10 @@ export class DeckStrip {
     r.assist.className = `badge ${d.assist.active ? 'info' : 'warn'}`;
     r.starved.hidden = !d.starved;
 
-    toggleAttr(r.play, 'aria-pressed', d.playing);
-    r.playIcon.setAttribute('href', d.playing ? '#i-pause' : '#i-play');
-    r.play.setAttribute('aria-label', d.playing ? 'Pause' : 'Play');
+    const running = d.playing && !d.previewing; // a CUE preview is not a play: PLAY keeps it going
+    toggleAttr(r.play, 'aria-pressed', running);
+    r.playIcon.setAttribute('href', running ? '#i-pause' : '#i-play');
+    r.play.setAttribute('aria-label', running ? 'Pause' : 'Play');
     r.cue.classList.toggle('on', !d.playing && Math.abs(d.playhead - d.cue) < 0.03);
     toggleAttr(r.sync, 'aria-pressed', d.sync.on);
     r.sync.classList.toggle('oor', d.sync.on && d.sync.outOfRange);

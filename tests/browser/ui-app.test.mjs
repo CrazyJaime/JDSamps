@@ -194,6 +194,19 @@ test('layout fits 1440x900 without scrolling and a screenshot is saved', async (
   await page.screenshot({ path: path.join(ART, 'deck-ui-1440x900.png') });
 });
 
+test('during a CUE preview the PLAY button offers Play, not Pause', async () => {
+  const s = threeDecks();
+  Object.assign(s.decks[2], { playing: true, previewing: true });
+  await ui.push({ t: 'state', s });
+  await page.waitForTimeout(80);
+  const play = deckEl(3).locator('[data-act="playToggle"]');
+  assert.equal(await play.locator('use').getAttribute('href'), '#i-play');
+  assert.equal(await play.getAttribute('aria-label'), 'Play');
+  assert.equal(await play.getAttribute('aria-pressed'), 'false');
+  await ui.push({ t: 'state', s: threeDecks() });
+  await page.waitForTimeout(50);
+});
+
 test('no console errors', () => { assert.deepEqual(ui.errors, []); });
 
 test('empty state is shown with no decks', async () => {
