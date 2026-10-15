@@ -1,0 +1,63 @@
+// ui/master-strip.js — master meters/limiter/volume, crossfader bar, REC MIX, clock and settings.
+import { $, $$, setText, toggleAttr, fmtBpm, fmtClock } from './util.js';
+import { Knob, Fader, bindSeg } from './controls.js';
+import { VMeter } from './meters.js';
+
+export class MasterStrip {
+  constructor({ conn, toast, persist }) {
+    this.conn = conn;
+    this.toast = toast;
+    this.persist = persist;
+    this.params = {};
+    this.rec = { state: 'idle' };
+    const vdb = (v) => { if (v <= 0) return '−∞'; const g = v >= 0.5 ? (6 * (v - 0.5)) / 0.5 : 20 * Math.log10((2 * v) ** 3); return `${g >= 0 ? '+' : '−'}${Math.abs(g).toFixed(1)} dB`; };
+    this.vol = new Knob($('#masterVol'), { label: 'VOLUME', def: 0.5, value: 0.5, format: vdb, onChange: (v) => conn.set(null, 'master.volume', v) });
+    this.limiter = $('#limiterBtn');
+    this.limiter.addEventListener('click', () => this.setPersisted('master.limiter', !this.params['master.limiter']));
+    this.xf = new Fader($('#crossfader'), { orientation: 'horizontal', label: 'Crossfader', min: 0, max: 1, def: 0.5, value: 0.5, center: true, step: 0.02, fine: 0.004, format: (v) => `${Math.round(v * 100)}`, onChange: (v) => conn.set(null, 'xfader.pos', v) });
+    this.curve = bindSeg($('#xfCurve'), { onSelect: (v) => this.setPersisted('xfader.curve', v) });
+    this.settings = $$('[data-setting]').map((el) => ({ key: el.dataset.setting, seg: bindSeg(el, { onSelect: (v) => this.setPersisted(el.dataset.setting, v) }) }));
+    this.meter = new VMeter($('#masterMeter'), { channels: 2 });
+    this.gr = new VMeter($('#grMeter'), { mode: 'gr' });
+    for (const id of ['#clipL', '#clipR']) $(id).addEventListener('click', () => conn.act(null, 'clipReset'));
+    $('#mixRecBtn').addEventListener('click', () => this.toggleMixRec());
+  }
+
+  setPersisted(key, value) {
+    this.conn.set(null, key, value);
+    this.persist(key, value);
+  }
+
+  async toggleMixRec() {
+    const r = await this.conn.act(null, this.rec.state === 'recording' ? 'mixRecStop' : 'mixRecStart');
+    if (!r.ok && r.error) this.toast(r.error, 'warn');
+  }
+
+  nudgeXf(delta) { const v = Math.max(0, Math.min(1, this.xf.value + delta)); this.xf.set(v); this.conn.set(null, 'xfader.pos', v); }
+  setXf(v) { this.xf.set(v); this.conn.set(null, 'xfader.pos', v); }
+
+  update(s) {
+    const m = s.master, p = m.params;
+    this.params = p;
+    this.rec = m.rec;
+    this.vol.set(p['master.volume']);
+    toggleAttr(this.limiter, 'aria-pressed', p['master.limiter']);
+    this.xf.set(p['xfader.pos']);
+    this.curve.set(p['xfader.curve']);
+    for (const st of this.settings) st.seg.set(p[st.key]);
+    const recBtn = $('#mixRecBtn');
+    toggleAttr(recBtn, 'aria-pressed', m.rec.state === 'recording');
+    setText($('#mixRecTime'), m.rec.state === 'idle' ? '' : fmtClock(m.rec.seconds));
+    $('#clipL').classList.toggle('on', m.clipL);
+    $('#clipR').classList.toggle('on', m.clipR);
+    setText($('#grText'), m.gr < -0.05 ? m.gr.toFixed(1) : '0.0');
+    this.meter.update([{ peak: m.peakL, rms: m.rmsL, clip: m.clipL }, { peak: m.peakR, rms: m.rmsR, clip: m.clipR }]);
+    this.gr.update({ gr: m.gr });
+    const c = s.clock;
+    setText($('#clockBpm'), c.bpm ? fmtBpm(c.bpm) : '—');
+    const slot = c.mode === 'deck' ? (s.decks.find((d) => d.id === c.deckId) || {}).slot : null;
+    setText($('#clockMode'), c.mode === 'deck' ? `DECK ${slot ?? '?'}` : c.mode === 'free' ? 'FREE RUNNING' : 'no master');
+  }
+
+  frame() { this.meter.draw(); this.gr.draw(); }
+}
