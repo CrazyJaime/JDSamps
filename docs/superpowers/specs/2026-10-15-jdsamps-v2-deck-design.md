@@ -78,10 +78,8 @@ research notes.
   stops the music.
 - **The deck UI connects to the engine directly** with `chrome.runtime.connect({name:'jds-ui'})`.
   No polling through the service worker. The UI reconnects automatically if the port drops.
-- **The tab agent connects to the engine directly** (`jds-agent` port). The engine asks the
-  service worker to inject or poke the agent. If the probe shows offscreen documents cannot
-  receive content-script ports, agent traffic relays through the service worker; assist commands
-  are infrequent, so the extra hop is acceptable.
+- **The tab agent connects to the engine directly** (`jds-agent` port, verified). The engine
+  asks the service worker to inject or poke the agent.
 
 ### 3.1 Adding tabs
 
@@ -145,8 +143,14 @@ switched off.
     beat once BPM locks.
 - **Key lock (KEY)** is on by default. Engine pitch shift: `semitones = keyLock ?
   -12·log2(sourceRate) : 12·log2(deckRate)`, where `sourceRate` is the assist rate (§3.4).
-- **Fallback if the probe rejects Signalsmith** under MV3: our own buffer player worklet with a
-  WSOLA stretcher (key lock) and a cubic resampler (vinyl). The engine API stays the same.
+- **Stretcher:** Signalsmith Stretch 1.3.2, vendored with a two-line fix. The probe found its
+  buffer-streaming mode reads wrong samples (or kills the node) whenever its read window spans
+  two `addBuffers()` chunks, and upstream HEAD still has the bug. It loads under MV3 with
+  `'wasm-unsafe-eval'`. Measured costs:
+  - about 0.12 s total latency;
+  - about 4.5 % of one core per deck;
+  - its playhead model `p(t) = input + rate·(t − output)` is accurate to about 2 ms.
+  It allows only one pending scheduled change at a time, and the engine respects that.
 
 ### 3.3 BPM, beat grid and SYNC
 
@@ -257,8 +261,13 @@ This uses the algorithm validated by the research prototype (11 synthetic genres
   - **SMOOTH** (equal power, the default);
   - **SHARP** (full level until about 5% from the far end, then a fast cut);
   - each deck's crossfader gain ramps over 10 ms.
-- **Master:** volume knob, then **LIMITER** (DynamicsCompressor: threshold −1 dBFS, ratio 20,
-  knee 0, attack 1 ms, release 100 ms; can be switched off), then the destination.
+- **Master:** volume knob, then **LIMITER**, then the destination. The limiter is a 5 ms
+  lookahead brickwall worklet with a −1 dBFS ceiling and 100 ms release, and can be switched
+  off.
+  - It is not a DynamicsCompressor: the Web Audio compressor applies automatic makeup gain,
+    so it cannot guarantee a ceiling.
+  - The same worklet produces the true per-channel meters and the engine's throttle-proof
+    tick.
   - It shows gain-reduction metering and an L/R peak + RMS meter.
   - Clip lights latch for 2 s, then clear; clicking clears them immediately.
 - Each deck meter shows post-fader level, and its clip light is reset the same way.
@@ -472,11 +481,12 @@ The remaining low-severity items follow the same pattern.
 
 ## 7. Open risks
 
-1. **Signalsmith under MV3 CSP, and its CPU cost with 4–6 decks.** A probe is in progress; the
-   WSOLA fallback is specified in §3.2.
+1. **Signalsmith under MV3 CSP, and its CPU cost with 4–6 decks.** Resolved by the probe: it
+   works with the vendored fix, and costs about 18 % of a core for 4 decks.
 2. **Real-track BPM accuracy.** Validated on synthetic material only. UNSURE state, TAP and
    GRID tools mitigate it.
-3. **Whether content-script ports reach the offscreen document.** Probe in progress; relay
-   fallback specified.
+3. **Whether content-script ports reach the offscreen document.** Resolved: they do. The
+   service worker must register no `onConnect` listener, because one receiver disconnecting
+   tears the port down for all of them.
 4. **Hidden-document timer throttling in the offscreen document.** All timing comes from
    worklet messages and the audio clock; there are no `setInterval` loops on critical paths.
