@@ -41,6 +41,7 @@ function onsetCurve(x, sigma) {
 }
 
 const rel = (a, b) => Math.abs(a / b - 1);
+const RELATED = [1, 2, 0.5, 1.5, 2 / 3, 3, 1 / 3]; // tempo ratios that count as the same beat
 const clamp01 = (v) => Math.max(0, Math.min(1, v));
 
 /** Tempos a manual ½× / 2× may reach. */
@@ -117,7 +118,7 @@ export class TempoTracker {
     let bpm = o.wideLo + (best + off) * o.grid;
     while (bpm < o.lo) bpm *= 2;
     while (bpm > o.hi) bpm /= 2;
-    const related = (b) => [1, 2, 0.5, 1.5, 2 / 3, 3, 1 / 3].some((m) => Math.abs(b / (bpm * m) - 1) < 0.04);
+    const related = (b) => { for (let i = 0; i < RELATED.length; i++) if (Math.abs(b / (bpm * RELATED[i]) - 1) < 0.04) return true; return false; };
     let second = 1e-9;
     for (let g = 0; g < nG; g++) { const b = o.wideLo + g * o.grid; if (!related(b) && Sw[g] > second) second = Sw[g]; }
     const salience = S[best], peakRatio = Sw[best] / second;
