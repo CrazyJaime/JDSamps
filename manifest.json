@@ -1,25 +1,20 @@
 {
   "manifest_version": 3,
   "name": "JD Samps",
-  "version": "1.0.0",
-  "description": "Capture audio from multiple Chrome tabs simultaneously, kept as separate streams for per-tab metering, recording and mixing. Made by godspee.",
-  "permissions": [
-    "tabCapture",
-    "offscreen",
-    "tabs",
-    "downloads",
-    "storage"
+  "version": "2.0.0",
+  "description": "Multi-tab DJ deck in your browser: load tabs onto decks, beat-sync them on the audio, EQ, FX, crossfader and recording. Made by godspee.",
+  "minimum_chrome_version": "119",
+  "permissions": ["tabCapture", "offscreen", "tabs", "downloads", "storage", "scripting", "contextMenus"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": { "default_title": "JD Samps: add this tab to the deck" },
+  "commands": {
+    "add-tab": { "suggested_key": { "default": "Alt+Shift+A" }, "description": "Add the current tab to the JD Samps deck" }
+  },
+  "content_scripts": [
+    { "matches": ["<all_urls>"], "js": ["agent/agent-main.js"], "run_at": "document_start", "all_frames": true, "match_origin_as_fallback": true, "world": "MAIN" },
+    { "matches": ["<all_urls>"], "js": ["agent/agent-relay.js"], "run_at": "document_start", "all_frames": true, "match_origin_as_fallback": true }
   ],
-  "background": {
-    "service_worker": "background.js"
-  },
-  "action": {
-    "default_popup": "popup.html",
-    "default_title": "JD Samps"
-  },
-  "icons": {
-    "16": "icons/icon16.png",
-    "48": "icons/icon48.png",
-    "128": "icons/icon128.png"
-  }
+  "content_security_policy": { "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'" },
+  "icons": { "16": "icons/icon16.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
 }
