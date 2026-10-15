@@ -291,9 +291,63 @@ test('ejected and closed deck tabs stop their audio processors (stretcher, input
   }
 });
 
+test("ejecting a deck pauses its tab's player, whether the user or the engine ejects it", async () => {
+  // 0: EJECT from the deck. 1: the engine ejects it (the tab stopped sharing audio).
+  for (let i = 0; i < 2; i++) {
+    const url = `${server.url('a')}?eject=${i}`;
+    const tab = await h.context.newPage();
+    await tab.goto(url);
+    const tabId = await tabIdFor(h, url);
+    const r = await hubCall(deck, { type: 'LOAD_TAB', tabId });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    const d = await waitFor(async () => (await state(deck)).decks.find((x) => x.tabId === tabId), 8000);
+    await waitFor(() => tab.evaluate(() => { const m = window.__media(); return !m.paused && m.t > 0.3; }), 8000);
+    // Wall-clock times of the page's pause and of the capture being released.
+    await tab.evaluate(() => document.getElementById('a').addEventListener('pause', () => { window.__pausedAt = Date.now(); }));
+    await offscreenEval(h, `(() => { window.__releasedAt = 0; const t = globalThis.__jdsEngine.decks.get(${d.id}).stream.getAudioTracks()[0], stop = t.stop.bind(t);
+      t.stop = () => { window.__releasedAt = Date.now(); stop(); }; return true; })()`);
+    if (i === 0) assert.equal((await act(deck, d.id, 'eject')).ok, true);
+    else await offscreenEval(h, `globalThis.__jdsEngine.decks.get(${d.id}).stream.getAudioTracks()[0].dispatchEvent(new Event('ended'))`);
+    await waitFor(async () => !(await state(deck)).decks.some((x) => x.tabId === tabId), 8000);
+    await waitFor(() => tab.evaluate(() => window.__media().paused), 1500).catch(() => {});
+    assert.equal((await tab.evaluate(() => window.__media())).paused, true, `eject ${i}: the tab's <audio> is still playing`);
+    const releasedAt = await waitFor(() => offscreenEval(h, 'window.__releasedAt || 0'), 3000);
+    const pausedAt = await tab.evaluate(() => window.__pausedAt);
+    assert.ok(pausedAt <= releasedAt, `eject ${i}: paused ${pausedAt - releasedAt} ms after the capture was released`);
+    assert.equal((await h.sw.evaluate((id) => chrome.tabs.get(id), tabId)).mutedInfo.muted, false, 'paused, so not muted');
+    await tab.close();
+  }
+});
+
 test('stop all ejects everything; no engine errors were reported', async () => {
   assert.equal((await act(deck, null, 'stopAll')).ok, true);
   await waitFor(async () => (await state(deck)).decks.length === 0, 8000);
   const errs = (await events(deck)).filter((e) => e.level === 'error');
   assert.deepEqual(errs, []);
+});
+
+test("STOP ALL left every deck's tab silent: players paused at their own rate, the Web-Audio tab muted", async () => {
+  await waitFor(() => tabs.a.evaluate(() => window.__media().paused), 1500).catch(() => {});
+  const m = await tabs.a.evaluate(() => window.__media());
+  assert.deepEqual([m.paused, m.rate, m.pp], [true, 1, true], 'deck 1 (<audio>, assisted earlier)');
+  const cId = await tabIdFor(h, server.url('c'));
+  const mi = await h.sw.evaluate((id) => chrome.tabs.get(id).then((t) => t.mutedInfo), cId);
+  assert.deepEqual([mi.muted, mi.reason, mi.extensionId], [true, 'extension', h.extId], 'Web-Audio tab muted by us');
+  assert.equal(await tabs.c.evaluate(() => document.getElementById('decor').paused), true, 'its muted decor <audio> is paused too');
+  const notes = (await events(deck)).filter((e) => /no pausable player/.test(e.text));
+  assert.equal(notes.length, 1, JSON.stringify(notes));
+  assert.match(notes[0].text, /^Deck \d: the tab has no pausable player, so it was muted\.$/);
+  assert.equal(notes[0].level, 'info');
+});
+
+test('loading a tab we muted unmutes it first, so the deck hears it', async () => {
+  const cId = await tabIdFor(h, server.url('c'));
+  assert.equal((await h.sw.evaluate((id) => chrome.tabs.get(id), cId)).mutedInfo.muted, true, 'muted by the STOP ALL');
+  const r = await hubCall(deck, { type: 'LOAD_TAB', tabId: cId });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal((await h.sw.evaluate((id) => chrome.tabs.get(id), cId)).mutedInfo.muted, false);
+  const d = await waitFor(async () => (await state(deck)).decks.find((x) => x.tabId === cId), 8000);
+  await waitFor(() => offscreenEval(h, `globalThis.__jdsEngine.decks.get(${d.id}).firstAudible != null`), 8000);
+  assert.equal((await act(deck, d.id, 'eject')).ok, true);
+  await waitFor(async () => (await state(deck)).decks.length === 0, 8000);
 });

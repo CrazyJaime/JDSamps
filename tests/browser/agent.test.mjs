@@ -213,6 +213,42 @@ test('elements that were only load()ed or pause()d are found too', async () => {
   await p.close();
 });
 
+test('stop pauses every playing element, in the DOM or detached, and counts the heard ones', async () => {
+  const p = await agentPage();
+  await p.evaluate(async () => {
+    document.body.innerHTML = '<audio id="el" src="/tone.wav" loop autoplay></audio>'; // never play()ed: found by the scan
+    const d = new Audio('/tone.wav'); d.loop = true; window.d = d;
+    const m = new Audio('/tone.wav'); m.loop = true; m.muted = true; window.m = m;
+    await Promise.all([d.play(), m.play()]);
+    const el = document.getElementById('el');
+    if (el.paused) await new Promise((r) => el.addEventListener('playing', r, { once: true }));
+  });
+  assert.deepEqual(await p.evaluate(() => [document.getElementById('el').paused, d.paused, m.paused]), [false, false, false]);
+  await p.evaluate(() => window.__cmd({ t: 'stop' })); // a stop is a first command too
+  await p.waitForTimeout(100);
+  assert.deepEqual(await p.evaluate(() => [document.getElementById('el').paused, d.paused, m.paused]), [true, true, true]);
+  assert.deepEqual(await p.evaluate(() => window.__status.filter((x) => x.t === 'stopped')), [{ t: 'stopped', count: 2 }], 'the muted one is paused but not counted');
+  await p.close();
+});
+
+test("stop gives the page its own rate back before pausing; a page with no media answers count 0", async () => {
+  const p = await agentPage();
+  await p.evaluate(() => { const a = new Audio('/tone.wav'); a.loop = true; a.playbackRate = 1.5; window.a = a; return a.play(); });
+  await p.evaluate(() => window.__cmd({ t: 'rate', rate: 1.02, seq: 4 }));
+  await p.waitForTimeout(100);
+  assert.equal(await p.evaluate(() => a.playbackRate), 1.02);
+  await p.evaluate(() => window.__cmd({ t: 'stop' }));
+  await p.waitForTimeout(100);
+  assert.deepEqual(await p.evaluate(() => [a.paused, a.playbackRate, a.preservesPitch]), [true, 1.5, true]);
+  assert.deepEqual(await p.evaluate(() => window.__status.filter((x) => x.t === 'stopped')), [{ t: 'stopped', count: 1 }]);
+  const q = await agentPage();
+  await q.evaluate(() => window.__cmd({ t: 'stop' }));
+  await q.waitForTimeout(100);
+  assert.deepEqual(await q.evaluate(() => window.__status), [{ t: 'stopped', count: 0 }]);
+  assert.deepEqual(errors, []);
+  await p.close(); await q.close();
+});
+
 /** A page running agent-relay.js against FAKE_CHROME, with the real agent-main.js or a stand-in. */
 async function relayPage({ main = true, relayFirst = false } = {}) {
   const p = await browser.newPage();
@@ -252,6 +288,28 @@ test('the relay gives the page its player back when the engine port goes away', 
   await p.waitForTimeout(200);
   assert.deepEqual(await p.evaluate(() => [a.playbackRate, a.preservesPitch]), [1, true]);
   await p.close();
+});
+
+// In the extension the relay's world is isolated, so only the service worker (executeScript) can
+// call __jdsStop; in these plain test pages it is simply on window.
+test('the relay passes a stop to its agent and answers with the count, or 0 when the agent is silent', async () => {
+  const p = await relayPage();
+  await p.evaluate(() => { const a = new Audio('/tone.wav'); a.loop = true; window.a = a; return a.play(); });
+  await p.evaluate(() => window.__eng.ask());
+  await p.waitForTimeout(200);
+  assert.deepEqual(await p.evaluate(() => window.__jdsStop()), { t: 'stopped', count: 1 });
+  assert.equal(await p.evaluate(() => a.paused), true);
+  await p.waitForTimeout(200);
+  assert.ok(!(await p.evaluate(() => window.__eng.posted)).some((m) => m.t === 'stopped'), 'the answer does not go up the engine port');
+  const q = await relayPage({ main: false }); // a stand-in that never answers
+  const t0 = Date.now();
+  assert.deepEqual(await q.evaluate(() => window.__jdsStop()), { t: 'stopped', count: 0 });
+  assert.ok(Date.now() - t0 < 1000, `answered after ${Date.now() - t0} ms`);
+  // A forged or malformed answer is not taken.
+  const pend = q.evaluate(() => window.__jdsStop());
+  await q.evaluate(() => { window.__toRelay({ t: 'stopped', count: -3 }); window.__toRelay({ t: 'stopped', count: 'x' }); });
+  assert.deepEqual(await pend, { t: 'stopped', count: 0 });
+  await p.close(); await q.close();
 });
 
 test('the relay forwards at a bounded rate, latest first, and drops repeats', async () => {

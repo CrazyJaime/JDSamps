@@ -1,7 +1,9 @@
 // agent/agent-relay.js — JD Samps relay (ISOLATED world, every frame). Connects this frame to the
 // offscreen engine (port 'jds-agent') only after the extension asks ({jds:'connect'}) and only if
 // the frame has media. Relays engine commands down to agent-main.js and status up, on a random
-// per-page channel it offers agent-main.js at document_start (see agent-main.js).
+// per-page channel it offers agent-main.js at document_start (see agent-main.js). On eject, the
+// service worker calls __jdsStop() here (scripting.executeScript, this isolated world only) to
+// have agent-main.js pause the frame's players before the capture goes.
 (() => {
   if (globalThis.__jdsRelay) return; // ISOLATED world: pages cannot see this
   globalThis.__jdsRelay = true;
@@ -49,11 +51,25 @@
     if (typeof e.detail !== 'string' || e.detail.length > 1000) return;
     let m;
     try { m = JSON.parse(e.detail); } catch (_) { return; }
+    if (m && m.t === 'stopped') {
+      if (Number.isInteger(m.count) && m.count >= 0 && m.count < 1000) { for (const f of stops) f(m.count); stops.clear(); }
+      return;
+    }
     if (!m || typeof m !== 'object' || (m.t !== 'status' && m.t !== 'external-rate')) return;
     if (m.t === 'status') last = e.detail;
     if (wanted && m.hasMedia) connect();
     pending[m.t] = e.detail;
     if (!timer) timer = setTimeout(flush, Math.max(0, at + 100 - performance.now()));
+  });
+
+  // Eject: resolves with {t:'stopped', count} (heard players paused), count 0 if agent-main.js does
+  // not answer in time, so an eject never waits on the page.
+  const STOP_WAIT = 150, stops = new Set();
+  globalThis.__jdsStop = () => new Promise((resolve) => {
+    const done = (count) => { clearTimeout(timer); stops.delete(done); resolve({ t: 'stopped', count }); };
+    const timer = setTimeout(() => done(0), STOP_WAIT);
+    stops.add(done);
+    toMain({ t: 'stop' });
   });
 
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {

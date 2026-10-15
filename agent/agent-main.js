@@ -1,9 +1,10 @@
 // agent/agent-main.js — JD Samps player-assist agent (page MAIN world, every frame, document_start).
 // Registers media elements the page plays (including detached `new Audio()` objects) and, only
 // when a deck asks, sets their playbackRate (with preservesPitch=false) so the engine can refill a
-// deck's buffer. Silent until its first command. Talks to agent-relay.js through window
-// CustomEvents carrying JSON strings (objects do not cross JS worlds reliably), on a channel name
-// the relay picks at random and hands over at document_start, before any page script runs.
+// deck's buffer, or pauses them all when the deck is ejected. Silent until its first command.
+// Talks to agent-relay.js through window CustomEvents carrying JSON strings (objects do not cross
+// JS worlds reliably), on a channel name the relay picks at random and hands over at
+// document_start, before any page script runs.
 // Leaves no global behind and keeps its wrappers looking native, so pages cannot fingerprint it.
 (() => {
   const HELLO = 'media-channel';
@@ -119,7 +120,7 @@
   };
   disguise(asNative);
 
-  const proto = HTMLMediaElement.prototype;
+  const proto = HTMLMediaElement.prototype, nativePause = proto.pause;
   for (const name of ['play', 'pause', 'load']) {
     const orig = proto[name];
     proto[name] = disguise({ [name](...args) { try { register(this); } catch (_) {} return orig.apply(this, args); } }[name]);
@@ -183,6 +184,21 @@
     } else if (m.t === 'release') {
       if (seq != null) st.seq = seq;
       release();
+    } else if (m.t === 'stop') {
+      // The deck is ejecting this tab: once its capture goes, the page plays out of the speakers.
+      // Give the page its own rate back, pause every player, and say how many of them were heard
+      // (0: nothing to pause here, so the tab gets muted instead).
+      if (seq != null) st.seq = seq;
+      release();
+      scan();
+      let count = 0;
+      for (const el of live()) {
+        if (el.paused) continue;
+        const heard = !el.muted && el.volume > 0;
+        try { nativePause.call(el); } catch (_) { continue; }
+        if (heard && el.paused) count++;
+      }
+      emit(JSON.stringify({ t: 'stopped', count }));
     }
   }
 })();

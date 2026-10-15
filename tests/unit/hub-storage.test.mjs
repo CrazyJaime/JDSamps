@@ -9,12 +9,12 @@ const settle = async () => { for (let i = 0; i < 400; i++) await turn(); };
 const event = () => { const ls = []; return { ls, addListener: (f) => ls.push(f), fire: (...a) => ls.map((f) => f(...a)) }; };
 const EXT = 'chrome-extension://abcdefghijklmnopabcdefghijklmnop/';
 
-let store, sent, items, nextId, onDownload, tabs;
+let store, sent, items, nextId, onDownload, tabs, scripts, runScript, ops;
 const chrome = {
   runtime: {
     id: 'abcdefghijklmnopabcdefghijklmnop', lastError: null, getURL: (p = '') => EXT + p,
     getContexts: async () => { await turn(); return [{}]; },
-    sendMessage: async (m) => { await turn(); sent.push(m); return m.type === 'PING' ? { ok: true, decks: [] } : { ok: true }; },
+    sendMessage: async (m) => { await turn(); sent.push(m); ops.push(m.type); return m.type === 'PING' ? { ok: true, decks: [] } : { ok: true }; },
     onMessage: event(), onInstalled: event(),
   },
   storage: { session: {
@@ -41,7 +41,16 @@ const chrome = {
   tabs: {
     get: async (id) => { await turn(); return tabs.find((t) => t.id === id); },
     query: async (q) => { await turn(); return q.url ? tabs.filter((t) => t.url === q.url) : tabs; },
-    update: async (id) => { await turn(); return { id, windowId: 1 }; },
+    update: async (id, props = {}) => {
+      await turn();
+      if ('muted' in props) {
+        const t = tabs.find((x) => x.id === id);
+        if (!t) throw new Error(`No tab with id: ${id}.`);
+        t.mutedInfo = { muted: props.muted, reason: 'extension', extensionId: chrome.runtime.id };
+        ops.push(`muted:${props.muted}`);
+      }
+      return { id, windowId: 1 };
+    },
     create: async (o) => { await turn(); return { id: 99, windowId: 1, ...o }; },
     sendMessage: async () => { await turn(); return { ok: true }; },
     onRemoved: event(), onUpdated: event(),
@@ -52,7 +61,7 @@ const chrome = {
   contextMenus: { onClicked: event(), removeAll: (cb) => cb && cb(), create: () => {} },
   tabCapture: { getMediaStreamId: (o, cb) => setImmediate(() => cb('stream-id')) },
   offscreen: { createDocument: async () => {} },
-  scripting: { executeScript: async () => [] },
+  scripting: { executeScript: async (o) => { await turn(); scripts.push(o); return runScript ? runScript(o) : []; } },
 };
 globalThis.chrome = chrome;
 await import('../../background.js');
@@ -74,7 +83,7 @@ function finish(id, state, error) {
 }
 
 beforeEach(() => {
-  store = {}; sent = []; items = {}; nextId = 1; onDownload = null;
+  store = {}; sent = []; items = {}; nextId = 1; onDownload = null; scripts = []; runScript = null; ops = [];
   tabs = [
     { id: 11, windowId: 1, url: 'https://a.example/x', title: 'A' },
     { id: 12, windowId: 1, url: 'https://b.example/y', title: 'B' },
@@ -131,4 +140,99 @@ test('closing one tab while another is granted keeps the other grant', async () 
     const r = await hub({ type: 'LIST_SOURCES' });
     assert.deepEqual(r.tabs.map((t) => [t.id, t.granted]), [[12, true]], `offset ${k}`);
   }
+});
+
+// ---------------------------------------------------------------- eject: stop the tab playing
+/** executeScript results: one {t:'stopped', count} per frame relay (null: no relay in that frame). */
+const frames = (...counts) => counts.map((c, i) => ({ frameId: i, result: c == null ? null : { t: 'stopped', count: c } }));
+const pausing = (...counts) => (o) => (o.func ? frames(...counts) : []);
+const stopTab = (tabId) => hub({ type: 'STOP_TAB', tabId });
+const muteRecords = () => Object.keys(store).filter((k) => k.startsWith('muted:'));
+
+test('STOP_TAB pauses the players in every frame and leaves the tab unmuted', async () => {
+  runScript = pausing(0, 2, null);
+  assert.deepEqual(await stopTab(11), { ok: true, paused: 2, muted: false });
+  assert.equal(scripts.length, 1);
+  assert.equal(scripts[0].target.tabId, 11);
+  assert.equal(scripts[0].target.allFrames, true);
+  assert.equal(tabs[0].mutedInfo, undefined);
+  assert.deepEqual(muteRecords(), []);
+});
+
+test('STOP_TAB with nothing paused mutes the tab and records it; closing the tab forgets it', async () => {
+  runScript = pausing(0);
+  assert.deepEqual(await stopTab(11), { ok: true, paused: 0, muted: true });
+  assert.equal(tabs[0].mutedInfo.muted, true);
+  assert.deepEqual(muteRecords(), ['muted:11']);
+  chrome.tabs.onRemoved.fire(11);
+  await settle();
+  assert.deepEqual(muteRecords(), []);
+});
+
+test('STOP_TAB puts the agent into a tab that has none, then pauses', async () => {
+  let injected = false;
+  runScript = (o) => { if (o.files) { injected = true; return []; } return frames(injected ? 1 : null); };
+  assert.deepEqual(await stopTab(11), { ok: true, paused: 1, muted: false });
+  assert.deepEqual(scripts.filter((o) => o.files).map((o) => [o.files[0], o.world || 'ISOLATED', o.target.allFrames]),
+    [['agent/agent-main.js', 'MAIN', true], ['agent/agent-relay.js', 'ISOLATED', true]]);
+});
+
+test('STOP_TAB that cannot pause in time mutes the tab instead, and answers within the bound', async () => {
+  runScript = () => new Promise(() => {}); // a frame that never answers
+  const t0 = Date.now();
+  assert.deepEqual(await stopTab(11), { ok: true, paused: 0, muted: true });
+  assert.ok(Date.now() - t0 < 400, `answered after ${Date.now() - t0} ms`);
+  // A page that cannot be scripted at all is muted too.
+  runScript = () => { throw new Error('Cannot access contents of the page.'); };
+  assert.deepEqual(await stopTab(12), { ok: true, paused: 0, muted: true });
+});
+
+test('STOP_TAB skips a closed or navigated-away tab silently', async () => {
+  tabs[0].url = 'chrome://newtab/';
+  for (const id of [11, 77, 'x']) {
+    const r = await stopTab(id);
+    if (id === 'x') assert.equal(r.ok, false);
+    else assert.deepEqual(r, { ok: true, paused: 0, muted: false });
+  }
+  assert.equal(scripts.length, 0);
+  assert.equal(tabs[0].mutedInfo, undefined);
+  assert.deepEqual(muteRecords(), []);
+  assert.deepEqual(sent.filter((m) => m.type === 'NOTIFY'), []);
+});
+
+test('LOAD_TAB on a tab we muted unmutes it first', async () => {
+  runScript = pausing(0);
+  await stopTab(11);
+  ops = [];
+  const r = await hub({ type: 'LOAD_TAB', tabId: 11 });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(tabs[0].mutedInfo.muted, false);
+  assert.ok(ops.includes('muted:false') && ops.indexOf('muted:false') < ops.indexOf('START'), ops.join());
+  assert.deepEqual(muteRecords(), []);
+});
+
+test('a mute the user made is left alone', async () => {
+  runScript = pausing(0);
+  // Muted by the user before the eject: not recorded, not undone.
+  tabs[0].mutedInfo = { muted: true, reason: 'user' };
+  assert.deepEqual(await stopTab(11), { ok: true, paused: 0, muted: false });
+  assert.deepEqual(muteRecords(), []);
+  assert.equal((await hub({ type: 'LOAD_TAB', tabId: 11 })).ok, true);
+  assert.deepEqual(tabs[0].mutedInfo, { muted: true, reason: 'user' });
+  // Muted by us, then muted again by the user: the user's mute stays.
+  assert.deepEqual(await stopTab(12), { ok: true, paused: 0, muted: true });
+  tabs[1].mutedInfo = { muted: true, reason: 'user' };
+  assert.equal((await hub({ type: 'LOAD_TAB', tabId: 12 })).ok, true);
+  assert.deepEqual(tabs[1].mutedInfo, { muted: true, reason: 'user' });
+  assert.ok(!ops.includes('muted:false'), ops.join());
+  assert.deepEqual(muteRecords(), []);
+});
+
+test('a LOAD_TAB that races a STOP_TAB of the same tab waits for it, so the capture is not muted', async () => {
+  runScript = async (o) => { await new Promise((r) => setTimeout(r, 50)); return pausing(0)(o); }; // a slow page
+  const stop = stopTab(11);
+  const load = hub({ type: 'LOAD_TAB', tabId: 11 });
+  await Promise.all([stop, load]);
+  assert.equal(tabs[0].mutedInfo.muted, false);
+  assert.ok(ops.lastIndexOf('muted:false') < ops.indexOf('START'), ops.join());
 });
