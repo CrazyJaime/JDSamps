@@ -159,3 +159,38 @@ test('SourceMap and GridMap are piecewise along the input timeline', () => {
   gm.prune(11);
   assert.equal(gm.at(5).T, 0.488);
 });
+
+test('GridMap keeps an old track\'s grid behind a new track, and edits stay within a track', () => {
+  const sm = new SourceMap();
+  const rateAt = (x) => sm.rateAt(x);
+  const gm = new GridMap();
+  const A = { t0: 1, T: 0.5, bar1: 3 };
+  gm.update(A, { n: 0, from: 0, prev: null });
+  sm.set(40, 1.02);
+  gm.split(40, { t0: 39.5, T: 0.5 / 1.02, bar1: 3 });
+  sm.set(50, 1.04);
+  gm.split(50, { t0: 49.9, T: 0.5 / 1.04, bar1: 3 });
+  // The tracker accepts a 100 BPM track that started at 45 s (between the two assist steps).
+  const B = { t0: 60.3, T: 0.6 / 1.04, bar1: null };
+  gm.update(B, { n: 1, from: 45, prev: { t0: 39.5, T: 0.5 / 1.02, bar1: 3 } }, rateAt);
+  assert.equal(gm.at(30).T, 0.5, 'the old track before the steps');
+  assert.deepEqual(gm.at(44), { t0: 39.5, T: 0.5 / 1.02, bar1: 3 }, 'the old track up to where the new one starts');
+  assert.equal(gm.trackAt(44), 0);
+  assert.equal(gm.trackAt(46), 1);
+  // The new track's grid is carried back across the 50 s step at the source rate there.
+  assert.ok(Math.abs(gm.at(46).T - 0.6 / 1.02) < 1e-12, `T before the step ${gm.at(46).T}`);
+  assert.deepEqual(gm.at(55), B);
+  const ph = (g, x) => { const b = (x - g.t0) / g.T; return b - Math.floor(b); };
+  assert.ok(Math.abs(ph(gm.at(49.99999), 50) - ph(gm.at(50), 50)) < 1e-6, 'beat phase continuous across the step');
+  // Manual edits stay within one track.
+  gm.editTrack(gm.trackAt(44), (g) => ({ ...g, t0: g.t0 + 0.1 }));
+  assert.equal(gm.at(30).t0, 1.1);
+  assert.equal(gm.at(55).t0, 60.3);
+  // Retiming the new track from its first segment carries forward too.
+  gm.retime(46, { t0: 46.2, T: 0.6 }, rateAt);
+  assert.ok(Math.abs(gm.at(55).T - (0.6 * 1.02) / 1.04) < 1e-12);
+  assert.equal(gm.at(44).t0, 39.6, 'the old track is untouched');
+  gm.prune(47);
+  assert.equal(gm.trackAt(0), 1);
+  assert.equal(gm.at(0).t0, 46.2);
+});

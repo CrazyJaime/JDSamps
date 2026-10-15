@@ -6,7 +6,7 @@
 //                                                                                    └─► recorder (pre-fader, post-FX)
 // All transport/tempo/phase changes are scheduled on the audio clock through Timeshift.
 import { BPM_RANGES, validateAgentMessage } from '../shared/protocol.js';
-import { DeckTempo } from './tempo.js';
+import { DeckTempo, MANUAL_BPM, octaveFold } from './tempo.js';
 import { Timeshift, SourceMap, GridMap, GUARD, LIVE_RESERVE } from './timeshift.js';
 import { createIsolator, createTrim } from './eq.js';
 import { createFxRack } from './fx.js';
@@ -117,8 +117,7 @@ export class Deck {
       }
     } else if (m.t === 'odf' && this.tempo) {
       this.tempo.pushBatch(m);
-      const g = this.tempo.get().grid;
-      this.grids.update(g);
+      const g = this.followTempo().grid;
       if (g && this.cueAuto && !this.cueSnapped && !this.hasPlayed && this.firstAudible != null) {
         this.cueSnapped = true;
         const k = Math.ceil((this.firstAudible - 0.05 - g.t0) / g.T);
@@ -148,12 +147,24 @@ export class Deck {
   }
 
   // ------------------------------------------------------------------ tempo
-  tempoInfo() {
+  /** Bring the grid map up to date with the tracker (live grid, track changes). */
+  followTempo() {
+    const g = this.tempo.get();
+    this.grids.update(g.grid, g.track, (x) => this.src.rateAt(x));
+    return g;
+  }
+
+  /**
+   * BPM of the audio at input position p (default: the playhead), so it follows what the DJ
+   * hears: the grid there, at the source rate that audio was captured at. Lock state is the
+   * tracker's, at the live edge.
+   */
+  tempoInfo(p = this.ts ? this.ts.posAt(this.now()) : 0) {
     const g = this.tempo ? this.tempo.get() : null;
-    const inBpm = g && g.inBpm ? g.inBpm : null;
-    // The tracker rescales its tempo the moment an assist step is commanded, so divide by the
-    // latest commanded source rate (not the rate at some older input position) to stay consistent.
-    const native = inBpm ? inBpm / this.assist.sourceRate : null;
+    const grid = this.grids.at(p);
+    let native = null;
+    if (grid) native = 60 / grid.T / this.src.rateAt(p);
+    else if (g && g.inBpm) native = g.inBpm / this.assist.sourceRate;
     return { g, native, out: native ? native * (1 + this.params.pitch) : null };
   }
   canBeat() { const g = this.tempo && this.tempo.get(); return !!(g && g.canBeat); }
@@ -277,15 +288,12 @@ export class Deck {
       case 'tap': {
         if (!this.tempo) return fail('Waiting for audio.');
         const t = this.engine.ctxTimeAtWall(arg.wallMs ?? this.engine.wallNow());
-        this.tempo.tap(Math.round(this.ts.posAt(t) * this.sr));
-        this.grids.update(this.tempo.get().grid);
+        this.tapAt(this.ts.posAt(t));
         return OK;
       }
-      case 'mult': if (this.tempo) { this.tempo.multiply(arg.factor); this.grids.update(this.tempo.get().grid); } return OK;
-      case 'gridShift': if (this.tempo) { this.tempo.shiftGrid(arg); this.grids.update(this.tempo.get().grid); } return OK;
-      case 'tap1':
-        if (this.tempo) { this.tempo.setBar1(Math.round(this.ts.posAt(this.engine.heardTime()) * this.sr)); this.grids.update(this.tempo.get().grid); }
-        return OK;
+      case 'mult': if (this.tempo) this.multiplyAt(this.heardPos(), arg.factor); return OK;
+      case 'gridShift': if (this.tempo) this.shiftAt(this.heardPos(), arg); return OK;
+      case 'tap1': if (this.tempo) this.bar1At(this.heardPos()); return OK;
       case 'rollStart': return this.rollStart(arg.beats, now, T);
       case 'rollEnd': return this.rollEnd(now, T);
       case 'recStart':
@@ -343,6 +351,64 @@ export class Deck {
     this.roll = null; this.loop = null; this.rollFrom = null;
     this.settleUntil = T + 0.3;
     return OK;
+  }
+
+  // ------------------------------------------------------------------ manual grid tools
+  // A correction acts on what the DJ hears: every grid segment of the track at the heard position
+  // (assist steps split a track's grid), plus the tracker when it is still on that track. A track
+  // the tracker has already left (the tab moved on) is corrected in the grid map only.
+
+  heardPos() { return this.ts.posAt(this.engine.heardTime()); }
+
+  followsTrackAt(p) { const n = this.grids.trackAt(p); return n == null || n === this.tempo.track.n; }
+
+  shiftAt(p, { beats = 0, ms = 0 }) {
+    if (this.followsTrackAt(p)) this.tempo.shiftGrid({ beats, ms });
+    this.grids.editTrack(this.grids.trackAt(p), (g) => ({ ...g, t0: g.t0 + beats * g.T + ms / 1000 }));
+    this.followTempo();
+  }
+
+  multiplyAt(p, factor) {
+    const g = this.grids.at(p);
+    if (this.followsTrackAt(p)) { if (!this.tempo.multiply(factor)) return; }
+    else if (!g || (60 * factor) / g.T < MANUAL_BPM[0] || (60 * factor) / g.T > MANUAL_BPM[1]) return;
+    this.grids.editTrack(this.grids.trackAt(p), (x) => ({ ...x, T: x.T / factor }));
+    this.followTempo();
+  }
+
+  bar1At(p) {
+    const g = this.grids.at(p);
+    const b = g ? g.t0 + Math.round((p - g.t0) / g.T) * g.T : p;
+    if (this.followsTrackAt(p)) this.tempo.setBar1(Math.round(b * this.sr), false);
+    this.grids.editTrack(this.grids.trackAt(p), (x) => ({ ...x, bar1: b }));
+    this.followTempo();
+  }
+
+  /** TAP at heard input position p: the tapped grid holds there, and is carried across its track at each source rate. */
+  tapAt(p) {
+    const fit = this.tempo.tapFit(Math.round(p * this.sr));
+    if (!fit) return;
+    this.grids.retime(p, { t0: fit.t0 / this.sr, T: fit.T / this.sr }, (x) => this.src.rateAt(x));
+    if (this.followsTrackAt(p)) {
+      const segs = this.grids.segs, live = segs.length ? segs[segs.length - 1].grid : null;
+      this.tempo.applyTap(live
+        ? { t0: live.t0 * this.sr, T: live.T * this.sr }
+        : { t0: fit.t0, T: (fit.T * this.src.rateAt(p)) / this.assist.sourceRate });
+    }
+    this.followTempo();
+  }
+
+  /** New BPM range: the tracker refolds its tempo; older tracks still in the grid map refold by their own octave. */
+  setRange(lo, hi) {
+    if (!this.tempo) return;
+    const f = this.tempo.setRange(lo, hi), done = new Set();
+    for (const s of this.grids.segs) {
+      if (!s.grid || done.has(s.track)) continue;
+      done.add(s.track);
+      const k = s.track === this.tempo.track.n ? f : octaveFold(60 / s.grid.T, lo, hi);
+      if (k !== 1) this.grids.editTrack(s.track, (g) => ({ ...g, T: g.T / k }));
+    }
+    this.followTempo();
   }
 
   // ------------------------------------------------------------------ params
@@ -506,7 +572,7 @@ export class Deck {
 
   masterInfo(now) {
     if (!this.ts) return null;
-    const p = this.ts.posAt(now), g = this.grids.at(p), rate = this.ts.rateAt(now), out = this.tempoInfo().out;
+    const p = this.ts.posAt(now), g = this.grids.at(p), rate = this.ts.rateAt(now), out = this.tempoInfo(p).out;
     if (!out) return null;
     const playing = this.wantPlay && !this.previewing && this.ts.playingAt(now);
     if (g && rate > 0) return { playing, bpm: out, lastBeat: lastBeatOut(g, p, rate, now), period: g.T / rate };
@@ -542,7 +608,7 @@ export class Deck {
   state(now) {
     const ts = this.ts;
     const p = ts ? ts.posAt(now) : 0;
-    const info = this.tempoInfo();
+    const info = this.tempoInfo(p);
     const g = info.g, grid = this.grids.at(p);
     const playingNow = !!ts && ts.playingAt(now);
     return {

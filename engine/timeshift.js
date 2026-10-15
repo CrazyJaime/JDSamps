@@ -148,27 +148,69 @@ export class SourceMap {
   }
 }
 
-/** Beat grid as a step function of input position (assist steps change the input tempo). */
+/**
+ * Beat grid as a step function of input position. Assist steps split a track's grid (the input
+ * tempo changes); a new track (DeckTempo's track.n) starts a segment of its own, so the audio
+ * still to be played from the old track keeps the old grid. Each segment is tagged with its track.
+ */
 export class GridMap {
   constructor() { this.segs = []; }
-  update(grid) {
-    if (!grid) return;
-    if (!this.segs.length) this.segs.push({ from: -Infinity, grid: { ...grid } });
-    else this.segs[this.segs.length - 1].grid = { ...grid };
+  /**
+   * Follow the tracker's live grid. A new track.n starts a segment at track.from, with the old
+   * track's grid track.prev before it; assist steps already past track.from become part of the
+   * new track, carried from the live grid at their source rates (rateAt(input)).
+   */
+  update(grid, track, rateAt = () => 1) {
+    const last = this.segs[this.segs.length - 1];
+    const n = track ? track.n : last ? last.track : 0;
+    if (last && n !== last.track) {
+      const old = this.segs.filter((s) => s.from < track.from);
+      if (track.prev && old.length) old[old.length - 1].grid = { ...track.prev };
+      const steps = this.segs.filter((s) => s.from > track.from).map((s) => ({ from: s.from, grid: null, track: n }));
+      this.segs = [...old, { from: track.from, grid: null, track: n }, ...steps];
+      if (grid) this.retime(Infinity, grid, rateAt);
+    } else if (grid) {
+      if (!last) this.segs.push({ from: -Infinity, grid: { ...grid }, track: n });
+      else last.grid = { ...grid };
+    }
   }
   split(inPos, grid) {
     if (!grid) return;
+    const track = this.segs.length ? this.segs[this.segs.length - 1].track : 0;
     this.segs = this.segs.filter((s) => s.from < inPos);
-    this.segs.push({ from: this.segs.length ? inPos : -Infinity, grid: { ...grid } });
+    this.segs.push({ from: this.segs.length ? inPos : -Infinity, grid: { ...grid }, track });
   }
-  at(inPos) {
+  seg(inPos) {
     let g = null;
-    for (const s of this.segs) { if (s.from <= inPos) g = s.grid; else break; }
+    for (const s of this.segs) { if (s.from <= inPos) g = s; else break; }
     return g;
+  }
+  at(inPos) { const s = this.seg(inPos); return s ? s.grid : null; }
+  trackAt(inPos) { const s = this.seg(inPos); return s ? s.track : null; }
+  /** Apply fn(grid) to every segment of track n (a manual correction). */
+  editTrack(n, fn) {
+    for (const s of this.segs) if (s.track === n && s.grid) s.grid = fn(s.grid);
+  }
+  /**
+   * Give the segment at inPos the grid {t0, T[, bar1]} and carry it across the rest of its track:
+   * the beat phase stays continuous at each boundary and the period follows the source rate there.
+   * Segments keep their own bar 1 unless the grid brings one.
+   */
+  retime(inPos, grid, rateAt) {
+    const segs = this.segs, k = segs.indexOf(this.seg(inPos));
+    if (k < 0) return;
+    const set = (j, t0, T, bar1 = segs[j].grid ? segs[j].grid.bar1 : null) => { segs[j].grid = { t0, T, bar1 }; };
+    const carry = (j, i, b) => { // segment j from neighbour i, continuous at input b
+      const g = segs[i].grid, T = (g.T * rateAt(segs[i].from)) / rateAt(segs[j].from), ph = (b - g.t0) / g.T;
+      set(j, b - (ph - Math.floor(ph)) * T, T, grid.bar1 !== undefined ? grid.bar1 : undefined);
+    };
+    set(k, grid.t0, grid.T, grid.bar1 !== undefined ? grid.bar1 : undefined);
+    for (let j = k + 1; j < segs.length && segs[j].track === segs[k].track; j++) carry(j, j - 1, segs[j].from);
+    for (let j = k - 1; j >= 0 && segs[j].track === segs[k].track; j--) carry(j, j + 1, segs[j + 1].from);
   }
   prune(inPos) {
     let i = 0;
     while (i + 1 < this.segs.length && this.segs[i + 1].from <= inPos) i++;
-    if (i > 0) { this.segs = [{ from: -Infinity, grid: this.segs[i].grid }, ...this.segs.slice(i + 1)]; }
+    if (i > 0) { const s = this.segs[i]; this.segs = [{ from: -Infinity, grid: s.grid, track: s.track }, ...this.segs.slice(i + 1)]; }
   }
 }
