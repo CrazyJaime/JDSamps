@@ -7,9 +7,11 @@ const turn = () => new Promise((r) => setImmediate(r));
 // Settle by turns, not wall time: under CPU load a 30 ms timer can fire before the chains finish.
 const settle = async () => { for (let i = 0; i < 400; i++) await turn(); };
 const event = () => { const ls = []; return { ls, addListener: (f) => ls.push(f), fire: (...a) => ls.map((f) => f(...a)) }; };
+/** Like Chrome's tabs.onUpdated, which throws on a listener filter (and would stop the hub from loading). */
+const noFilterEvent = () => { const e = event(); return { ...e, addListener: (f, o) => { if (o !== undefined) throw new Error('This event does not support filters'); e.addListener(f); } }; };
 const EXT = 'chrome-extension://abcdefghijklmnopabcdefghijklmnop/';
 
-let store, sent, items, nextId, onDownload, tabs, scripts, runScript, ops;
+let store, sent, items, nextId, onDownload, tabs, scripts, runScript, ops, local, reads = 0, created;
 const chrome = {
   runtime: {
     id: 'abcdefghijklmnopabcdefghijklmnop', lastError: null, getURL: (p = '') => EXT + p,
@@ -20,11 +22,14 @@ const chrome = {
   storage: { session: {
     get: async (k) => {
       await turn();
+      reads++;
       const keys = k == null ? Object.keys(store) : [].concat(k);
       return structuredClone(Object.fromEntries(keys.filter((x) => x in store).map((x) => [x, store[x]])));
     },
     set: async (o) => { await turn(); Object.assign(store, structuredClone(o)); },
     remove: async (k) => { await turn(); for (const x of [].concat(k)) delete store[x]; },
+  }, local: {
+    get: async (k) => { await turn(); return structuredClone(Object.fromEntries([].concat(k).filter((x) => x in local).map((x) => [x, local[x]]))); },
   } },
   downloads: {
     download: async (o) => {
@@ -57,9 +62,9 @@ const chrome = {
       }
       return { id, windowId: 1 };
     },
-    create: async (o) => { await turn(); const t = { id: 99, windowId: 1, ...o }; tabs.push(t); return t; },
+    create: async (o) => { await turn(); created.push(o.url); return { id: 99, windowId: 1, ...o }; },
     sendMessage: async () => { await turn(); return { ok: true }; },
-    onRemoved: event(), onUpdated: event(),
+    onRemoved: event(), onUpdated: noFilterEvent(),
   },
   windows: { update: async () => { await turn(); } },
   action: { onClicked: event(), setBadgeBackgroundColor: async () => {}, setBadgeText: async () => {} },
@@ -89,11 +94,21 @@ function finish(id, state, error) {
 }
 
 beforeEach(() => {
-  store = {}; sent = []; items = {}; nextId = 1; onDownload = null; scripts = []; runScript = null; ops = [];
+  store = {}; sent = []; items = {}; nextId = 1; onDownload = null; scripts = []; runScript = null; ops = []; local = {}; created = [];
   tabs = [
     { id: 11, windowId: 1, url: 'https://a.example/x', title: 'A' },
     { id: 12, windowId: 1, url: 'https://b.example/y', title: 'B' },
   ];
+});
+
+const toEngineOf = (type) => sent.filter((m) => m.target === 'engine' && m.type === type);
+
+// Runs first, while this service worker has no deck list in memory (as after a restart).
+test('after a service-worker restart the deck list comes back from storage', async () => {
+  store.decks = [{ tabId: 11, slot: 1 }];
+  chrome.tabs.onUpdated.fire(11, { title: 'A2' }, { ...tabs[0], title: 'A2' });
+  await settle();
+  assert.deepEqual(toEngineOf('META').map((m) => [m.tabId, m.meta.title]), [[11, 'A2']]);
 });
 
 test('two downloads started together are both reported and forgotten', async () => {
@@ -296,16 +311,92 @@ test('a closed deck tab is forgotten, not given back', async () => {
 });
 
 test('the deck page is kept from being discarded when it opens or is focused, and ejects leave it so', async () => {
-  chrome.action.onClicked.fire({ id: 5, windowId: 1, url: 'chrome://newtab/' }); // nothing to capture: just opens the deck
+  const create = chrome.tabs.create;
+  chrome.tabs.create = async (o) => { const t = await create(o); tabs.push(t); return t; }; // the new tab exists from now on
+  try {
+    chrome.action.onClicked.fire({ id: 5, windowId: 1, url: 'chrome://newtab/' }); // nothing to capture: just opens the deck
+    await settle();
+    const deck = tabs.find((t) => t.url === `${EXT}deck.html`);
+    assert.ok(deck, 'deck page opened');
+    assert.equal(deck.autoDiscardable, false);
+    await decksAre();
+    await settle();
+    assert.equal(deck.autoDiscardable, false, 'not given back on an eject');
+    // Focused again later (toolbar icon on another tab): still kept, and not set twice.
+    chrome.action.onClicked.fire({ id: 6, windowId: 1, url: 'chrome://newtab/' });
+    await settle();
+    assert.deepEqual(discards(), [`discardable:${deck.id}:false`]);
+  } finally { chrome.tabs.create = create; }
+});
+
+// ---------------------------------------------------------------- tab updates (platform/M3)
+test('with no decks, tab updates read nothing from storage', async () => {
+  await hub({ type: 'DECKS_CHANGED', decks: [] });
   await settle();
-  const deck = tabs.find((t) => t.url === `${EXT}deck.html`);
-  assert.ok(deck, 'deck page opened');
-  assert.equal(deck.autoDiscardable, false);
-  await decksAre();
+  const before = reads;
+  for (let i = 0; i < 3; i++) chrome.tabs.onUpdated.fire(12, { title: `B${i}` }, { ...tabs[1], title: `B${i}` });
+  chrome.tabs.onUpdated.fire(12, { status: 'complete' }, tabs[1]);
   await settle();
-  assert.equal(deck.autoDiscardable, false, 'not given back on an eject');
-  // Focused again later (toolbar icon on another tab): still kept, and not set twice.
-  chrome.action.onClicked.fire({ id: 6, windowId: 1, url: 'chrome://newtab/' });
+  assert.equal(reads - before, 0, 'storage reads');
+  assert.deepEqual(sent, []);
+});
+
+test('a deck tab update is found from memory and refreshes the deck meta', async () => {
+  await hub({ type: 'DECKS_CHANGED', decks: [{ tabId: 12, slot: 1 }] });
   await settle();
-  assert.deepEqual(discards(), [`discardable:${deck.id}:false`]);
+  const before = reads;
+  chrome.tabs.onUpdated.fire(12, { title: 'B!' }, { ...tabs[1], title: 'B!' });
+  chrome.tabs.onUpdated.fire(12, { audible: true }, { ...tabs[1], title: 'B!', audible: true });
+  chrome.tabs.onUpdated.fire(11, { title: 'A!' }, { ...tabs[0], title: 'A!' });
+  await settle();
+  assert.equal(reads - before, 0, 'storage reads');
+  assert.deepEqual(toEngineOf('META').map((m) => [m.tabId, m.meta.title]), [[12, 'B!']]);
+  await hub({ type: 'DECKS_CHANGED', decks: [] });
+  await settle();
+});
+
+// ---------------------------------------------------------------- uncapturable tabs (conformance/M5)
+test('the icon on a Chrome page or the Web Store says why it cannot be captured, then opens the deck', async () => {
+  const pages = [
+    [{ id: 21, windowId: 1, url: 'chrome://settings/', title: 'Settings' }, /Chrome pages can.t be captured/],
+    [{ id: 22, windowId: 1, url: 'https://chromewebstore.google.com/detail/x/abc', title: 'Store' }, /Chrome Web Store can.t be captured/],
+    [{ id: 23, windowId: 1, url: 'file:///home/u/a.mp3', title: 'a.mp3' }, /can.t be captured/],
+  ];
+  for (const [tab, re] of pages) {
+    sent = []; created = []; tabs.push(tab);
+    chrome.action.onClicked.fire(tab);
+    await settle();
+    const notes = toEngineOf('NOTIFY');
+    assert.equal(notes.length, 1, tab.url);
+    assert.equal(notes[0].level, 'warn');
+    assert.match(notes[0].text, re);
+    assert.match(notes[0].text, /web page/);
+    assert.deepEqual(toEngineOf('START'), [], tab.url);
+    assert.deepEqual(created, [`${EXT}deck.html`], 'the deck opens');
+  }
+  const r = await hub({ type: 'LIST_SOURCES' });
+  assert.deepEqual(r.tabs.map((t) => t.id).sort(), [11, 12], 'uncapturable tabs are not offered as sources');
+  // On the deck page itself the icon only focuses it.
+  const self = { id: 99, windowId: 1, url: `${EXT}deck.html`, title: 'JD Samps' };
+  sent = []; tabs.push(self);
+  chrome.action.onClicked.fire(self);
+  await settle();
+  assert.deepEqual(sent.filter((m) => m.target === 'engine' && m.type !== 'PING'), []);
+});
+
+// ---------------------------------------------------------------- stored settings (ui/M3)
+test('a capture passes the saved settings to the engine with START', async () => {
+  local = { 'pitch.defaultRange': 0.16, 'bpm.range': '78-155', 'rec.format': 'webm', 'master.volume': 0.9, junk: 1 };
+  chrome.action.onClicked.fire(tabs[0]);
+  await settle();
+  const [start] = toEngineOf('START');
+  assert.ok(start, 'START sent');
+  assert.deepEqual(start.settings, { 'pitch.defaultRange': 0.16, 'bpm.range': '78-155', 'rec.format': 'webm' });
+});
+
+// ---------------------------------------------------------------- incognito (platform/M6)
+test('the extension never runs in incognito, so incognito tabs cannot reach Sources or the download history', async () => {
+  const { readFile } = await import('node:fs/promises');
+  const manifest = JSON.parse(await readFile(new URL('../../manifest.json', import.meta.url), 'utf8'));
+  assert.equal(manifest.incognito, 'not_allowed');
 });

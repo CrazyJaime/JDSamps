@@ -149,6 +149,42 @@ test('keyboard shortcuts drive the selected deck and the mixer', async () => {
   assert.ok(s.some((m) => m.deck === null && m.key === 'xfader.pos' && Math.abs(m.value - 0.45) < 1e-9));
 });
 
+// The engine lets go of a press tagged hold:true if the page goes away before its release.
+test('kill and FX pads tag a press as held until its release decides (off, or latched on)', async () => {
+  const at = async (sel, slot) => { const b = await deckEl(slot).locator(sel).boundingBox(); await page.mouse.move(b.x + 5, b.y + 5); };
+  const press = async (ms) => { await page.mouse.down(); await page.waitForTimeout(ms); await page.mouse.up(); await page.waitForTimeout(30); };
+  const got = async (slot, key) => (await sets((m) => m.deck === slot && m.key === key)).map((m) => [m.value, m.hold === true]);
+  await at('[data-kill="mid"]', 1);
+  await ui.clearSent();
+  await press(350); // held: momentary
+  assert.deepEqual(await got(1, 'kill.mid'), [[true, true], [false, false]]);
+  await ui.clearSent();
+  await press(40); // tapped: latched on, no longer held
+  assert.deepEqual(await got(1, 'kill.mid'), [[true, true], [true, false]]);
+  await ui.clearSent();
+  await press(40); // tapped again: off
+  assert.deepEqual(await got(1, 'kill.mid'), [[false, false]]);
+  await at('[data-pad="fx.on"]', 3);
+  await ui.clearSent();
+  await press(40);
+  assert.deepEqual(await got(3, 'fx.on'), [[true, true], [true, false]]);
+  await at('[data-kill="low"]', 3); // already latched on: a press holds nothing new
+  await ui.clearSent();
+  await press(350);
+  assert.deepEqual(await got(3, 'kill.low'), [[false, false]]);
+});
+
+test('kill and FX keys tag a press as held until its release decides', async () => {
+  await page.locator('body').click({ position: { x: 5, y: 300 } });
+  await page.keyboard.press('Digit1');
+  await ui.clearSent();
+  await page.keyboard.down('KeyZ'); await page.waitForTimeout(300); await page.keyboard.up('KeyZ');
+  await page.keyboard.down('KeyF'); await page.waitForTimeout(30); await page.keyboard.up('KeyF');
+  await page.waitForTimeout(30);
+  const got = (await sets((m) => m.deck === 1)).map((m) => [m.key, m.value, m.hold === true]);
+  assert.deepEqual(got, [['kill.low', true, true], ['kill.low', false, false], ['fx.on', true, true], ['fx.on', true, false]]);
+});
+
 test('channel faders and the crossfader ignore the wheel and double-click; the tempo fader still wheels', async () => {
   const at = async (loc) => { const b = await loc.boundingBox(); await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2); };
   await ui.clearSent();
@@ -357,6 +393,23 @@ test('empty state is shown with no decks', async () => {
     fs.mkdirSync(ART, { recursive: true });
     await u2.page.screenshot({ path: path.join(ART, 'deck-ui-empty.png') });
   } finally { await u2.close(); }
+});
+
+test('settings are restored again when the engine is re-created while the page stays open', async () => {
+  const st = (engineId) => ({ ...makeState({ decks: [], clock: { mode: 'none', deckId: null, bpm: null } }), engineId });
+  const u = await openUi({ state: st('e1'), storage: { 'pitch.defaultRange': 0.16 } });
+  try {
+    const restores = async () => (await u.sent()).filter((m) => m.t === 'set' && m.deck === null && m.key === 'pitch.defaultRange' && m.value === 0.16).length;
+    await u.page.waitForFunction(() => window.__fake.sent.some((m) => m.t === 'set' && m.key === 'pitch.defaultRange'));
+    assert.equal(await restores(), 1);
+    await u.push({ t: 'state', s: st('e1') });
+    await u.page.waitForTimeout(80);
+    assert.equal(await restores(), 1, 'same engine: restored once');
+    await u.push({ t: 'state', s: st('e2') }); // a new engine instance, back at its defaults
+    await u.page.waitForTimeout(80);
+    assert.equal(await restores(), 2, 'new engine: restored again');
+    assert.deepEqual(u.errors, []);
+  } finally { await u.close(); }
 });
 
 // Spec §3.9: DOM nodes are updated only when their values change.

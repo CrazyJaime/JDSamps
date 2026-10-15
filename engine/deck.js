@@ -374,6 +374,14 @@ export class Deck {
     return OK;
   }
 
+  /** The deck page went away mid-press: end what only lasts while held (roll, nudge, CUE preview). */
+  async releaseHolds() {
+    if (!this.ts || this.disposed) return;
+    if (this.rollFrom) await this.act('rollEnd');
+    if (this.nudge) await this.act('nudge', { dir: 0 });
+    if (this.previewing) await this.act('cueUp');
+  }
+
   // ------------------------------------------------------------------ manual grid tools
   // A correction acts on what the DJ hears: every grid segment of the track at the heard position
   // (assist steps split a track's grid), plus the tracker when it is still on that track. A track
@@ -659,8 +667,11 @@ export class Deck {
     const p = this.ts.posAt(now), g = this.grids.at(p), rate = this.ts.rateAt(now), out = this.tempoInfo(p).out;
     if (!out) return null;
     const playing = this.wantPlay && !this.previewing && this.ts.playingAt(now);
-    if (g && rate > 0) return { playing, bpm: out, lastBeat: lastBeatOut(g, p, rate, now), period: g.T / rate };
-    return { playing, bpm: out, lastBeat: now, period: 60 / out };
+    // A starved deck plays slower than its set tempo: publish the tempo of the beat it plays,
+    // so slaves match the same beat their phase lock follows.
+    if (g && rate > 0) return { playing, bpm: this.starved ? (60 * rate) / g.T : out, lastBeat: lastBeatOut(g, p, rate, now), period: g.T / rate };
+    const bpm = this.starved && rate > 0 ? (out * rate) / this.desiredRate(p) : out;
+    return { playing, bpm, lastBeat: now, period: 60 / bpm };
   }
 
   // ------------------------------------------------------------------ agent (player assist)
