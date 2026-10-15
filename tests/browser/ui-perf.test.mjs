@@ -106,6 +106,36 @@ test('wake lock: one lock survives repeated tab switches and is released with no
   } finally { await b.close(); }
 });
 
+test('the deck page tells the engine when it is hidden or shown, again after a reconnect, and applies the state it gets back', async () => {
+  const b = await openBoard({ state: threeDecks(), init: [fakeWakeLock] });
+  const { page } = b;
+  const vis = () => page.evaluate(() => window.__fake.sent.filter((m) => m.t === 'vis').map((m) => m.hidden));
+  try {
+    await page.waitForSelector('.deck >> nth=2');
+    assert.deepEqual(await vis(), [], 'a shown page has nothing to report');
+    await page.evaluate(() => window.__hide());
+    assert.deepEqual(await vis(), [true]);
+    await page.evaluate(() => window.__show());
+    assert.deepEqual(await vis(), [true, false]);
+    // A new port starts out shown: a page hidden across a reconnect says so again after its hello.
+    await page.evaluate(() => window.__hide());
+    await page.evaluate(() => window.__fake.disconnect());
+    await page.waitForFunction(() => window.__fake.sent.filter((m) => m.t === 'hello').length >= 2, null, { timeout: 4000 });
+    await page.waitForFunction(() => document.getElementById('engineStatus').dataset.status === 'up', null, { timeout: 2000 });
+    await page.waitForTimeout(50);
+    const sent = await page.evaluate(() => window.__fake.sent.map((m) => m.t === 'vis' ? `vis:${m.hidden}` : m.t).filter((t) => t === 'hello' || t.startsWith('vis')));
+    assert.deepEqual(sent.slice(-2), ['hello', 'vis:true'], JSON.stringify(sent));
+    // Shown again, the engine sends a full state: the page applies it.
+    await page.evaluate(() => window.__show());
+    const s = threeDecks();
+    s.decks[0].title = 'Back from another tab';
+    await b.push({ t: 'state', s });
+    await page.waitForFunction(() => document.querySelector('.deck [data-title]').textContent.trim() === 'Back from another tab', null, { timeout: 1000 });
+    assert.deepEqual((await vis()).slice(-1), [false]);
+    assert.deepEqual(b.errors, []);
+  } finally { await b.close(); }
+});
+
 // ---------------------------------------------------------------- waveform
 
 /** Records fillText calls made on the waveform canvases: [{row, text, x, y}]. */
@@ -234,6 +264,63 @@ test('waveform tile cache draws what a fresh render draws', async () => {
       return { appended, resent, rescaled };
     }, { wave: makeWave(1, 20, 124) });
     assert.deepEqual(r, { appended: 0, resent: 0, rescaled: 0 });
+  } finally { await browser.close(); await server.close(); }
+});
+
+test('waveform store stays bounded by historyStart, and a backlog after a live chunk is drawn (tile cache matches a fresh render)', async () => {
+  const server = await startStaticServer(ROOT);
+  const browser = await launchPlain();
+  try {
+    const page = await browser.newPage();
+    await page.goto(`${server.origin}/deck.css`);
+    const r = await page.evaluate(async ({ wave }) => {
+      const { WaveStore, drawWave } = await import('/ui/waveform.js');
+      const W = 1200, H = 80, hop = wave.hop, T = 60 / 124, per = 37;
+      const view = (store, o) => ({
+        w: W, h: H, store, grid: { t0: 0.1, T, bar1: 0.1 }, cue: 2, loop: null,
+        color: '#22d3ee', pxPerBeat: 56, pxPerSec: 110, playing: true, dpr: 1, ...o,
+      });
+      const pixels = (g) => g.getImageData(0, 0, W, H).data;
+      const diff = (a, b) => { let n = 0; for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) n++; return n; };
+      const fresh = (data, o) => {
+        const s = new WaveStore(); s.add({ tStart: 0, hop, data });
+        const g = new OffscreenCanvas(W, H).getContext('2d');
+        drawWave(g, view(s, o));
+        return pixels(g);
+      };
+      // A deck playing for 2 minutes with an 18 s buffer: the playhead 3 s after historyStart.
+      const store = new WaveStore(), g = new OffscreenCanvas(W, H).getContext('2d');
+      const diffs = [];
+      let maxBytes = 0;
+      for (let i = 0; i * per * 3 < wave.data.length; i++) {
+        store.add({ tStart: i * per * hop, hop, data: wave.data.slice(i * per * 3, (i + 1) * per * 3) });
+        const end = (i + 1) * per * hop, hs = Math.max(0, end - 18);
+        const o = { playhead: Math.max(5, hs + 3), liveEdge: end, historyStart: hs };
+        drawWave(g, view(store, o));
+        maxBytes = Math.max(maxBytes, store.data.length);
+        if (i % 60 === 59) diffs.push(diff(pixels(g), fresh(wave.data.slice(0, (i + 1) * per * 3), o)));
+      }
+      // A reloaded page: one live chunk arrives before the hello backlog.
+      const s2 = new WaveStore(), g2 = new OffscreenCanvas(W, H).getContext('2d');
+      const o2 = { playhead: 6, liveEdge: 8.5, historyStart: 0 }, k = Math.floor(8 / hop);
+      s2.add({ tStart: k * hop, hop, data: wave.data.slice(k * 3, (k + per) * 3) });
+      drawWave(g2, view(s2, o2));
+      s2.add({ tStart: 0, hop, data: wave.data.slice(0, (k + per) * 3) });
+      drawWave(g2, view(s2, o2));
+      // The cached tiles show what a new canvas shows for the same store (its origin is the live chunk's).
+      const g3 = new OffscreenCanvas(W, H).getContext('2d');
+      drawWave(g3, view(s2, o2));
+      const rebased = diff(pixels(g2), pixels(g3));
+      // Waveform (deck colour) is drawn over the backlog's span, 1-6 s, left of the live chunk at 8 s.
+      const px = pixels(g2);
+      let wavePx = 0;
+      for (let y = 0; y < H; y++) for (let x = 40; x < 560; x++) { const j = (y * W + x) * 4; if (px[j + 1] - px[j] > 40) wavePx++; }
+      return { diffs, maxBytes, rebased, wavePx };
+    }, { wave: makeWave(1, 120, 124) });
+    assert.ok(r.diffs.length >= 4 && r.diffs.every((n) => n === 0), `cache vs fresh pixel diffs ${JSON.stringify(r.diffs)}`);
+    assert.ok(r.maxBytes <= 16384, `store grew to ${r.maxBytes} bytes for an 18 s buffer`);
+    assert.ok(r.wavePx > 2000, `backlog before the live chunk: ${r.wavePx} waveform pixels drawn`);
+    assert.equal(r.rebased, 0, 'tile cache after the re-base matches a fresh canvas');
   } finally { await browser.close(); await server.close(); }
 });
 

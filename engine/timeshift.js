@@ -6,6 +6,7 @@
 
 export const GUARD = 0.5;        // s of reserve below which the deck may not play faster than 1×
 export const LIVE_RESERVE = 0.6; // s of reserve kept by the LIVE jump
+const KEEP = 2;                  // s of past schedule kept for heard-time and TAP lookups
 
 const FIELDS = ['active', 'rate', 'semitones', 'input', 'loopStart', 'loopEnd'];
 const TRANSPORT = ['active', 'input', 'loopStart', 'loopEnd']; // start/pause, jump, loop: intent a rate update must not undo
@@ -34,10 +35,12 @@ export class Timeshift {
 
   soon(now) { return now + this.lat + 0.03; }
 
+  /** Segment in effect at output time t (the first one before any). Scans from the end: 'now' and later are O(1). */
   segAt(t) {
-    let s = this.segs[0];
-    for (const x of this.segs) { if (x.output <= t) s = x; else break; }
-    return s;
+    const segs = this.segs;
+    let i = segs.length - 1;
+    while (i > 0 && segs[i].output > t) i--;
+    return segs[i];
   }
 
   posAt(t) {
@@ -57,7 +60,7 @@ export class Timeshift {
   }
 
   /** Output time of the last planned change (pending or queued), or -Infinity. */
-  pendingUntil() { return this.segs.length > 1 ? this.segs[this.segs.length - 1].output : -Infinity; }
+  pendingUntil() { return this.segs[this.segs.length - 1].output; }
 
   build(T, fields) {
     const base = this.segAt(T);
@@ -77,8 +80,7 @@ export class Timeshift {
    */
   change(now, T, fields) {
     const planned = this.segs.find((s) => s.output > now && s.transport && (fields.active === undefined || fields.active === s.active));
-    this.segs = this.segs.filter((s) => s.output <= now);
-    if (!this.segs.length) this.segs = [{ output: -Infinity, input: 0, rate: 1, active: false, semitones: 0, loopStart: 0, loopEnd: 0 }];
+    this.cut(now);
     this.queue = [];
     if (planned) {
       T = fields.input === undefined ? planned.output : Math.max(T, planned.output);
@@ -90,6 +92,19 @@ export class Timeshift {
     this.segs.push(seg);
     this.send(seg);
     return seg;
+  }
+
+  /**
+   * Drop everything planned after `now`, and the past no lookup needs: segments that ended more
+   * than KEEP s ago (the last one starting at or before now − KEEP stays, so heard-time and TAP
+   * lookups up to KEEP s back are exact).
+   */
+  cut(now) {
+    const segs = this.segs;
+    let end = segs.length, start = 0;
+    while (end > 0 && segs[end - 1].output > now) end--;
+    while (start + 1 < end && segs[start + 1].output <= now - KEEP) start++;
+    this.segs = end ? segs.slice(start, end) : [{ output: -Infinity, input: 0, rate: 1, active: false, semitones: 0, loopStart: 0, loopEnd: 0 }];
   }
 
   /** Plan a change after the currently planned one (it is sent once that one has passed). */

@@ -15,6 +15,8 @@ const STRETCH_URL = new URL('../vendor/signalsmith-stretch/SignalsmithStretch.js
 SignalsmithStretch.moduleUrl = STRETCH_URL;
 const workletUrl = (f) => new URL(`../worklets/${f}`, import.meta.url).href;
 const withTimeout = (p, ms, msg) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
+const HIDDEN_STATE_SEC = 0.5; // state period for a UI page that is hidden (no waveform at all)
+const TICK_FRAMES = 1536;     // the master worklet's meter (tick) period
 // An eject waits at most this long for its tab to stop playing. The hub bounds its own work (pause
 // for 250 ms, else mute), so this only guards against a hub that never answers; on a busy machine
 // a tighter limit would release the capture while the tab is still playing.
@@ -42,6 +44,11 @@ class Engine {
     this.nextId = 1;
     this.clock = new MasterClock();
     this.ui = new Set();
+    // UI port -> {hidden, nextState, waves: Map(deck id -> input time its waveform was sent up to)}.
+    // Set by the port's hello: only then does it join the state and waveform stream.
+    this.uiStream = new WeakMap();
+    this.idleMs = 30000; // no decks, no UI and no mix recording for this long: the AudioContext is suspended
+    this.idleSince = null;
     this.holds = new Set(); // 'deckId|key': kills/FX held down in the UI (set with hold:true)
     this.notes = []; // hub notices waiting for a deck page
     this.serialQ = Promise.resolve();
@@ -131,11 +138,15 @@ class Engine {
     const reply = (ok, error) => { if (m && m.id) this.post(port, { t: 'reply', id: m.id, ok, error }); };
     if (!v.ok) { reply(false, v.error); return; }
     if (m.t === 'hello') {
-      this.post(port, { t: 'state', s: this.snapshot(this.ctx.currentTime) });
-      for (const d of this.decks.values()) { const w = d.waveBacklog(); if (w) this.post(port, w); }
+      if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+      const u = { hidden: false, nextState: 0, waves: new Map() };
+      this.uiStream.set(port, u);
+      this.post(port, this.stateMsg(this.ctx.currentTime));
+      this.sendWaves(port, u);
       this.flushNotes(port);
       return;
     }
+    if (m.t === 'vis') { this.setHidden(port, m.hidden); return; }
     if (m.t === 'set') {
       if (m.deck === null) this.setMasterParam(m.key, v.value);
       else { const d = this.decks.get(m.deck); if (d) { d.setParam(m.key, v.value); this.noteHold(m, v.value); } else { reply(false, 'That deck is gone.'); return; } }
@@ -245,6 +256,7 @@ class Engine {
     const existing = this.deckByTab(tabId);
     if (existing) return { ok: false, error: `That tab is already on deck ${existing.slot}.` };
     if (this.decks.size >= MAX_DECKS) return { ok: false, error: `All ${MAX_DECKS} decks are in use. Eject one first.` };
+    this.idleSince = null;
     if (this.ctx.state !== 'running') await this.ctx.resume().catch(() => {});
     let stream;
     try {
@@ -328,7 +340,78 @@ class Engine {
     this.updateClock(now);
     for (const d of this.decks.values()) d.syncTick(now);
     if (now >= this.nextPhase) { this.nextPhase = now + 0.5; for (const d of this.decks.values()) d.phaseTick(now); }
-    if (this.ui.size) this.broadcast({ t: 'state', s: this.snapshot(now) });
+    // After a main-thread stall the meter ticks queue up and run back to back: a tick whose
+    // successor is already waiting sends no state, so only the newest of them builds one.
+    if (!(now * this.ctx.sampleRate - m.frame > TICK_FRAMES)) this.broadcastState(now);
+    this.idleTick();
+  }
+
+  // ------------------------------------------------------------------ UI stream
+  // A shown page gets a state every tick and each waveform batch as it arrives; a hidden one
+  // ({t:'vis', hidden:true}) a state every HIDDEN_STATE_SEC and no waveform until it is shown again.
+
+  /** A state message, with the decks' meters measured for it (nothing to measure when no page is shown one). */
+  stateMsg(now) {
+    for (const d of this.decks.values()) d.meterTick(now);
+    return { t: 'state', s: this.snapshot(now) };
+  }
+
+  broadcastState(now) {
+    let msg = null;
+    for (const p of this.ui) {
+      const u = this.uiStream.get(p);
+      if (!u || (u.hidden && now < u.nextState)) continue;
+      if (u.hidden) u.nextState = now + HIDDEN_STATE_SEC;
+      if (!msg) msg = this.stateMsg(now);
+      this.post(p, msg);
+      if (u.hidden) continue;
+      // A deck new to this page: its whole waveform follows the first state that lists it.
+      for (const d of this.decks.values()) {
+        if (u.waves.has(d.id)) continue;
+        const w = d.waveBacklog();
+        if (w) this.post(p, w);
+        u.waves.set(d.id, d.waveEnd());
+      }
+      if (u.waves.size > this.decks.size) for (const id of u.waves.keys()) if (!this.decks.has(id)) u.waves.delete(id);
+    }
+  }
+
+  /** A deck's new waveform hops, to each shown page that has its earlier ones. */
+  broadcastWave(d, tStart, hop, bands) {
+    let msg = null;
+    for (const p of this.ui) {
+      const u = this.uiStream.get(p);
+      if (!u || u.hidden || !u.waves.has(d.id)) continue;
+      if (!msg) msg = { t: 'wave', deck: d.id, tStart, hop, data: Array.from(bands) };
+      this.post(p, msg);
+      u.waves.set(d.id, d.waveEnd());
+    }
+  }
+
+  /** Each deck's waveform a page does not have yet: all that is buffered, or what came after its last batch. */
+  sendWaves(port, u) {
+    for (const d of this.decks.values()) {
+      const w = d.waveSince(u.waves.has(d.id) ? u.waves.get(d.id) : -Infinity);
+      if (w) this.post(port, w);
+      u.waves.set(d.id, d.waveEnd());
+    }
+  }
+
+  setHidden(port, hidden) {
+    const u = this.uiStream.get(port);
+    if (!u || u.hidden === hidden) return;
+    u.hidden = hidden;
+    if (hidden) { u.nextState = this.ctx.currentTime + HIDDEN_STATE_SEC; return; }
+    this.post(port, this.stateMsg(this.ctx.currentTime));
+    this.sendWaves(port, u);
+  }
+
+  /** With no decks, no UI and no mix recording for idleMs, suspend the AudioContext (START and hello resume it). */
+  idleTick() {
+    if (this.decks.size || this.ui.size || this.mixRec.state !== 'idle') { this.idleSince = null; return; }
+    const t = performance.now();
+    if (this.idleSince == null) this.idleSince = t;
+    else if (t - this.idleSince >= this.idleMs) { this.idleSince = null; this.ctx.suspend().catch(() => {}); }
   }
 
   snapshot(now) {
