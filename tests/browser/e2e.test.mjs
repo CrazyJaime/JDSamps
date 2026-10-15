@@ -147,7 +147,7 @@ test('player assist refills the reserve on a media-element page', async () => {
   }, 15000, 300);
 });
 
-test('a Web-Audio-only page has no assist and the reserve stays protected', async () => {
+test('a Web-Audio page with a muted decorative <audio> has no assist and the reserve stays protected', async () => {
   tabs.c = await h.context.newPage();
   await tabs.c.goto(server.url('c'));
   await sleep(500);
@@ -170,6 +170,11 @@ test('a Web-Audio-only page has no assist and the reserve stays protected', asyn
     assert.ok(d.reserve >= 0 && d.engineRate <= 1.0001, JSON.stringify({ reserve: d.reserve, rate: d.engineRate }));
     await sleep(200);
   }
+  // The muted element was left alone and the tempo/pitch model is untouched.
+  const d = deckBy(await state(deck), 3);
+  assert.equal(d.assist.sourceRate, 1);
+  assert.ok(Math.abs(d.bpm.native - 120) < 0.4, `native ${d.bpm.native}`);
+  assert.deepEqual(await tabs.c.evaluate(() => { const a = document.getElementById('decor'); return [a.paused, a.playbackRate, a.preservesPitch]; }), [false, 1, true]);
 });
 
 test('recordings stopped together are all saved, reported and released', async () => {

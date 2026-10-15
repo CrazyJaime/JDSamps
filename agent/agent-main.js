@@ -2,55 +2,93 @@
 // Registers media elements the page plays (including detached `new Audio()` objects) and, only
 // when a deck asks, sets their playbackRate (with preservesPitch=false) so the engine can refill a
 // deck's buffer. Silent until its first command. Talks to agent-relay.js through window
-// CustomEvents carrying JSON strings (objects do not cross JS worlds reliably).
+// CustomEvents carrying JSON strings (objects do not cross JS worlds reliably), on a channel name
+// the relay picks at random and hands over at document_start, before any page script runs.
+// Leaves no global behind and keeps its wrappers looking native, so pages cannot fingerprint it.
 (() => {
-  const KEY = Symbol.for('jdsamps.agent');
-  if (window[KEY]) return;
-  Object.defineProperty(window, KEY, { value: true });
+  const HELLO = 'media-channel';
 
-  const seen = new WeakSet();
+  // Per element: the page's own settings before a deck touched it, recent rate changes the page
+  // made itself, and whether the agent gave the element back to a page that insists on its rate.
+  const info = new WeakMap();
   let refs = [];
-  const st = { active: false, enforcing: false, target: 1, selfSet: 0, queued: false };
+  const st = { active: false, enforcing: false, target: 1, seq: 0, dog: 0 };
+  const out = { last: '', at: -1e9, timer: 0, queued: false };
 
   const live = () => { refs = refs.filter((r) => { const el = r.deref(); return !!el && (el.isConnected || !!el.currentSrc); }); return refs.map((r) => r.deref()); };
-  const emit = (m) => window.dispatchEvent(new CustomEvent('jds-agent-status', { detail: JSON.stringify(m) }));
+  let chan = null;
+  const emit = (s) => { if (chan) window.dispatchEvent(new CustomEvent(`s${chan}`, { detail: s })); };
 
+  function status() {
+    const els = live();
+    let playing = false, audible = 0, main = null;
+    for (const el of els) {
+      if (el.paused) continue;
+      playing = true;
+      if (!el.muted && el.volume > 0) { if (!audible++) main = el; } else if (!audible) main = el;
+    }
+    return {
+      t: 'status', hasMedia: els.length > 0, playing, rate: main ? main.playbackRate : 1, preservesPitch: main ? main.preservesPitch !== false : true,
+      muted: main ? main.muted : false, volume: main ? main.volume : 1, audible, count: els.length, seq: st.seq,
+    };
+  }
+
+  // At most four statuses a second, and only when something changed.
+  function flush() {
+    out.timer = 0; out.queued = false;
+    const s = JSON.stringify(status());
+    if (s === out.last) return;
+    out.last = s; out.at = performance.now();
+    emit(s);
+  }
   function report() {
-    if (!st.active || st.queued) return;
-    st.queued = true;
-    queueMicrotask(() => {
-      st.queued = false;
-      const els = live();
-      let playing = false, rate = 1, pp = true;
-      for (const el of els) if (!el.paused) { playing = true; rate = el.playbackRate; pp = el.preservesPitch !== false; }
-      emit({ t: 'status', hasMedia: els.length > 0, playing, rate, preservesPitch: pp, count: els.length });
-    });
+    if (!st.active || out.timer || out.queued) return;
+    const wait = out.at + 250 - performance.now();
+    if (wait > 0) out.timer = setTimeout(flush, wait);
+    else { out.queued = true; queueMicrotask(flush); }
   }
 
   function apply(el) {
+    const x = info.get(el);
+    if (!x || x.off) return;
     try {
+      if (!x.base) x.base = { rate: el.playbackRate, dflt: el.defaultPlaybackRate, pp: el.preservesPitch };
       if (el.preservesPitch !== false) el.preservesPitch = false;
       el.defaultPlaybackRate = st.target;
-      if (Math.abs(el.playbackRate - st.target) > 1e-6) { st.selfSet++; el.playbackRate = st.target; }
+      if (Math.abs(el.playbackRate - st.target) > 1e-6) el.playbackRate = st.target;
     } catch (_) { /* element in a bad state: ignore */ }
   }
 
+  /** Put back the page's own settings: its rate from before the deck, unless it has set a new one. */
+  function restore(el, x, rate = x.base.rate) {
+    try { el.defaultPlaybackRate = x.base.dflt; el.preservesPitch = x.base.pp; el.playbackRate = rate; } catch (_) {}
+  }
+
   function onRate(e) {
-    const el = e.currentTarget;
-    if (st.selfSet > 0) { st.selfSet--; report(); return; }
-    if (st.enforcing && Math.abs(el.playbackRate - st.target) > 1e-6) {
-      if (st.active) emit({ t: 'external-rate', rate: el.playbackRate });
-      apply(el);
+    const el = e.currentTarget, x = info.get(el);
+    if (st.enforcing && x && !x.off && Math.abs(el.playbackRate - st.target) > 1e-6) {
+      // The page changed the rate itself. Re-apply (players reset it on load), but give the element
+      // back to a page that keeps resetting it instead of fighting it forever.
+      const t = performance.now();
+      x.ext = x.ext.filter((v) => t - v < 2000);
+      x.ext.push(t);
+      if (x.ext.length < 3) apply(el);
+      else {
+        x.off = true;
+        const rate = el.playbackRate;
+        restore(el, x, rate);
+        emit(JSON.stringify({ t: 'external-rate', rate }));
+      }
     }
     report();
   }
 
   function register(el) {
-    if (!(el instanceof HTMLMediaElement) || seen.has(el)) return;
-    seen.add(el);
+    if (!(el instanceof HTMLMediaElement) || info.has(el)) return;
+    info.set(el, { base: null, ext: [], off: false });
     refs.push(new WeakRef(el));
     el.addEventListener('ratechange', onRate);
-    for (const ev of ['play', 'playing', 'pause', 'emptied', 'loadedmetadata']) {
+    for (const ev of ['play', 'playing', 'pause', 'emptied', 'loadedmetadata', 'volumechange']) {
       el.addEventListener(ev, () => { if (st.enforcing && (ev === 'playing' || ev === 'loadedmetadata')) apply(el); report(); });
     }
     if (st.enforcing) apply(el);
@@ -59,43 +97,92 @@
 
   const scan = () => { try { for (const el of document.querySelectorAll('audio, video')) register(el); } catch (_) {} };
 
+  function release() {
+    clearTimeout(st.dog);
+    st.enforcing = false; st.target = 1;
+    for (const el of live()) {
+      const x = info.get(el);
+      if (!x) continue;
+      if (x.base && !x.off) restore(el, x);
+      x.base = null; x.ext = []; x.off = false;
+    }
+    report();
+  }
+
+  // Wrappers answer toString() like the built-ins they replace.
+  const native = new WeakMap(), fnToString = Function.prototype.toString;
+  const asNative = { toString() { return native.has(this) ? native.get(this) : fnToString.call(this); } }.toString;
+  const disguise = (fn) => {
+    native.set(fn, `function ${fn.name}() { [native code] }`);
+    Object.defineProperty(fn, 'toString', { value: asNative, writable: true, configurable: true });
+    return fn;
+  };
+  disguise(asNative);
+
   const proto = HTMLMediaElement.prototype;
-  const origPlay = proto.play;
-  proto.play = function play(...args) { try { register(this); } catch (_) {} return origPlay.apply(this, args); };
-  // Players poll currentTime/paused for their progress bars: that finds elements that were
-  // already playing before a late injection.
-  for (const prop of ['currentTime', 'paused']) {
-    const d = Object.getOwnPropertyDescriptor(proto, prop);
-    if (d && d.get && d.configurable) {
-      Object.defineProperty(proto, prop, {
-        ...d,
-        get() { if (!seen.has(this)) { try { register(this); } catch (_) {} } return d.get.call(this); },
-      });
+  for (const name of ['play', 'pause', 'load']) {
+    const orig = proto[name];
+    proto[name] = disguise({ [name](...args) { try { register(this); } catch (_) {} return orig.apply(this, args); } }[name]);
+  }
+  // Players poll currentTime/paused for their progress bars: that finds elements that were already
+  // playing before a late injection (tabs open before install, which get the agent when they are
+  // loaded on a deck, i.e. just before the first command). Patched only from the first command on.
+  let polled = false;
+  function watchPolling() {
+    if (polled) return;
+    polled = true;
+    for (const prop of ['currentTime', 'paused']) {
+      const d = Object.getOwnPropertyDescriptor(proto, prop);
+      if (!d || !d.get || !d.configurable) continue;
+      const get = Object.getOwnPropertyDescriptor({ get [prop]() { if (!info.has(this)) { try { register(this); } catch (_) {} } return d.get.call(this); } }, prop).get;
+      Object.defineProperty(proto, prop, { ...d, get: disguise(get) });
     }
   }
 
-  window.addEventListener('jds-agent-cmd', (e) => {
+  // Channel handshake: take the first offer (the relay's), then stop listening. Ask once in case
+  // the relay ran first.
+  function onOffer(e) {
+    if (chan || e.defaultPrevented || typeof e.detail !== 'string' || !/^[0-9a-f]{32}$/.test(e.detail)) return;
+    e.preventDefault();
+    chan = e.detail;
+    window.removeEventListener(HELLO, onOffer);
+    window.addEventListener(`c${chan}`, onCommand);
+  }
+  window.addEventListener(HELLO, onOffer);
+  window.dispatchEvent(new CustomEvent(HELLO));
+
+  function onCommand(e) {
     if (typeof e.detail !== 'string' || e.detail.length > 200) return;
     let m;
     try { m = JSON.parse(e.detail); } catch (_) { return; }
     if (!m || typeof m !== 'object') return;
+    const seq = Number.isSafeInteger(m.seq) && m.seq >= 0 ? m.seq : null;
+    if (m.t === 'query' || m.t === 'rate' || m.t === 'release') watchPolling();
     if (m.t === 'query') {
-      st.active = true; scan(); report();
+      // Always answered, and at once.
+      st.active = true; scan();
+      clearTimeout(out.timer);
+      Object.assign(out, { last: '', at: -1e9, timer: 0 });
+      report();
     } else if (m.t === 'rate') {
       if (typeof m.rate !== 'number' || !Number.isFinite(m.rate) || m.rate < 0.5 || m.rate > 2) return;
-      st.active = true; st.target = m.rate; st.enforcing = true; scan();
-      for (const el of live()) apply(el);
-      report();
-    } else if (m.t === 'release') {
-      st.enforcing = false; st.target = 1;
+      // A new command takes back elements the agent gave up on; a keep-alive (same rate and seq) does not.
+      const fresh = m.rate !== st.target || (seq != null && seq !== st.seq);
+      st.active = true; st.target = m.rate; st.enforcing = true;
+      if (seq != null) st.seq = seq;
+      // The engine re-sends the rate at least every second while it needs it: without that, let go.
+      clearTimeout(st.dog);
+      st.dog = setTimeout(release, 3000);
+      scan();
       for (const el of live()) {
-        try {
-          el.defaultPlaybackRate = 1;
-          if (el.playbackRate !== 1) { st.selfSet++; el.playbackRate = 1; }
-          el.preservesPitch = true;
-        } catch (_) {}
+        const x = info.get(el);
+        if (fresh && x) { x.off = false; x.ext = []; }
+        apply(el);
       }
       report();
+    } else if (m.t === 'release') {
+      if (seq != null) st.seq = seq;
+      release();
     }
-  });
+  }
 })();

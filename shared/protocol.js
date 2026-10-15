@@ -158,7 +158,12 @@ export function validateAgentMessage(m) {
     if (typeof m.hasMedia !== 'boolean' || typeof m.playing !== 'boolean') return null;
     if (typeof rate !== 'number' || !Number.isFinite(rate) || rate < 0 || rate > 16) return null;
     const count = Number.isInteger(m.count) && m.count >= 0 && m.count < 1000 ? m.count : 0;
-    return { t: 'status', hasMedia: m.hasMedia, playing: m.playing, rate, preservesPitch: m.preservesPitch === true, count };
+    // audible = playing, unmuted elements with volume > 0; muted/volume describe the reported one;
+    // seq echoes the last command the agent applied.
+    const audible = Number.isInteger(m.audible) && m.audible >= 0 && m.audible < 1000 ? m.audible : 0;
+    const volume = typeof m.volume === 'number' && m.volume >= 0 && m.volume <= 1 ? m.volume : 1;
+    const seq = Number.isSafeInteger(m.seq) && m.seq >= 0 ? m.seq : -1;
+    return { t: 'status', hasMedia: m.hasMedia, playing: m.playing, rate, preservesPitch: m.preservesPitch === true, count, muted: m.muted === true, volume, audible, seq };
   }
   if (m.t === 'external-rate') {
     if (typeof m.rate !== 'number' || !Number.isFinite(m.rate) || m.rate <= 0 || m.rate > 16) return null;

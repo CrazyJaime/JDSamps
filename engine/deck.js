@@ -19,6 +19,10 @@ const fail = (error) => ({ ok: false, error });
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const withTimeout = (p, ms, msg) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
 const CAP_MARGIN = 4; // s of audio always kept behind a playing deck's playhead (covers small backward jumps)
+// Player assist: rate match tolerance (steps are 0.25 %), how long the page has to confirm a rate,
+// how long assist stays off after the page refused it, and the keep-alive period (the agent lets
+// go of the page after 3 s without a command).
+const ASSIST_EPS = 1e-4, ASSIST_CONFIRM = 2, ASSIST_OFF = 30, ASSIST_KEEPALIVE = 1;
 
 export class Deck {
   constructor(engine, { id, slot, tabId, stream, meta, params }) {
@@ -53,7 +57,11 @@ export class Deck {
     this.loop = null;
     this.starved = false;
     this.emergencyUntil = 0;
-    this.assist = { target: 1, sourceRate: 1, active: false };
+    // sourceRate is what the page confirmed (the source model); sent is the last rate commanded,
+    // to the frame agent of the one audible element (agent).
+    this.assist = {
+      target: 1, sourceRate: 1, active: false, sent: 1, agent: null, seq: Math.floor(Math.random() * 1e9), okSeq: -1, inflight: [], sentAt: -Infinity, offUntil: 0,
+    };
     this.agents = new Map();
     this.meter = { peak: 0, rms: 0, clipUntil: 0 };
     this.error = null;
@@ -440,25 +448,28 @@ export class Deck {
   }
 
   assistTick(now, res) {
+    const as = this.assist;
+    if (as.inflight.length && now - as.inflight[0].at > ASSIST_CONFIRM) { this.refuseAssist(now); return; }
     const enabled = !!this.engine.params['assist.on'];
-    const available = this.agentAvailable();
+    const available = this.agentAvailable(now), heard = this.audibleAgent();
+    // The heard element went away or moved to another frame: let go, and start again from 1x.
+    if ((as.sent !== 1 || as.sourceRate !== 1) && (!available || heard !== as.agent)) { this.dropAssist(); return; }
     const st = assistStep({
-      need: this.wantPlay ? 1 + this.params.pitch : 1, reserve: res, sourceRate: this.assist.sourceRate,
-      target: this.assist.target, available, playing: this.wantPlay, enabled,
+      need: this.wantPlay ? 1 + this.params.pitch : 1, reserve: res, sourceRate: as.sent,
+      target: as.target, available, playing: this.wantPlay, enabled,
     });
-    this.assist.target = st.target;
-    if (Math.abs(st.next - this.assist.sourceRate) > 1e-9) {
-      const prev = this.assist.sourceRate;
-      this.assist.sourceRate = st.next;
-      const atIn = this.ts.liveEdge + 0.08;
-      this.src.set(atIn, st.next);
-      if (this.tempo) {
-        this.tempo.sourceRateChanged(st.next / prev, Math.round(atIn * this.sr));
-        this.grids.split(atIn, this.tempo.get().grid);
-      }
-      this.sendAgent(st.next === 1 && st.target === 1 ? { t: 'release' } : { t: 'rate', rate: st.next });
+    as.target = st.target;
+    if (Math.abs(st.next - as.sent) > 1e-9) {
+      // Committed to the source model only when the page confirms it (onAgentStatus).
+      as.sent = st.next;
+      as.agent = heard;
+      as.inflight.push({ seq: ++as.seq, rate: st.next, at: now });
+      this.postAssist(st.next === 1 && st.target === 1 ? { t: 'release', seq: as.seq } : { t: 'rate', rate: st.next, seq: as.seq });
+      as.sentAt = now;
+    } else if (as.sent !== 1 && now - as.sentAt >= ASSIST_KEEPALIVE) {
+      this.postAssist({ t: 'rate', rate: as.sent, seq: as.seq });
+      as.sentAt = now;
     }
-    this.assist.active = this.assist.sourceRate !== 1;
   }
 
   async trim(now, p) {
@@ -546,21 +557,82 @@ export class Deck {
   }
 
   // ------------------------------------------------------------------ agent (player assist)
-  agentAvailable() { for (const a of this.agents.values()) if (a.status && a.status.hasMedia) return true; return false; }
+  /** A source-rate step the page confirmed: it starts at the current live edge. */
+  commitSourceRate(rate, seq) {
+    const as = this.assist, prev = as.sourceRate;
+    if (seq != null) as.okSeq = seq;
+    as.active = rate !== 1;
+    if (Math.abs(rate - prev) < 1e-9) return;
+    as.sourceRate = rate;
+    const atIn = this.ts.liveEdge;
+    this.src.set(atIn, rate);
+    if (this.tempo) {
+      this.tempo.sourceRateChanged(rate / prev, Math.round(atIn * this.sr));
+      this.grids.split(atIn, this.tempo.get().grid);
+    }
+  }
+
+  /** Give the page its player back and roll the source model back to 1x at the live edge. */
+  dropAssist() {
+    const as = this.assist;
+    as.inflight = []; as.target = 1; as.sent = 1; as.agent = null;
+    this.sendAgent({ t: 'release', seq: ++as.seq });
+    as.sentAt = this.now();
+    this.commitSourceRate(1);
+  }
+
+  /** The page did not hold the rate (it resets it, or the rate went to an element that is not heard). */
+  refuseAssist(now = this.now()) {
+    this.dropAssist();
+    this.assist.offUntil = now + ASSIST_OFF;
+  }
+
+  /** The frame agent whose tab has exactly one playing, audible media element, or null. */
+  audibleAgent() {
+    let found = null, n = 0;
+    for (const a of this.agents.values()) if (a.status && a.status.audible) { n += a.status.audible; found = a; }
+    return n === 1 ? found : null;
+  }
+
+  /** Assist drives one audible element only, and engages only if the page plays it at 1x. */
+  agentAvailable(now = this.now()) {
+    const as = this.assist, a = this.audibleAgent();
+    if (now < as.offUntil || !a) return false;
+    return as.sent !== 1 || as.sourceRate !== 1 || as.inflight.length > 0 || Math.abs(a.status.rate - 1) < ASSIST_EPS;
+  }
+
+  /** Confirm commanded rates from the audible element's status (it echoes the command's seq). */
+  onAgentStatus(a) {
+    const as = this.assist, s = a.status;
+    if (a !== as.agent || a !== this.audibleAgent() || (as.sourceRate === 1 && !as.inflight.length)) return;
+    const i = as.inflight.findIndex((x) => x.seq === s.seq);
+    if (i >= 0) {
+      const want = as.inflight[i].rate;
+      as.inflight.splice(0, i + 1);
+      if (Math.abs(s.rate - want) < ASSIST_EPS) this.commitSourceRate(want, s.seq);
+      else this.refuseAssist();
+    } else if (s.seq === as.okSeq && Math.abs(s.rate - as.sourceRate) >= ASSIST_EPS) {
+      this.refuseAssist(); // the page changed the rate after confirming it
+    }
+  }
 
   attachAgent(port, frameId) {
-    this.agents.set(frameId, { port, status: null });
+    const a = { port, status: null };
+    this.agents.set(frameId, a);
     port.onMessage.addListener((raw) => {
       const m = validateAgentMessage(raw);
-      if (!m) return;
-      const a = this.agents.get(frameId);
-      if (a && m.t === 'status') a.status = m;
+      if (!m || this.disposed || this.agents.get(frameId) !== a) return;
+      if (m.t === 'status') { a.status = m; this.onAgentStatus(a); }
+      else if (m.t === 'external-rate' && a === this.assist.agent) this.refuseAssist();
     });
-    port.onDisconnect.addListener(() => { void chrome.runtime.lastError; this.agents.delete(frameId); });
-    try {
-      port.postMessage({ t: 'query' });
-      if (this.assist.sourceRate !== 1) port.postMessage({ t: 'rate', rate: this.assist.sourceRate });
-    } catch (_) {}
+    port.onDisconnect.addListener(() => { void chrome.runtime.lastError; if (this.agents.get(frameId) === a) this.agents.delete(frameId); });
+    try { port.postMessage({ t: 'query' }); } catch (_) {}
+  }
+
+  /** Assist rate commands go to the heard element's frame only. */
+  postAssist(msg) {
+    const a = this.assist.agent;
+    if (a) { try { a.port.postMessage(msg); } catch (_) {} }
   }
 
   sendAgent(msg) {
