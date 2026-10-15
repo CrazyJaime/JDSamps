@@ -22,6 +22,7 @@ before(async () => {
           window.fader = new Fader(document.getElementById('f'), { label: 'FADER', def: 1, value: 1, onChange: (v) => log.push(['f', v]) });
           window.pad = bindPad(document.getElementById('p'), { latch: true, onDown: () => log.push(['down']), onUp: () => log.push(['up']) });
           window.seg = bindSeg(document.getElementById('s'), { onSelect: (v) => log.push(['seg', v]) });
+          window.bindPad = bindPad;
           // Fresh control per test in #x; window.c is the current one.
           window.mk = (kind, o) => {
             const el = document.createElement('div');
@@ -221,4 +222,134 @@ test('stale engine echoes do not overwrite a fresh local commit', async () => {
   await page.waitForTimeout(300); // the hold expires even if no matching echo came back
   await page.evaluate(() => window.c.set(0.3));
   assert.equal(await cval(), 0.3);
+});
+
+// Switching away mid-press: the release (pointerup / keyup) goes to another window or tab, so the
+// control lets go when the window loses focus or the page is hidden.
+const hide = () => page.evaluate(() => { Object.defineProperty(document, 'hidden', { value: true, configurable: true }); document.dispatchEvent(new Event('visibilitychange')); });
+const unhide = () => page.evaluate(() => { delete document.hidden; });
+
+test('a held pad lets go when the window loses focus or the page is hidden', async () => {
+  await log();
+  const box = await page.locator('#p').boundingBox();
+  await page.mouse.move(box.x + 5, box.y + 5);
+  await page.mouse.down();
+  await page.waitForTimeout(300); // held: momentary
+  assert.deepEqual(await log(), [['down']]);
+  await page.evaluate(() => window.dispatchEvent(new Event('blur')));
+  assert.deepEqual(await log(), [['up']]);
+  await page.mouse.up();
+  assert.deepEqual(await log(), [], 'let go once');
+  await page.mouse.down();
+  await page.waitForTimeout(300);
+  assert.deepEqual(await log(), [['down']]);
+  await hide();
+  assert.deepEqual(await log(), [['up']]);
+  await unhide();
+  await page.mouse.up();
+  assert.deepEqual(await log(), []);
+  assert.equal(await page.getAttribute('#p', 'aria-pressed'), 'false');
+});
+
+test('a drag ends when the window loses focus, so engine values apply again', async () => {
+  const box = await page.locator('#f').boundingBox();
+  await page.mouse.move(box.x + box.width / 2, box.y + 20);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width / 2, box.y + 60, { steps: 3 });
+  assert.equal(await page.evaluate(() => window.fader.dragging), true);
+  await page.evaluate(() => window.dispatchEvent(new Event('blur')));
+  assert.equal(await page.evaluate(() => window.fader.dragging), false);
+  await page.waitForTimeout(300);
+  await page.evaluate(() => window.fader.set(0.75));
+  assert.equal(await page.evaluate(() => window.fader.value), 0.75);
+  await page.mouse.up();
+});
+
+// ---------------------------------------------------------------- pointer edge cases
+// A second finger is a synthetic pointer here (id 7; the mouse is 1). The page cannot capture a
+// pointer it did not create, so capturing one is made a no-op, as for a real second touch.
+const allowSyntheticCapture = () => page.evaluate(() => {
+  if (window.__capPatched) return;
+  window.__capPatched = true;
+  const orig = Element.prototype.setPointerCapture;
+  Element.prototype.setPointerCapture = function (id) { try { orig.call(this, id); } catch (_) {} };
+});
+const finger = (sel, type, init) => page.evaluate(([s, t, i]) => {
+  document.querySelector(s).dispatchEvent(new PointerEvent(t, { bubbles: true, cancelable: true, button: 0, buttons: t === 'pointerup' ? 0 : 1, pointerType: 'touch', isPrimary: false, ...i }));
+}, [sel, type, init]);
+const dragging = () => page.evaluate(() => window.c.dragging);
+
+test('a second pointer on a control being dragged is ignored; only the first pointer moves and ends the drag', async () => {
+  await allowSyntheticCapture();
+  for (const kind of ['knob', 'fader']) {
+    await mk(kind, { def: 0.5, value: 0.5 });
+    const sel = kind === 'knob' ? '#x svg' : '#x > *';
+    const b = await page.locator(sel).boundingBox();
+    const x = b.x + b.width / 2, y = b.y + b.height / 2;
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await page.mouse.move(x, y - 10, { steps: 2 });
+    const v1 = await cval();
+    assert.ok(v1 > 0.5, `${kind}: first drag moved to ${v1}`);
+    await finger(sel, 'pointerdown', { pointerId: 7, clientX: x + 4, clientY: y });
+    await finger(sel, 'pointermove', { pointerId: 7, clientX: x + 4, clientY: y - 60 });
+    assert.equal(await cval(), v1, `${kind}: the second pointer moves nothing`);
+    await finger(sel, 'pointerup', { pointerId: 7, clientX: x + 4, clientY: y - 60 });
+    assert.equal(await dragging(), true, `${kind}: lifting the second pointer does not end the first drag`);
+    await page.mouse.move(x, y - 20, { steps: 2 });
+    const v2 = await cval();
+    const per10 = v1 - 0.5;
+    assert.ok(near(v2 - v1, per10, 0.01), `${kind}: the first pointer's next 10 px moved ${(v2 - v1).toFixed(3)}, expected ${per10.toFixed(3)}`);
+    await page.mouse.up();
+    assert.equal(await dragging(), false, `${kind}: the first pointer's lift ends the drag`);
+  }
+});
+
+test('lost pointer capture ends a drag like pointerup (knob and fader)', async () => {
+  for (const kind of ['knob', 'fader']) {
+    await mk(kind, { def: 0.5, value: 0.5 });
+    const sel = kind === 'knob' ? '#x svg' : '#x > *';
+    const b = await page.locator(sel).boundingBox();
+    const x = b.x + b.width / 2, y = b.y + b.height / 2;
+    await page.mouse.move(x, y);
+    await page.mouse.down();
+    await page.mouse.move(x, y - 10, { steps: 2 });
+    await page.locator(sel).evaluate((el) => el.releasePointerCapture(1));
+    await page.mouse.move(x, y - 11); // lostpointercapture fires before the next pointer event
+    const moved = await cval();
+    assert.equal(await dragging(), false, `${kind}: drag ended`);
+    assert.equal(await page.evaluate(() => window.c.el.classList.contains('active')), false);
+    await page.mouse.move(x, y - 40, { steps: 2 });
+    assert.equal(await cval(), moved, `${kind}: later moves no longer drag`);
+    await page.waitForTimeout(300); // past the echo hold
+    await page.evaluate(() => window.c.set(0.2));
+    assert.equal(await cval(), 0.2, `${kind}: follows the engine again`);
+    await page.mouse.up();
+  }
+});
+
+test('pad: a second pointer neither presses nor releases a held pad; lost capture releases it', async () => {
+  await allowSyntheticCapture();
+  await page.evaluate(() => {
+    const el = document.createElement('button');
+    el.className = 'pad'; el.id = 'hp'; el.textContent = 'H';
+    document.getElementById('x').replaceChildren(el);
+    window.hp = window.bindPad(el, { latch: false, onDown: () => log.push(['hdown']), onUp: () => log.push(['hup']) });
+  });
+  await log();
+  const b = await page.locator('#hp').boundingBox();
+  const x = b.x + b.width / 2, y = b.y + b.height / 2;
+  await page.mouse.move(x, y);
+  await page.mouse.down();
+  await page.mouse.move(x + 1, y); // the capture takes effect at the next pointer event
+  await finger('#hp', 'pointerdown', { pointerId: 7, clientX: x + 2, clientY: y });
+  await finger('#hp', 'pointerup', { pointerId: 7, clientX: x + 2, clientY: y });
+  await finger('#hp', 'pointercancel', { pointerId: 7, clientX: x + 2, clientY: y });
+  assert.deepEqual(await log(), [['hdown']], 'the second pointer changes nothing');
+  assert.equal(await page.locator('#hp').evaluate((el) => el.classList.contains('on')), true);
+  await page.locator('#hp').evaluate((el) => el.releasePointerCapture(1));
+  await page.mouse.move(x + 300, y + 300); // off the pad: its pointerup will not land on it
+  await page.mouse.up();
+  assert.deepEqual(await log(), [['hup']], 'lost capture released the pad');
+  assert.equal(await page.locator('#hp').evaluate((el) => el.classList.contains('on')), false);
 });

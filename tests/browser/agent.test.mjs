@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startStaticServer } from './static-server.mjs';
-import { launchPlain } from './playwright.mjs';
+import { launchPlain, chromium } from './playwright.mjs';
 import { makeTrackWav } from './ext-harness.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
@@ -32,19 +32,50 @@ function MAIN_SIDE() {
 }
 
 // chrome.runtime for agent-relay.js running in a plain page; window.__eng is the engine's end.
+// window.__update() acts out an extension update: the old runtime dies (its port drops, its id is
+// gone, connect throws) and a fresh chrome.runtime takes its place, with a new window.__eng.
 function FAKE_CHROME() {
-  const hub = [];
-  const eng = { posted: [], connects: 0, msg: [], gone: [] };
-  const port = {
-    postMessage: (m) => eng.posted.push(m), disconnect() {},
-    onMessage: { addListener: (f) => eng.msg.push(f) }, onDisconnect: { addListener: (f) => eng.gone.push(f) },
+  function make() {
+    const hub = [];
+    const eng = { posted: [], times: [], cmdAt: {}, connects: 0, msg: [], gone: [] };
+    const port = {
+      postMessage: (m) => { eng.posted.push(m); eng.times.push(performance.now()); }, disconnect() {},
+      onMessage: { addListener: (f) => eng.msg.push(f) }, onDisconnect: { addListener: (f) => eng.gone.push(f) },
+    };
+    eng.send = (m) => eng.msg.forEach((f) => f(m));
+    eng.die = () => eng.gone.forEach((f) => f());
+    eng.ask = () => hub.forEach((f) => f({ jds: 'connect' }, {}, () => {}));
+    window.__eng = eng;
+    const runtime = { id: 'ext', connect: () => { eng.connects++; return port; }, onMessage: { addListener: (f) => hub.push(f) }, lastError: undefined };
+    Object.defineProperty(window, 'chrome', { value: { runtime }, configurable: true, writable: true });
+    return { eng, runtime };
+  }
+  let cur = make();
+  window.__update = () => {
+    const old = cur;
+    old.eng.die();
+    old.runtime.id = undefined;
+    old.runtime.connect = () => { throw new Error('Extension context invalidated.'); };
+    cur = make();
   };
-  eng.send = (m) => eng.msg.forEach((f) => f(m));
-  eng.die = () => eng.gone.forEach((f) => f());
-  eng.ask = () => hub.forEach((f) => f({ jds: 'connect' }, {}, () => {}));
-  window.__eng = eng;
-  const runtime = { connect: () => { eng.connects++; return port; }, onMessage: { addListener: (f) => hub.push(f) }, lastError: undefined };
-  Object.defineProperty(window, 'chrome', { value: { runtime }, configurable: true, writable: true });
+}
+
+// Intensive wake-up throttling (a tab hidden for 5 minutes): every page timer fires a minute late.
+function SLOW_TIMERS() {
+  const st = window.setTimeout.bind(window), si = window.setInterval.bind(window);
+  window.setTimeout = (fn, ms = 0, ...a) => st(fn, ms + 60000, ...a);
+  window.setInterval = (fn, ms = 0, ...a) => si(fn, ms + 60000, ...a);
+}
+
+// A timer that fires although it was cleared: the agent must not trust a timer on its own.
+function STICKY_TIMERS() { window.clearTimeout = () => {}; }
+
+// Counts the WeakRefs the agent makes and how many of them are garbage collected.
+function COUNT_WEAKREFS() {
+  const Real = WeakRef, n = { made: 0, freed: 0 };
+  const fr = new FinalizationRegistry(() => { n.freed++; });
+  window.__wr = n;
+  window.WeakRef = class WeakRef extends Real { constructor(t) { super(t); n.made++; fr.register(this, 0); } };
 }
 
 before(async () => {
@@ -62,9 +93,10 @@ before(async () => {
 after(async () => { await browser?.close(); await server?.close(); });
 
 /** A fresh page with the agent injected at document_start and wired like the relay does. */
-async function agentPage() {
+async function agentPage({ init = [] } = {}) {
   const p = await browser.newPage();
   p.on('pageerror', (e) => errors.push(String(e)));
+  for (const fn of init) await p.addInitScript(fn);
   await p.addInitScript(AGENT);
   await p.addInitScript(WIRE);
   await p.goto(`${server.origin}/__agent.html`);
@@ -213,10 +245,47 @@ test('elements that were only load()ed or pause()d are found too', async () => {
   await p.close();
 });
 
+test('stop pauses every playing element, in the DOM or detached, and counts the heard ones', async () => {
+  const p = await agentPage();
+  await p.evaluate(async () => {
+    document.body.innerHTML = '<audio id="el" src="/tone.wav" loop autoplay></audio>'; // never play()ed: found by the scan
+    const d = new Audio('/tone.wav'); d.loop = true; window.d = d;
+    const m = new Audio('/tone.wav'); m.loop = true; m.muted = true; window.m = m;
+    await Promise.all([d.play(), m.play()]);
+    const el = document.getElementById('el');
+    if (el.paused) await new Promise((r) => el.addEventListener('playing', r, { once: true }));
+  });
+  assert.deepEqual(await p.evaluate(() => [document.getElementById('el').paused, d.paused, m.paused]), [false, false, false]);
+  await p.evaluate(() => window.__cmd({ t: 'stop' })); // a stop is a first command too
+  await p.waitForTimeout(100);
+  assert.deepEqual(await p.evaluate(() => [document.getElementById('el').paused, d.paused, m.paused]), [true, true, true]);
+  assert.deepEqual(await p.evaluate(() => window.__status.filter((x) => x.t === 'stopped')), [{ t: 'stopped', count: 2 }], 'the muted one is paused but not counted');
+  await p.close();
+});
+
+test("stop gives the page its own rate back before pausing; a page with no media answers count 0", async () => {
+  const p = await agentPage();
+  await p.evaluate(() => { const a = new Audio('/tone.wav'); a.loop = true; a.playbackRate = 1.5; window.a = a; return a.play(); });
+  await p.evaluate(() => window.__cmd({ t: 'rate', rate: 1.02, seq: 4 }));
+  await p.waitForTimeout(100);
+  assert.equal(await p.evaluate(() => a.playbackRate), 1.02);
+  await p.evaluate(() => window.__cmd({ t: 'stop' }));
+  await p.waitForTimeout(100);
+  assert.deepEqual(await p.evaluate(() => [a.paused, a.playbackRate, a.preservesPitch]), [true, 1.5, true]);
+  assert.deepEqual(await p.evaluate(() => window.__status.filter((x) => x.t === 'stopped')), [{ t: 'stopped', count: 1 }]);
+  const q = await agentPage();
+  await q.evaluate(() => window.__cmd({ t: 'stop' }));
+  await q.waitForTimeout(100);
+  assert.deepEqual(await q.evaluate(() => window.__status), [{ t: 'stopped', count: 0 }]);
+  assert.deepEqual(errors, []);
+  await p.close(); await q.close();
+});
+
 /** A page running agent-relay.js against FAKE_CHROME, with the real agent-main.js or a stand-in. */
-async function relayPage({ main = true, relayFirst = false } = {}) {
+async function relayPage({ main = true, relayFirst = false, init = [] } = {}) {
   const p = await browser.newPage();
   p.on('pageerror', (e) => errors.push(String(e)));
+  for (const fn of init) await p.addInitScript(fn);
   await p.addInitScript(FAKE_CHROME);
   if (relayFirst) await p.addInitScript(RELAY);
   if (main) await p.addInitScript(AGENT); else await p.addInitScript(MAIN_SIDE);
@@ -252,6 +321,28 @@ test('the relay gives the page its player back when the engine port goes away', 
   await p.waitForTimeout(200);
   assert.deepEqual(await p.evaluate(() => [a.playbackRate, a.preservesPitch]), [1, true]);
   await p.close();
+});
+
+// In the extension the relay's world is isolated, so only the service worker (executeScript) can
+// call __jdsStop; in these plain test pages it is simply on window.
+test('the relay passes a stop to its agent and answers with the count, or 0 when the agent is silent', async () => {
+  const p = await relayPage();
+  await p.evaluate(() => { const a = new Audio('/tone.wav'); a.loop = true; window.a = a; return a.play(); });
+  await p.evaluate(() => window.__eng.ask());
+  await p.waitForTimeout(200);
+  assert.deepEqual(await p.evaluate(() => window.__jdsStop()), { t: 'stopped', count: 1 });
+  assert.equal(await p.evaluate(() => a.paused), true);
+  await p.waitForTimeout(200);
+  assert.ok(!(await p.evaluate(() => window.__eng.posted)).some((m) => m.t === 'stopped'), 'the answer does not go up the engine port');
+  const q = await relayPage({ main: false }); // a stand-in that never answers
+  const t0 = Date.now();
+  assert.deepEqual(await q.evaluate(() => window.__jdsStop()), { t: 'stopped', count: 0 });
+  assert.ok(Date.now() - t0 < 1000, `answered after ${Date.now() - t0} ms`);
+  // A forged or malformed answer is not taken.
+  const pend = q.evaluate(() => window.__jdsStop());
+  await q.evaluate(() => { window.__toRelay({ t: 'stopped', count: -3 }); window.__toRelay({ t: 'stopped', count: 'x' }); });
+  assert.deepEqual(await pend, { t: 'stopped', count: 0 });
+  await p.close(); await q.close();
 });
 
 test('the relay forwards at a bounded rate, latest first, and drops repeats', async () => {
@@ -329,4 +420,110 @@ test('a page cannot drive the agent or get a status out of it', async () => {
   assert.equal(await p.evaluate(() => a.playbackRate), 1);
   assert.equal(await p.evaluate(() => window.__status.length), 0, 'nothing reached the relay either');
   await p.close();
+});
+
+// ---------------------------------------------------------------- background tabs
+// Chrome throttles timers in hidden tabs (1 Hz, then once a minute), but not message events: the
+// command → status path must not wait on a timer anywhere, in the agent or in the relay.
+
+test('with page timers a minute late (a long-hidden tab) every rate command is confirmed at once and the rate holds', async () => {
+  const p = await relayPage({ init: [SLOW_TIMERS] });
+  await p.evaluate(() => { const a = document.createElement('audio'); a.src = '/tone.wav'; a.loop = true; document.body.append(a); window.a = a; return a.play(); });
+  await p.evaluate(() => window.__eng.ask());
+  await p.waitForTimeout(150);
+  assert.equal(await p.evaluate(() => window.__eng.connects), 1);
+  const rate = (r, seq, ramp) => p.evaluate(([r, seq, ramp]) => {
+    if (ramp) window.__eng.cmdAt[seq] = performance.now();
+    window.__eng.send({ t: 'rate', rate: r, seq });
+  }, [r, seq, ramp]);
+  // The engine ramps a step every 250 ms, then keeps the rate alive every second.
+  let seq = 100;
+  for (let i = 1; i <= 8; i++) { await rate(1 + 0.0025 * i, ++seq, true); await p.waitForTimeout(250); }
+  for (let i = 0; i < 4; i++) { await rate(1.02, seq, false); await p.waitForTimeout(1000); }
+  const lags = await p.evaluate(() => {
+    const e = window.__eng;
+    return Object.entries(e.cmdAt).map(([q, at]) => {
+      const i = e.posted.findIndex((m) => m.t === 'status' && m.seq === Number(q));
+      return { seq: Number(q), lag: i < 0 ? null : Math.round(e.times[i] - at), rate: i < 0 ? null : e.posted[i].rate };
+    });
+  });
+  assert.equal(lags.length, 8);
+  for (const [i, l] of lags.entries()) {
+    assert.ok(l.lag != null && l.lag < 100, `seq ${l.seq} confirmed after ${l.lag} ms`);
+    assert.ok(Math.abs(l.rate - (1 + 0.0025 * (i + 1))) < 1e-9, `seq ${l.seq} confirms rate ${l.rate}`);
+  }
+  assert.deepEqual(await p.evaluate(() => [a.playbackRate, a.preservesPitch]), [1.02, false], 'still held after 4 s of keep-alives');
+  await p.close();
+});
+
+test('with page timers a minute late the agent still lets go 3 s after the last command', async () => {
+  const p = await agentPage({ init: [SLOW_TIMERS] });
+  await p.evaluate(() => { const a = new Audio('/tone.wav'); a.loop = true; window.a = a; return a.play(); });
+  await p.evaluate(() => window.__cmd({ t: 'rate', rate: 1.02, seq: 1 }));
+  await p.waitForTimeout(1500);
+  assert.deepEqual(await p.evaluate(() => [a.playbackRate, a.preservesPitch]), [1.02, false], 'held 1.5 s after the command');
+  await p.waitForTimeout(2200);
+  assert.deepEqual(await p.evaluate(() => [a.playbackRate, a.preservesPitch]), [1, true], 'released 3.7 s after the command, with no timer');
+  await p.close();
+});
+
+test('a stale watchdog timer never lets go while the engine keeps the rate alive', async () => {
+  const p = await agentPage({ init: [STICKY_TIMERS] });
+  await p.evaluate(() => { const a = new Audio('/tone.wav'); a.loop = true; window.a = a; return a.play(); });
+  const t0 = Date.now();
+  await p.evaluate(() => window.__cmd({ t: 'rate', rate: 1.02, seq: 1 }));
+  // Keep-alives every 0.8 s, so a stale 3 s timer would fire between two of them.
+  let next = 800;
+  const seen = [];
+  while (Date.now() - t0 < 4600) {
+    if (Date.now() - t0 >= next) { await p.evaluate(() => window.__cmd({ t: 'rate', rate: 1.02, seq: 1 })); next += 800; }
+    seen.push([Date.now() - t0, await p.evaluate(() => a.playbackRate)]);
+    await p.waitForTimeout(100);
+  }
+  assert.deepEqual(seen.filter(([, r]) => r !== 1.02), [], 'never released while keep-alives keep coming');
+  await p.close();
+});
+
+test('a relay left behind by an extension update is replaced, so assist works again without a reload', async () => {
+  const p = await relayPage();
+  await p.evaluate(() => { const a = document.createElement('audio'); a.src = '/tone.wav'; a.loop = true; document.body.append(a); window.a = a; return a.play(); });
+  await p.evaluate(() => window.__eng.ask());
+  await p.waitForTimeout(150);
+  assert.equal(await p.evaluate(() => window.__eng.connects), 1);
+  await p.evaluate(() => window.__update());
+  // What connectAgent injects when the tab does not answer.
+  await p.addScriptTag({ content: AGENT });
+  await p.addScriptTag({ content: RELAY });
+  await p.evaluate(() => window.__eng.ask());
+  await p.waitForTimeout(150);
+  assert.equal(await p.evaluate(() => window.__eng.connects), 1, 'the new relay connects to the new engine');
+  await p.evaluate(() => window.__eng.send({ t: 'rate', rate: 1.04, seq: 3 }));
+  await p.waitForTimeout(150);
+  assert.equal(await p.evaluate(() => a.playbackRate), 1.04);
+  assert.deepEqual(await p.evaluate(() => { const m = window.__eng.posted.filter((x) => x.t === 'status').at(-1); return [m.rate, m.seq]; }), [1.04, 3]);
+  assert.deepEqual(await p.evaluate(() => window.__jdsStop()), { t: 'stopped', count: 1 }, 'an eject reaches the page through the new relay');
+  await p.close();
+});
+
+test('on a page that is never decked the agent does not keep a reference per media element it ever saw', async () => {
+  const gcBrowser = await chromium.launch({ headless: true, args: ['--autoplay-policy=no-user-gesture-required', '--js-flags=--expose-gc'] });
+  try {
+    const p = await gcBrowser.newPage();
+    p.on('pageerror', (e) => errors.push(String(e)));
+    await p.addInitScript(COUNT_WEAKREFS);
+    await p.addInitScript(AGENT);
+    await p.addInitScript(WIRE);
+    await p.goto(`${server.origin}/__agent.html`);
+    // A feed that creates and drops media elements for hours, each touched once.
+    const churn = (k) => p.evaluate((k) => { for (let i = 0; i < k; i++) new Audio().pause(); }, k);
+    const collect = () => p.evaluate(async () => { for (let i = 0; i < 4; i++) { gc(); await new Promise((r) => setTimeout(r, 25)); } });
+    await churn(2000);
+    await collect();
+    await churn(3000);
+    await collect();
+    const n = await p.evaluate(() => window.__wr);
+    assert.equal(n.made, 5000);
+    assert.ok(n.freed >= 1500, `references to collected elements still held: ${n.made - n.freed} of ${n.made}`);
+    assert.equal(await p.evaluate(() => window.__status.length), 0, 'still passive');
+  } finally { await gcBrowser.close(); }
 });

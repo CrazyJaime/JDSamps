@@ -1,6 +1,6 @@
 // ui/app.js — deck page entry point.
 import { PERSISTED_MASTER_KEYS } from '../shared/protocol.js';
-import { $, setText, wallNow } from './util.js';
+import { $, setText, wallNow, trapFocus } from './util.js';
 import { EngineConnection } from './connection.js';
 import { DeckStrip } from './deck-strip.js';
 import { MasterStrip } from './master-strip.js';
@@ -11,6 +11,7 @@ const strips = new Map();
 let snap = null;
 let selected = null;
 let restored = false;
+let engineId; // snapshot.engineId of the engine the settings were restored into
 let wakeLock = null;
 let wakeLockPending = false;
 
@@ -75,6 +76,7 @@ async function restoreSettings(s) {
 
 function onState(s) {
   snap = s;
+  if (s.engineId !== engineId) { engineId = s.engineId; restored = false; } // a re-created engine starts from defaults
   if (!restored) restoreSettings(s);
   const ids = new Set(s.decks.map((d) => d.id));
   for (const [id, st] of strips) if (!ids.has(id)) { st.destroy(); strips.delete(id); }
@@ -129,6 +131,7 @@ function frame() {
 
 function toggle(el, open) { el.hidden = open == null ? !el.hidden : !open; }
 const settings = $('#settings'), help = $('#help');
+trapFocus(help); // aria-modal: focus moves in, Tab stays inside, and returns on close (Esc: keys.js)
 $('#settingsBtn').addEventListener('click', () => toggle(settings));
 settings.querySelector('[data-close]').addEventListener('click', () => toggle(settings, false));
 $('#helpBtn').addEventListener('click', () => toggle(help));

@@ -4,6 +4,7 @@
   "version": "2.0.0",
   "description": "Multi-tab DJ deck in your browser: load tabs onto decks, beat-sync them on the audio, EQ, FX, crossfader and recording. Made by godspee.",
   "minimum_chrome_version": "119",
+  "incognito": "not_allowed",
   "permissions": ["tabCapture", "offscreen", "tabs", "downloads", "storage", "scripting", "contextMenus"],
   "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js", "type": "module" },
