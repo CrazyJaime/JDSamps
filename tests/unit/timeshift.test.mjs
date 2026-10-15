@@ -205,3 +205,45 @@ test('GridMap keeps an old track\'s grid behind a new track, and edits stay with
   assert.equal(gm.trackAt(0), 1);
   assert.equal(gm.at(0).t0, 46.2);
 });
+
+test('GridMap splits at a capture gap: the audio before it keeps its grid, and edits keep the jump', () => {
+  const gm = new GridMap();
+  const track = { n: 0, from: 0, prev: null, jump: null };
+  const beatNear = (g, x) => g.t0 + Math.round((x - g.t0) / g.T) * g.T;
+  gm.update({ t0: 1, T: 0.5, bar1: null }, track);
+  // The tracker re-phased 15 ms early after a gap at 20.2 s; before it, the grid stood at prev.
+  track.jump = { n: 0, from: 20.2, prev: { t0: 19.5, T: 0.5, bar1: null } };
+  gm.update({ t0: 25.485, T: 0.5, bar1: null }, track);
+  assert.deepEqual(gm.at(12), { t0: 19.5, T: 0.5, bar1: null }, 'before the gap');
+  assert.deepEqual(gm.at(21), { t0: 25.485, T: 0.5, bar1: null }, 'after the gap');
+  assert.equal(gm.trackAt(21), 0, 'same track');
+  // The live grid moves on after the gap only; the same jump never splits again.
+  gm.update({ t0: 26.4851, T: 0.5, bar1: null }, track);
+  assert.equal(gm.segs.length, 2);
+  assert.equal(gm.at(12).t0, 19.5);
+  assert.equal(gm.at(21).t0, 26.4851);
+  const jumpAt = (x) => beatNear(gm.at(x + 1e-6), x) - beatNear(gm.at(x - 1e-6), x);
+  assert.ok(Math.abs(jumpAt(20.2) + 0.015) < 2e-4, `jump ${jumpAt(20.2)}`);
+  // GRID shift, ½×/2× and TAP 1 edit both sides.
+  gm.editTrack(0, (g) => ({ ...g, t0: g.t0 + 0.01, bar1: 3 }));
+  assert.equal(gm.at(12).t0, 19.51);
+  assert.equal(gm.at(21).bar1, 3);
+  assert.ok(Math.abs(jumpAt(20.2) + 0.015) < 2e-4);
+  // TAP before the gap carries the tapped grid across it, jump kept.
+  gm.retime(12, { t0: 12.02, T: 0.48 }, () => 1);
+  assert.equal(gm.at(12).t0, 12.02);
+  assert.equal(gm.at(21).T, 0.48);
+  assert.ok(Math.abs(jumpAt(20.2) + 0.015) < 2e-4, `jump after TAP ${jumpAt(20.2)}`);
+  // ... and TAP after it carries back, jump kept.
+  gm.retime(21, { t0: 21.3, T: 0.5 }, () => 1);
+  assert.ok(Math.abs(jumpAt(20.2) + 0.015) < 2e-4, `jump after a later TAP ${jumpAt(20.2)}`);
+  // Once the audio before the gap is dropped, its segment goes and the jump stays applied.
+  gm.prune(21);
+  gm.update({ t0: 27.4851, T: 0.5, bar1: 3 }, track);
+  assert.equal(gm.segs.length, 1);
+  assert.equal(gm.at(0).t0, 27.4851);
+  // A new track drops the jump.
+  gm.update({ t0: 40.1, T: 0.6, bar1: null }, { n: 1, from: 39, prev: { t0: 38.4851, T: 0.5, bar1: 3 }, jump: null });
+  assert.equal(gm.at(30).t0, 38.4851);
+  assert.equal(gm.trackAt(40), 1);
+});

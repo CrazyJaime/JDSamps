@@ -239,6 +239,46 @@ export class BeatClock {
   }
 }
 
+// Capture gaps: smallest phase jump (s) acted on, largest (beats), and how far it must stand out of
+// the per-beat jitter (standard deviations).
+const JUMP = { min: 0.005, max: 1 / 8, z: 6 };
+
+/**
+ * Where per-beat onset offsets r (oldest first) step: the least-squares fit r_i = a + b·i + D·[i ≥ j]
+ * (a level, a drift from a slightly wrong period, and a step) over every split j with at least 4
+ * beats before it and 3 after, leaving out beat `skip`. Returns the best {j, D, clear, worst} or
+ * null; clear when the step stands out of the jitter, outweighs the drift across the window and
+ * every beat sits nearer its own side of the step; worst is the beat farthest off the fit.
+ */
+function phaseStep(r, skip = -1) {
+  const K = r.length, n = K - (skip >= 0 ? 1 : 0);
+  if (n < 7) return null;
+  const det3 = (m) => m[0] * (m[4] * m[8] - m[5] * m[7]) - m[1] * (m[3] * m[8] - m[5] * m[6]) + m[2] * (m[3] * m[7] - m[4] * m[6]);
+  let Si = 0, Sii = 0, Sr = 0, Sir = 0, Srr = 0, best = null;
+  for (let i = 0; i < K; i++) if (i !== skip) { Si += i; Sii += i * i; Sr += r[i]; Sir += i * r[i]; Srr += r[i] * r[i]; }
+  for (let j = 1; j < K; j++) {
+    let Su = 0, Siu = 0, Sur = 0;
+    for (let i = j; i < K; i++) if (i !== skip) { Su++; Siu += i; Sur += r[i]; }
+    if (n - Su < 4 || Su < 3) continue;
+    const det = det3([n, Si, Su, Si, Sii, Siu, Su, Siu, Su]);
+    if (!det) continue;
+    const a = det3([Sr, Si, Su, Sir, Sii, Siu, Sur, Siu, Su]) / det;
+    const b = det3([n, Sr, Su, Si, Sir, Siu, Su, Sur, Su]) / det;
+    const D = det3([n, Si, Sr, Si, Sii, Sir, Su, Siu, Sur]) / det;
+    const sse = Srr - a * Sr - b * Sir - D * Sur;
+    if (!best || sse < best.sse) best = { j, a, b, D, sse };
+  }
+  if (!best) return null;
+  const { j, a, b, D, sse } = best;
+  let worst = -1, we = -1;
+  for (let i = 0; i < K; i++) {
+    const e = i === skip ? 0 : Math.abs(r[i] - a - b * i - (i >= j ? D : 0));
+    if (e > we) { we = e; worst = i; }
+  }
+  const clear = Math.abs(D) >= JUMP.z * Math.sqrt(Math.max(0, sse) / (n - 3)) && Math.max(we, Math.abs(b) * (K - 1)) < Math.abs(D) / 2;
+  return { j, D, worst, clear };
+}
+
 /** One deck's tempo state: tracker + beat clock + manual corrections (×2/½, TAP, GRID, TAP 1). */
 export class DeckTempo {
   constructor({ sampleRate, fps, lo = DEFAULTS.lo, hi = DEFAULTS.hi }) {
@@ -260,10 +300,15 @@ export class DeckTempo {
     this.sinceEst = 0;
     this.snap = { state: 'search', bpm: 0, coarse: 0, conf: 0 };
     // The track the tracker follows: n counts tracks, from (input s) is where this one took over
-    // and prev is the previous track's grid as it stood there.
-    this.track = { n: this.track ? this.track.n + 1 : 0, from: this.tracker.lastT / this.sr, prev: null };
+    // and prev is the previous track's grid as it stood there. jump is the latest capture gap in
+    // it: n counts them, from (input s) is where the beat phase jumped and prev the grid before.
+    this.track = { n: this.track ? this.track.n + 1 : 0, from: this.tracker.lastT / this.sr, prev: null, jump: null };
     this.hist = []; // recent beat-clock states {t, t0, T} (input frames), oldest first
+    this.jumpsFrom(this.tracker.lastT);
   }
+
+  /** Look for capture gaps only after input frame t (the grid was replaced or rescaled there). */
+  jumpsFrom(t) { this.jumpFrom = t; this.jumpCand = null; }
 
   /**
    * New BPM range: fold the tempo into it by octaves, keeping the lock, the grid (anchor beat
@@ -282,6 +327,7 @@ export class DeckTempo {
       const T = this.clock.T;
       if (T && Math.abs(this.gridOffset) > T / 2) this.gridOffset -= Math.round(this.gridOffset / T) * T;
       for (const h of this.hist) h.T /= f;
+      this.jumpsFrom(tr.lastT);
     }
     this.snap = { ...this.snap, bpm: tr.bestBpm(), coarse: tr.bpm };
     return f;
@@ -328,8 +374,9 @@ export class DeckTempo {
       // track starts where its beats took over (the playhead may still be playing the old one),
       // and the old track keeps the grid it had there, before the new beats could pull the clock.
       const from = this.tracker.changePoint(prev, this.snap.coarse);
-      this.track = { n: this.track.n + 1, from: from / this.sr, prev: this.gridBefore(from) };
+      this.track = { n: this.track.n + 1, from: from / this.sr, prev: this.gridBefore(from), jump: null };
       this.mult = 1; this.tapped = null; this.gridOffset = 0; this.clock = new BeatClock(); this.bar1 = null; this.hist = [];
+      this.jumpsFrom(from);
     }
     const bpm = this.bpmIn();
     const usable = this.tapped || this.tracker.state === 'locked';
@@ -338,6 +385,65 @@ export class DeckTempo {
     const ph = this.tracker.phase(bpm, this.tapped ? 1 : this.mult);
     if (ph.clarity >= 2 || this.clock.t0 == null) this.clock.update(ph.beatT + this.gridOffset, ph.periodT);
     else this.clock.T = ph.periodT;
+    this.detectJump();
+  }
+
+  /**
+   * Each beat of the clock grid since input frame `from` (at most the last 8 s), with the offset
+   * r (input frames) of the strongest onset within T/6 of it: {beat, r}, oldest first.
+   */
+  beatOffsets(from) {
+    const tr = this.tracker, { t0, T } = this.clock, spf = tr.spf;
+    const W = Math.min(tr.full.count, Math.round(8 * this.fps), Math.floor((tr.lastT - from) / spf));
+    const half = Math.max(2, Math.round(T / 6 / spf)), out = [];
+    if (!(W > 4 * half)) return out;
+    const f = tr.full.last(W, new Float32Array(W)), l = tr.low.last(W, new Float32Array(W));
+    let mf = 1e-9, ml = 1e-9; for (let i = 0; i < W; i++) { mf += f[i]; ml += l[i]; } mf /= W; ml /= W;
+    const z = new Float32Array(W);
+    for (let i = 0; i < W; i++) z[i] = f[i] / mf + l[i] / ml;
+    const s = gaussSmooth(z, 1);
+    const start = tr.lastT - (W - 1) * spf, off = (tr.o.phaseOffsetMs / 1000) * this.sr;
+    for (let k = Math.ceil((start - t0) / T); ; k++) {
+      const beat = t0 + k * T, c = (beat - off - start) / spf, ci = Math.round(c);
+      if (ci + half > W - 3) break;
+      if (ci - half < 1) continue;
+      let bi = ci - half; for (let i = bi + 1; i <= ci + half; i++) if (s[i] > s[bi]) bi = i;
+      const a = s[bi - 1], b = s[bi], d = s[bi + 1], q = a - 2 * b + d;
+      out.push({ beat, r: (bi + (q < 0 ? (0.5 * (a - d)) / q : 0) - c) * spf });
+    }
+    return out;
+  }
+
+  /**
+   * A capture gap: under load the tab capture drops or repeats a few ms of audio, so the beats
+   * after one input position come that much early or late. The onsets then step against the
+   * grid between two beats; once the same step shows in two evaluations in a row, record it as
+   * track.jump (the audio before it keeps the grid it had there) and re-phase at once: the beat
+   * clock moves by the step from that grid, the phase comb looks only past the jump, and the
+   * fine tempo fit keeps its older beats, moved by the step.
+   */
+  detectJump() {
+    const tr = this.tracker, clock = this.clock, sr = this.sr;
+    if (clock.t0 == null || !(clock.T > 0) || tr.cand) { this.jumpCand = null; return; }
+    const rs = this.beatOffsets(Math.max(this.jumpFrom, tr.phaseFrom, this.track.from * sr)), r = rs.map((x) => x.r);
+    // The gap itself can click: a beat next to the jump whose strongest onset is that click may be left out.
+    let st = phaseStep(r), skip = -1;
+    if (st && !st.clear) { skip = st.worst; st = phaseStep(r, skip); if (st && skip !== st.j - 1 && skip !== st.j) st = null; }
+    if (!st || !st.clear || Math.abs(st.D) < JUMP.min * sr || Math.abs(st.D) > JUMP.max * clock.T) { this.jumpCand = null; return; }
+    const D = st.D, before = rs[st.j - 1 === skip ? st.j - 2 : st.j - 1], after = rs[st.j === skip ? st.j + 1 : st.j];
+    const at = (before.beat + after.beat + D) / 2; // between the last beat before the jump and the first after
+    const cand = this.jumpCand;
+    this.jumpCand = { at, D };
+    if (!cand || Math.abs(cand.at - at) > clock.T / 2 || Math.abs(cand.D - D) > Math.max(0.3 * Math.abs(D), 0.002 * sr)) return;
+    const prev = this.gridBefore(at), t0 = prev.t0 * sr, T = prev.T * sr;
+    this.track.jump = { n: this.track.jump ? this.track.jump.n + 1 : 0, from: at / sr, prev };
+    this.jumpsFrom(at);
+    tr.phaseFrom = at;
+    tr.beats = tr.beats.filter((x) => x.t < at).map((x) => ({ n: x.n, t: x.t + D }));
+    tr.fit = null;
+    clock.t0 = t0 + Math.round((clock.t0 - t0) / T) * T + D;
+    clock.miss = 0;
+    for (const h of this.hist) if (h.t > at) { h.t0 = clock.t0; h.T = clock.T; }
   }
 
   bpmIn() {
@@ -361,6 +467,7 @@ export class DeckTempo {
     }
     this.tracker.resetFine();
     for (const h of this.hist) h.T /= factor;
+    this.jumpsFrom(this.tracker.lastT);
     return true;
   }
 
@@ -395,6 +502,7 @@ export class DeckTempo {
     this.clock.t0 = t0;
     this.clock.T = T;
     this.hist = [];
+    this.jumpsFrom(this.tracker.lastT);
   }
 
   tap(inFrame) {
@@ -431,6 +539,7 @@ export class DeckTempo {
       this.clock.miss = 0;
     }
     this.gridOffset /= ratio;
+    this.jumpsFrom(atFrame);
     this.snap = { ...this.snap, bpm: this.snap.bpm * ratio, coarse: this.snap.coarse * ratio };
   }
 

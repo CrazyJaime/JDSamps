@@ -61,6 +61,37 @@ test('BPM, grid and master clock follow the playhead across a track change', asy
   assert.ok(near(inB.master.bpm, 100, 0.2), `master clock after the crossing ${inB.master.bpm.toFixed(2)}`);
 });
 
+test('the master clock keeps the beat phase of the audio before a capture gap', async () => {
+  // A steady 128 BPM tab whose capture drops 15 ms at X, played 20 s behind the live edge.
+  const A = synth({ ...PATTERNS.house, bpm: 128, bars: 44 });
+  const X = 32.2, gapN = Math.round(0.015 * FS), T = 60 / 128;
+  const i = Math.round(X * FS);
+  const x = new Float32Array(A.x.length - gapN); x.set(A.x.subarray(0, i)); x.set(A.x.subarray(i + gapN), i);
+  const { d, clock } = realDeck();
+  const proc = new Input();
+  const out = [[new Float32Array(128)]];
+  let checks = 0, worst = 0, worstT = 0;
+  for (let s = 0; s + 128 <= x.length; s += 128) {
+    const blk = x.subarray(s, s + 128);
+    proc.process([[blk, blk]], out, {});
+    clock.t += 128 / FS;
+    for (const { msg } of proc.port.posted.splice(0)) d.onInput(msg);
+    if (s % 2048) continue;
+    if (!d.wantPlay && d.ts.liveEdge >= 20) await d.act('play');
+    if (!d.wantPlay) continue;
+    const now = clock.t, p = d.ts.posAt(now), rate = d.ts.rateAt(now);
+    if (d.ts.liveEdge < X + 4 || p > X - T) continue;
+    // The beat the master clock publishes, as an input position.
+    const m = d.masterInfo(now), last = p - (now - m.lastBeat) * rate;
+    checks++;
+    worst = Math.max(worst, Math.abs(nearestBeatError(last, A.truth)) * 1000);
+    worstT = Math.max(worstT, Math.abs(m.period * rate - T) * 1000);
+  }
+  assert.ok(checks > 50, `checked ${checks} times`);
+  assert.ok(worst < 2, `master clock beat ${worst.toFixed(1)} ms off the playhead's beats`);
+  assert.ok(worstT < 0.1, `master clock period ${worstT.toFixed(3)} ms off`);
+});
+
 /**
  * A playing deck with a tapped 120 BPM grid whose source assist has stepped up 8 times (+2%),
  * so the playhead (heard audio) is in the oldest grid segment.

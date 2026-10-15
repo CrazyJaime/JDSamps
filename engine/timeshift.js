@@ -173,14 +173,16 @@ export class SourceMap {
 /**
  * Beat grid as a step function of input position. Assist steps split a track's grid (the input
  * tempo changes); a new track (DeckTempo's track.n) starts a segment of its own, so the audio
- * still to be played from the old track keeps the old grid. Each segment is tagged with its track.
+ * still to be played from the old track keeps the old grid. A capture gap (track.jump) splits it
+ * too: the beats jump there, by the segment's shift (s). Each segment is tagged with its track.
  */
 export class GridMap {
-  constructor() { this.segs = []; }
+  constructor() { this.segs = []; this.jump = null; }
   /**
    * Follow the tracker's live grid. A new track.n starts a segment at track.from, with the old
    * track's grid track.prev before it; assist steps already past track.from become part of the
-   * new track, carried from the live grid at their source rates (rateAt(input)).
+   * new track, carried from the live grid at their source rates (rateAt(input)). A new
+   * track.jump starts a segment at jump.from, with the grid jump.prev before it.
    */
   update(grid, track, rateAt = () => 1) {
     const last = this.segs[this.segs.length - 1];
@@ -194,6 +196,16 @@ export class GridMap {
     } else if (grid) {
       if (!last) this.segs.push({ from: -Infinity, grid: { ...grid }, track: n });
       else last.grid = { ...grid };
+    }
+    const jump = track && track.jump;
+    if (jump && jump !== this.jump) {
+      this.jump = jump;
+      const s = this.segs[this.segs.length - 1];
+      if (s && s.grid && jump.prev && s.track === n && s.from < jump.from) {
+        const g = s.grid, p = jump.prev, b = p.t0 + Math.round((jump.from - p.t0) / p.T) * p.T;
+        s.grid = { ...p };
+        this.segs.push({ from: jump.from, grid: g, track: n, shift: g.t0 + Math.round((b - g.t0) / g.T) * g.T - b });
+      }
     }
   }
   split(inPos, grid) {
@@ -215,20 +227,20 @@ export class GridMap {
   }
   /**
    * Give the segment at inPos the grid {t0, T[, bar1]} and carry it across the rest of its track:
-   * the beat phase stays continuous at each boundary and the period follows the source rate there.
-   * Segments keep their own bar 1 unless the grid brings one.
+   * the beat phase stays continuous at each boundary (but for a capture gap's shift there) and the
+   * period follows the source rate there. Segments keep their own bar 1 unless the grid brings one.
    */
   retime(inPos, grid, rateAt) {
     const segs = this.segs, k = segs.indexOf(this.seg(inPos));
     if (k < 0) return;
     const set = (j, t0, T, bar1 = segs[j].grid ? segs[j].grid.bar1 : null) => { segs[j].grid = { t0, T, bar1 }; };
-    const carry = (j, i, b) => { // segment j from neighbour i, continuous at input b
+    const carry = (j, i, b, shift) => { // segment j from neighbour i, continuous at input b, then shifted
       const g = segs[i].grid, T = (g.T * rateAt(segs[i].from)) / rateAt(segs[j].from), ph = (b - g.t0) / g.T;
-      set(j, b - (ph - Math.floor(ph)) * T, T, grid.bar1 !== undefined ? grid.bar1 : undefined);
+      set(j, b - (ph - Math.floor(ph)) * T + shift, T, grid.bar1 !== undefined ? grid.bar1 : undefined);
     };
     set(k, grid.t0, grid.T, grid.bar1 !== undefined ? grid.bar1 : undefined);
-    for (let j = k + 1; j < segs.length && segs[j].track === segs[k].track; j++) carry(j, j - 1, segs[j].from);
-    for (let j = k - 1; j >= 0 && segs[j].track === segs[k].track; j--) carry(j, j + 1, segs[j + 1].from);
+    for (let j = k + 1; j < segs.length && segs[j].track === segs[k].track; j++) carry(j, j - 1, segs[j].from, segs[j].shift || 0);
+    for (let j = k - 1; j >= 0 && segs[j].track === segs[k].track; j--) carry(j, j + 1, segs[j + 1].from, -(segs[j + 1].shift || 0));
   }
   prune(inPos) {
     let i = 0;
