@@ -149,6 +149,123 @@ function spyWaveText() {
   };
 }
 
+/** Counts layout reads and canvas gradients made while window.__spy is on. */
+function layoutSpy() {
+  window.__spy = false;
+  window.__reads = {};
+  const count = (k) => { if (window.__spy) window.__reads[k] = (window.__reads[k] || 0) + 1; };
+  for (const [proto, props] of [[Element.prototype, ['clientWidth', 'clientHeight', 'scrollWidth', 'scrollHeight']], [HTMLElement.prototype, ['offsetWidth', 'offsetHeight', 'offsetTop', 'offsetLeft']]]) {
+    for (const k of props) {
+      const d = Object.getOwnPropertyDescriptor(proto, k);
+      Object.defineProperty(proto, k, { ...d, get() { count(k); return d.get.call(this); } });
+    }
+  }
+  for (const [proto, k] of [[Element.prototype, 'getBoundingClientRect'], [Element.prototype, 'getClientRects'], [window, 'getComputedStyle'], [CanvasRenderingContext2D.prototype, 'createLinearGradient']]) {
+    const f = proto[k];
+    proto[k] = function (...a) { count(k); return f.apply(this, a); };
+  }
+}
+
+test('a meter draw reads no layout and reuses its gradient; a resize still reaches it', async () => {
+  const server = await startStaticServer(ROOT);
+  const browser = await launchPlain();
+  try {
+    const ctx = await browser.newContext({ deviceScaleFactor: 2 });
+    const page = await ctx.newPage();
+    await page.addInitScript(layoutSpy);
+    await page.goto(`${server.origin}/__blank`); // any page of the server's origin (a 404 will do)
+    await page.setContent('<canvas id="m" style="display:block;width:12px;height:100px"></canvas><canvas id="g" style="display:block;width:10px;height:80px"></canvas>');
+    const r = await page.evaluate(async (origin) => {
+      const { VMeter } = await import(`${origin}/ui/meters.js`);
+      const frame = () => new Promise((res) => requestAnimationFrame(() => res()));
+      const m = new VMeter(document.getElementById('m'), { channels: 2 }), g = new VMeter(document.getElementById('g'), { mode: 'gr' });
+      const v = [{ peak: 0.8, rms: 0.3 }, { peak: 0.5, rms: 0.2 }];
+      m.update(v); g.update({ gr: -3 });
+      m.draw(); g.draw();
+      await frame(); await frame();
+      window.__spy = true;
+      for (let i = 0; i < 5; i++) { m.update(v); m.draw(); g.draw(); await frame(); }
+      const steady = { ...window.__reads };
+      window.__reads = {};
+      document.getElementById('m').style.height = '150px';
+      await frame(); await frame();
+      m.draw(); g.draw();
+      const resized = { ...window.__reads };
+      window.__spy = false;
+      const c = document.getElementById('m');
+      return { steady, resized, size: [c.width, c.height] };
+    }, server.origin);
+    assert.deepEqual(r, { steady: {}, resized: { createLinearGradient: 1 }, size: [24, 300] });
+  } finally { await browser.close(); await server.close(); }
+});
+
+test('6 decks at DPR 2: an animation frame reads no layout and makes no gradient', async () => {
+  const n = 6;
+  const state = makeState({ decks: Array.from({ length: n }, (_, i) => deck({ id: i + 1, slot: i + 1, tabId: 100 + i, playhead: 30, liveEdge: 58, historyStart: 0 })) });
+  const b = await openBoard({ state, dpr: 2, viewport: { width: 1920, height: 1080 }, init: [layoutSpy] });
+  const { page } = b;
+  try {
+    await page.waitForSelector(`.wave-row >> nth=${n - 1}`);
+    for (let i = 1; i <= n; i++) await b.push(makeWave(i, 60, 124));
+    await page.waitForTimeout(300);
+    const r = await page.evaluate(async (s) => {
+      const frame = () => new Promise((res) => requestAnimationFrame(() => res()));
+      await frame();
+      window.__spy = true;
+      for (let k = 0; k < 20; k++) {
+        s.ctxTime += 0.032; s.wallMs = performance.timeOrigin + performance.now();
+        for (const d of s.decks) { d.playhead += 0.032; d.meter = { peak: 0.5 + 0.02 * k, rms: 0.2, clip: false }; }
+        window.__fake.push({ t: 'state', s });
+        await frame();
+      }
+      window.__spy = false;
+      return window.__reads;
+    }, state);
+    assert.deepEqual(r, {}, 'layout reads or gradients in 20 frames');
+    assert.deepEqual(b.errors, []);
+  } finally { await b.close(); }
+});
+
+// A busy main thread delivers several snapshots back to back (31 Hz from the engine): only the
+// latest one reaches the DOM, once per frame.
+test('snapshots that arrive within one frame are rendered once, the latest', async () => {
+  const b = await openBoard({ state: threeDecks() });
+  const { page } = b;
+  try {
+    await page.waitForSelector('.deck >> nth=2');
+    await page.waitForTimeout(100);
+    const r = await page.evaluate(async (s0) => {
+      const frame = () => new Promise((res) => requestAnimationFrame(() => res()));
+      await frame();
+      const title = document.querySelector('.deck [data-title]'), vol = document.getElementById('masterVol'), clock = document.getElementById('clockBpm');
+      const recs = [];
+      const mo = new MutationObserver((rs) => recs.push(...rs));
+      for (const el of [title, vol, clock]) mo.observe(el, { subtree: true, attributes: true, childList: true, characterData: true });
+      for (let i = 0; i < 10; i++) {
+        const s = structuredClone(s0);
+        s.decks[0].title = `Burst ${i}`;
+        s.master.params['master.volume'] = i / 10;
+        s.clock = { ...s.clock, bpm: 120 + i };
+        window.__fake.push({ t: 'state', s });
+      }
+      recs.push(...mo.takeRecords());
+      const during = recs.length;
+      await frame();
+      await frame();
+      recs.push(...mo.takeRecords());
+      mo.disconnect();
+      // Text writes (childList) on the title and the clock, value writes on the volume knob.
+      const n = (el, attr) => recs.filter((m) => (m.target === el || el.contains(m.target)) && (attr ? m.attributeName === attr : m.type !== 'attributes')).length;
+      return {
+        during, titleWrites: n(title), volWrites: n(vol, 'aria-valuenow'), clockWrites: n(clock),
+        shown: [title.textContent, vol.getAttribute('aria-valuenow'), clock.textContent],
+      };
+    }, threeDecks());
+    assert.deepEqual(r, { during: 0, titleWrites: 1, volWrites: 1, clockWrites: 1, shown: ['Burst 9', '0.900', '129.0'] });
+    assert.deepEqual(b.errors, []);
+  } finally { await b.close(); }
+});
+
 test('waveform draws bar numbers at bar lines once bar 1 is known', async () => {
   const T = 60 / 124;
   const state = makeState({

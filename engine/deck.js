@@ -70,12 +70,14 @@ export class Deck {
     this.dryNoticeAt = -Infinity;
     this.dryUnnoticed = 0;
     // sourceRate is what the page confirmed (the source model); sent is the last rate commanded,
-    // to the frame agent of the one audible element (agent).
+    // to the frame agent of the one audible element (agent). inLag: context time minus input
+    // position (the input timeline runs on the audio clock), its smallest value seen.
     this.assist = {
       target: 1, sourceRate: 1, active: false, sent: 1, agent: null, seq: Math.floor(Math.random() * 1e9), okSeq: -1, inflight: [], sentAt: -Infinity, offUntil: 0,
+      inLag: Infinity,
     };
     this.agents = new Map();
-    this.meter = { peak: 0, rms: 0, clipUntil: 0 };
+    this.meter = { peak: 0, rms: 0, clipUntil: 0, clipFrame: Math.round(engine.ctx.currentTime * this.sr) }; // clips before this deck are not its own
     this.error = null;
     this.nextTrim = 0;
     this.capNotice = null; // latched buffer-cap notice: null | 'near' | 'full'
@@ -112,15 +114,12 @@ export class Deck {
     this.rack = createFxRack(ctx);
     this.fader = ctx.createGain();
     this.xfGain = ctx.createGain();
-    this.analyser = ctx.createAnalyser();
-    this.analyser.fftSize = 2048;
-    this.meterBuf = new Float32Array(this.analyser.fftSize);
     this.stretch.connect(this.trimNode.input);
     this.trimNode.output.connect(this.eq.input);
     this.eq.output.connect(this.rack.input);
     this.rack.output.connect(this.fader);
     this.fader.connect(this.xfGain);
-    this.fader.connect(this.analyser);
+    e.master.meterIn(this.slot, this.fader);
     this.xfGain.connect(e.master.bus);
     this.recorder = new Recorder(ctx, this.rack.output, {
       format: e.params['rec.format'], who: `D${this.slot}`, title: () => this.meta.title || `Tab ${this.tabId}`, sink: e.silentSink,
@@ -564,15 +563,19 @@ export class Deck {
     if (now >= this.nextTrim) { this.nextTrim = now + 2; this.trim(now, p); }
   }
 
-  /** Post-fader meter over the last 2048 frames; only measured for a state a UI will be sent. */
+  /**
+   * Post-fader meter over the latest engine tick, measured in the master worklet (this deck's
+   * input there is its slot); read only for a state a UI will be sent. The worklet keeps the
+   * latest clip's frame, so a clip between two reads (a hidden page reads twice a second) still
+   * lights the clip light for 2 s from the clip.
+   */
   meterTick(now) {
     if (!this.ts || this.disposed) return;
-    this.analyser.getFloatTimeDomainData(this.meterBuf);
-    let pk = 0, sq = 0;
-    for (let i = 0; i < this.meterBuf.length; i++) { const x = this.meterBuf[i], a = x < 0 ? -x : x; if (a > pk) pk = a; sq += x * x; }
-    this.meter.peak = pk;
-    this.meter.rms = Math.sqrt(sq / this.meterBuf.length);
-    if (pk >= 0.999) this.meter.clipUntil = now + 2;
+    const m = this.engine.master.deckMeter(this.slot), mt = this.meter;
+    if (!m) return;
+    mt.peak = m.peak;
+    mt.rms = m.rms;
+    if (m.clipFrame > mt.clipFrame) { mt.clipFrame = m.clipFrame; mt.clipUntil = Math.max(mt.clipUntil, m.clipFrame / this.sr + 2); }
   }
 
   /** When the playhead reaches an input position where the source rate changed, change the engine rate exactly there. */
@@ -606,6 +609,9 @@ export class Deck {
 
   assistTick(now, res) {
     const as = this.assist;
+    // Input chunks reach the main thread late, never early: the smallest lag maps context time
+    // onto the input timeline (agentLetGo), whatever a stall did to the order of messages.
+    if (now - this.ts.liveEdge < as.inLag) as.inLag = now - this.ts.liveEdge;
     // A late confirmation is still taken (onAgentStatus); only silence this long refuses.
     const overdue = as.inflight.length ? now - as.inflight[0].at : 0;
     if (overdue > ASSIST_REFUSE) { this.refuseAssist(now); return; }
@@ -732,14 +738,13 @@ export class Deck {
   }
 
   // ------------------------------------------------------------------ agent (player assist)
-  /** A source-rate step the page confirmed: it starts at the current live edge. */
-  commitSourceRate(rate, seq) {
+  /** A source-rate step the page confirmed: it starts at the current live edge, or at input position atIn. */
+  commitSourceRate(rate, seq, atIn = this.ts.liveEdge) {
     const as = this.assist, prev = as.sourceRate;
     if (seq != null) as.okSeq = seq;
     as.active = rate !== 1;
     if (Math.abs(rate - prev) < 1e-9) return;
     as.sourceRate = rate;
-    const atIn = this.ts.liveEdge;
     this.src.set(atIn, rate);
     if (this.tempo) {
       this.tempo.sourceRateChanged(rate / prev, Math.round(atIn * this.sr));
@@ -754,6 +759,23 @@ export class Deck {
     this.sendAgent({ t: 'release', seq: ++as.seq });
     as.sentAt = this.now();
     this.commitSourceRate(1);
+  }
+
+  /**
+   * The agent let go of the page by itself at wall time `at` (ms): it had no command for a long
+   * while, because this engine stalled. Not a refusal: the source model steps back to 1x where
+   * the page did (not where the engine heard of it, maybe seconds later), and assist ramps again
+   * from 1x. The release (a new seq) stops a command still on its way from taking the page back.
+   */
+  agentLetGo(at) {
+    const as = this.assist, now = this.now();
+    this.postAssist({ t: 'release', seq: ++as.seq });
+    as.inflight = []; as.target = 1; as.sent = 1; as.agent = null; as.okSeq = -1; as.sentAt = now;
+    // Where the input timeline was then: maybe past the live edge, if the audio from the stall is
+    // still on its way.
+    const ago = Math.max(0, (this.engine.wallNow() - at) / 1000);
+    const atIn = Number.isFinite(as.inLag) ? now - ago - as.inLag : this.ts.liveEdge - ago;
+    this.commitSourceRate(1, null, Math.max(this.src.steps[this.src.steps.length - 1].inPos + 1e-6, atIn));
   }
 
   /** The page did not hold the rate (it resets it, or the rate went to an element that is not heard). */
@@ -781,6 +803,8 @@ export class Deck {
     const as = this.assist, s = a.status;
     if (a !== as.agent || a !== this.audibleAgent() || (as.sourceRate === 1 && !as.inflight.length)) return;
     const i = as.inflight.findIndex((x) => x.seq === s.seq);
+    // Let go by itself after our latest command it applied (a later one would have taken it back).
+    if (s.selfReleased) { if (i >= 0 || s.seq === as.okSeq) this.agentLetGo(s.releasedAt); return; }
     if (i >= 0) {
       const want = as.inflight[i].rate;
       as.inflight.splice(0, i + 1);
@@ -864,7 +888,7 @@ export class Deck {
       if (st.destroy) calls.push(st.destroy());
       await withTimeout(Promise.all(calls), 1500, 'The time-stretcher did not stop').catch(() => {});
     }
-    const nodes = [this.source, this.inputNode, st, this.fader, this.xfGain, this.analyser];
+    const nodes = [this.source, this.inputNode, st, this.fader, this.xfGain];
     for (const n of nodes) { try { n && n.disconnect(); } catch (_) {} }
     for (const n of [this.inputNode, st]) { try { n && n.port.close(); } catch (_) {} }
     for (const m of [this.trimNode, this.eq, this.rack]) { try { m && m.dispose(); } catch (_) {} }

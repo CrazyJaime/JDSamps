@@ -79,6 +79,20 @@ test('validateAgentMessage rejects hostile payloads', () => {
   assert.deepEqual(validateAgentMessage({ t: 'external-rate', rate: 1.25 }), { t: 'external-rate', rate: 1.25 });
 });
 
+test('validateAgentMessage passes on an agent that let go by itself, only with a sane release time', () => {
+  const st = { t: 'status', hasMedia: true, playing: true, rate: 1, count: 1, audible: 1, seq: 4 };
+  assert.deepEqual(validateAgentMessage({ ...st, selfReleased: true, releasedAt: 1760500000123.5 }), {
+    t: 'status', hasMedia: true, playing: true, rate: 1, preservesPitch: false, count: 1, muted: false, volume: 1, audible: 1, seq: 4,
+    selfReleased: true, releasedAt: 1760500000123.5,
+  });
+  for (const releasedAt of [undefined, -1, 0, NaN, Infinity, '1', null, {}]) {
+    const m = validateAgentMessage({ ...st, selfReleased: true, releasedAt });
+    assert.deepEqual(['selfReleased' in m, 'releasedAt' in m], [false, false], String(releasedAt));
+  }
+  const m = validateAgentMessage({ ...st, selfReleased: 'yes', releasedAt: 5 });
+  assert.deepEqual(['selfReleased' in m, 'releasedAt' in m], [false, false]);
+});
+
 test("validateAgentMessage takes an eject's {t:'stopped', count} only with a sane count", () => {
   assert.deepEqual(validateAgentMessage({ t: 'stopped', count: 0 }), { t: 'stopped', count: 0 });
   assert.deepEqual(validateAgentMessage({ t: 'stopped', count: 3, extra: 'x' }), { t: 'stopped', count: 3 });

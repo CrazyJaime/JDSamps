@@ -153,6 +153,30 @@ test('SYNC PLAY matches tempo and phase to the master', async () => {
   }, 15000, 200).catch(() => assert.fail(`phase ${JSON.stringify(ph.slice(-10))}`));
 });
 
+test('deck meters read each playing deck post-fader (from the master worklet); a closed fader reads silence', async () => {
+  // A meter covers one 32 ms tick and the clicks are short: take the loudest of 1.5 s of states.
+  const loudest = async () => {
+    const pk = { 1: 0, 2: 0 }, rms = { 1: 0, 2: 0 };
+    for (let i = 0; i < 15; i++) {
+      const s = await state(deck);
+      for (const k of [1, 2]) { const m = deckBy(s, k).meter; pk[k] = Math.max(pk[k], m.peak); rms[k] = Math.max(rms[k], m.rms); }
+      await sleep(100);
+    }
+    return { pk, rms };
+  };
+  const on = await loudest();
+  for (const k of [1, 2]) assert.ok(on.pk[k] > 0.05 && on.rms[k] > 0.005 && on.pk[k] < 0.999, `deck ${k}: ${JSON.stringify(on)}`);
+  const fader = deckBy(await state(deck), 2).params.fader;
+  set(deck, 2, 'fader', 0);
+  try {
+    await sleep(300);
+    const off = await loudest();
+    assert.ok(off.pk[2] < 1e-3, `deck 2 with its fader closed: ${JSON.stringify(off)}`);
+    assert.ok(off.pk[1] > 0.05, 'deck 1 untouched');
+  } finally { set(deck, 2, 'fader', fader); }
+  await sleep(300);
+});
+
 // The next four tests share one 60 s window: decks 1 (synced, +3.2 %, assist off) and 2 (master)
 // are each recorded with deck REC while the engine heap and deck 1's reserve are sampled. Run them
 // together (--test-name-pattern '60 s' plus the setup tests above).

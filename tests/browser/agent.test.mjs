@@ -1,11 +1,11 @@
-import test, { before, after } from 'node:test';
+import test, { before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startStaticServer } from './static-server.mjs';
 import { launchPlain, chromium } from './playwright.mjs';
-import { makeTrackWav } from './ext-harness.mjs';
+import { makeTrackWav, prepareExtension, launchExtension } from './ext-harness.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const AGENT = fs.readFileSync(path.join(ROOT, 'agent/agent-main.js'), 'utf8');
@@ -216,20 +216,149 @@ test("status counts only playing, audible elements; release restores the page's 
   await p.close();
 });
 
-test('the agent lets go of the page by itself when the engine goes quiet', async () => {
-  const p = await agentPage();
-  await p.evaluate(() => { const a = new Audio('/tone.wav'); a.loop = true; window.a = a; return a.play(); });
-  await p.evaluate(() => window.__cmd({ t: 'rate', rate: 1.02 }));
-  await p.waitForTimeout(1500);
-  await p.evaluate(() => window.__cmd({ t: 'rate', rate: 1.02 })); // keep-alive
-  await p.waitForTimeout(2000);
-  assert.deepEqual(await p.evaluate(() => [a.playbackRate, a.preservesPitch]), [1.02, false], 'still held 2 s after a keep-alive');
-  await p.waitForTimeout(1500);
-  assert.deepEqual(await p.evaluate(() => [a.playbackRate, a.preservesPitch]), [1, true], 'released 3.5 s after the last command');
-  await p.evaluate(() => { a.playbackRate = 1.25; });
+// The engine keeps a rate alive every second; the agent lets go of the page after LET_GO without
+// a command. That is long enough to ride out a stalled engine (a busy main thread holds its
+// keep-alives back for seconds); a dead engine is let go of at once by the relay (onDisconnect).
+const LET_GO = 10000;
+
+describe('watchdog', { concurrency: 3 }, () => {
+  test('the agent lets go of the page by itself when the engine goes quiet, says so, and takes only a new command', async () => {
+    const p = await agentPage();
+    await p.evaluate(() => { const a = new Audio('/tone.wav'); a.loop = true; window.a = a; return a.play(); });
+    await p.evaluate(() => window.__cmd({ t: 'rate', rate: 1.02, seq: 5 }));
+    await p.waitForTimeout(1500);
+    await p.evaluate(() => window.__cmd({ t: 'rate', rate: 1.02, seq: 5 })); // keep-alive
+    await p.waitForTimeout(LET_GO - 1500);
+    assert.deepEqual(await p.evaluate(() => [a.playbackRate, a.preservesPitch]), [1.02, false], `still held ${(LET_GO - 1500) / 1000} s after a keep-alive`);
+    assert.ok(!(await lastOf(p)).selfReleased);
+    const t0 = await p.evaluate(() => performance.timeOrigin + performance.now());
+    await p.waitForTimeout(3000);
+    assert.deepEqual(await p.evaluate(() => [a.playbackRate, a.preservesPitch]), [1, true], `released ${(LET_GO + 1500) / 1000} s after the last command`);
+    // The engine is told the page let go by itself, and when (wall-clock ms), so a stall is not
+    // taken for a page that refused the rate.
+    const s = await lastOf(p);
+    assert.deepEqual([s.rate, s.seq, s.selfReleased], [1, 5, true], JSON.stringify(s));
+    assert.ok(s.releasedAt > t0 - 500 && s.releasedAt < t0 + 1600, `released at ${s.releasedAt - t0} ms`);
+    // A keep-alive of the old command (an engine back from a stall) does not take the page back.
+    await p.evaluate(() => window.__cmd({ t: 'rate', rate: 1.02, seq: 5 }));
+    await p.waitForTimeout(100);
+    assert.equal(await p.evaluate(() => a.playbackRate), 1);
+    assert.equal((await lastOf(p)).selfReleased, true);
+    // A new command does.
+    await p.evaluate(() => window.__cmd({ t: 'rate', rate: 1.0025, seq: 6 }));
+    await p.waitForTimeout(100);
+    assert.equal(await p.evaluate(() => a.playbackRate), 1.0025);
+    const s2 = await lastOf(p);
+    assert.deepEqual([s2.rate, s2.seq, s2.selfReleased, s2.releasedAt], [1.0025, 6, undefined, undefined]);
+    await p.evaluate(() => window.__cmd({ t: 'release', seq: 7 }));
+    await p.evaluate(() => { a.playbackRate = 1.25; });
+    await p.waitForTimeout(200);
+    assert.equal(await p.evaluate(() => a.playbackRate), 1.25, 'the page owns its speed again');
+    assert.equal((await lastOf(p)).selfReleased, undefined, 'an engine release is not a self-release');
+    await p.close();
+  });
+
+  test('with page timers a minute late the agent still lets go after the timeout', async () => {
+    const p = await agentPage({ init: [SLOW_TIMERS] });
+    await p.evaluate(() => { const a = new Audio('/tone.wav'); a.loop = true; window.a = a; return a.play(); });
+    await p.evaluate(() => window.__cmd({ t: 'rate', rate: 1.02, seq: 1 }));
+    await p.waitForTimeout(LET_GO - 1000);
+    assert.deepEqual(await p.evaluate(() => [a.playbackRate, a.preservesPitch]), [1.02, false], `held ${(LET_GO - 1000) / 1000} s after the command`);
+    await p.waitForTimeout(1800);
+    assert.deepEqual(await p.evaluate(() => [a.playbackRate, a.preservesPitch]), [1, true], `released ${(LET_GO + 800) / 1000} s after the command, with no timer`);
+    assert.equal((await lastOf(p)).selfReleased, true);
+    await p.close();
+  });
+
+  test('a stale watchdog timer never lets go while the engine keeps the rate alive', async () => {
+    const p = await agentPage({ init: [STICKY_TIMERS] });
+    await p.evaluate(() => { const a = new Audio('/tone.wav'); a.loop = true; window.a = a; return a.play(); });
+    const t0 = Date.now();
+    await p.evaluate(() => window.__cmd({ t: 'rate', rate: 1.02, seq: 1 }));
+    // Keep-alives every 0.8 s, so a stale timer would fire between two of them.
+    let next = 800;
+    const seen = [];
+    while (Date.now() - t0 < LET_GO + 1600) {
+      if (Date.now() - t0 >= next) { await p.evaluate(() => window.__cmd({ t: 'rate', rate: 1.02, seq: 1 })); next += 800; }
+      seen.push([Date.now() - t0, await p.evaluate(() => a.playbackRate)]);
+      await p.waitForTimeout(100);
+    }
+    assert.deepEqual(seen.filter(([, r]) => r !== 1.02), [], 'never released while keep-alives keep coming');
+    await p.close();
+  });
+});
+
+// Counts the listeners added to media elements, and the distinct functions they use.
+function COUNT_LISTENERS() {
+  const add = EventTarget.prototype.addEventListener, fns = new Set();
+  window.__ls = { n: 0, fns };
+  EventTarget.prototype.addEventListener = function (type, fn, opts) {
+    if (this instanceof HTMLMediaElement) { window.__ls.n++; fns.add(fn); }
+    return add.call(this, type, fn, opts);
+  };
+}
+
+test('a page that is never decked gets no listener on its media elements; the first command adds them, one handler for all', async () => {
+  const p = await agentPage({ init: [COUNT_LISTENERS] });
+  await p.evaluate(() => {
+    window.els = [];
+    for (let i = 0; i < 20; i++) { const m = new Audio('/tone.wav'); m.muted = true; m.loop = true; window.els.push(m); m.play(); }
+  });
   await p.waitForTimeout(200);
-  assert.equal(await p.evaluate(() => a.playbackRate), 1.25, 'the page owns its speed again');
+  assert.equal(await p.evaluate(() => window.__ls.n), 0, 'no listeners while passive');
+  await p.evaluate(() => window.__cmd({ t: 'query' }));
+  await p.waitForTimeout(100);
+  const r = await p.evaluate(() => ({ n: window.__ls.n, fns: window.__ls.fns.size }));
+  assert.ok(r.n >= 20 * 7, `listeners after the first command: ${r.n}`);
+  assert.ok(r.fns <= 2, `distinct listener functions: ${r.fns}`);
+  // Elements played after the first command are wired at once; their events reach the status.
+  await p.evaluate(() => { const b = new Audio('/tone.wav'); b.loop = true; window.b = b; return b.play(); });
+  await p.waitForTimeout(400);
+  const s = await lastOf(p);
+  assert.deepEqual([s.count, s.audible, s.playing], [21, 1, true], JSON.stringify(s));
+  await p.evaluate(() => window.b.pause());
+  await p.waitForTimeout(400);
+  assert.equal((await lastOf(p)).audible, 0, 'the pause reached the status');
+  assert.deepEqual(errors, []);
   await p.close();
+});
+
+/** JS heap growth per element over `n` `new Audio().play()` calls the page drops, after full GCs. */
+async function heapPerElement(page, cdp, n) {
+  const gc = async () => { for (let i = 0; i < 4; i++) { await cdp.send('HeapProfiler.collectGarbage'); await page.waitForTimeout(50); } };
+  await page.evaluate(() => {
+    window.__sfx = (k) => { for (let i = 0; i < k; i++) { const a = new Audio(); a.muted = true; a.play().catch(() => {}); } };
+    window.__sfx(10); // warm up: compile, inline caches, the agent's first registrations
+  });
+  await page.waitForTimeout(300);
+  await gc();
+  const h0 = (await cdp.send('Runtime.getHeapUsage')).usedSize;
+  await page.evaluate((k) => window.__sfx(k), n);
+  await page.waitForTimeout(500);
+  await gc();
+  return ((await cdp.send('Runtime.getHeapUsage')).usedSize - h0) / n;
+}
+
+test('with the extension, a page that is never decked holds at most ~150 B more JS heap per media element it plays', async () => {
+  // Sound effects and feeds play thousands of short-lived elements. Chrome keeps an element whose
+  // play() is pending alive, with or without the agent: what the agent adds is its registry entry.
+  const N = 5000;
+  const plain = await launchPlain();
+  let base, ext;
+  try {
+    const p = await plain.newPage();
+    await p.goto(`${server.origin}/__agent.html`);
+    base = await heapPerElement(p, await p.context().newCDPSession(p), N);
+  } finally { await plain.close(); }
+  const h = await launchExtension({ ext: prepareExtension() });
+  try {
+    const p = await h.context.newPage();
+    await p.goto(`${server.origin}/__agent.html`);
+    assert.ok(!(await p.evaluate(() => Function.prototype.toString.call(HTMLMediaElement.prototype.play))).includes('[native code]'), 'the agent is in the page');
+    ext = await heapPerElement(p, await h.context.newCDPSession(p), N);
+  } finally { await h.close(); }
+  console.log(`JS heap per element: ${ext.toFixed(1)} B with the extension, ${base.toFixed(1)} B without`);
+  assert.ok(ext - base <= 150, `the agent adds ${(ext - base).toFixed(0)} B per element (${ext.toFixed(0)} vs ${base.toFixed(0)} B)`);
 });
 
 test('elements that were only load()ed or pause()d are found too', async () => {
@@ -453,34 +582,6 @@ test('with page timers a minute late (a long-hidden tab) every rate command is c
     assert.ok(Math.abs(l.rate - (1 + 0.0025 * (i + 1))) < 1e-9, `seq ${l.seq} confirms rate ${l.rate}`);
   }
   assert.deepEqual(await p.evaluate(() => [a.playbackRate, a.preservesPitch]), [1.02, false], 'still held after 4 s of keep-alives');
-  await p.close();
-});
-
-test('with page timers a minute late the agent still lets go 3 s after the last command', async () => {
-  const p = await agentPage({ init: [SLOW_TIMERS] });
-  await p.evaluate(() => { const a = new Audio('/tone.wav'); a.loop = true; window.a = a; return a.play(); });
-  await p.evaluate(() => window.__cmd({ t: 'rate', rate: 1.02, seq: 1 }));
-  await p.waitForTimeout(1500);
-  assert.deepEqual(await p.evaluate(() => [a.playbackRate, a.preservesPitch]), [1.02, false], 'held 1.5 s after the command');
-  await p.waitForTimeout(2200);
-  assert.deepEqual(await p.evaluate(() => [a.playbackRate, a.preservesPitch]), [1, true], 'released 3.7 s after the command, with no timer');
-  await p.close();
-});
-
-test('a stale watchdog timer never lets go while the engine keeps the rate alive', async () => {
-  const p = await agentPage({ init: [STICKY_TIMERS] });
-  await p.evaluate(() => { const a = new Audio('/tone.wav'); a.loop = true; window.a = a; return a.play(); });
-  const t0 = Date.now();
-  await p.evaluate(() => window.__cmd({ t: 'rate', rate: 1.02, seq: 1 }));
-  // Keep-alives every 0.8 s, so a stale 3 s timer would fire between two of them.
-  let next = 800;
-  const seen = [];
-  while (Date.now() - t0 < 4600) {
-    if (Date.now() - t0 >= next) { await p.evaluate(() => window.__cmd({ t: 'rate', rate: 1.02, seq: 1 })); next += 800; }
-    seen.push([Date.now() - t0, await p.evaluate(() => a.playbackRate)]);
-    await p.waitForTimeout(100);
-  }
-  assert.deepEqual(seen.filter(([, r]) => r !== 1.02), [], 'never released while keep-alives keep coming');
   await p.close();
 });
 

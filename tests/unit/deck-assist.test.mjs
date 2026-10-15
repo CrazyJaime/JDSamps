@@ -3,12 +3,15 @@
 // agent-main.js behind agent-relay.js (they answer commands with a status a little later).
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { Deck } from '../../engine/deck.js';
 import { Timeshift } from '../../engine/timeshift.js';
 import { MasterClock } from '../../engine/sync.js';
 
 globalThis.chrome = globalThis.chrome || { runtime: {} };
 const DT = 1536 / 48000;
+// How long agent-main.js holds a rate without a command before it lets go of the page by itself.
+const LET_GO = Number(/const LET_GO = (\d+);/.exec(fs.readFileSync(new URL('../../agent/agent-main.js', import.meta.url), 'utf8'))[1]) / 1000;
 
 class FakeNode {
   constructor(clock) { this.clock = clock; this.map = [{ active: false, input: 0, output: 0, rate: 1, loopStart: 0, loopEnd: 0 }]; }
@@ -62,10 +65,12 @@ async function setup({ pitch = 0.06 } = {}) {
 
 /**
  * A frame's agent. `page` is the media element the page plays: `obey` = it takes the rates the
- * agent sets; `audible` = whether the tab's captured sound comes from it.
+ * agent sets; `audible` = whether the tab's captured sound comes from it. Like agent-main.js it
+ * lets go of the page LET_GO after the last rate command, says so (selfReleased, with the wall
+ * time), and then takes the page back only on a command with a new seq.
  */
 function agent(env, frameId, { audible = true, obey = true, rate = 1, delay = 0.05 } = {}) {
-  const page = { rate, base: rate, seq: 0, obey };
+  const page = { rate, base: rate, seq: 0, obey, enforcing: false, cmdAt: 0, letGo: 0 };
   const q = [];
   const port = {
     sent: [], listeners: [], dropListeners: [],
@@ -73,16 +78,28 @@ function agent(env, frameId, { audible = true, obey = true, rate = 1, delay = 0.
     onDisconnect: { addListener: (f) => port.dropListeners.push(f) },
     postMessage(m) {
       port.sent.push({ at: env.clock.t, ...m });
-      if (Number.isSafeInteger(m.seq)) page.seq = m.seq;
-      if (m.t === 'rate' && page.obey) page.rate = m.rate;
-      if (m.t === 'release') page.rate = page.base;
+      if (!(m.t === 'rate' && page.letGo && m.seq === page.seq)) {
+        if (m.t === 'rate' || m.t === 'release') page.letGo = 0;
+        if (Number.isSafeInteger(m.seq)) page.seq = m.seq;
+        if (m.t === 'rate') { page.enforcing = true; page.cmdAt = env.clock.t; }
+        if (m.t === 'rate' && page.obey) page.rate = m.rate;
+        if (m.t === 'release') { page.rate = page.base; page.enforcing = false; }
+      }
       port.reply(delay);
     },
     disconnect() {},
     status: () => ({
       t: 'status', hasMedia: true, playing: true, rate: page.rate, preservesPitch: page.rate === page.base,
       muted: !audible, volume: 1, audible: audible ? 1 : 0, count: 1, seq: page.seq,
+      ...(page.letGo ? { selfReleased: true, releasedAt: page.letGo } : {}),
     }),
+    /** The agent's own clock (its tab is not stalled with the engine): the watchdog. */
+    watch(t) {
+      if (!page.enforcing || t - page.cmdAt < LET_GO) return;
+      const at = page.cmdAt + LET_GO;
+      page.enforcing = false; page.rate = page.base; page.letGo = page.letGoAt = at * 1000; // the engine's wallNow() is clock.t * 1000
+      q.push({ at: at + delay, m: null });
+    },
     reply(after = delay, m = null) { q.push({ at: env.clock.t + after, m }); },
     pump(t) { while (q.length && q[0].at <= t) { const { m } = q.shift(); port.deliver(m || port.status()); } },
     deliver(m) { for (const f of port.listeners) f(m); },
@@ -101,7 +118,7 @@ function run(env, seconds, { src = () => 1, onTick } = {}) {
   while (env.clock.t < end - 1e-9) {
     env.clock.t += DT;
     env.d.ts.liveEdge += DT * src();
-    for (const a of env.agents) a.pump(env.clock.t);
+    for (const a of env.agents) { a.watch(env.clock.t); a.pump(env.clock.t); }
     if (onTick) onTick(env.clock.t);
     env.d.tick(env.clock.t);
   }
@@ -300,6 +317,71 @@ test('a page that never confirms is refused after about 5 s, and the ramp holds 
   assert.equal(env.d.assist.sourceRate, 1);
   assert.equal(env.d.state(env.clock.t).assist.available, false);
 });
+
+/**
+ * The engine's main thread is blocked for `seconds`: no ticks, no messages. The captured audio
+ * queues up (appended in one go afterwards, `chunksFirst`, or after the agents' statuses), and the
+ * agents' tabs run on. The input timeline runs on the audio clock: src defaults to 1 s per s.
+ */
+function stall(env, seconds, { src = () => 1, chunksFirst = true } = {}) {
+  let backlog = 0;
+  const end = env.clock.t + seconds;
+  while (env.clock.t < end - 1e-9) {
+    env.clock.t += DT;
+    backlog += DT * src();
+    for (const a of env.agents) a.watch(env.clock.t);
+  }
+  if (chunksFirst) env.d.ts.liveEdge += backlog;
+  for (const a of env.agents) a.pump(env.clock.t);
+  if (!chunksFirst) env.d.ts.liveEdge += backlog;
+}
+
+test("an engine stall shorter than the agent's timeout keeps assist engaged: no release, no refusal, no empty reserve", async () => {
+  const env = await setup();
+  const a = agent(env, 0);
+  run(env, 8);
+  const engaged = env.d.assist.sourceRate;
+  assert.ok(engaged > 1.01, `engaged at ${engaged}`);
+  const n = a.sent.length;
+  stall(env, 5);
+  const off = [];
+  run(env, 20, { onTick: (t) => { if (!env.d.assist.active) off.push(t); } });
+  assert.deepEqual(off, [], 'assist stayed engaged');
+  assert.ok(!a.sent.slice(n).some((m) => m.t === 'release'), 'never released');
+  assert.equal(a.page.letGoAt, undefined, 'the page never let go');
+  assert.ok(env.d.assist.sourceRate > 1.01);
+  assert.equal(env.d.state(env.clock.t).assist.available, true);
+  assert.deepEqual(env.engine.events.filter((e) => /reserve empty/.test(e.text)), []);
+});
+
+for (const chunksFirst of [true, false]) {
+  test(`an agent that let go by itself is not a refusal: the model steps back to 1x where the page did, and assist ramps again (${chunksFirst ? 'audio' : 'status'} first after the stall)`, async () => {
+    const env = await setup();
+    const a = agent(env, 0);
+    run(env, 8);
+    const engaged = env.d.assist.sourceRate;
+    assert.ok(engaged > 1.01, `engaged at ${engaged}`);
+    // The engine stalls past the agent's timeout: the page goes back to 1x mid-stall.
+    const edge0 = env.d.ts.liveEdge, t0 = env.clock.t;
+    stall(env, LET_GO + 3, { chunksFirst });
+    assert.ok(a.page.letGoAt > 0, 'the agent let go');
+    const edgeAtLetGo = edge0 + (a.page.letGoAt / 1000 - t0);
+    const seqs = new Set(a.sent.map((m) => m.seq));
+    run(env, DT); // the first tick after the stall
+    assert.equal(env.d.state(env.clock.t).assist.available, true, 'not refused');
+    assert.equal(env.d.assist.sourceRate, 1);
+    const step = env.d.src.steps.at(-1);
+    assert.equal(step.rate, 1);
+    assert.ok(Math.abs(step.inPos - edgeAtLetGo) < 0.1, `step back to 1x at ${step.inPos.toFixed(2)}; the page let go at ${edgeAtLetGo.toFixed(2)}, the engine heard of it at ${env.d.ts.liveEdge.toFixed(2)}`);
+    assert.ok(env.d.src.rateAt(step.inPos - 0.5) > 1.01, 'audio from before the page let go keeps its rate');
+    assert.ok(Math.abs(env.d.tempo.bpm - 124) < 1e-6, `tempo back to the page's own ${env.d.tempo.bpm}`);
+    run(env, 4);
+    const fresh = rates(a).filter((m) => !seqs.has(m.seq));
+    assert.ok(fresh.length > 0, 'new rate commands');
+    assert.ok(env.d.assist.sourceRate > 1, `re-engaged at ${env.d.assist.sourceRate}`);
+    assert.equal(a.page.rate, env.d.assist.sourceRate, 'the page plays what the engine believes');
+  });
+}
 
 test('malformed or hostile agent messages change nothing in the engine (Review Focus 5)', async () => {
   const env = await setup();

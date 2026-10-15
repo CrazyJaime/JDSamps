@@ -321,14 +321,22 @@ chrome.tabs.onRemoved.addListener(async (tabId) => {
     chrome.runtime.sendMessage({ target: TARGET.ENGINE, type: ENGINE.EJECT, tabId }).catch(() => {});
   }
 });
-chrome.tabs.onUpdated.addListener(async (tabId, info, tab) => {
-  if (info.url) await revoke(tabId, originOf(info.url));
+// Chrome takes no filter here ('This event does not support filters'): every tab's title, favicon
+// and loading changes come here, so a tab that is not a deck is told apart from memory and the
+// handler returns before any await (only a restarted worker reads the deck list once).
+chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
+  const revoked = info.url ? revoke(tabId, originOf(info.url)).catch(() => {}) : null;
+  if (deckIds && !deckIds.includes(tabId)) return;
+  return deckTabUpdated(tabId, info, tab, revoked);
+});
+async function deckTabUpdated(tabId, info, tab, revoked) {
+  await revoked;
   if (!(await deckTabIds()).includes(tabId)) return;
   if (info.title || info.favIconUrl || info.url) {
     toEngine({ type: ENGINE.META, tabId, meta: { title: tab.title || '', url: tab.url || '', favIconUrl: tab.favIconUrl || '' } }).catch(() => {});
   }
   if (info.status === 'complete') connectAgent(tabId);
-}); // Chrome takes no filter here ('This event does not support filters'): the handler stays cheap instead
+}
 
 async function badge(decks) {
   await chrome.action.setBadgeBackgroundColor({ color: '#22c55e' });

@@ -1,4 +1,6 @@
 // ui/meters.js — vertical level / gain-reduction meters with peak hold, drawn on canvas.
+import { cssSize } from './util.js';
+
 const FLOOR_DB = -48;
 const toDb = (x) => (x > 0 ? 20 * Math.log10(x) : -Infinity);
 const frac = (db) => Math.max(0, Math.min(1, (db - FLOOR_DB) / -FLOOR_DB));
@@ -11,6 +13,8 @@ export class VMeter {
     this.mode = mode;
     this.vals = Array.from({ length: channels }, () => ({ peak: 0, rms: 0, hold: 0, holdAt: 0, clip: false }));
     this.gr = 0;
+    this.grad = null; // the level gradient, for a canvas gradH device pixels high
+    this.gradH = 0;
   }
 
   update(values) {
@@ -23,9 +27,10 @@ export class VMeter {
     });
   }
 
+  /** Every animation frame: no layout reads (the size comes from a ResizeObserver), one gradient per height. */
   draw() {
-    const dpr = window.devicePixelRatio || 1;
-    const W = Math.max(1, Math.round(this.c.clientWidth * dpr)), H = Math.max(1, Math.round(this.c.clientHeight * dpr));
+    const dpr = window.devicePixelRatio || 1, size = cssSize(this.c);
+    const W = Math.max(1, Math.round(size.w * dpr)), H = Math.max(1, Math.round(size.h * dpr));
     if (this.c.width !== W || this.c.height !== H) { this.c.width = W; this.c.height = H; }
     const g = this.g;
     g.clearRect(0, 0, W, H);
@@ -38,8 +43,12 @@ export class VMeter {
       return;
     }
     const gap = Math.max(1, Math.round(dpr)), cw = (W - gap * (this.channels - 1)) / this.channels;
-    const grad = g.createLinearGradient(0, H, 0, 0);
-    grad.addColorStop(0, '#22c55e'); grad.addColorStop(0.7, '#a3e635'); grad.addColorStop(0.86, '#fbbf24'); grad.addColorStop(1, '#ef4444');
+    if (this.gradH !== H) {
+      this.grad = g.createLinearGradient(0, H, 0, 0);
+      this.grad.addColorStop(0, '#22c55e'); this.grad.addColorStop(0.7, '#a3e635'); this.grad.addColorStop(0.86, '#fbbf24'); this.grad.addColorStop(1, '#ef4444');
+      this.gradH = H;
+    }
+    const grad = this.grad;
     this.vals.forEach((s, i) => {
       const x = i * (cw + gap);
       const rh = frac(toDb(s.rms)) * H, ph = frac(toDb(s.peak)) * H, hh = frac(toDb(s.hold)) * H;

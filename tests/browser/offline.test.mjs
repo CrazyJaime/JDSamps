@@ -116,6 +116,22 @@ test('limiter is transparent below the ceiling', async () => {
   assert.ok(Math.abs(20 * Math.log10(r.outRms / r.inRms)) < 0.05, JSON.stringify(r));
 });
 
+test('deck meters from the master worklet match what the AnalyserNode read, post-fader', async () => {
+  const r = await run('deckMeter');
+  assert.ok(r.length >= 15, `reads ${r.length}`);
+  for (const x of r) {
+    assert.ok(x.worklet, `no meter message for frame ${x.frame}`);
+    const w = x.worklet;
+    assert.ok(Math.abs(w.peak - x.peak) <= 0.01 * x.peak, `frame ${x.frame}: peak ${w.peak} vs analyser ${x.peak}`);
+    assert.ok(Math.abs(w.rms - x.rms) <= 0.02 * x.rms, `frame ${x.frame}: rms ${w.rms} vs analyser ${x.rms}`);
+    assert.equal(w.clip, -1);
+    assert.ok(w.others.every((v) => v === 0 || v === -1), 'other slots read silence');
+  }
+  const before = r.filter((x) => x.frame <= 48000), after = r.filter((x) => x.frame > 48000);
+  assert.ok(before.length && after.length);
+  assert.ok(Math.abs(after[0].worklet.rms / before[0].worklet.rms - 0.4 / 0.9) < 0.02, 'post-fader');
+});
+
 test('crossfader at B silences an A-assigned deck', async () => {
   const r = await run('xfader');
   assert.ok(r.rms < 1e-4, JSON.stringify(r));

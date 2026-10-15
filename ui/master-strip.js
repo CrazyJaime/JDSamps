@@ -48,13 +48,12 @@ export class MasterStrip {
   nudgeXf(delta) { this.xf.commit(this.xf.value + delta); }
   setXf(v) { this.xf.commit(v); }
 
-  /** Every snapshot is stored; the DOM follows only while the page is visible (and catches up when it shows). */
+  /** Every snapshot is stored; the DOM follows once per animation frame (frame()), with the latest one. */
   update(s) {
     this.params = s.master.params;
     this.rec = s.master.rec;
     this.snap = s;
-    if (pageHidden()) { this.stale = true; return; }
-    this.render(s);
+    this.stale = true;
   }
 
   render(s) {
@@ -82,5 +81,8 @@ export class MasterStrip {
     setText($('#clockMode'), c.mode === 'deck' ? `DECK ${slot ?? '?'}` : c.mode === 'free' ? 'FREE RUNNING' : 'no master');
   }
 
-  frame() { this.meter.draw(); this.gr.draw(); }
+  frame() {
+    if (this.stale && !pageHidden()) this.render(this.snap);
+    this.meter.draw(); this.gr.draw();
+  }
 }

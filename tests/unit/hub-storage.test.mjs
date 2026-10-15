@@ -376,6 +376,23 @@ test('a deck tab update is found from memory and refreshes the deck meta', async
   await settle();
 });
 
+test('updates of a tab that is not a deck are answered from memory, before any await, with no hub work', async () => {
+  await hub({ type: 'DECKS_CHANGED', decks: [{ tabId: 11, slot: 1 }] });
+  await settle();
+  sent = []; scripts = [];
+  const before = reads;
+  const returned = [];
+  for (let i = 0; i < 30; i++) returned.push(...chrome.tabs.onUpdated.fire(12, { title: `chat (${i})` }, { ...tabs[1], title: `chat (${i})` }));
+  returned.push(...chrome.tabs.onUpdated.fire(12, { favIconUrl: 'https://b.example/f.ico' }, tabs[1]));
+  returned.push(...chrome.tabs.onUpdated.fire(12, { status: 'complete' }, tabs[1]));
+  assert.deepEqual(returned.filter((r) => r !== undefined), [], 'the handler returned at once (no promise: nothing awaited)');
+  await settle();
+  assert.equal(reads - before, 0, 'storage reads');
+  assert.deepEqual([sent, scripts], [[], []], 'hub work');
+  await hub({ type: 'DECKS_CHANGED', decks: [] });
+  await settle();
+});
+
 // ---------------------------------------------------------------- uncapturable tabs (conformance/M5)
 test('the icon on a Chrome page or the Web Store says why it cannot be captured, then opens the deck', async () => {
   const pages = [
