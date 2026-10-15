@@ -64,7 +64,8 @@ export class DeckStrip {
       filter: knob('filter', { min: -1, max: 1, def: 0, bipolar: true, format: (v) => (Math.abs(v) < 0.04 ? 'OFF' : v < 0 ? `LP ${Math.round(-v * 100)}` : `HP ${Math.round(v * 100)}`) }),
       'fx.level': knob('fx.level', { def: 0.5, format: (v) => `${Math.round(v * 100)}%` }),
     };
-    this.fader = new Fader(this.q('[data-ctl="fader"]'), { label: 'Channel fader', def: 1, value: p.fader, ticks: [0, 0.25, 0.5, 0.75, 1], onChange: (v) => this.set('fader', v), format: (v) => `${Math.round(v * 100)}%` });
+    // On-air fader: no wheel (a stray scroll must not cut a deck) and no double-click jump to full.
+    this.fader = new Fader(this.q('[data-ctl="fader"]'), { label: 'Channel fader', def: 1, value: p.fader, ticks: [0, 0.25, 0.5, 0.75, 1], wheel: false, reset: false, onChange: (v) => this.set('fader', v), format: (v) => `${Math.round(v * 100)}%` });
     this.pitch = new Fader(this.q('[data-ctl="pitch"]'), {
       orientation: 'horizontal', label: 'Tempo', min: -1, max: 1, def: 0, value: p.range ? p.pitch / p.range : 0, center: true, readout: true,
       step: 0.005, fine: 0.0005,
@@ -92,7 +93,7 @@ export class DeckStrip {
       bindPad(this.q(sel), { latch: false, onDown: () => this.act('nudge', { dir, fine: false }), onUp: () => this.act('nudge', { dir: 0 }) });
     }
     const on = (sel, fn) => this.q(sel).addEventListener('click', fn);
-    on('[data-act="playToggle"]', () => this.act(this.d.playing ? 'pause' : 'play'));
+    on('[data-act="playToggle"]', () => this.act('playToggle'));
     on('[data-act="sync"]', () => this.act('sync', { on: !this.d.sync.on }));
     on('[data-act="master"]', () => this.act('master'));
     on('[data-act="syncPlay"]', () => this.act('syncPlay'));
@@ -127,9 +128,10 @@ export class DeckStrip {
     if (name.startsWith('kill.')) this.set(name, !this.d.params[name]);
     else if (name === 'keyLock') this.set('keyLock', !this.d.params.keyLock);
   }
+  /** From the tempo fader's local value, so key repeats never build on a stale snapshot. */
   nudgePitch(delta) {
     const r = this.d.params.range;
-    this.set('pitch', Math.max(-r, Math.min(r, this.d.params.pitch + delta)));
+    if (r) this.pitch.commit(this.pitch.value + delta / r);
   }
 
   update(d, s) {

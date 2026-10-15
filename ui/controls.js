@@ -1,10 +1,15 @@
 // ui/controls.js — knob, fader, pad and segmented controls tuned for live use:
 // vertical drag (Shift = fine), wheel, double-click = default, arrow keys when focused.
-// External updates are ignored while the user is dragging, so engine echoes never fight the hand.
+// External updates are ignored while the user is dragging and for HOLD_MS after any local change
+// (unless the echo matches what was sent), so stale engine snapshots never fight the hand.
 import { clamp } from './util.js';
 
 const SVGNS = 'http://www.w3.org/2000/svg';
 const ARC = 270;
+const HOLD_MS = 250;     // ignore engine values this long after a local change
+const WHEEL_PX = 48;     // wheel travel per step: about 50 px of trackpad, one notch of a mouse
+const LINE_PX = 16;      // deltaMode 1 (lines) in pixels
+const CLICK_SLOP = 3;    // px a press may wander and still count as a click for double-click reset
 const polar = (cx, cy, r, deg) => {
   const a = ((deg - 90) * Math.PI) / 180;
   return [cx + r * Math.cos(a), cy + r * Math.sin(a)];
@@ -17,22 +22,40 @@ function arcPath(r, from, to) {
 const svgEl = (tag, attrs) => { const e = document.createElementNS(SVGNS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; };
 
 class Continuous {
+  /** o.wheel = false: no scroll-wheel control; o.reset = false: no double-click reset. */
   constructor(el, o) {
     this.el = el;
-    this.o = { min: 0, max: 1, step: 0.01, fine: 0.002, format: (v) => v.toFixed(2), ...o };
+    this.o = { min: 0, max: 1, step: 0.01, fine: 0.002, format: (v) => v.toFixed(2), wheel: true, reset: true, ...o };
     this.value = this.o.value ?? this.o.def ?? this.o.min;
     this.dragging = false;
+    this.sent = this.value;
+    this.heldUntil = 0;
+    this.wheelPx = 0;
+    this.wheelAt = 0;
     el.setAttribute('role', 'slider');
     el.tabIndex = 0;
     el.setAttribute('aria-label', this.o.label || '');
     el.setAttribute('aria-valuemin', String(this.o.min));
     el.setAttribute('aria-valuemax', String(this.o.max));
-    el.addEventListener('dblclick', () => this.commit(this.o.def ?? this.o.min));
-    el.addEventListener('wheel', (e) => {
-      e.preventDefault();
-      const d = (e.deltaY < 0 ? 1 : -1) * (e.shiftKey ? this.o.fine : this.o.step);
-      this.commit(this.value + d);
-    }, { passive: false });
+    // Double-click resets only when both presses were still clicks: a tap followed by a quick
+    // re-grab and drag also raises dblclick, and must never throw the control to its default.
+    let press = null;
+    const dirty = [true, true];
+    el.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0) return;
+      press = { x: e.clientX, y: e.clientY, v: this.value };
+      dirty.shift(); dirty.push(false);
+    });
+    el.addEventListener('pointermove', (e) => {
+      if (press && Math.hypot(e.clientX - press.x, e.clientY - press.y) > CLICK_SLOP) dirty[1] = true;
+    });
+    const release = () => { if (press && this.value !== press.v) dirty[1] = true; press = null; };
+    el.addEventListener('pointerup', release);
+    el.addEventListener('pointercancel', release);
+    el.addEventListener('dblclick', () => {
+      if (this.o.reset && !dirty[0] && !dirty[1]) this.commit(this.o.def ?? this.o.min);
+    });
+    if (this.o.wheel) el.addEventListener('wheel', (e) => this.wheel(e), { passive: false });
     el.addEventListener('keydown', (e) => {
       const big = (this.o.max - this.o.min) / 10;
       const d = { ArrowUp: this.o.step, ArrowRight: this.o.step, ArrowDown: -this.o.step, ArrowLeft: -this.o.step, PageUp: big, PageDown: -big }[e.key];
@@ -42,16 +65,45 @@ class Continuous {
     });
   }
 
+  /**
+   * Vertical wheel only: a sideways swipe is not taken (no preventDefault), so it still scrolls
+   * the deck row. Browsers deliver Shift+wheel as deltaX, so with Shift (fine) either axis counts.
+   * Small trackpad deltas accumulate; at most one step per event, so a mouse notch is one step.
+   */
+  wheel(e) {
+    let d = e.deltaY;
+    if (Math.abs(d) <= Math.abs(e.deltaX)) { if (!e.shiftKey) return; d = e.deltaX; }
+    if (!d) return;
+    e.preventDefault();
+    const px = d * (e.deltaMode === 1 ? LINE_PX : e.deltaMode === 2 ? window.innerHeight || 800 : 1);
+    const now = performance.now();
+    if (now - this.wheelAt > 250 || Math.sign(px) !== Math.sign(this.wheelPx)) this.wheelPx = 0;
+    this.wheelAt = now;
+    this.wheelPx += px;
+    if (Math.abs(this.wheelPx) < WHEEL_PX) return;
+    this.wheelPx = 0;
+    this.commit(this.value - Math.sign(px) * (e.shiftKey ? this.o.fine : this.o.step));
+  }
+
   commit(v) {
     const nv = clamp(v, this.o.min, this.o.max);
     if (nv === this.value) return;
     this.value = nv;
+    this.sent = nv;
+    this.heldUntil = performance.now() + HOLD_MS;
     this.render();
     this.o.onChange && this.o.onChange(nv);
   }
 
+  /** Engine value. Ignored mid-drag, and just after a local change until it echoes back. */
   set(v) {
-    if (this.dragging || typeof v !== 'number' || v === this.value) return;
+    if (this.dragging || typeof v !== 'number') return;
+    if (this.heldUntil) {
+      if (Math.abs(v - this.sent) <= 1e-9 * (this.o.max - this.o.min)) { this.heldUntil = 0; return; }
+      if (performance.now() < this.heldUntil) return;
+      this.heldUntil = 0;
+    }
+    if (v === this.value) return;
     this.value = clamp(v, this.o.min, this.o.max);
     this.render();
   }

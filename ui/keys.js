@@ -38,7 +38,7 @@ export function bindKeys({ getStrip, selectSlot, conn, master, toggleHelp, close
     let handled = true;
     switch (c) {
       case 'Space':
-        if (once) strip.act(e.shiftKey ? 'syncPlay' : d.playing ? 'pause' : 'play');
+        if (once) strip.act(e.shiftKey ? 'syncPlay' : 'playToggle');
         break;
       case 'KeyC': if (once) { held.set(c, { cue: true, strip }); strip.act('cueDown'); } break;
       case 'KeyS': if (once) { if (e.shiftKey) strip.act('master'); else strip.act('sync', { on: !d.sync.on }); } break;

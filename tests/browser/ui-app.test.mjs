@@ -1,4 +1,4 @@
-import test, { before, after } from 'node:test';
+import test, { before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
@@ -58,7 +58,7 @@ test('transport and sync buttons send actions', async () => {
   await deckEl(1).locator('[data-act="sync"]').click();
   await page.waitForTimeout(50);
   const a = await acts();
-  assert.ok(a.some((m) => m.deck === 3 && m.a === 'play'));
+  assert.ok(a.some((m) => m.deck === 3 && m.a === 'playToggle'));
   assert.ok(a.some((m) => m.deck === 1 && m.a === 'sync' && m.arg.on === false));
 });
 
@@ -120,10 +120,39 @@ test('keyboard shortcuts drive the selected deck and the mixer', async () => {
   await page.keyboard.down('KeyV'); await page.waitForTimeout(40); await page.keyboard.up('KeyV');
   await page.waitForTimeout(60);
   const a = (await acts((m) => m.deck === 2)).map((m) => [m.a, m.arg]);
-  assert.deepEqual(a, [['pause', {}], ['master', {}], ['nudge', { dir: -1, fine: false }], ['nudge', { dir: 0 }], ['rollStart', { beats: 0.125 }], ['rollEnd', {}]]);
+  assert.deepEqual(a, [['playToggle', {}], ['master', {}], ['nudge', { dir: -1, fine: false }], ['nudge', { dir: 0 }], ['rollStart', { beats: 0.125 }], ['rollEnd', {}]]);
   const s = await sets();
   assert.ok(s.some((m) => m.deck === 2 && m.key === 'kill.hi' && m.value === true));
   assert.ok(s.some((m) => m.deck === null && m.key === 'xfader.pos' && Math.abs(m.value - 0.45) < 1e-9));
+});
+
+test('channel faders and the crossfader ignore the wheel and double-click; the tempo fader still wheels', async () => {
+  const at = async (loc) => { const b = await loc.boundingBox(); await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2); };
+  await ui.clearSent();
+  await at(deckEl(1).locator('[data-ctl="fader"]'));
+  for (let i = 0; i < 3; i++) await page.mouse.wheel(0, 100);
+  await at(page.locator('#crossfader'));
+  for (let i = 0; i < 3; i++) await page.mouse.wheel(0, -100);
+  await page.waitForTimeout(60);
+  assert.deepEqual(await sets((m) => m.key === 'fader' || m.key === 'xfader.pos'), []);
+  // A deliberate double-click is not a reset for faders that are on air.
+  const f = deckEl(1).locator('[data-ctl="fader"]');
+  const b = await f.boundingBox();
+  await page.mouse.move(b.x + b.width / 2, b.y + 20);
+  await page.mouse.down(); await page.mouse.move(b.x + b.width / 2, b.y + 60, { steps: 4 }); await page.mouse.up();
+  const lowered = Number(await f.getAttribute('aria-valuenow'));
+  assert.ok(lowered < 0.9, `fader at ${lowered}`);
+  await page.waitForTimeout(600);
+  await f.dblclick();
+  await page.locator('#crossfader').dblclick();
+  await page.waitForTimeout(60);
+  assert.equal(Number(await f.getAttribute('aria-valuenow')), lowered);
+  assert.equal(Number(await page.locator('#crossfader').getAttribute('aria-valuenow')), 0.45);
+  await ui.clearSent();
+  await at(deckEl(1).locator('[data-ctl="pitch"]'));
+  await page.mouse.wheel(0, -100);
+  await page.waitForTimeout(60);
+  assert.equal((await sets((m) => m.deck === 1 && m.key === 'pitch')).length, 1);
 });
 
 test('sources drawer lists tabs with the right action per state', async () => {
@@ -176,4 +205,116 @@ test('empty state is shown with no decks', async () => {
     fs.mkdirSync(ART, { recursive: true });
     await u2.page.screenshot({ path: path.join(ART, 'deck-ui-empty.png') });
   } finally { await u2.close(); }
+});
+
+// A fake engine with a real round trip: a message is applied 2 ms after it is posted, the engine
+// snapshots every 32 ms and each snapshot lands 3 ms later, so the UI always sees slightly old state.
+describe('with a lagging engine', () => {
+  let lu, lp;
+  const near = (a, b, eps = 1e-9) => Math.abs(a - b) <= eps;
+  const eng = () => lp.evaluate(() => window.__eng);
+  const key = (type, code, extra = {}) => ({ type, code, key: code === 'Space' ? ' ' : code, ...extra });
+  const keys = (list) => lp.evaluate((l) => { for (const k of l) document.body.dispatchEvent(new KeyboardEvent(k.type, { bubbles: true, cancelable: true, ...k })); }, list);
+
+  before(async () => {
+    lu = await openUi({ state: threeDecks() });
+    lp = lu.page;
+    await lp.waitForSelector('.deck >> nth=2');
+    await lp.evaluate(() => {
+      const f = window.__fake;
+      const e = JSON.parse(JSON.stringify(f.state));
+      window.__eng = e;
+      const push = f.sent.push.bind(f.sent);
+      f.sent.push = (m) => {
+        setTimeout(() => {
+          const d = e.decks.find((x) => x.id === m.deck);
+          if (m.t === 'set') (m.deck === null ? e.master.params : d.params)[m.key] = m.value;
+          if (m.t === 'act' && d) {
+            if (m.a === 'play') d.playing = true;
+            else if (m.a === 'pause' || (m.a === 'cueDown' && d.playing)) d.playing = false;
+            else if (m.a === 'playToggle') d.playing = !d.playing;
+          }
+        }, 2);
+        return push(m);
+      };
+      setInterval(() => { const s = JSON.parse(JSON.stringify(e)); setTimeout(() => f.push({ t: 'state', s }), 3); }, 32);
+    });
+    await lp.waitForTimeout(150);
+  });
+  after(async () => { await lu?.close(); });
+
+  test('wheel steps on a knob all land despite stale snapshots', async () => {
+    const before0 = (await eng()).decks[0].params.trim;
+    await lp.evaluate(() => new Promise((res) => {
+      const svg = document.querySelector('.deck [data-ctl="trim"] svg');
+      let k = 0;
+      const id = setInterval(() => {
+        svg.dispatchEvent(new WheelEvent('wheel', { deltaY: -100, bubbles: true, cancelable: true }));
+        if (++k >= 20) { clearInterval(id); res(); }
+      }, 16);
+    }));
+    await lp.waitForTimeout(350);
+    const after0 = (await eng()).decks[0].params.trim;
+    assert.ok(near(after0 - before0, 0.2, 1e-6), `trim moved ${(after0 - before0).toFixed(3)}, not 0.200`);
+  });
+
+  test('held ↑ moves the tempo by every repeat', async () => {
+    const before0 = (await eng()).decks[0].params.pitch;
+    await lp.evaluate(() => new Promise((res) => {
+      let k = 0;
+      const id = setInterval(() => {
+        document.body.dispatchEvent(new KeyboardEvent('keydown', { code: 'ArrowUp', key: 'ArrowUp', repeat: k > 0, bubbles: true, cancelable: true }));
+        if (++k >= 30) {
+          clearInterval(id);
+          document.body.dispatchEvent(new KeyboardEvent('keyup', { code: 'ArrowUp', key: 'ArrowUp', bubbles: true, cancelable: true }));
+          res();
+        }
+      }, 33);
+    }));
+    await lp.waitForTimeout(350);
+    const after0 = (await eng()).decks[0].params.pitch;
+    assert.ok(near(after0 - before0, 0.03, 1e-6), `tempo moved ${((after0 - before0) * 100).toFixed(2)} %, not 3.00 %`);
+  });
+
+  test('CUE then PLAY before the next snapshot starts the deck', async () => {
+    assert.equal((await eng()).decks[0].playing, true);
+    await keys([key('keydown', 'KeyC'), key('keyup', 'KeyC'), key('keydown', 'Space'), key('keyup', 'Space')]);
+    await lp.waitForTimeout(150);
+    assert.equal((await eng()).decks[0].playing, true);
+  });
+
+  test('a held kill is released at once when the page loses focus while hidden', async () => {
+    await lp.evaluate(() => { window.requestAnimationFrame = () => 0; }); // hidden page: no animation frames
+    await lu.clearSent();
+    await keys([key('keydown', 'KeyQ')]);
+    await lp.waitForTimeout(300);
+    await lp.evaluate(() => window.dispatchEvent(new Event('blur')));
+    const s = (await lu.sent()).filter((m) => m.t === 'set' && m.key === 'kill.hi');
+    assert.deepEqual(s.map((m) => [m.deck, m.value]), [[1, true], [1, false]]);
+  });
+
+  test('pending continuous sets are coalesced, then flushed on blur and when the page is hidden', async () => {
+    const turn = () => lp.evaluate(() => {
+      const svg = document.querySelector('.deck [data-ctl="eq.mid"] svg');
+      for (let i = 0; i < 3; i++) svg.dispatchEvent(new WheelEvent('wheel', { deltaY: -100, bubbles: true, cancelable: true }));
+    });
+    const mids = async () => (await lu.sent()).filter((m) => m.t === 'set' && m.key === 'eq.mid');
+    await lu.clearSent();
+    await turn();
+    assert.equal((await mids()).length, 0);
+    await lp.evaluate(() => window.dispatchEvent(new Event('blur')));
+    assert.equal((await mids()).length, 1);
+    await lu.clearSent();
+    await turn();
+    await lp.evaluate(() => {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+      Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
+      document.dispatchEvent(new Event('visibilitychange'));
+    });
+    const m = await mids();
+    assert.equal(m.length, 1);
+    assert.ok(near(m[0].value, 0.56), `eq.mid ${m[0].value}`);
+  });
+
+  test('no console errors (lagging engine)', () => { assert.deepEqual(lu.errors, []); });
 });

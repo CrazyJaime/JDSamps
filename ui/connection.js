@@ -1,6 +1,6 @@
 // ui/connection.js — the UI's link to the offscreen engine (port 'jds-ui') and the service worker hub.
 // Reconnects forever with backoff; while disconnected the engine keeps playing.
-import { PORT_UI, TARGET, HUB } from '../shared/protocol.js';
+import { PORT_UI, TARGET, HUB, DECK_PARAMS, MASTER_PARAMS } from '../shared/protocol.js';
 
 export class EngineConnection {
   constructor({ onState, onWave, onEvent, onStatus }) {
@@ -16,6 +16,9 @@ export class EngineConnection {
   }
 
   start() {
+    // No animation frame runs while the page is hidden: send anything still queued right away.
+    window.addEventListener('blur', () => this.flush());
+    document.addEventListener('visibilitychange', () => this.flush());
     this.hub(HUB.ENSURE_ENGINE).catch(() => {}).finally(() => this.connect());
   }
 
@@ -68,14 +71,23 @@ export class EngineConnection {
     try { this.port.postMessage(msg); return true; } catch (_) { return false; }
   }
 
-  /** Continuous controls: only the latest value per key is sent, once per animation frame. */
+  /**
+   * Continuous (numeric) parameters: only the latest value per key is sent, once per animation frame.
+   * Discrete ones (booleans, enums) go out at once, after anything queued, so a kill or FX release
+   * is never stuck waiting for a frame that a hidden page does not run.
+   */
   set(deck, key, value) {
-    this.sets.set(`${deck}|${key}`, { t: 'set', deck, key, value });
-    if (!this.raf) this.raf = requestAnimationFrame(() => {
-      this.raf = 0;
-      for (const msg of this.sets.values()) this.post(msg);
-      this.sets.clear();
-    });
+    const msg = { t: 'set', deck, key, value };
+    const spec = (deck === null ? MASTER_PARAMS : DECK_PARAMS)[key];
+    if (!spec || spec.type !== 'num') { this.flush(); this.post(msg); return; }
+    this.sets.set(`${deck}|${key}`, msg);
+    if (!this.raf) this.raf = requestAnimationFrame(() => { this.raf = 0; this.flush(); });
+  }
+
+  flush() {
+    if (this.raf) { cancelAnimationFrame(this.raf); this.raf = 0; }
+    for (const msg of this.sets.values()) this.post(msg);
+    this.sets.clear();
   }
 
   act(deck, a, arg) {

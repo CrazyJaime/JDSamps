@@ -14,7 +14,8 @@ export class MasterStrip {
     this.vol = new Knob($('#masterVol'), { label: 'VOLUME', def: 0.5, value: 0.5, format: vdb, onChange: (v) => conn.set(null, 'master.volume', v) });
     this.limiter = $('#limiterBtn');
     this.limiter.addEventListener('click', () => this.setPersisted('master.limiter', !this.params['master.limiter']));
-    this.xf = new Fader($('#crossfader'), { orientation: 'horizontal', label: 'Crossfader', min: 0, max: 1, def: 0.5, value: 0.5, center: true, step: 0.02, fine: 0.004, format: (v) => `${Math.round(v * 100)}`, onChange: (v) => conn.set(null, 'xfader.pos', v) });
+    // On-air control: no wheel and no double-click jump to centre (\ centres it on purpose).
+    this.xf = new Fader($('#crossfader'), { orientation: 'horizontal', label: 'Crossfader', min: 0, max: 1, def: 0.5, value: 0.5, center: true, step: 0.02, fine: 0.004, wheel: false, reset: false, format: (v) => `${Math.round(v * 100)}`, onChange: (v) => conn.set(null, 'xfader.pos', v) });
     this.curve = bindSeg($('#xfCurve'), { onSelect: (v) => this.setPersisted('xfader.curve', v) });
     this.settings = $$('[data-setting]').map((el) => ({ key: el.dataset.setting, seg: bindSeg(el, { onSelect: (v) => this.setPersisted(el.dataset.setting, v) }) }));
     this.meter = new VMeter($('#masterMeter'), { channels: 2 });
@@ -33,8 +34,9 @@ export class MasterStrip {
     if (!r.ok && r.error) this.toast(r.error, 'warn');
   }
 
-  nudgeXf(delta) { const v = Math.max(0, Math.min(1, this.xf.value + delta)); this.xf.set(v); this.conn.set(null, 'xfader.pos', v); }
-  setXf(v) { this.xf.set(v); this.conn.set(null, 'xfader.pos', v); }
+  // Local commits (sent via onChange), so a stale snapshot cannot undo a key press.
+  nudgeXf(delta) { this.xf.commit(this.xf.value + delta); }
+  setXf(v) { this.xf.commit(v); }
 
   update(s) {
     const m = s.master, p = m.params;
