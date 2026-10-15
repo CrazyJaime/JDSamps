@@ -1,15 +1,24 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { startStaticServer } from './static-server.mjs';
 import { launchPlain } from './playwright.mjs';
+import { PATCHES } from '../../vendor/signalsmith-stretch/patch.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 let server, browser, page; const errors = [];
 
+// The vendored stretcher without its process-cost patch (every other patch kept), for the equivalence check.
+const STRETCH = path.join(ROOT, 'vendor/signalsmith-stretch/SignalsmithStretch.js');
+const withoutCostPatch = () => PATCHES.filter((p) => p.id === 'process-cost')
+  .reduceRight((s, p) => s.replace(p.new, () => p.old), fs.readFileSync(STRETCH, 'utf8'));
+
 before(async () => {
-  server = await startStaticServer(ROOT);
+  server = await startStaticServer(ROOT, {
+    '/stretch-without-cost-patch.js': (req, res) => { res.writeHead(200, { 'content-type': 'text/javascript' }); res.end(withoutCostPatch()); },
+  });
   browser = await launchPlain();
   page = await browser.newPage();
   page.on('pageerror', (e) => errors.push(String(e)));
@@ -110,6 +119,12 @@ test('limiter is transparent below the ceiling', async () => {
 test('crossfader at B silences an A-assigned deck', async () => {
   const r = await run('xfader');
   assert.ok(r.rms < 1e-4, JSON.stringify(r));
+});
+
+test('stretcher: the process-cost patch renders bit-identical audio (trimmed start, jump, loop, a trim while playing)', async () => {
+  const r = await run('stretchEquivalence', { files: ['/stretch-without-cost-patch.js', '/vendor/signalsmith-stretch/SignalsmithStretch.js'] });
+  assert.ok(r.energy > 1000, JSON.stringify(r));
+  assert.equal(r.differing, 0, JSON.stringify(r));
 });
 
 test('no page errors', () => { assert.deepEqual(errors, []); });
