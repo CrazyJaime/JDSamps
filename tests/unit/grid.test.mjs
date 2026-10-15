@@ -76,8 +76,16 @@ async function assistedDeck() {
   d.params.pitch = 0.04;
   d.applyRate();
   clock.t += 0.25;
-  d.agents.set(1, { port: { postMessage() {} }, status: { hasMedia: true } });
-  for (let i = 0; i < 8; i++) { clock.t += 0.25; d.ts.liveEdge += 0.25; d.assistTick(clock.t, 2); }
+  // A page that obeys and confirms every rate (assist commits a step only once it is confirmed).
+  const page = { rate: 1, seq: -1 }, heard = [];
+  const status = () => ({ t: 'status', hasMedia: true, playing: true, rate: page.rate, preservesPitch: page.rate === 1, muted: false, volume: 1, audible: 1, count: 1, seq: page.seq });
+  d.attachAgent({
+    onMessage: { addListener: (f) => heard.push(f) }, onDisconnect: { addListener() {} }, disconnect() {},
+    postMessage(m) { if (Number.isSafeInteger(m.seq)) page.seq = m.seq; if (m.t === 'rate') page.rate = m.rate; if (m.t === 'release') page.rate = 1; },
+  }, 1);
+  const confirm = () => { for (const f of heard) f(status()); };
+  confirm();
+  for (let i = 0; i < 8; i++) { clock.t += 0.25; d.ts.liveEdge += 0.25; d.assistTick(clock.t, 2); confirm(); }
   assert.ok(near(d.assist.sourceRate, 1.02, 1e-9), `assist at ${d.assist.sourceRate}`);
   clock.t += 0.25;
   const p = d.ts.posAt(clock.t);
