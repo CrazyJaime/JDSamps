@@ -15,7 +15,10 @@ const STRETCH_URL = new URL('../vendor/signalsmith-stretch/SignalsmithStretch.js
 SignalsmithStretch.moduleUrl = STRETCH_URL;
 const workletUrl = (f) => new URL(`../worklets/${f}`, import.meta.url).href;
 const withTimeout = (p, ms, msg) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
-const STOP_TAB_MS = 400; // an eject waits at most this long for its tab to stop playing
+// An eject waits at most this long for its tab to stop playing. The hub bounds its own work (pause
+// for 250 ms, else mute), so this only guards against a hub that never answers; on a busy machine
+// a tighter limit would release the capture while the tab is still playing.
+const STOP_TAB_MS = 2500;
 const INSTANCE = crypto.randomUUID(); // snapshot.engineId: the UI restores its settings into each new engine
 const NOTE_TTL = 60000; // a hub notice raised with no deck page open waits this long for one
 

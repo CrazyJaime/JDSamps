@@ -291,9 +291,10 @@ test('ejected and closed deck tabs stop their audio processors (stretcher, input
   }
 });
 
-test("ejecting a deck pauses its tab's player, whether the user or the engine ejects it", async () => {
+test("ejecting a deck pauses its tab's player, whether the user or the engine ejects it, even with a slow hub", async () => {
   // 0: EJECT from the deck. 1: the engine ejects it (the tab stopped sharing audio).
-  for (let i = 0; i < 2; i++) {
+  // 2: EJECT while the hub answers slowly (a busy machine): the capture still waits for the pause.
+  for (let i = 0; i < 3; i++) {
     const url = `${server.url('a')}?eject=${i}`;
     const tab = await h.context.newPage();
     await tab.goto(url);
@@ -306,7 +307,11 @@ test("ejecting a deck pauses its tab's player, whether the user or the engine ej
     await tab.evaluate(() => document.getElementById('a').addEventListener('pause', () => { window.__pausedAt = Date.now(); }));
     await offscreenEval(h, `(() => { window.__releasedAt = 0; const t = globalThis.__jdsEngine.decks.get(${d.id}).stream.getAudioTracks()[0], stop = t.stop.bind(t);
       t.stop = () => { window.__releasedAt = Date.now(); stop(); }; return true; })()`);
-    if (i === 0) assert.equal((await act(deck, d.id, 'eject')).ok, true);
+    if (i === 2) {
+      await offscreenEval(h, `(() => { const e = globalThis.__jdsEngine, hub = e.hub.bind(e); e.__hub = hub;
+        e.hub = (m) => (m.type === 'STOP_TAB' ? new Promise((r) => setTimeout(r, 700)).then(() => hub(m)) : hub(m)); return true; })()`);
+    }
+    if (i !== 1) assert.equal((await act(deck, d.id, 'eject')).ok, true);
     else await offscreenEval(h, `globalThis.__jdsEngine.decks.get(${d.id}).stream.getAudioTracks()[0].dispatchEvent(new Event('ended'))`);
     await waitFor(async () => !(await state(deck)).decks.some((x) => x.tabId === tabId), 8000);
     await waitFor(() => tab.evaluate(() => window.__media().paused), 1500).catch(() => {});
@@ -315,6 +320,7 @@ test("ejecting a deck pauses its tab's player, whether the user or the engine ej
     const pausedAt = await tab.evaluate(() => window.__pausedAt);
     assert.ok(pausedAt <= releasedAt, `eject ${i}: paused ${pausedAt - releasedAt} ms after the capture was released`);
     assert.equal((await h.sw.evaluate((id) => chrome.tabs.get(id), tabId)).mutedInfo.muted, false, 'paused, so not muted');
+    if (i === 2) await offscreenEval(h, '(() => { const e = globalThis.__jdsEngine; e.hub = e.__hub; delete e.__hub; return true; })()');
     await tab.close();
   }
 });

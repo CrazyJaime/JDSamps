@@ -1,6 +1,6 @@
 // ui/app.js — deck page entry point.
 import { PERSISTED_MASTER_KEYS } from '../shared/protocol.js';
-import { $, setText, wallNow } from './util.js';
+import { $, setText, wallNow, trapFocus } from './util.js';
 import { EngineConnection } from './connection.js';
 import { DeckStrip } from './deck-strip.js';
 import { MasterStrip } from './master-strip.js';
@@ -127,6 +127,7 @@ function frame() {
 
 function toggle(el, open) { el.hidden = open == null ? !el.hidden : !open; }
 const settings = $('#settings'), help = $('#help');
+trapFocus(help); // aria-modal: focus moves in, Tab stays inside, and returns on close (Esc: keys.js)
 $('#settingsBtn').addEventListener('click', () => toggle(settings));
 settings.querySelector('[data-close]').addEventListener('click', () => toggle(settings, false));
 $('#helpBtn').addEventListener('click', () => toggle(help));

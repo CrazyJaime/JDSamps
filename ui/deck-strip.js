@@ -1,7 +1,7 @@
 // ui/deck-strip.js — one deck: its column in the board and its row in the waveform stack.
 // All page-derived text goes through textContent; favicons are only set after isSafeIconUrl().
 import { DECK_COLORS, PITCH_RANGES, isSafeIconUrl } from '../shared/protocol.js';
-import { $, $$, clone, setText, toggleAttr, fmtBpm, fmtPct, fmtClock } from './util.js';
+import { $, $$, clone, setText, toggleAttr, setAttr, setHidden, setClass, setStyle, pageHidden, fmtBpm, fmtPct, fmtClock } from './util.js';
 import { Knob, Fader, bindPad, bindSeg } from './controls.js';
 import { WaveStore, drawWave, beatIndex } from './waveform.js';
 import { VMeter } from './meters.js';
@@ -9,6 +9,8 @@ import { bindHold } from './hold.js';
 
 const RANGE_LABEL = { 0.06: '±6', 0.1: '±10', 0.16: '±16', 0.5: 'WIDE' };
 const STATE_CLASS = { LOCKED: 'ok', SEARCH: '', UNSURE: 'warn', HOLD: 'info' };
+// Screen-reader names for the knobs, after "Deck N" (the visible labels are terse).
+const KNOB_NAME = { trim: 'gain', filter: 'filter', 'filter.res': 'filter resonance', 'eq.hi': 'EQ high', 'eq.mid': 'EQ mid', 'eq.low': 'EQ low', 'fx.level': 'FX level' };
 
 export class DeckStrip {
   constructor(d, { conn, toast, onSelect }) {
@@ -44,7 +46,9 @@ export class DeckStrip {
     this.waveCtx = this.refs.wave.getContext('2d');
     this.meter = new VMeter(this.q('[data-meter]'));
     this.buildControls(d);
-    this.update(d, null);
+    this.render();
+    this.onVisible = () => { if (this.stale && !pageHidden()) this.render(); };
+    document.addEventListener('visibilitychange', this.onVisible);
   }
 
   set(key, value, hold) { this.conn.set(this.id, key, value, hold); }
@@ -56,7 +60,7 @@ export class DeckStrip {
 
   buildControls(d) {
     const p = d.params;
-    const knob = (key, o) => new Knob(this.q(`[data-ctl="${key}"]`), { label: this.q(`[data-ctl="${key}"]`).dataset.label, def: 0.5, value: p[key], onChange: (v) => this.set(key, v), ...o });
+    const knob = (key, o) => new Knob(this.q(`[data-ctl="${key}"]`), { label: this.q(`[data-ctl="${key}"]`).dataset.label, name: `Deck ${d.slot} ${KNOB_NAME[key]}`, def: 0.5, value: p[key], onChange: (v) => this.set(key, v), ...o });
     const db = (v, max) => { if (v <= 0) return '−∞'; const g = v >= 0.5 ? (max * (v - 0.5)) / 0.5 : 20 * Math.log10((2 * v) ** 3); return `${g >= 0 ? '+' : '−'}${Math.abs(g).toFixed(1)}`; };
     this.knobs = {
       trim: knob('trim', { format: (v) => db(v, 12) }),
@@ -68,9 +72,9 @@ export class DeckStrip {
       'fx.level': knob('fx.level', { def: 0.5, format: (v) => `${Math.round(v * 100)}%` }),
     };
     // On-air fader: no wheel (a stray scroll must not cut a deck) and no double-click jump to full.
-    this.fader = new Fader(this.q('[data-ctl="fader"]'), { label: 'Channel fader', def: 1, value: p.fader, ticks: [0, 0.25, 0.5, 0.75, 1], wheel: false, reset: false, onChange: (v) => this.set('fader', v), format: (v) => `${Math.round(v * 100)}%` });
+    this.fader = new Fader(this.q('[data-ctl="fader"]'), { label: `Deck ${d.slot} channel fader`, def: 1, value: p.fader, ticks: [0, 0.25, 0.5, 0.75, 1], wheel: false, reset: false, onChange: (v) => this.set('fader', v), format: (v) => `${Math.round(v * 100)}%` });
     this.pitch = new Fader(this.q('[data-ctl="pitch"]'), {
-      orientation: 'horizontal', label: 'Tempo', min: -1, max: 1, def: 0, value: p.range ? p.pitch / p.range : 0, center: true, readout: true,
+      orientation: 'horizontal', label: `Deck ${d.slot} tempo`, min: -1, max: 1, def: 0, value: p.range ? p.pitch / p.range : 0, center: true, readout: true,
       step: 0.005, fine: 0.0005,
       format: (v) => fmtPct(v * this.d.params.range),
       onChange: (v) => this.set('pitch', v * this.d.params.range),
@@ -91,7 +95,8 @@ export class DeckStrip {
       onDown: () => this.rollDown(el, Number(el.dataset.roll)),
       onUp: () => this.rollUp(el),
     }));
-    this.cue = bindPad(this.refs.cue, { latch: false, onDown: () => this.act('cueDown'), onUp: () => this.act('cueUp') });
+    // The CUE light is engine state (render): a press-time paint would fight the next snapshot.
+    this.cue = bindPad(this.refs.cue, { latch: false, paint: false, onDown: () => this.act('cueDown'), onUp: () => this.act('cueUp') });
     for (const [sel, dir] of [['[data-hold="nudge-"]', -1], ['[data-hold="nudge+"]', 1]]) {
       // Shift = fine ±1% (spec §3.3), like the arrow keys. Registered before bindPad so the press sees it.
       const el = this.q(sel);
@@ -161,14 +166,25 @@ export class DeckStrip {
     if (r) this.pitch.commit(this.pitch.value + delta / r);
   }
 
+  /** Every snapshot is stored; the DOM follows only while the page is visible (and catches up when it shows). */
   update(d, s) {
     this.d = d;
+    if (pageHidden()) { this.stale = true; return; }
+    this.render();
+  }
+
+  /** Writes only what changed (spec §3.9): at 30 Hz per deck, same-value attribute writes add up. */
+  render() {
+    const d = this.d;
+    this.stale = false;
     const r = this.refs, p = d.params;
-    this.el.dataset.tstate = d.bpm.state;
-    setText(r.title, d.title || `Tab ${d.tabId}`);
-    this.el.title = d.title || '';
-    if (isSafeIconUrl(d.favIconUrl)) { if (r.fav.getAttribute('src') !== d.favIconUrl) r.fav.src = d.favIconUrl; r.fav.hidden = false; }
-    else r.fav.hidden = true;
+    setAttr(this.el, 'data-tstate', d.bpm.state);
+    const title = d.title || `Tab ${d.tabId}`;
+    setText(r.title, title);
+    setAttr(r.title, 'title', d.title || ''); // the full title on hover, over the title only
+    setAttr(this.el, 'aria-label', `Deck ${d.slot}: ${title}`);
+    if (isSafeIconUrl(d.favIconUrl)) { if (r.fav.getAttribute('src') !== d.favIconUrl) r.fav.src = d.favIconUrl; setHidden(r.fav, false); }
+    else setHidden(r.fav, true);
 
     const out = d.bpm.out;
     if (out == null) this.shownBpm = null;
@@ -176,27 +192,28 @@ export class DeckStrip {
     setText(r.bpm, fmtBpm(this.shownBpm));
     setText(r.wbpm, fmtBpm(this.shownBpm));
     setText(r.tstate, d.bpm.tapped ? 'TAP' : d.bpm.state);
-    r.tstate.className = `badge ${d.bpm.tapped ? 'ok' : STATE_CLASS[d.bpm.state] || ''}`;
+    setClass(r.tstate, `badge ${d.bpm.tapped ? 'ok' : STATE_CLASS[d.bpm.state] || ''}`);
     setText(r.pitch, fmtPct(p.pitch));
     setText(r.native, d.bpm.native ? `orig ${fmtBpm(d.bpm.native)}${d.bpm.mult !== 1 ? ` ×${d.bpm.mult}` : ''}` : '');
 
     const resFrac = Math.min(1, d.reserve / 30);
-    r.reserveFill.style.width = `${(resFrac * 100).toFixed(1)}%`;
+    setStyle(r.reserveFill, 'width', `${(resFrac * 100).toFixed(1)}%`);
     setText(r.reserveText, `${d.reserve.toFixed(1)}s`);
     r.reserve.classList.toggle('low', d.reserve < 4);
-    r.assist.hidden = !(d.assist.active || (!d.assist.available && d.sync.on && d.engineRate > 1));
+    setHidden(r.assist, !(d.assist.active || (!d.assist.available && d.sync.on && d.engineRate > 1)));
     setText(r.assist, d.assist.active ? `ASSIST ${d.assist.sourceRate.toFixed(3)}×` : 'ASSIST n/a');
-    r.assist.className = `badge ${d.assist.active ? 'info' : 'warn'}`;
-    r.starved.hidden = !d.starved;
+    setClass(r.assist, `badge ${d.assist.active ? 'info' : 'warn'}`);
+    setHidden(r.starved, !d.starved);
 
     const running = d.playing && !d.previewing; // a CUE preview is not a play: PLAY keeps it going
     toggleAttr(r.play, 'aria-pressed', running);
-    r.playIcon.setAttribute('href', running ? '#i-pause' : '#i-play');
-    r.play.setAttribute('aria-label', running ? 'Pause' : 'Play');
-    r.cue.classList.toggle('on', !d.playing && Math.abs(d.playhead - d.cue) < 0.03);
+    setAttr(r.playIcon, 'href', running ? '#i-pause' : '#i-play');
+    setAttr(r.play, 'aria-label', running ? 'Pause' : 'Play');
+    // CUE is lit while it previews and while the deck sits paused at the cue point.
+    r.cue.classList.toggle('on', d.previewing || (!d.playing && Math.abs(d.playhead - d.cue) < 0.03));
     toggleAttr(r.sync, 'aria-pressed', d.sync.on);
     r.sync.classList.toggle('oor', d.sync.on && d.sync.outOfRange);
-    r.sync.title = d.sync.outOfRange ? 'Tempo is outside the pitch range: widen the range for a full sync' : '';
+    setAttr(r.sync, 'title', d.sync.outOfRange ? 'Tempo is outside the pitch range: widen the range for a full sync' : '');
     toggleAttr(r.master, 'aria-pressed', d.sync.isMaster);
     toggleAttr(r.keyLock, 'aria-pressed', p.keyLock);
     setText(r.syncMode, p.syncMode);
@@ -215,11 +232,11 @@ export class DeckStrip {
     this.fxOn.setOn(p['fx.on']);
     for (const k of Object.keys(this.segs)) this.segs[k].set(p[k]);
 
-    r.phase.hidden = !(d.sync.on && d.sync.phaseMs != null && !d.sync.isMaster);
+    setHidden(r.phase, !(d.sync.on && d.sync.phaseMs != null && !d.sync.isMaster));
     if (!r.phase.hidden && d.grid) {
       const half = (d.grid.T * 1000) / Math.max(0.25, d.engineRate) / 2;
       const f = Math.max(-1, Math.min(1, d.sync.phaseMs / half));
-      r.phaseDot.style.left = `${50 + f * 50}%`;
+      setStyle(r.phaseDot, 'left', `${(50 + f * 50).toFixed(1)}%`);
       r.phase.classList.toggle('locked', Math.abs(d.sync.phaseMs) < 10);
     }
     this.meter.update([d.meter]);
@@ -232,7 +249,12 @@ export class DeckStrip {
   frame(nowCtx) {
     const d = this.d;
     const dt = Math.max(0, Math.min(0.25, nowCtx - this.snapCtx));
-    const playhead = d.playing ? d.playhead + d.engineRate * dt : d.playhead;
+    let playhead = d.playing ? d.playhead + d.engineRate * dt : d.playhead;
+    // A roll loops the engine's playhead: the extrapolation wraps inside the loop the same way.
+    const lp = d.loop;
+    if (lp && lp.end > lp.start && playhead >= lp.end && d.playhead >= lp.start && d.playhead <= lp.end) {
+      playhead = lp.start + ((playhead - lp.start) % (lp.end - lp.start));
+    }
     const c = this.refs.wave, dpr = window.devicePixelRatio || 1;
     const W = Math.max(1, Math.round(c.clientWidth * dpr)), H = Math.max(1, Math.round(c.clientHeight * dpr));
     if (c.width !== W || c.height !== H) { c.width = W; c.height = H; }
@@ -254,5 +276,5 @@ export class DeckStrip {
 
   setSnapshotTime(ctxTime) { this.snapCtx = ctxTime; }
 
-  destroy() { this.el.remove(); this.waveRow.remove(); }
+  destroy() { document.removeEventListener('visibilitychange', this.onVisible); this.el.remove(); this.waveRow.remove(); }
 }
