@@ -140,7 +140,7 @@ test('SYNC PLAY matches tempo and phase to the master', async () => {
   }, 15000, 200).catch(() => assert.fail(`phase ${JSON.stringify(ph.slice(-10))}`));
 });
 
-// The next three tests share one 60 s window: decks 1 (synced, +3.2 %, assist off) and 2 (master)
+// The next four tests share one 60 s window: decks 1 (synced, +3.2 %, assist off) and 2 (master)
 // are each recorded with deck REC while the engine heap and deck 1's reserve are sampled. Run them
 // together (--test-name-pattern '60 s' plus the setup tests above).
 const LONG_S = 60;
@@ -200,19 +200,28 @@ test('60 s deck recordings: valid WAV headers, no lost frames, durations within 
   }
 });
 
+/**
+ * Beats in the two 60 s recordings, between the marker pulses (0.5 s clear of each), on one
+ * timeline: seconds after the first pulse, less the detector's own lateness on each sound. When
+ * the box is busy, tab capture now and then drops or repeats 10-20 ms, so a recording is a series
+ * of steady runs with small jumps; `bpm` counts beats over the whole window, jumps included.
+ */
+function beats() {
+  if (long.beats) return long.beats;
+  const bias = { low: onsetBias(124, 'low', 'low'), high: onsetBias(128, 'high', 'high') };
+  const one = (k, band) => {
+    const { wav, marks: m } = long.files[k], from = m[0] + Math.round(0.5 * wav.sr);
+    const on = bandOnsets(wav.mono.subarray(from, m[1] - Math.round(0.5 * wav.sr)), wav.sr, band).map((x) => x + (from - m[0]) / wav.sr - bias[band]);
+    const fit = steadyBeats(on), n = on.slice(1).reduce((acc, x, i) => acc + Math.round((x - on[i]) / fit.T), 0);
+    return { on, fit, bpm: (60 * n) / (on[on.length - 1] - on[0]) };
+  };
+  long.beats = { bias, 1: one(1, 'low'), 2: one(2, 'high') };
+  return long.beats;
+}
+
 test('60 s deck recordings: the synced deck matches the master within 0.2 % tempo and 20 ms phase', async (t) => {
   assert.ok(long, 'needs the 60 s recording test');
-  // Beats between the two marker pulses (0.5 s clear of each), on one timeline: seconds after the
-  // first pulse, less the detector's own lateness on that sound. Tab capture in headless Chromium
-  // hands the engine each tab's audio ~0.23 % slow and now and then skips 10-20 ms to catch up, so
-  // a recording is a series of steady runs (127.7 BPM for the 128 BPM track) with small jumps.
-  const onsets = (k, band, bias) => {
-    const { wav, marks: m } = long.files[k], from = m[0] + Math.round(0.5 * wav.sr);
-    return bandOnsets(wav.mono.subarray(from, m[1] - Math.round(0.5 * wav.sr)), wav.sr, band).map((x) => x + (from - m[0]) / wav.sr - bias);
-  };
-  const bias = { low: onsetBias(124, 'low', 'low'), high: onsetBias(128, 'high', 'high') };
-  const a = onsets(1, 'low', bias.low), b = onsets(2, 'high', bias.high);
-  const A = { on: a, fit: steadyBeats(a) }, B = { on: b, fit: steadyBeats(b) };
+  const { bias, 1: A, 2: B } = beats();
   const tempoErr = A.fit.T / B.fit.T - 1;
   // A capture jump moves that deck's beats, and the follower re-locks over a few seconds. Phase is
   // judged once both decks have played K steady beats since their last jump or phase bend.
@@ -235,6 +244,16 @@ test('60 s deck recordings: the synced deck matches the master within 0.2 % temp
   assert.ok(Math.abs(tempoErr) < 0.002, `tempo error ${tempoErr * 100} %`);
   assert.ok(st.n >= 40, `only ${st.n} settled beats`);
   assert.ok(st.p90 <= 20, `settled beat offsets: ${f(st)}`);
+});
+
+test('60 s deck recordings: each BPM readout is within ±0.2 of the beats per minute in its recording', async (t) => {
+  assert.ok(long, 'needs the 60 s recording test');
+  const b = beats();
+  for (const k of [1, 2]) {
+    const out = median(long.samples.map((s) => s[`d${k}`].bpm.out));
+    t.diagnostic(`deck ${k}: readout ${out.toFixed(3)} BPM (median), recording ${b[k].bpm.toFixed(3)} BPM over ${b[k].on.length} beats`);
+    assert.ok(Math.abs(out - b[k].bpm) <= 0.2, `deck ${k}: readout ${out} vs ${b[k].bpm} BPM recorded`);
+  }
 });
 
 test('60 s deck recordings: with assist off the reserve drained at rate − 1, the playhead always latency behind the live edge', async (t) => {

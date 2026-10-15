@@ -202,10 +202,10 @@ export function bandRms(mono, sr, band) {
 /** Onset times (s) in one band: 2 ms envelope, rising through 35% of max, 150 ms refractory. */
 export function bandOnsets(mono, sr, band) {
   const y = bandFilter(mono, sr, band);
-  const hop = Math.round(sr * 0.002), env = [];
+  const hop = Math.round(sr * 0.002), dt = hop / sr, env = []; // 88 samples at 44.1 kHz: dt is not 2 ms
   for (let i = 0; i + hop <= y.length; i += hop) { let m = 0; for (let j = 0; j < hop; j++) m = Math.max(m, Math.abs(y[i + j])); env.push(m); }
   const max = Math.max(...env), thr = max * 0.35, out = [];
-  for (let i = 1; i < env.length; i++) if (env[i] >= thr && env[i - 1] < thr && (!out.length || i * 0.002 - out[out.length - 1] > 0.15)) out.push(i * 0.002);
+  for (let i = 1; i < env.length; i++) if (env[i] >= thr && env[i - 1] < thr && (!out.length || i * dt - out[out.length - 1] > 0.15)) out.push(i * dt);
   return out;
 }
 
