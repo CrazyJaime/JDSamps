@@ -32,6 +32,12 @@ export class Timeshift {
     return this.liveEdge;
   }
 
+  /** Audio the deck's input worklet handed to the node itself (worklet to worklet): only the live edge moves. */
+  extend(frames) {
+    this.liveEdge += frames / this.sr;
+    return this.liveEdge;
+  }
+
   soon(now) { return now + this.lat + 0.03; }
 
   segAt(t) {

@@ -1,6 +1,9 @@
 // worklets/deck-input.js — one per deck, fed by the captured tab's MediaStreamSource.
 //  1. Counts input frames from 0: this is the deck's input timeline.
-//  2. Batches stereo audio into 2048-frame transferable chunks for the time-shift buffer.
+//  2. Batches stereo audio into 2048-frame chunks for the time-shift buffer. The deck's stretcher runs in
+//     this AudioWorkletGlobalScope, on this thread: once its attachInput(pipeId) has registered an input
+//     here, each chunk goes straight to it and the main thread only hears that the live edge moved (a busy
+//     main thread cannot starve the stretcher). Otherwise chunks go to the main thread, transferred.
 //  3. Runs the onset detection function on the mono downmix and batches its frames
 //     (onset strength + waveform band levels) for tempo tracking and the UI waveform.
 import { OdfCore } from './odf-core.js';
@@ -8,10 +11,13 @@ import { OdfCore } from './odf-core.js';
 const CHUNK = 2048;
 const ODF_BATCH = 8;
 const AUDIBLE = 0.003; // about -50 dBFS
+const PIPES = '__jdsStretchInputs'; // pipeId → the stretcher's input function (vendor patch, attachInput)
 
 class DeckInput extends AudioWorkletProcessor {
-  constructor() {
+  constructor(options) {
     super();
+    this.pipeId = options && options.processorOptions ? options.processorOptions.pipeId : undefined;
+    this.sink = undefined; // the stretcher's input, or null for the main thread: chosen at the first chunk, then kept
     this.frames = 0;
     this.mono = new Float32Array(128);
     this.newChunk(0);
@@ -20,8 +26,31 @@ class DeckInput extends AudioWorkletProcessor {
     this.disposed = false;
     this.live = false; // the timeline starts at the first real input block (the capture connects late)
     // Chrome keeps calling process() on a disconnected node until it returns false.
-    this.port.onmessage = (e) => { if (e.data && e.data.t === 'dispose') this.disposed = true; };
+    this.port.onmessage = (e) => { if (e.data && e.data.t === 'dispose') this.dispose(); };
     this.port.postMessage({ t: 'init', fps: this.odf.fps, spf: this.odf.spf, chunk: CHUNK });
+  }
+
+  dispose() {
+    this.disposed = true;
+    const pipes = globalThis[PIPES];
+    if (pipes && this.pipeId !== undefined) pipes.delete(this.pipeId);
+  }
+
+  /** Hand a full chunk to the stretcher (same thread) or post it to the main thread; tell the main thread either way. */
+  flushChunk() {
+    if (this.sink === undefined) {
+      const pipes = globalThis[PIPES];
+      this.sink = (this.pipeId !== undefined && pipes && pipes.get(this.pipeId)) || null;
+    }
+    if (this.sink) {
+      this.sink([this.L, this.R]);
+      this.port.postMessage({ t: 'chunk', start: this.chunkStart, n: CHUNK, piped: true, at: currentFrame, peak: this.peak, firstAbove: this.firstAbove });
+    } else {
+      this.port.postMessage(
+        { t: 'chunk', start: this.chunkStart, L: this.L, R: this.R, at: currentFrame, peak: this.peak, firstAbove: this.firstAbove },
+        [this.L.buffer, this.R.buffer],
+      );
+    }
   }
 
   newChunk(start) {
@@ -79,10 +108,7 @@ class DeckInput extends AudioWorkletProcessor {
       if (mx > this.peak) this.peak = mx;
       if (this.firstAbove < 0 && mx > AUDIBLE) this.firstAbove = f;
       if (++this.fill === CHUNK) {
-        this.port.postMessage(
-          { t: 'chunk', start: this.chunkStart, L: this.L, R: this.R, peak: this.peak, firstAbove: this.firstAbove },
-          [this.L.buffer, this.R.buffer],
-        );
+        this.flushChunk();
         this.newChunk(blockStart + i + 1);
       }
     }

@@ -20,6 +20,12 @@
   4. One-way `addBuffers()` (`one-way` hunks): the node posts it with a `null` message id and the processor
      does not answer a `null` id, so it returns `undefined`, not a Promise. Upstream answered every chunk
      (~22/s per deck), each answer a main-thread wakeup nobody read.
+  5. Worklet-to-worklet input (`pipe` hunks): `attachInput(id)` registers an `addBuffers` function under `id` in
+     `globalThis.__jdsStretchInputs`. The deck's `jds-deck-input` processor runs in the same
+     AudioWorkletGlobalScope, on the same thread; it hands each chunk to that function, so the engine's main
+     thread (shared with the deck page and the service worker, and sometimes stalled for seconds) no longer
+     carries the audio. `jds-deck-input` removes the entry on dispose. The same hunks add a dropout counter:
+     a block that reads past the buffered audio counts as dry, and each dry run is posted as `['dry', seconds]`.
 - Behaviour notes the engine relies on (measured in Chromium 141):
   - `schedule()` resolves to the stored segment; `p(t) = input + rate·(t − output)` is the audible position.
   - A new `schedule()` drops every change scheduled at/after `currentTime` (README says "after this one").

@@ -144,6 +144,18 @@ test('trim never drops past the limit it is given, even over the cap', async () 
   assert.equal(r2.dropped, false, 'less than a second to gain');
 });
 
+test('extend() moves the live edge for audio the input worklet handed to the node directly', async () => {
+  const { ts, node } = mk({ capSec: 20 });
+  ts.append(...chunk(1));
+  for (let i = 0; i < 680; i++) ts.extend(2048);
+  assert.equal(node.buffers, 48000, 'extend() sends the node nothing');
+  assert.ok(near(ts.liveEdge, 1 + (680 * 2048) / 48000, 1e-9), `live edge ${ts.liveEdge}`);
+  assert.ok(near(ts.reserveAt(0), ts.liveEdge - 0.12));
+  const r = await ts.trim(0, 0); // the cap counts from the extended edge
+  assert.equal(r.dropped, true);
+  assert.ok(near(node.drops[0], ts.liveEdge - 20), `dropped to ${node.drops[0]}`);
+});
+
 test('SourceMap and GridMap are piecewise along the input timeline', () => {
   const sm = new SourceMap();
   assert.equal(sm.rateAt(5), 1);

@@ -151,3 +151,39 @@ test('stretcher RPC: addBuffers sent one-way (null id) is applied without a repl
   assert.deepEqual(p.port.posted.slice(before).map((x) => x.msg), [[77, (11 * CH) / SR]]);
   call(p, 'destroy');
 });
+
+test('stretcher attachInput(id): registers an input the deck input calls on the audio thread, ignored once destroyed', async () => {
+  const p = await processor();
+  const n = p.port.posted.length;
+  p.port.deliver([5, 'attachInput', 'deck-3']);
+  assert.deepEqual(p.port.posted.slice(n).map((x) => x.msg), [[5, undefined]], 'answered, so the deck can wait for it');
+  const input = globalThis.__jdsStretchInputs.get('deck-3');
+  assert.equal(typeof input, 'function');
+  input(chunk(0));
+  input(chunk(1));
+  assert.equal(p.audioBuffersEnd, 2 * CH);
+  assert.equal(p.audioBuffers.length, 2);
+  assert.equal(p.port.posted.length, n + 1, 'no message per chunk');
+  call(p, 'destroy');
+  input(chunk(2));
+  assert.equal(p.audioBuffers.length, 0);
+  globalThis.__jdsStretchInputs.delete('deck-3');
+});
+
+test('stretcher: reading past the buffered audio (a dropout) is reported once per run, with its length', async () => {
+  const p = await processor();
+  addSeconds(p, 2);
+  globalThis.currentTime = 0;
+  call(p, 'schedule', { active: true, input: 1, output: 0, rate: 1 });
+  const dry = () => p.port.posted.map((x) => x.msg).filter((m) => m[0] === 'dry');
+  run(p, Math.round(0.5 * SR / 128));
+  assert.deepEqual(dry(), [], 'no dropout while the reserve lasts');
+  run(p, Math.round(0.6 * SR / 128)); // runs past the end of the audio...
+  addSeconds(p, 4, 100); // ...until the input catches up
+  run(p, 50);
+  const d = dry();
+  assert.equal(d.length, 1, JSON.stringify(d));
+  const latency = p.inputLatencySeconds + p.outputLatencySeconds;
+  assert.ok(Math.abs(d[0][1] - (0.1 + latency)) < 0.02, `dry ${d[0][1]} s, expected ~${0.1 + latency}`);
+  call(p, 'destroy');
+});

@@ -126,6 +126,13 @@ function registerWorkletProcessor(Module, audioNodeKey) {
 					
 					return obj;
 				},
+				// PATCHED (JD Samps): take audio straight from the deck's jds-deck-input processor, which runs in this
+				// AudioWorkletGlobalScope on this thread, so a busy main thread cannot starve this one. Registers an
+				// addBuffers() function under `id` in globalThis.__jdsStretchInputs; the deck input removes it on dispose.
+				attachInput: id => {
+					let inputs = globalThis.__jdsStretchInputs || (globalThis.__jdsStretchInputs = new Map());
+					inputs.set(id, sampleBuffers => { if (!this.destroyed) remoteMethods.addBuffers(sampleBuffers); });
+				},
 				dropBuffers: toSeconds => {
 					if (typeof toSeconds !== 'number') {
 						let buffers = this.audioBuffers.flat(1).map(b => b.buffer);
@@ -202,6 +209,15 @@ function registerWorkletProcessor(Module, audioNodeKey) {
 		config = {
 			preset: 'default'
 		};
+		// PATCHED (JD Samps): count blocks that read past the buffered audio (a dropout: the input came too late).
+		// Each run is reported when it ends, or every second while it lasts, as ['dry', seconds].
+		dropout(dry, blockSize) {
+			if (dry) this.drySamples = (this.drySamples || 0) + blockSize;
+			if (this.drySamples && (!dry || this.drySamples >= sampleRate)) {
+				this.port.postMessage(['dry', this.drySamples/sampleRate]);
+				this.drySamples = 0;
+			}
+		}
 		configure() {
 			if (this.config.blockMs) {
 				let blockSamples = Math.round(this.config.blockMs/1000*sampleRate);
@@ -324,6 +340,7 @@ function registerWorkletProcessor(Module, audioNodeKey) {
 				
 				inputTime += this.inputLatencySeconds;
 				let inputSamplesEnd = Math.round(inputTime*sampleRate);
+				this.dropout(inputSamplesEnd > this.audioBuffersEnd, outputBlockSize); // PATCHED (JD Samps): reading past the buffered audio
 
 				// Fill the buffer with previous input
 				let buffers = this.views(memory, outputBlockSize).input; // PATCHED (JD Samps): cached views

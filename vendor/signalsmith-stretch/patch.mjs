@@ -15,6 +15,10 @@
 //    OfflineAudioContext check in tests/browser/offline.test.mjs).
 // 4. one-way (id 'one-way'): addBuffers() is posted with a null message id and the processor does not
 //    answer a null id. Upstream answered every chunk (~22/s per deck), waking the main thread for nothing.
+// 5. pipe (id 'pipe'): an attachInput(id) remote method lets the deck's jds-deck-input processor (same
+//    AudioWorkletGlobalScope, same thread) hand over its chunks directly instead of through the main
+//    thread, which the engine shares with the deck page and the service worker; and a dropout counter
+//    that reports reads past the buffered audio to the main thread as ['dry', seconds].
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,7 +26,7 @@ import { fileURLToPath } from 'node:url';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 /** Multi-line hunks are written with two spaces per indent level; upstream indents with tabs. */
 const T = (s) => s.replace(/^(?: {2})+/gm, (m) => '\t'.repeat(m.length / 2));
-const COST = 'process-cost', ONE_WAY = 'one-way';
+const COST = 'process-cost', ONE_WAY = 'one-way', PIPE = 'pipe';
 export const PATCHES = [
   {
     old: '\t\t\t\t\t\taudioSamples += count;\n\t\t\t\t\t\tblockSamples += count;',
@@ -165,6 +169,37 @@ export const PATCHES = [
     id: ONE_WAY,
     old: '\t\t\t\t\t\treturn post(transfer, key, ...args);\n',
     new: '\t\t\t\t\t\tif (key == \'addBuffers\') return void audioNode.port.postMessage([null, key].concat(args), transfer); // PATCHED (JD Samps): one-way, no reply per chunk\n\t\t\t\t\t\treturn post(transfer, key, ...args);\n',
+  },
+  {
+    id: PIPE,
+    old: '\t\t\t\tdropBuffers: toSeconds => {\n',
+    new: T(`        // PATCHED (JD Samps): take audio straight from the deck's jds-deck-input processor, which runs in this
+        // AudioWorkletGlobalScope on this thread, so a busy main thread cannot starve this one. Registers an
+        // addBuffers() function under \`id\` in globalThis.__jdsStretchInputs; the deck input removes it on dispose.
+        attachInput: id => {
+          let inputs = globalThis.__jdsStretchInputs || (globalThis.__jdsStretchInputs = new Map());
+          inputs.set(id, sampleBuffers => { if (!this.destroyed) remoteMethods.addBuffers(sampleBuffers); });
+        },
+`) + '\t\t\t\tdropBuffers: toSeconds => {\n',
+  },
+  {
+    id: PIPE,
+    old: '\t\t\t\tlet inputSamplesEnd = Math.round(inputTime*sampleRate);\n',
+    new: '\t\t\t\tlet inputSamplesEnd = Math.round(inputTime*sampleRate);\n\t\t\t\tthis.dropout(inputSamplesEnd > this.audioBuffersEnd, outputBlockSize); // PATCHED (JD Samps): reading past the buffered audio\n',
+  },
+  {
+    id: PIPE,
+    old: '\t\tconfigure() {\n',
+    new: T(`    // PATCHED (JD Samps): count blocks that read past the buffered audio (a dropout: the input came too late).
+    // Each run is reported when it ends, or every second while it lasts, as ['dry', seconds].
+    dropout(dry, blockSize) {
+      if (dry) this.drySamples = (this.drySamples || 0) + blockSize;
+      if (this.drySamples && (!dry || this.drySamples >= sampleRate)) {
+        this.port.postMessage(['dry', this.drySamples/sampleRate]);
+        this.drySamples = 0;
+      }
+    }
+`) + '\t\tconfigure() {\n',
   },
 ];
 

@@ -78,3 +78,68 @@ test('ODF batches are evenly stamped and drive tempo detection', () => {
   assert.equal(g.state, 'LOCKED');
   assert.ok(Math.abs(g.inBpm - 124) < 0.15, String(g.inBpm));
 });
+
+// The deck's stretcher runs in the same AudioWorkletGlobalScope and thread. Its attachInput(id) registers
+// an input function under the deck's pipe id; the deck input hands it each chunk, and the main thread only
+// hears where the live edge is, so a busy main thread cannot starve the stretcher.
+const PIPES = '__jdsStretchInputs';
+const stereo = (n) => [new Float32Array(n).map((_, i) => Math.sin(i / 10)), new Float32Array(n).map((_, i) => Math.cos(i / 7))];
+
+test('chunks go straight to the stretcher input registered for its pipe id; the main thread gets the live edge only', () => {
+  const got = [];
+  globalThis[PIPES] = new Map([[7, (bufs) => got.push(bufs)]]);
+  const p = new Proc({ processorOptions: { pipeId: 7 } });
+  const [L, R] = stereo(2048 * 3);
+  globalThis.currentFrame = 4800;
+  runBlocks(p, [L, R]);
+  assert.equal(got.length, 3);
+  got.forEach(([l, r], k) => {
+    assert.deepEqual(Array.from(l), Array.from(L.subarray(k * 2048, (k + 1) * 2048)));
+    assert.deepEqual(Array.from(r), Array.from(R.subarray(k * 2048, (k + 1) * 2048)));
+  });
+  const chunks = msgs(p, 'chunk');
+  assert.equal(chunks.length, 3);
+  chunks.forEach((c, k) => {
+    assert.deepEqual(Object.keys(c).sort(), ['at', 'firstAbove', 'n', 'peak', 'piped', 'start', 't']);
+    assert.deepEqual([c.piped, c.n, c.start, c.at], [true, 2048, k * 2048, 4800]);
+  });
+  assert.ok(p.port.posted.filter((x) => x.msg.t === 'chunk').every((x) => x.transfer.length === 0));
+  delete globalThis[PIPES];
+});
+
+test('with no stretcher input registered, chunks carry their audio to the main thread, stamped with the audio frame', () => {
+  const p = new Proc({ processorOptions: { pipeId: 8 } });
+  globalThis.currentFrame = 960;
+  runBlocks(p, stereo(2048));
+  const [c] = msgs(p, 'chunk');
+  assert.equal(c.L.length, 2048);
+  assert.equal(c.at, 960);
+  assert.equal(c.piped, undefined);
+});
+
+test('the route is chosen at the first chunk and kept, so chunks never reach the stretcher out of order', () => {
+  const got = [];
+  globalThis[PIPES] = new Map();
+  const late = new Proc({ processorOptions: { pipeId: 9 } });
+  runBlocks(late, stereo(2048));
+  globalThis[PIPES].set(9, (bufs) => got.push(bufs)); // registered after the first chunk went the slow way
+  runBlocks(late, stereo(2048));
+  assert.equal(got.length, 0);
+  assert.equal(msgs(late, 'chunk').filter((c) => c.L).length, 2);
+
+  globalThis[PIPES].set(10, (bufs) => got.push(bufs));
+  const early = new Proc({ processorOptions: { pipeId: 10 } });
+  runBlocks(early, stereo(2048));
+  globalThis[PIPES].delete(10);
+  runBlocks(early, stereo(2048));
+  assert.equal(got.length, 2, 'still handed over (the stretcher ignores audio once destroyed)');
+  delete globalThis[PIPES];
+});
+
+test('dispose removes the deck\'s stretcher input from the shared registry', () => {
+  globalThis[PIPES] = new Map([[11, () => {}], [12, () => {}]]);
+  const p = new Proc({ processorOptions: { pipeId: 11 } });
+  p.port.deliver({ t: 'dispose' });
+  assert.deepEqual([...globalThis[PIPES].keys()], [12]);
+  delete globalThis[PIPES];
+});

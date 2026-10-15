@@ -32,4 +32,23 @@ test('a playing deck\'s stretcher sends the main thread nothing in steady state 
   assert.ok(fromStretch <= 2, `stretcher → main messages in 2 s: ${info}`);
 });
 
+test('deck audio goes from the input worklet to the stretcher directly: the main thread gets no audio and posts none', async () => {
+  const r = await run('messages', { seconds: 2 });
+  const info = JSON.stringify(r);
+  assert.ok((r.fromInput.chunk || 0) > 30, `the main thread still hears of every chunk (live edge): ${info}`);
+  assert.equal(r.inputAudio, 0, `chunk messages to the main thread carry audio: ${info}`);
+  assert.equal(r.toStretch.addBuffers || 0, 0, `the main thread forwards audio to the stretcher: ${info}`);
+});
+
+test('a 1.8 s main-thread stall does not starve a deck playing with ~1 s of reserve', async () => {
+  const r = await run('stall', { reserve: 1, blockMs: 1800 });
+  const info = JSON.stringify(r);
+  assert.ok(r.blockedMs > 1500, `the main thread was blocked: ${info}`);
+  assert.ok(r.before.reserve > 0.6 && r.before.reserve < 1.6, `reserve before the stall: ${info}`);
+  assert.equal(r.silentBlocks, 0, `the deck output went silent for ${r.longestSilentMs} ms: ${info}`);
+  assert.deepEqual(r.dropouts, { runs: 0, seconds: 0 }, `the stretcher read past its buffered audio: ${info}`);
+  assert.deepEqual(r.jumps, [], `the deck jumped (emergency) after the stall: ${info}`);
+  assert.equal(r.starved, false, `the deck was marked starved: ${info}`);
+});
+
 test('no page errors', () => { assert.deepEqual(errors, []); });
