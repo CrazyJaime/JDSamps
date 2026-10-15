@@ -1,14 +1,22 @@
 // agent/agent-relay.js — JD Samps relay (ISOLATED world, every frame). Connects this frame to the
 // offscreen engine (port 'jds-agent') only after the extension asks ({jds:'connect'}) and only if
-// the frame has media. Relays engine commands down to agent-main.js and status up.
+// the frame has media. Relays engine commands down to agent-main.js and status up, on a random
+// per-page channel it offers agent-main.js at document_start (see agent-main.js).
 (() => {
-  if (globalThis.__jdsRelay) return;
+  if (globalThis.__jdsRelay) return; // ISOLATED world: pages cannot see this
   globalThis.__jdsRelay = true;
+  const HELLO = 'media-channel';
+  const chan = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, '0')).join('');
+  // Offer the channel now and whenever agent-main asks, until agent-main takes it (it cancels the offer).
+  const offer = () => { if (!window.dispatchEvent(new CustomEvent(HELLO, { detail: chan, cancelable: true }))) window.removeEventListener(HELLO, onHello); };
+  function onHello(e) { if (e.detail == null) offer(); }
+  window.addEventListener(HELLO, onHello);
+  offer();
   let port = null, wanted = false, last = null, rated = false;
   // Upward traffic, per message type: the last JSON forwarded and the latest one waiting.
   const sent = {}, pending = {};
   let timer = 0, at = -1e9;
-  const toMain = (m) => window.dispatchEvent(new CustomEvent('jds-agent-cmd', { detail: JSON.stringify(m) }));
+  const toMain = (m) => window.dispatchEvent(new CustomEvent(`c${chan}`, { detail: JSON.stringify(m) }));
 
   function connect() {
     if (port) return;
@@ -37,7 +45,7 @@
     }
   }
 
-  window.addEventListener('jds-agent-status', (e) => {
+  window.addEventListener(`s${chan}`, (e) => {
     if (typeof e.detail !== 'string' || e.detail.length > 1000) return;
     let m;
     try { m = JSON.parse(e.detail); } catch (_) { return; }

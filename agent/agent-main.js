@@ -2,11 +2,11 @@
 // Registers media elements the page plays (including detached `new Audio()` objects) and, only
 // when a deck asks, sets their playbackRate (with preservesPitch=false) so the engine can refill a
 // deck's buffer. Silent until its first command. Talks to agent-relay.js through window
-// CustomEvents carrying JSON strings (objects do not cross JS worlds reliably).
+// CustomEvents carrying JSON strings (objects do not cross JS worlds reliably), on a channel name
+// the relay picks at random and hands over at document_start, before any page script runs.
+// Leaves no global behind and keeps its wrappers looking native, so pages cannot fingerprint it.
 (() => {
-  const KEY = Symbol.for('jdsamps.agent');
-  if (window[KEY]) return;
-  Object.defineProperty(window, KEY, { value: true });
+  const HELLO = 'media-channel';
 
   // Per element: the page's own settings before a deck touched it, recent rate changes the page
   // made itself, and whether the agent gave the element back to a page that insists on its rate.
@@ -16,7 +16,8 @@
   const out = { last: '', at: -1e9, timer: 0, queued: false };
 
   const live = () => { refs = refs.filter((r) => { const el = r.deref(); return !!el && (el.isConnected || !!el.currentSrc); }); return refs.map((r) => r.deref()); };
-  const emit = (s) => window.dispatchEvent(new CustomEvent('jds-agent-status', { detail: s }));
+  let chan = null;
+  const emit = (s) => { if (chan) window.dispatchEvent(new CustomEvent(`s${chan}`, { detail: s })); };
 
   function status() {
     const els = live();
@@ -108,29 +109,55 @@
     report();
   }
 
+  // Wrappers answer toString() like the built-ins they replace.
+  const native = new WeakMap(), fnToString = Function.prototype.toString;
+  const asNative = { toString() { return native.has(this) ? native.get(this) : fnToString.call(this); } }.toString;
+  const disguise = (fn) => {
+    native.set(fn, `function ${fn.name}() { [native code] }`);
+    Object.defineProperty(fn, 'toString', { value: asNative, writable: true, configurable: true });
+    return fn;
+  };
+  disguise(asNative);
+
   const proto = HTMLMediaElement.prototype;
   for (const name of ['play', 'pause', 'load']) {
     const orig = proto[name];
-    proto[name] = { [name](...args) { try { register(this); } catch (_) {} return orig.apply(this, args); } }[name];
+    proto[name] = disguise({ [name](...args) { try { register(this); } catch (_) {} return orig.apply(this, args); } }[name]);
   }
-  // Players poll currentTime/paused for their progress bars: that finds elements that were
-  // already playing before a late injection.
-  for (const prop of ['currentTime', 'paused']) {
-    const d = Object.getOwnPropertyDescriptor(proto, prop);
-    if (d && d.get && d.configurable) {
-      Object.defineProperty(proto, prop, {
-        ...d,
-        get() { if (!info.has(this)) { try { register(this); } catch (_) {} } return d.get.call(this); },
-      });
+  // Players poll currentTime/paused for their progress bars: that finds elements that were already
+  // playing before a late injection (tabs open before install, which get the agent when they are
+  // loaded on a deck, i.e. just before the first command). Patched only from the first command on.
+  let polled = false;
+  function watchPolling() {
+    if (polled) return;
+    polled = true;
+    for (const prop of ['currentTime', 'paused']) {
+      const d = Object.getOwnPropertyDescriptor(proto, prop);
+      if (!d || !d.get || !d.configurable) continue;
+      const get = Object.getOwnPropertyDescriptor({ get [prop]() { if (!info.has(this)) { try { register(this); } catch (_) {} } return d.get.call(this); } }, prop).get;
+      Object.defineProperty(proto, prop, { ...d, get: disguise(get) });
     }
   }
 
-  window.addEventListener('jds-agent-cmd', (e) => {
+  // Channel handshake: take the first offer (the relay's), then stop listening. Ask once in case
+  // the relay ran first.
+  function onOffer(e) {
+    if (chan || e.defaultPrevented || typeof e.detail !== 'string' || !/^[0-9a-f]{32}$/.test(e.detail)) return;
+    e.preventDefault();
+    chan = e.detail;
+    window.removeEventListener(HELLO, onOffer);
+    window.addEventListener(`c${chan}`, onCommand);
+  }
+  window.addEventListener(HELLO, onOffer);
+  window.dispatchEvent(new CustomEvent(HELLO));
+
+  function onCommand(e) {
     if (typeof e.detail !== 'string' || e.detail.length > 200) return;
     let m;
     try { m = JSON.parse(e.detail); } catch (_) { return; }
     if (!m || typeof m !== 'object') return;
     const seq = Number.isSafeInteger(m.seq) && m.seq >= 0 ? m.seq : null;
+    if (m.t === 'query' || m.t === 'rate' || m.t === 'release') watchPolling();
     if (m.t === 'query') {
       // Always answered, and at once.
       st.active = true; scan();
@@ -157,5 +184,5 @@
       if (seq != null) st.seq = seq;
       release();
     }
-  });
+  }
 })();
