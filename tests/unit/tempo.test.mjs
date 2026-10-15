@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { OdfCore } from '../../worklets/odf-core.js';
 import { DeckTempo } from '../../engine/tempo.js';
+import { GridMap } from '../../engine/timeshift.js';
 import { synth, PATTERNS, FS, nearestBeatError } from './fixtures/synth.mjs';
 
 /** Feed audio through OdfCore -> DeckTempo, calling onEval(tSec, deck) after every 0.5 s evaluation. */
@@ -154,4 +155,110 @@ test('OdfCore emits band bytes and is allocation-free per sample', () => {
   const beatFrames = frames.filter((f) => (f[2] / FS) % (60 / 124) < 0.03);
   const avgLow = (arr) => arr.reduce((a, f) => a + f[3], 0) / arr.length;
   assert.ok(avgLow(beatFrames) > avgLow(frames));
+});
+
+const concat = (...xs) => { const out = new Float32Array(xs.reduce((n, a) => n + a.length, 0)); let o = 0; for (const a of xs) { out.set(a, o); o += a.length; } return out; };
+const bpmOf = (g) => 60 / g.T;
+/** Phase error (ms) of the grid beat nearest p against the truth beat times. */
+const gridErrMs = (g, p, truth) => nearestBeatError(g.t0 + Math.round((p - g.t0) / g.T) * g.T, truth) * 1000;
+
+test('a new track keeps the old grid at the playhead until the playhead reaches it', () => {
+  // The tab autoplays a 100 BPM track after a 124 BPM one; the deck plays 20 s behind the live edge.
+  const A = synth({ ...PATTERNS.house, bars: 40, tail: 0 });
+  const B = synth({ ...PATTERNS.house, bpm: 100, bars: 20, tail: 0, seed: 9 });
+  const x = concat(A.x, B.x), boundary = A.x.length / FS, reserve = 20;
+  const truthB = B.truth.map((t) => t + boundary);
+  const grids = new GridMap();
+  let inA = null, inB = null;
+  const { deck } = run(x, {}, {
+    onEval: (t, d) => {
+      const g = d.get();
+      grids.update(g.grid, g.track);
+      const p = t - reserve, gp = grids.at(p);
+      if (!inA && t > boundary + 6 && g.inBpm && Math.abs(g.inBpm - 100) < 1) inA = { p, gp, live: g.inBpm };
+      if (!inB && p > boundary + 1.5) inB = { p, gp };
+    },
+  });
+  assert.ok(inA, 'the live edge moved on to the 100 BPM track');
+  assert.ok(inA.p < boundary - 10, `playhead ${inA.p} is still in the first track`);
+  assert.ok(Math.abs(bpmOf(inA.gp) - 124) < 0.2, `grid at the playhead ${bpmOf(inA.gp).toFixed(2)} BPM while the live edge reads ${inA.live.toFixed(2)}`);
+  assert.ok(Math.abs(gridErrMs(inA.gp, inA.p, A.truth)) < 5, `first-track phase ${gridErrMs(inA.gp, inA.p, A.truth).toFixed(1)} ms`);
+  const from = deck.get().track && deck.get().track.from;
+  assert.ok(Math.abs(from - boundary) < 0.5, `new track found at ${from} s, it starts at ${boundary.toFixed(2)} s`);
+  assert.ok(inB, 'the playhead crossed into the second track');
+  assert.ok(Math.abs(bpmOf(inB.gp) - 100) < 0.2, `grid after the crossing ${bpmOf(inB.gp).toFixed(2)} BPM`);
+  assert.ok(Math.abs(gridErrMs(inB.gp, inB.p, truthB)) < 10, `second-track phase ${gridErrMs(inB.gp, inB.p, truthB).toFixed(1)} ms`);
+});
+
+test('the old track keeps the grid it had before the new track bled into the beat clock', () => {
+  // Here the beat clock re-phases on the trap track's hits about 2 s before the new tempo is accepted.
+  const A = synth({ ...PATTERNS.house, bars: 40, tail: 0 });
+  const B = synth({ ...PATTERNS.trap, bars: 30, tail: 0, seed: 9 });
+  const x = concat(A.x, B.x), boundary = A.x.length / FS;
+  const grids = new GridMap();
+  let checked = false;
+  run(x, {}, {
+    onEval: (t, d) => {
+      const g = d.get();
+      grids.update(g.grid, g.track);
+      if (checked || t < boundary + 8) return;
+      checked = true;
+      for (const p of [boundary - 12, boundary - 1.5]) {
+        const gp = grids.at(p);
+        assert.ok(Math.abs(bpmOf(gp) - 124) < 0.2, `grid at ${p.toFixed(1)} s: ${bpmOf(gp).toFixed(2)} BPM`);
+        assert.ok(Math.abs(gridErrMs(gp, p, A.truth)) < 5, `phase at ${p.toFixed(1)} s: ${gridErrMs(gp, p, A.truth).toFixed(1)} ms`);
+      }
+    },
+  });
+  assert.ok(checked);
+});
+
+test('½× / 2× after TAP scale the tapped tempo instead of discarding it', () => {
+  const d = new DeckTempo({ sampleRate: FS, fps: 93.75 });
+  for (let k = 0; k < 8; k++) d.tap(Math.round(10 * FS + k * 0.75 * FS));
+  const t0 = d.get().grid.t0;
+  d.multiply(2);
+  let g = d.get();
+  assert.equal(g.tapped, true, 'still tapped');
+  assert.ok(Math.abs(g.inBpm - 160) < 0.5, `2× of an 80 BPM tap reads ${g.inBpm}`);
+  assert.ok(g.grid && Math.abs(g.grid.T - 0.375) < 0.002 && Math.abs(g.grid.t0 - t0) < 1e-9, `grid ${JSON.stringify(g.grid)}`);
+  d.multiply(0.5); d.multiply(0.5);
+  g = d.get();
+  assert.ok(Math.abs(g.inBpm - 40) < 0.3, `½ ½ reads ${g.inBpm}`);
+  assert.ok(Math.abs(g.grid.T - 1.5) < 0.01);
+});
+
+test('changing the BPM range refolds the tempo and keeps the grid, the taps and bar 1', () => {
+  const { x } = synth({ ...PATTERNS.dnb, bars: 24 });
+  const { deck } = run(x);
+  const before = deck.get();
+  assert.ok(Math.abs(before.inBpm - 87) < 0.2, `AUTO reads ${before.inBpm}`);
+  deck.setBar1(Math.round(before.grid.t0 * FS));
+  const bar1 = deck.get().grid.bar1;
+  deck.setRange(88, 175);
+  const g = deck.get();
+  assert.equal(g.state, before.state, 'lock kept');
+  assert.ok(Math.abs(g.inBpm - 2 * before.inBpm) < 1e-6, `refolded to ${g.inBpm}`);
+  assert.ok(g.grid, 'grid kept');
+  assert.ok(Math.abs(g.grid.t0 - before.grid.t0) < 1e-9 && Math.abs(g.grid.T - before.grid.T / 2) < 1e-9, `grid ${JSON.stringify(g.grid)}`);
+  assert.equal(g.grid.bar1, bar1, 'bar 1 kept');
+  assert.equal(g.canBeat, before.canBeat);
+  // A manual 2× that already put the tempo in range survives a range change.
+  deck.setRange(55, 115);
+  assert.ok(Math.abs(deck.get().inBpm - before.inBpm) < 1e-6, `55-115 reads ${deck.get().inBpm}`);
+  deck.multiply(2);
+  const m = deck.get();
+  deck.setRange(88, 175);
+  assert.ok(Math.abs(deck.get().inBpm - m.inBpm) < 1e-6, `manual 2× kept: ${deck.get().inBpm} vs ${m.inBpm}`);
+  // A tapped tempo stays tapped, refolded like any other tempo.
+  const t = new DeckTempo({ sampleRate: FS, fps: 93.75 });
+  for (let k = 0; k < 8; k++) t.tap(Math.round(10 * FS + k * 0.5 * FS));
+  const tg = t.get();
+  t.setRange(68, 135);
+  assert.deepEqual(t.get(), tg, 'in range: nothing changes');
+  t.setRange(55, 115);
+  assert.equal(t.get().tapped, true);
+  assert.ok(Math.abs(t.get().inBpm - tg.inBpm / 2) < 1e-9, `tapped refolded to ${t.get().inBpm}`);
+  assert.ok(Math.abs(t.get().grid.t0 - tg.grid.t0) < 1e-9 && Math.abs(t.get().grid.T - 2 * tg.grid.T) < 1e-9);
+  assert.equal(t.taps.length, 8, 'taps kept');
 });

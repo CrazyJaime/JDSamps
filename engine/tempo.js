@@ -29,8 +29,29 @@ function gaussSmooth(x, sigma) {
   return y;
 }
 
+/** Onset strength above its local mean, smoothed: what the tempo combs correlate. */
+function onsetCurve(x, sigma) {
+  const W = x.length, y = new Float32Array(W);
+  for (let i = 0; i < W; i++) {
+    let s = 0, c = 0;
+    for (let j = Math.max(0, i - 8); j <= Math.min(W - 1, i + 7); j++) { s += x[j]; c++; }
+    y[i] = Math.max(0, x[i] - s / c);
+  }
+  return gaussSmooth(y, sigma);
+}
+
 const rel = (a, b) => Math.abs(a / b - 1);
 const clamp01 = (v) => Math.max(0, Math.min(1, v));
+
+/** Tempos a manual ½× / 2× may reach. */
+export const MANUAL_BPM = Object.freeze([DEFAULTS.wideLo / 2, DEFAULTS.wideHi * 2]);
+
+/** Power-of-two factor that folds bpm into [lo, hi] (1 when there is no tempo). */
+export function octaveFold(bpm, lo, hi) {
+  let f = 1;
+  if (bpm > 0) { while (bpm * f < lo) f *= 2; while (bpm * f > hi) f /= 2; }
+  return f;
+}
 
 export class TempoTracker {
   constructor(fps, opts = {}) {
@@ -71,14 +92,7 @@ export class TempoTracker {
     const o = this.o, fps = this.fps;
     const W = Math.min(this.full.count, Math.round(o.windowSec * fps));
     if (W < 4 * fps) return null;
-    const x = this.full.last(W, new Float32Array(W));
-    let y = new Float32Array(W);
-    for (let i = 0; i < W; i++) {
-      let s = 0, c = 0;
-      for (let j = Math.max(0, i - 8); j <= Math.min(W - 1, i + 7); j++) { s += x[j]; c++; }
-      y[i] = Math.max(0, x[i] - s / c);
-    }
-    y = gaussSmooth(y, o.smoothSigma);
+    const y = onsetCurve(this.full.last(W, new Float32Array(W)), o.smoothSigma);
     let mean = 0; for (let i = 0; i < W; i++) mean += y[i]; mean /= W;
     let energy = 0; for (let i = 0; i < W; i++) { y[i] -= mean; energy += y[i] * y[i]; }
     if (energy / W < 1e-4) return { silent: true };
@@ -139,6 +153,22 @@ export class TempoTracker {
 
   bestBpm() { return this.fineBpm && rel(this.fineBpm, this.bpm) < 0.01 ? this.fineBpm : this.bpm; }
   snapshot(tag) { return { state: tag || this.state, bpm: this.bestBpm(), coarse: this.bpm, conf: this.conf }; }
+
+  /**
+   * Input frame where tempo bpmB took over from bpmA within the onset history: the split that
+   * best explains the frames before it by bpmA's beat comb and the frames after it by bpmB's.
+   */
+  changePoint(bpmA, bpmB) {
+    const W = this.full.count, H = this.o.harmonics;
+    if (W < 2 || !this.spf) return this.lastT;
+    const y = onsetCurve(this.full.last(W, new Float32Array(W)), this.o.smoothSigma);
+    const at = (pos) => { const i = Math.floor(pos), f = pos - i; return i < 0 || i + 1 >= W ? 0 : y[i] * (1 - f) + y[i + 1] * f; };
+    const comb = (i, tau) => { let s = 0; for (let k = 0; k < H.length; k++) s += H[k] * (at(i - (k + 1) * tau) + at(i + (k + 1) * tau)); return y[i] * s; };
+    const tauA = (60 * this.fps) / bpmA, tauB = (60 * this.fps) / bpmB;
+    let acc = 0, best = 0, split = 0;
+    for (let i = 0; i < W; i++) { acc += comb(i, tauA) - comb(i, tauB); if (acc > best) { best = acc; split = i + 1; } }
+    return Math.min(this.lastT, this.lastT - (W - 1 - split) * this.spf);
+  }
 
   /** Phase comb at `bpm` (already multiplied by `mult`). Returns times in input frames. */
   phase(bpm, mult = 1) {
@@ -229,9 +259,48 @@ export class DeckTempo {
     this.gridOffset = 0;
     this.sinceEst = 0;
     this.snap = { state: 'search', bpm: 0, coarse: 0, conf: 0 };
+    // The track the tracker follows: n counts tracks, from (input s) is where this one took over
+    // and prev is the previous track's grid as it stood there.
+    this.track = { n: this.track ? this.track.n + 1 : 0, from: this.tracker.lastT / this.sr, prev: null };
+    this.hist = []; // recent beat-clock states {t, t0, T} (input frames), oldest first
   }
 
-  setRange(lo, hi) { this.tracker.o.lo = lo; this.tracker.o.hi = hi; this.reset(); }
+  /**
+   * New BPM range: fold the tempo into it by octaves, keeping the lock, the grid (anchor beat
+   * kept, period scaled), the taps and bar 1. Returns the factor applied to the tempo.
+   */
+  setRange(lo, hi) {
+    const tr = this.tracker;
+    const f = octaveFold(this.bpmIn(), lo, hi), fTr = octaveFold(tr.bpm, lo, hi);
+    tr.o.lo = lo; tr.o.hi = hi;
+    tr.cand = null; tr.candCount = 0;
+    if ((f !== 1 || fTr !== 1) && this.snap.bpm) { tr.bpm = this.snap.bpm * fTr; tr.resetFine(); }
+    if (this.tapped) this.tapped.bpm *= f;
+    else this.mult *= f / fTr;
+    if (f !== 1) {
+      if (this.clock.T) this.clock.T /= f;
+      const T = this.clock.T;
+      if (T && Math.abs(this.gridOffset) > T / 2) this.gridOffset -= Math.round(this.gridOffset / T) * T;
+      for (const h of this.hist) h.T /= f;
+    }
+    this.snap = { ...this.snap, bpm: tr.bestBpm(), coarse: tr.bpm };
+    return f;
+  }
+
+  /** Remember the beat clock as it stands now, for the grid an old track keeps after a track change. */
+  remember() {
+    const t = this.tracker.lastT;
+    this.hist.push({ t, t0: this.clock.t0, T: this.clock.T });
+    while (this.hist.length && this.hist[0].t < t - 16 * this.sr) this.hist.shift();
+  }
+
+  /** The grid (input s) as it stood when the live edge reached input frame `from`. */
+  gridBefore(from) {
+    let h = null;
+    for (const e of this.hist) { if (e.t <= from) h = e; else break; }
+    h = h || this.hist[0] || (this.clock.t0 != null && this.clock.T > 0 ? this.clock : null);
+    return h ? { t0: h.t0 / this.sr, T: h.T / this.sr, bar1: this.bar1 == null ? null : this.bar1 / this.sr } : null;
+  }
 
   pushBatch({ t0, spf, full, low }) { for (let i = 0; i < full.length; i++) this.pushFrame(full[i], low[i], t0 + i * spf); }
 
@@ -251,11 +320,16 @@ export class DeckTempo {
 
   evaluate() {
     const prev = this.snap.coarse;
+    if (this.clock.t0 != null && this.clock.T > 0) this.remember();
     this.snap = this.tracker.update(this.tracker.estimate());
     if (this.snap.state !== 'hold' && this.snap.bpm && this.recentlyQuiet()) this.snap = this.tracker.snapshot('hold');
     if (prev && this.snap.coarse && rel(this.snap.coarse, prev) > 0.03 && this.snap.state !== 'hold') {
-      // The tracker accepted a new tempo (new track): manual corrections no longer apply.
-      this.mult = 1; this.tapped = null; this.gridOffset = 0; this.clock = new BeatClock(); this.bar1 = null;
+      // The tracker accepted a new tempo (new track): manual corrections no longer apply. The new
+      // track starts where its beats took over (the playhead may still be playing the old one),
+      // and the old track keeps the grid it had there, before the new beats could pull the clock.
+      const from = this.tracker.changePoint(prev, this.snap.coarse);
+      this.track = { n: this.track.n + 1, from: from / this.sr, prev: this.gridBefore(from) };
+      this.mult = 1; this.tapped = null; this.gridOffset = 0; this.clock = new BeatClock(); this.bar1 = null; this.hist = [];
     }
     const bpm = this.bpmIn();
     const usable = this.tapped || this.tracker.state === 'locked';
@@ -271,17 +345,27 @@ export class DeckTempo {
     return this.snap.bpm ? this.snap.bpm * this.mult : 0;
   }
 
+  /** ½× / 2×. A tapped tempo is scaled (keeping its anchor beat), not discarded. Returns false if refused. */
   multiply(factor) {
-    const next = this.mult * factor;
-    if (next < 0.25 || next > 4) return;
-    this.mult = next;
-    this.tapped = null;
+    if (this.tapped) {
+      const bpm = this.tapped.bpm * factor;
+      if (bpm < MANUAL_BPM[0] || bpm > MANUAL_BPM[1]) return false;
+      this.tapped.bpm = bpm;
+      this.clock.T /= factor;
+    } else {
+      const next = this.mult * factor;
+      if (next < 0.25 || next > 4) return false;
+      this.mult = next;
+      this.gridOffset = 0;
+      this.clock = new BeatClock();
+    }
     this.tracker.resetFine();
-    this.gridOffset = 0;
-    this.clock = new BeatClock();
+    for (const h of this.hist) h.T /= factor;
+    return true;
   }
 
-  tap(inFrame) {
+  /** Record a tap (input frame) and fit the taps so far: {bpm, t0, T} (input frames) or null. */
+  tapFit(inFrame) {
     const last = this.taps[this.taps.length - 1];
     if (last != null && inFrame - last > 2 * this.sr) this.taps = [];
     this.taps.push(inFrame);
@@ -299,14 +383,25 @@ export class DeckTempo {
     if (!(period > 0)) return null;
     const b0 = (st - period * sn) / m;
     const nLast = Math.round((this.taps[m - 1] - first) / med);
-    const bpm = (60 * this.sr) / period;
-    this.tapped = { bpm };
+    return { bpm: (60 * this.sr) / period, t0: b0 + nLast * period, T: period };
+  }
+
+  /** Use a tapped grid ({t0, T} in input frames, at the live edge's source rate) as the tempo. */
+  applyTap({ t0, T }) {
+    this.tapped = { bpm: (60 * this.sr) / T };
     this.mult = 1;
     this.gridOffset = 0;
     this.clock = new BeatClock();
-    this.clock.t0 = b0 + nLast * period;
-    this.clock.T = period;
-    return bpm;
+    this.clock.t0 = t0;
+    this.clock.T = T;
+    this.hist = [];
+  }
+
+  tap(inFrame) {
+    const fit = this.tapFit(inFrame);
+    if (!fit) return null;
+    this.applyTap(fit);
+    return fit.bpm;
   }
 
   shiftGrid({ beats = 0, ms = 0 }) {
@@ -316,11 +411,13 @@ export class DeckTempo {
     this.gridOffset += delta;
     if (Math.abs(this.gridOffset) > T / 2) this.gridOffset -= Math.round(this.gridOffset / T) * T;
     this.clock.t0 += delta;
+    for (const h of this.hist) h.t0 += beats * h.T + (ms / 1000) * this.sr;
   }
 
-  setBar1(inFrame) {
+  /** Bar 1 at the beat nearest inFrame (or exactly at inFrame when snap is false). */
+  setBar1(inFrame, snap = true) {
     const { t0, T } = this.clock;
-    this.bar1 = t0 != null && T ? t0 + Math.round((inFrame - t0) / T) * T : inFrame;
+    this.bar1 = snap && t0 != null && T ? t0 + Math.round((inFrame - t0) / T) * T : inFrame;
   }
 
   sourceRateChanged(ratio, atFrame) {
@@ -349,6 +446,6 @@ export class DeckTempo {
       ? { t0: this.clock.t0 / this.sr, T: this.clock.T / this.sr, bar1: this.bar1 == null ? null : this.bar1 / this.sr }
       : null;
     const canBeat = !!grid && (!!this.tapped || (tr.state === 'locked' && tr.conf >= 0.5));
-    return { state, inBpm: bpm || null, conf: this.tapped ? 1 : tr.conf, mult: this.mult, tapped: !!this.tapped, grid, canBeat };
+    return { state, inBpm: bpm || null, conf: this.tapped ? 1 : tr.conf, mult: this.mult, tapped: !!this.tapped, grid, canBeat, track: this.track };
   }
 }

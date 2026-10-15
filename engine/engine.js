@@ -146,7 +146,7 @@ class Engine {
       case 'xfader.pos': case 'xfader.curve': this.master.setCrossfader(this.params['xfader.pos'], this.params['xfader.curve']); break;
       case 'bpm.range': {
         const [lo, hi] = BPM_RANGES[v];
-        for (const d of this.decks.values()) if (d.tempo) d.tempo.setRange(lo, hi);
+        for (const d of this.decks.values()) d.setRange(lo, hi);
         break;
       }
       case 'buffer.capSec': for (const d of this.decks.values()) if (d.ts) d.ts.capSec = v; break;
