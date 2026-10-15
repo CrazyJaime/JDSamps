@@ -195,6 +195,7 @@ export function createFxRack(ctx) {
       filter.dispose(); flanger.dispose(); echo.dispose();
       if (reverb) reverb.dispose();
       for (const r of retiring) r.rv.dispose();
+      beatfx.port.postMessage({ t: 'dispose' }); // else Chrome keeps running the disconnected processor
       beatfx.port.close();
       for (const n of [beatfx, post, output]) n.disconnect();
     },

@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   prepareExtension, launchExtension, startTrackServer, openExtPage, hubCall, tabIdFor, waitFor, installClient,
-  act, set, state, events, downloadIds, waitForDownload, parseWav, bandOnsets, bandRms, medianBpm,
+  act, set, state, events, downloadIds, waitForDownload, parseWav, bandOnsets, bandRms, medianBpm, offscreenEval,
 } from './ext-harness.mjs';
 
 const ART = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'artifacts');
@@ -196,6 +196,65 @@ test('closing a recording tab saves its recording and frees the master clock', a
   assert.ok(wav.seconds > 1.5, `seconds ${wav.seconds}`);
   await waitFor(async () => (await state(deck)).decks.length === 2, 8000);
   assert.equal((await state(deck)).clock.mode, 'free');
+});
+
+// Inside the engine: wrap AudioWorkletNode to log what each new node is told (port messages and
+// stretcher remote calls), and whether the stretcher processor answered destroy().
+const NODE_PROBE = `(() => {
+  const Orig = AudioWorkletNode, lc = window.__lc = { Orig, nodes: [] };
+  window.AudioWorkletNode = class extends Orig {
+    constructor(ctx, name, opts) {
+      super(ctx, name, opts);
+      const rec = { name, sent: [], destroyAnswered: false };
+      lc.nodes.push(rec);
+      const port = this.port, post = port.postMessage.bind(port);
+      let destroyId = null;
+      port.postMessage = (...args) => {
+        const m = args[0];
+        if (Array.isArray(m)) { if (m[1] !== 'addBuffers') rec.sent.push(m[1]); if (m[1] === 'destroy') destroyId = m[0]; }
+        else if (m && m.t) rec.sent.push(m.t);
+        return post(...args);
+      };
+      port.addEventListener('message', (e) => { if (destroyId !== null && Array.isArray(e.data) && e.data[0] === destroyId) rec.destroyAnswered = true; });
+    }
+  };
+  return true;
+})()`;
+
+test('ejected and closed deck tabs stop their audio processors (stretcher, input, FX, recorder)', async () => {
+  await offscreenEval(h, NODE_PROBE);
+  try {
+    // 0: eject. 1: record, stop, close the tab. 2: eject while recording.
+    for (let i = 0; i < 3; i++) {
+      const url = `${server.url('a')}?lifecycle=${i}`;
+      const tab = await h.context.newPage();
+      await tab.goto(url);
+      const tabId = await tabIdFor(h, url);
+      const r = await hubCall(deck, { type: 'LOAD_TAB', tabId });
+      assert.equal(r.ok, true, JSON.stringify(r));
+      const d = await waitFor(async () => (await state(deck)).decks.find((x) => x.tabId === tabId), 8000);
+      await sleep(1500);
+      if (i > 0) { assert.equal((await act(deck, d.id, 'recStart')).ok, true); await sleep(1000); }
+      if (i === 1) { await act(deck, d.id, 'recStop'); await tab.close(); } else { assert.equal((await act(deck, d.id, 'eject')).ok, true); await tab.close(); }
+      await waitFor(async () => !(await state(deck)).decks.some((x) => x.tabId === tabId), 10000);
+    }
+    const done = (n) => n.filter((x) => x.name === 'signalsmith-stretch').every((x) => x.destroyAnswered)
+      && n.filter((x) => x.name === 'jds-recorder').every((x) => x.sent.includes('dispose'));
+    await waitFor(async () => done(await offscreenEval(h, 'window.__lc.nodes')), 15000, 250).catch(() => {});
+    const nodes = await offscreenEval(h, 'window.__lc.nodes');
+    const by = (name) => nodes.filter((x) => x.name === name);
+    assert.equal(by('signalsmith-stretch').length, 3);
+    for (const s of by('signalsmith-stretch')) {
+      assert.ok(s.sent.includes('dropBuffers') && s.destroyAnswered, `stretcher not destroyed: ${JSON.stringify(s)}`);
+    }
+    for (const name of ['jds-deck-input', 'jds-beatfx']) {
+      assert.equal(by(name).length, 3, name);
+      for (const x of by(name)) assert.ok(x.sent.includes('dispose'), `${name} not disposed: ${JSON.stringify(x.sent.slice(-5))}`);
+    }
+    assert.deepEqual(by('jds-recorder').map((x) => x.sent), [['start', 'stop', 'dispose'], ['start', 'stop', 'dispose']]);
+  } finally {
+    await offscreenEval(h, 'window.AudioWorkletNode = window.__lc.Orig, true').catch(() => {});
+  }
 });
 
 test('stop all ejects everything; no engine errors were reported', async () => {

@@ -14,9 +14,14 @@ class Recorder extends AudioWorkletProcessor {
     this.on = false;
     this.buf = null;
     this.n = 0;
+    this.disposed = false;
     this.port.onmessage = (e) => {
       const m = e.data || {};
-      if (m.t === 'start') {
+      if (m.t === 'dispose') { // process() returns false from now on, so Chrome stops calling it
+        this.disposed = true;
+        this.on = false;
+        this.buf = null;
+      } else if (m.t === 'start') {
         this.on = true;
         this.buf = new Int16Array(BATCH * 2);
         this.n = 0;
@@ -37,6 +42,7 @@ class Recorder extends AudioWorkletProcessor {
   }
 
   process(inputs) {
+    if (this.disposed) return false;
     if (!this.on) return true;
     const input = inputs[0];
     const l = input && input.length ? input[0] : null;

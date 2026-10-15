@@ -18,9 +18,11 @@ class BeatFx extends AudioWorkletProcessor {
     this.mbuf = new Float32Array(128);
     this.hold = new Float32Array(2);
     this.holdCount = 0;
+    this.disposed = false;
     this.port.onmessage = (e) => {
       const m = e.data || {};
-      if (m.t === 'mode') this.mode = m.mode;
+      if (m.t === 'dispose') this.disposed = true; // process() returns false from now on, so Chrome stops calling it
+      else if (m.t === 'mode') this.mode = m.mode;
       else if (m.t === 'gate') { this.depth = m.depth; this.stepBeats = m.stepBeats; }
       else if (m.t === 'crush') this.amount = m.amount;
       else if (m.t === 'clock' && m.periodFrames > 0) { this.anchor = m.anchorFrame; this.period = m.periodFrames; }
@@ -28,6 +30,7 @@ class BeatFx extends AudioWorkletProcessor {
   }
 
   process(inputs, outputs) {
+    if (this.disposed) return false;
     const inp = inputs[0], out = outputs[0];
     const n = out[0].length;
     if (this.gbuf.length !== n) { this.gbuf = new Float32Array(n); this.mbuf = new Float32Array(n); }
