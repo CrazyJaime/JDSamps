@@ -202,6 +202,27 @@ test('STOP_TAB that cannot pause in time mutes the tab instead, and answers with
   assert.deepEqual(await stopTab(12), { ok: true, paused: 0, muted: true });
 });
 
+test('a pause that lands after the mute takes the mute back off: the tab ends paused, not muted', async () => {
+  let land;
+  runScript = (o) => (o.func ? new Promise((r) => { land = () => r(frames(1)); }) : []); // a slow page (a busy machine)
+  assert.deepEqual(await stopTab(11), { ok: true, paused: 0, muted: true });
+  assert.equal(tabs[0].mutedInfo.muted, true, 'muted while the pause is late');
+  land();
+  await settle();
+  assert.equal(tabs[0].mutedInfo.muted, false, 'paused now, so our mute is undone');
+  assert.deepEqual(muteRecords(), []);
+});
+
+test('a late pause that found nothing heard keeps the mute', async () => {
+  let land;
+  runScript = (o) => (o.func ? new Promise((r) => { land = () => r(frames(0)); }) : []);
+  assert.deepEqual(await stopTab(11), { ok: true, paused: 0, muted: true });
+  land();
+  await settle();
+  assert.equal(tabs[0].mutedInfo.muted, true);
+  assert.deepEqual(muteRecords(), ['muted:11']);
+});
+
 test('STOP_TAB skips a closed or navigated-away tab silently', async () => {
   tabs[0].url = 'chrome://newtab/';
   for (const id of [11, 77, 'x']) {

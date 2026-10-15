@@ -257,9 +257,13 @@ async function unmuteOurs(tab) {
 async function stopTab(tabId) {
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (!tab || !capturable(tab.url)) return { ok: true, paused: 0, muted: false }; // closed or navigated away
-  const paused = await Promise.race([pauseTab(tabId).catch(() => 0), new Promise((r) => setTimeout(r, STOP_MS, 0))]);
+  const pausing = pauseTab(tabId).catch(() => 0);
+  const paused = await Promise.race([pausing, new Promise((r) => setTimeout(r, STOP_MS, 0))]);
   if (paused > 0) return { ok: true, paused, muted: false };
-  return { ok: true, paused: 0, muted: await muteTab(tab).catch(() => false) };
+  const muted = await muteTab(tab).catch(() => false);
+  // A slow page (a busy machine) may still pause after the mute: then the mute is not needed.
+  if (muted) pausing.then(async (n) => { if (n > 0) { const t = await chrome.tabs.get(tabId).catch(() => null); if (t) await unmuteOurs(t); } });
+  return { ok: true, paused: 0, muted };
 }
 
 // ---------------------------------------------------------------- tab lifecycle

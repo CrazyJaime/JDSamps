@@ -305,6 +305,9 @@ test("ejecting a deck pauses its tab's player, whether the user or the engine ej
     await waitFor(() => tab.evaluate(() => { const m = window.__media(); return !m.paused && m.t > 0.3; }), 8000);
     // Wall-clock times of the page's pause and of the capture being released.
     await tab.evaluate(() => document.getElementById('a').addEventListener('pause', () => { window.__pausedAt = Date.now(); }));
+    // On a busy machine the hub may mute first (the pause is late); either way the tab is silent.
+    await h.sw.evaluate((id) => { globalThis.__mutedAt = 0; chrome.tabs.onUpdated.addListener((t, info) => {
+      if (t === id && info.mutedInfo && info.mutedInfo.muted && !globalThis.__mutedAt) globalThis.__mutedAt = Date.now(); }); }, tabId);
     await offscreenEval(h, `(() => { window.__releasedAt = 0; const t = globalThis.__jdsEngine.decks.get(${d.id}).stream.getAudioTracks()[0], stop = t.stop.bind(t);
       t.stop = () => { window.__releasedAt = Date.now(); stop(); }; return true; })()`);
     if (i === 2) {
@@ -318,8 +321,12 @@ test("ejecting a deck pauses its tab's player, whether the user or the engine ej
     assert.equal((await tab.evaluate(() => window.__media())).paused, true, `eject ${i}: the tab's <audio> is still playing`);
     const releasedAt = await waitFor(() => offscreenEval(h, 'window.__releasedAt || 0'), 3000);
     const pausedAt = await tab.evaluate(() => window.__pausedAt);
-    assert.ok(pausedAt <= releasedAt, `eject ${i}: paused ${pausedAt - releasedAt} ms after the capture was released`);
-    assert.equal((await h.sw.evaluate((id) => chrome.tabs.get(id), tabId)).mutedInfo.muted, false, 'paused, so not muted');
+    const mutedAt = await h.sw.evaluate(() => globalThis.__mutedAt);
+    assert.ok(pausedAt <= releasedAt || (mutedAt && mutedAt <= releasedAt),
+      `eject ${i}: the tab was still playing when the capture was released (paused ${pausedAt - releasedAt} ms after, muted ${mutedAt ? mutedAt - releasedAt : 'never'})`);
+    // Paused in the end, so any mute made while the pause was late is taken back off.
+    await waitFor(async () => !(await h.sw.evaluate((id) => chrome.tabs.get(id), tabId)).mutedInfo.muted, 3000)
+      .catch(() => assert.fail(`eject ${i}: paused, but the tab was left muted`));
     if (i === 2) await offscreenEval(h, '(() => { const e = globalThis.__jdsEngine; e.hub = e.__hub; delete e.__hub; return true; })()');
     await tab.close();
   }
