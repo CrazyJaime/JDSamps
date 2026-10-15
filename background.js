@@ -3,10 +3,10 @@
 //   toolbar icon, the Alt+Shift+A command and the context-menu item all capture the current
 //   tab, then open (or focus) the full-page deck.
 // * Owns tabCapture stream ids, the offscreen engine's lifetime, the Sources list, downloads,
-//   badge, tab lifecycle and player-assist injection.
+//   badge, tab lifecycle, player-assist injection, and stopping a tab's playback on eject.
 // * Registers NO runtime.onConnect listener: a receiver that disconnects a port tears it down
 //   for every receiver. UI and agent ports go straight to the offscreen engine.
-import { TARGET, HUB, ENGINE } from './shared/protocol.js';
+import { TARGET, HUB, ENGINE, validateAgentMessage } from './shared/protocol.js';
 
 const OFFSCREEN = 'offscreen.html';
 const DECK = 'deck.html';
@@ -79,11 +79,13 @@ function streamIdFor(tabId) {
 
 async function capture(tabId) {
   if (!Number.isInteger(tabId)) return { ok: false, error: 'Bad tab id.' };
+  await stopping.get(tabId); // an eject of this tab that may still mute it
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (!tab) return { ok: false, error: 'That tab is gone.' };
   if (!capturable(tab.url)) return { ok: false, error: 'Only web pages (http/https) can be loaded. Chrome pages cannot be captured.' };
   const on = (await engineDecks()).find((d) => d.tabId === tabId);
   if (on) return { ok: false, error: `That tab is already on deck ${on.slot}.` };
+  await unmuteOurs(tab);
   let streamId;
   try {
     streamId = await streamIdFor(tabId);
@@ -174,12 +176,15 @@ chrome.downloads.onChanged.addListener((d) => {
 });
 
 // ---------------------------------------------------------------- player-assist agent
+async function injectAgent(tabId) {
+  await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['agent/agent-main.js'], world: 'MAIN' });
+  await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['agent/agent-relay.js'] });
+}
 async function connectAgent(tabId) {
   const ask = () => chrome.tabs.sendMessage(tabId, { jds: 'connect' });
   try { await ask(); return { ok: true }; } catch (_) { /* not injected yet (tab predates install) */ }
   try {
-    await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['agent/agent-main.js'], world: 'MAIN' });
-    await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, files: ['agent/agent-relay.js'] });
+    await injectAgent(tabId);
     await ask();
     return { ok: true };
   } catch (err) {
@@ -187,9 +192,64 @@ async function connectAgent(tabId) {
   }
 }
 
+// ---------------------------------------------------------------- eject: stop the tab playing
+// Once a deck lets go of its capture, the tab plays out of the speakers again. So before an eject
+// the engine asks for STOP_TAB: every frame's agent pauses its page's players, or, when nothing
+// heard could be paused in time, the tab is muted. Mutes made here are recorded per tab and undone
+// when the tab is loaded again; a mute the user made is never touched.
+const STOP_MS = 250; // the engine waits about 400 ms for the whole STOP_TAB
+const muteKey = (tabId) => `muted:${tabId}`;
+const stopping = new Map(); // tabId → STOP_TAB in flight (never rejects)
+
+/** Heard players paused across the tab's frames, or null when no frame has the relay. */
+async function pauseFrames(tabId) {
+  const res = await chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    func: () => (typeof globalThis.__jdsStop === 'function' ? globalThis.__jdsStop() : null),
+  });
+  let any = false, n = 0;
+  for (const r of res || []) {
+    if (r.result == null) continue;
+    any = true;
+    const m = validateAgentMessage(r.result); // page-adjacent data
+    if (m && m.t === 'stopped') n += m.count;
+  }
+  return any ? n : null;
+}
+async function pauseTab(tabId) {
+  const n = await pauseFrames(tabId);
+  if (n != null) return n;
+  await injectAgent(tabId); // the tab predates install and missed the agent
+  return (await pauseFrames(tabId)) || 0;
+}
+
+async function muteTab(tab) {
+  if (tab.mutedInfo && tab.mutedInfo.muted) return false; // muted already (by the user, or by an earlier eject)
+  try { await chrome.tabs.update(tab.id, { muted: true }); } catch (_) { return false; } // closed meanwhile
+  await chrome.storage.session.set({ [muteKey(tab.id)]: true });
+  return true;
+}
+/** Undoes a mute STOP_TAB made, unless the user has muted the tab since. */
+async function unmuteOurs(tab) {
+  const key = muteKey(tab.id);
+  if (!(await chrome.storage.session.get(key))[key]) return;
+  await chrome.storage.session.remove(key);
+  const m = tab.mutedInfo;
+  if (m && m.muted && m.reason === 'extension' && m.extensionId === chrome.runtime.id) await chrome.tabs.update(tab.id, { muted: false }).catch(() => {});
+}
+
+async function stopTab(tabId) {
+  const tab = await chrome.tabs.get(tabId).catch(() => null);
+  if (!tab || !capturable(tab.url)) return { ok: true, paused: 0, muted: false }; // closed or navigated away
+  const paused = await Promise.race([pauseTab(tabId).catch(() => 0), new Promise((r) => setTimeout(r, STOP_MS, 0))]);
+  if (paused > 0) return { ok: true, paused, muted: false };
+  return { ok: true, paused: 0, muted: await muteTab(tab).catch(() => false) };
+}
+
 // ---------------------------------------------------------------- tab lifecycle
 async function deckTabIds() { return ((await chrome.storage.session.get('decks')).decks || []).map((d) => d.tabId); }
 chrome.tabs.onRemoved.addListener(async (tabId) => {
+  chrome.storage.session.remove(muteKey(tabId)).catch(() => {});
   await revoke(tabId);
   if ((await deckTabIds()).includes(tabId) && (await hasEngine())) {
     chrome.runtime.sendMessage({ target: TARGET.ENGINE, type: ENGINE.EJECT, tabId }).catch(() => {});
@@ -223,6 +283,14 @@ async function handle(msg) {
     }
     case HUB.DOWNLOAD: return download(msg.url, msg.filename);
     case HUB.AGENT_CONNECT: return Number.isInteger(msg.tabId) ? connectAgent(msg.tabId) : { ok: false, error: 'Bad tab id.' };
+    case HUB.STOP_TAB: {
+      const id = msg.tabId;
+      if (!Number.isInteger(id)) return { ok: false, error: 'Bad tab id.' };
+      const p = stopTab(id).catch(() => ({ ok: true, paused: 0, muted: false }));
+      stopping.set(id, p);
+      p.then(() => { if (stopping.get(id) === p) stopping.delete(id); });
+      return p;
+    }
     case HUB.DECKS_CHANGED: {
       const decks = Array.isArray(msg.decks) ? msg.decks.filter((d) => Number.isInteger(d.tabId) && Number.isInteger(d.slot)) : [];
       await chrome.storage.session.set({ decks });

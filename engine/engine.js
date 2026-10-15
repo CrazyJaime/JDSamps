@@ -15,6 +15,7 @@ const STRETCH_URL = new URL('../vendor/signalsmith-stretch/SignalsmithStretch.js
 SignalsmithStretch.moduleUrl = STRETCH_URL;
 const workletUrl = (f) => new URL(`../worklets/${f}`, import.meta.url).href;
 const withTimeout = (p, ms, msg) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
+const STOP_TAB_MS = 400; // an eject waits at most this long for its tab to stop playing
 
 // Trust: the relay content script runs in every frame of every site, so any renderer can speak
 // as it. Only extension contexts (the service worker, the deck page) may command the engine.
@@ -32,6 +33,7 @@ class Engine {
     this.ctx = new AudioContext({ latencyHint: 'interactive' });
     this.params = defaults(MASTER_PARAMS);
     this.decks = new Map();
+    this.tabStops = new WeakMap(); // deck → its STOP_TAB (sent once)
     this.nextId = 1;
     this.clock = new MasterClock();
     this.ui = new Set();
@@ -241,7 +243,23 @@ class Engine {
     return { ok: true, deckId: deck.id, slot };
   }
 
+  /** Before a deck's capture goes, stop its tab playing (the hub pauses the page's players, or
+   *  mutes the tab), so the ejected track does not come out of the speakers. Bounded. */
+  stopTab(d) {
+    let p = this.tabStops.get(d);
+    if (!p) {
+      p = withTimeout(this.hub({ type: HUB.STOP_TAB, tabId: d.tabId }), STOP_TAB_MS, 'STOP_TAB timed out').then((r) => {
+        if (r && r.ok && r.muted) this.event('info', `Deck ${d.slot}: the tab has no pausable player, so it was muted.`);
+      }, () => {});
+      this.tabStops.set(d, p);
+    }
+    return p;
+  }
+
   eject(id, reason) {
+    // Stopping the tab starts now, ahead of the queue, so STOP ALL stops every tab in parallel.
+    const d0 = this.decks.get(id);
+    if (d0) this.stopTab(d0);
     return this.serial(async () => {
       const d = this.decks.get(id);
       if (!d) return;
@@ -249,6 +267,7 @@ class Engine {
       this.clock.release(id);
       if (reason) this.event('warn', reason);
       this.hub({ type: HUB.DECKS_CHANGED, decks: [...this.decks.values()].map((x) => ({ tabId: x.tabId, slot: x.slot })) });
+      await this.stopTab(d);
       await d.dispose();
     });
   }
