@@ -4,7 +4,8 @@ import test, { beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 const turn = () => new Promise((r) => setImmediate(r));
-const settle = () => new Promise((r) => setTimeout(r, 30));
+// Settle by turns, not wall time: under CPU load a 30 ms timer can fire before the chains finish.
+const settle = async () => { for (let i = 0; i < 400; i++) await turn(); };
 const event = () => { const ls = []; return { ls, addListener: (f) => ls.push(f), fire: (...a) => ls.map((f) => f(...a)) }; };
 const EXT = 'chrome-extension://abcdefghijklmnopabcdefghijklmnop/';
 
