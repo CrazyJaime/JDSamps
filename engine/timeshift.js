@@ -109,10 +109,10 @@ export class Timeshift {
     if (r && typeof r.then === 'function') r.catch(() => {});
   }
 
-  /** Drop audio older than keepFrom (input s); never keep more than capSec. */
-  async trim(now, keepFrom) {
+  /** Drop audio older than keepFrom (input s); never keep more than capSec, but never drop past limit. */
+  async trim(now, keepFrom, limit = Infinity) {
     if (this.trimming) return { dropped: false, start: this.historyStart };
-    const target = Math.max(keepFrom, this.liveEdge - this.capSec);
+    const target = Math.min(Math.max(keepFrom, this.liveEdge - this.capSec), limit);
     if (target <= this.historyStart + 1) return { dropped: false, start: this.historyStart };
     this.trimming = true;
     try {
