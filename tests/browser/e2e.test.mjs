@@ -5,12 +5,14 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
-  prepareExtension, launchExtension, startTrackServer, openExtPage, hubCall, tabIdFor, waitFor, installClient,
+  prepareExtension, launchExtension, startTrackServer, hubCall, tabIdFor, waitFor, installClient,
   act, set, state, events, downloadIds, waitForDownload, parseWav, bandOnsets, bandRms, medianBpm, offscreenEval,
+  offscreenHeap, steadyBeats, wavHeader, makeTrackWav,
 } from './ext-harness.mjs';
 
 const ART = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'artifacts');
 let h, server, deck, tabs = {};
+const deckPageErrors = [];
 const deckBy = (s, slot) => s.decks.find((d) => d.slot === slot);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -24,11 +26,55 @@ async function record(target, seconds) {
   return { dl, wav: parseWav(fs.readFileSync(dl.filename)) };
 }
 
+const median = (xs) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
+/** Each deck's stretcher latency (s), by slot. */
+const latencies = async () => Object.fromEntries(await offscreenEval(h, '[...globalThis.__jdsEngine.decks.values()].map((d) => [d.slot, d.ts.lat])'));
+/**
+ * The playhead never passes the live edge minus the stretcher latency. The snapshot playhead is
+ * the heard position; the node is rendering outputLatency later, so that is where it is checked.
+ */
+function assertBehindLiveEdge(s, d, lat) {
+  const ahead = d.liveEdge - (d.playhead + d.engineRate * s.outputLatency);
+  assert.ok(ahead >= lat, `deck ${d.slot}: live edge ${d.liveEdge.toFixed(3)} - playhead ${d.playhead.toFixed(3)} (+ ${s.outputLatency} s output latency) = ${ahead.toFixed(3)} < latency ${lat}`);
+}
+
+// Lining up separate recordings: one 10 ms full-scale pulse, scheduled on the audio clock and
+// added to the inputs of the given decks' recorders, lands on the same context frame in each file.
+// (The decks' own audio stays well under full scale at the default trim.)
+const MARK = (slots) => `(() => {
+  const e = globalThis.__jdsEngine, ctx = e.ctx, t = ctx.currentTime + 0.25;
+  const nodes = [...e.decks.values()].filter((d) => ${JSON.stringify(slots)}.includes(d.slot)).map((d) => d.recorder.node);
+  if (nodes.length !== ${slots.length} || nodes.some((n) => !n)) throw new Error('recorders not running');
+  const c = ctx.createConstantSource();
+  c.offset.value = 2;
+  for (const n of nodes) c.connect(n);
+  c.onended = () => c.disconnect();
+  c.start(t); c.stop(t + 0.01);
+  return t;
+})()`;
+/** Frame index of each marker pulse in a 16-bit stereo WAV: >= 5 ms with both channels pinned at +32767. */
+function markerFrames(buf) {
+  const frames = wavHeader(buf).dataSize / 4, out = [];
+  for (let i = 0, run = 0; i < frames; i++) {
+    run = buf.readInt16LE(44 + i * 4) === 32767 && buf.readInt16LE(46 + i * 4) === 32767 ? run + 1 : 0;
+    if (run === 240) out.push(i - 239);
+  }
+  return out;
+}
+/** How late bandOnsets() reports a beat of the synthetic track itself (s): subtracted before comparing decks. */
+function onsetBias(bpm, kind, band) {
+  const w = parseWav(makeTrackWav({ bpm, kind, seconds: 8 })), T = 60 / bpm;
+  return median(bandOnsets(w.mono, w.sr, band).map((t) => t - Math.round(t / T) * T));
+}
+
 before(async () => {
-  server = await startTrackServer();
+  server = await startTrackServer({ seconds: 240 }); // longer than the suite: no <audio> loop restart (a 0.1 s gap) mid-test
   h = await launchExtension({ ext: prepareExtension() });
   for (const k of ['a', 'b']) { tabs[k] = await h.context.newPage(); await tabs[k].goto(server.url(k)); }
-  deck = await openExtPage(h, 'deck.html');
+  deck = await h.context.newPage(); // the deck page, watched for console errors from its first load
+  deck.on('console', (m) => { if (m.type() === 'error') deckPageErrors.push(m.text()); });
+  deck.on('pageerror', (e) => deckPageErrors.push(String(e)));
+  await deck.goto(`chrome-extension://${h.extId}/deck.html`);
   for (const k of ['a', 'b']) {
     const r = await hubCall(deck, { type: 'LOAD_TAB', tabId: await tabIdFor(h, server.url(k)) });
     assert.equal(r.ok, true, JSON.stringify(r));
@@ -43,7 +89,11 @@ test('two tabs load as cued decks and start buffering', async () => {
   for (const d of s.decks) assert.equal(d.playing, false);
   await sleep(1500);
   const s2 = await state(deck);
-  for (const d of s2.decks) assert.ok(d.liveEdge > 1 && d.reserve > 0.5, JSON.stringify({ liveEdge: d.liveEdge, reserve: d.reserve }));
+  for (const d of s2.decks) {
+    assert.ok(d.liveEdge > 1 && d.reserve > 0.5, JSON.stringify({ liveEdge: d.liveEdge, reserve: d.reserve }));
+    // Cued: parked on the cue point (the first audible sample, near the start), not moving.
+    assert.ok(d.cue >= 0 && d.cue < 1 && Math.abs(d.playhead - d.cue) < 1e-6 && d.engineRate === 0, JSON.stringify({ cue: d.cue, playhead: d.playhead, rate: d.engineRate }));
+  }
   assert.equal(await deck.locator('.deck').count(), 2);
 });
 
@@ -56,6 +106,9 @@ test('tempo locks on both decks', async () => {
 });
 
 test('SYNC PLAY matches tempo and phase to the master', async () => {
+  // Player assist stays off until the assist test: deck 1's reserve then falls at exactly rate − 1
+  // (measured during the 60 s recordings) and every buffered second was captured at 1×.
+  set(deck, null, 'assist.on', false);
   assert.equal((await act(deck, 2, 'master')).ok, true);
   assert.equal((await act(deck, 2, 'play')).ok, true);
   await sleep(1000);
@@ -77,10 +130,129 @@ test('SYNC PLAY matches tempo and phase to the master', async () => {
   assert.ok(Math.abs(a.params.pitch - (128 / 124 - 1)) < 0.0025, `pitch ${a.params.pitch}`);
   assert.ok(Math.abs(a.bpm.out - s.clock.bpm) < 0.02, `out ${a.bpm.out} vs clock ${s.clock.bpm}`);
   assert.ok(Math.abs(a.bpm.out - 128) < 0.3, `out ${a.bpm.out}`);
+  // Phase lock: median of 10 readings over 2 s < 15 ms. A capture dropout (see the 60 s tests) moves
+  // a deck's beat grid now and then and the loop takes a few seconds to re-lock, so allow 15 s.
   const ph = [];
-  for (let i = 0; i < 10; i++) { const d = deckBy(await state(deck), 1); if (d.sync.phaseMs != null) ph.push(Math.abs(d.sync.phaseMs)); await sleep(200); }
-  ph.sort((x, y) => x - y);
-  assert.ok(ph.length && ph[Math.floor(ph.length / 2)] < 15, `phase ${JSON.stringify(ph)}`);
+  await waitFor(async () => {
+    const p = deckBy(await state(deck), 1).sync.phaseMs;
+    if (p != null) ph.push(Math.abs(p));
+    return ph.length >= 10 && median(ph.slice(-10)) < 15;
+  }, 15000, 200).catch(() => assert.fail(`phase ${JSON.stringify(ph.slice(-10))}`));
+});
+
+// The next three tests share one 60 s window: decks 1 (synced, +3.2 %, assist off) and 2 (master)
+// are each recorded with deck REC while the engine heap and deck 1's reserve are sampled. Run them
+// together (--test-name-pattern '60 s' plus the setup tests above).
+const LONG_S = 60;
+let long = null;
+
+test('60 s deck recordings: valid WAV headers, no lost frames, durations within 1 %, flat engine heap', async (t) => {
+  const s0 = await state(deck);
+  const d1 = deckBy(s0, 1);
+  assert.ok(d1.playing && d1.sync.on && !s0.master.params['assist.on'] && d1.assist.sourceRate === 1, JSON.stringify({ sync: d1.sync, assist: d1.assist }));
+  const lat = await latencies(), known = await downloadIds(h), started = {}, stopped = {}, samples = [], heap = [];
+  for (const k of [1, 2]) { assert.equal((await act(deck, k, 'recStart')).ok, true); started[k] = Date.now(); }
+  const t0 = Date.now(), end = t0 + LONG_S * 1000, marks = [];
+  heap.push({ at: 0, ...(await offscreenHeap(h)) });
+  marks.push(await offscreenEval(h, MARK([1, 2])));
+  while (Date.now() < end - 1500) {
+    const s = await state(deck);
+    samples.push({ t: s.ctxTime, outputLatency: s.outputLatency, d1: deckBy(s, 1), d2: deckBy(s, 2) });
+    if (heap.length === 1 && Date.now() - t0 > LONG_S * 500) heap.push({ at: (Date.now() - t0) / 1000, ...(await offscreenHeap(h)) });
+    await sleep(250);
+  }
+  marks.push(await offscreenEval(h, MARK([1, 2])));
+  heap.push({ at: (Date.now() - t0) / 1000, ...(await offscreenHeap(h)) });
+  await sleep(Math.max(0, end - Date.now()));
+  for (const k of [1, 2]) { stopped[k] = Date.now(); await act(deck, k, 'recStop'); }
+  const files = {};
+  await waitFor(async () => {
+    const xs = await h.sw.evaluate((ids) => chrome.downloads.search({ state: 'complete' }).then((ds) => ds.filter((d) => !ids.includes(d.id)).map((d) => d.filename)), known);
+    for (const f of xs) { const m = path.basename(f).match(/^JDSamps-D([12])-/); if (m) files[m[1]] = f; }
+    return files[1] && files[2];
+  }, 20000, 250);
+  long = { samples, lat, marks, files: {} };
+  for (const k of [1, 2]) {
+    const buf = fs.readFileSync(files[k]);
+    long.files[k] = { buf, hdr: wavHeader(buf), wav: parseWav(buf), marks: markerFrames(buf), wallSec: (stopped[k] - started[k]) / 1000 };
+  }
+  for (const k of [1, 2]) {
+    const { hdr, wav, marks: m, wallSec } = long.files[k];
+    t.diagnostic(`deck ${k}: ${hdr.fileBytes} bytes, ${wav.seconds.toFixed(3)} s of audio for ${wallSec.toFixed(3)} s between REC and STOP; markers at frames ${m}`);
+    assert.deepEqual([hdr.riff, hdr.wave, hdr.fmt, hdr.data], ['RIFF', 'WAVE', 'fmt ', 'data']);
+    assert.deepEqual([hdr.fmtSize, hdr.format, hdr.ch, hdr.sr, hdr.bits], [16, 1, 2, s0.sampleRate, 16]);
+    assert.equal(hdr.blockAlign, 4);
+    assert.equal(hdr.byteRate, hdr.sr * 4);
+    assert.equal(hdr.riffSize, hdr.fileBytes - 8, 'RIFF size = file length - 8');
+    assert.equal(hdr.dataSize, hdr.fileBytes - 44, 'data size = file length - 44');
+    assert.equal(hdr.dataSize % 4, 0);
+    assert.ok(Math.abs(wav.seconds - wallSec) < 0.01 * wallSec, `deck ${k}: ${wav.seconds} s of audio for ${wallSec} s recorded`);
+    // Both pulses are in the file, exactly as many frames apart as they were scheduled: no frame lost or doubled.
+    assert.equal(m.length, 2, `deck ${k} markers ${m}`);
+    assert.ok(Math.abs(m[1] - m[0] - Math.round((marks[1] - marks[0]) * hdr.sr)) <= 1, `deck ${k}: ${m[1] - m[0]} frames between markers, scheduled ${(marks[1] - marks[0]) * hdr.sr}`);
+  }
+  const mb = (x) => (x / 2 ** 20).toFixed(2);
+  t.diagnostic(`engine heap after GC (used / ArrayBuffer backing stores, MB): ${heap.map((x) => `${x.at.toFixed(0)} s ${mb(x.usedSize)} / ${mb(x.backingStorageSize || 0)}`).join(', ')}`);
+  // 60 s of 16-bit stereo is 11 MB per deck: kept in the engine, it would show up here.
+  for (const x of heap.slice(1)) {
+    assert.ok(x.usedSize - heap[0].usedSize < 2 * 2 ** 20, `JS heap grew ${mb(x.usedSize - heap[0].usedSize)} MB by ${x.at} s`);
+    assert.ok((x.backingStorageSize || 0) - (heap[0].backingStorageSize || 0) < 2 * 2 ** 20, `ArrayBuffers grew by ${x.at} s`);
+  }
+});
+
+test('60 s deck recordings: the synced deck matches the master within 0.2 % tempo and 20 ms phase', async (t) => {
+  assert.ok(long, 'needs the 60 s recording test');
+  // Beats between the two marker pulses (0.5 s clear of each), on one timeline: seconds after the
+  // first pulse, less the detector's own lateness on that sound. Tab capture in headless Chromium
+  // hands the engine each tab's audio ~0.23 % slow and now and then skips 10-20 ms to catch up, so
+  // a recording is a series of steady runs (127.7 BPM for the 128 BPM track) with small jumps.
+  const onsets = (k, band, bias) => {
+    const { wav, marks: m } = long.files[k], from = m[0] + Math.round(0.5 * wav.sr);
+    return bandOnsets(wav.mono.subarray(from, m[1] - Math.round(0.5 * wav.sr)), wav.sr, band).map((x) => x + (from - m[0]) / wav.sr - bias);
+  };
+  const bias = { low: onsetBias(124, 'low', 'low'), high: onsetBias(128, 'high', 'high') };
+  const a = onsets(1, 'low', bias.low), b = onsets(2, 'high', bias.high);
+  const A = { on: a, fit: steadyBeats(a) }, B = { on: b, fit: steadyBeats(b) };
+  const tempoErr = A.fit.T / B.fit.T - 1;
+  // A capture jump moves that deck's beats, and the follower re-locks over a few seconds. Phase is
+  // judged once both decks have played K steady beats since their last jump or phase bend.
+  const K = 8, at = new Map();
+  B.fit.runs.forEach((r) => r.forEach((u, k) => at.set(u, k)));
+  const all = [], settled = [];
+  for (const r of A.fit.runs) {
+    r.forEach((x, k) => {
+      const u = B.on.reduce((best, y) => (Math.abs(x - y) < Math.abs(x - best) ? y : best), Infinity);
+      all.push((x - u) * 1000);
+      if (k >= K && at.get(u) >= K) settled.push((x - u) * 1000);
+    });
+  }
+  const stats = (xs) => { const v = xs.map(Math.abs).sort((p, q) => p - q); return { n: v.length, med: v[v.length >> 1], p90: v[Math.floor(v.length * 0.9)], max: v[v.length - 1] }; };
+  const st = stats(settled), sa = stats(all), f = (o) => `median ${o.med.toFixed(1)}, p90 ${o.p90.toFixed(1)}, max ${o.max.toFixed(1)} over ${o.n} beats`;
+  t.diagnostic(`detector lateness: kick ${(bias.low * 1000).toFixed(1)} ms, click ${(bias.high * 1000).toFixed(1)} ms`);
+  t.diagnostic(`steady tempo: deck 1 ${(60 / A.fit.T).toFixed(3)} BPM (runs ${A.fit.runs.map((r) => r.length)}), deck 2 ${(60 / B.fit.T).toFixed(3)} BPM (runs ${B.fit.runs.map((r) => r.length)}): error ${(tempoErr * 100).toFixed(4)} %`);
+  t.diagnostic(`|beat offset| deck 1 - deck 2 (ms), settled: ${f(st)}; every beat: ${f(sa)}`);
+  assert.ok(A.fit.n > 60 && B.fit.n > 60, `steady beats ${A.fit.n}, ${B.fit.n}`);
+  assert.ok(Math.abs(tempoErr) < 0.002, `tempo error ${tempoErr * 100} %`);
+  assert.ok(st.n >= 40, `only ${st.n} settled beats`);
+  assert.ok(st.p90 <= 20, `settled beat offsets: ${f(st)}`);
+});
+
+test('60 s deck recordings: with assist off the reserve drained at rate − 1, the playhead always latency behind the live edge', async (t) => {
+  assert.ok(long, 'needs the 60 s recording test');
+  const xs = long.samples, x = median(xs.map((s) => s.d1.params.pitch));
+  for (const s of xs) {
+    assert.equal(s.d1.starved, false);
+    assert.equal(s.d1.assist.sourceRate, 1);
+    for (const d of [s.d1, s.d2]) assertBehindLiveEdge(s, d, long.lat[d.slot]);
+  }
+  // Least-squares slope of reserve against the audio clock.
+  const mt = xs.reduce((a, s) => a + s.t, 0) / xs.length, mr = xs.reduce((a, s) => a + s.d1.reserve, 0) / xs.length;
+  let sxy = 0, sxx = 0;
+  for (const s of xs) { sxy += (s.t - mt) * (s.d1.reserve - mr); sxx += (s.t - mt) ** 2; }
+  const slope = sxy / sxx;
+  t.diagnostic(`deck 1 at +${(x * 100).toFixed(2)} %: reserve ${xs[0].d1.reserve.toFixed(2)} -> ${xs[xs.length - 1].d1.reserve.toFixed(2)} s, slope ${slope.toFixed(4)} s/s over ${(xs[xs.length - 1].t - xs[0].t).toFixed(1)} s (${xs.length} samples)`);
+  assert.ok(x > 0.03, `pitch ${x}`);
+  assert.ok(Math.abs(slope + x) < 0.1 * x, `reserve slope ${slope} s/s, expected ${-x}`);
 });
 
 test('the mix recording has both decks at 128 BPM with aligned beats', async () => {
@@ -94,44 +266,61 @@ test('the mix recording has both decks at 128 BPM with aligned beats', async () 
   assert.ok(med < 25, `median beat offset ${med.toFixed(1)} ms`);
 });
 
-test('crossfader isolates A from B', async () => {
+test('crossfader extremes isolate the A and B sides', async (t) => {
+  // Deck 1 (A) is the low kick, deck 2 (B) the high click: each side is measured in its own band.
   set(deck, 1, 'xf', 'A'); set(deck, 2, 'xf', 'B'); set(deck, null, 'xfader.pos', 0.5);
   await sleep(300);
   const both = await record('mix', 3);
   set(deck, null, 'xfader.pos', 1);
   await sleep(300);
   const onlyB = await record('mix', 3);
-  const drop = 20 * Math.log10(bandRms(onlyB.wav.mono, onlyB.wav.sr, 'low') / bandRms(both.wav.mono, both.wav.sr, 'low'));
-  assert.ok(drop < -30, `A drop ${drop.toFixed(1)} dB`);
-  set(deck, null, 'xfader.pos', 0.5); set(deck, 1, 'xf', 'THRU'); set(deck, 2, 'xf', 'THRU');
+  set(deck, null, 'xfader.pos', 0);
+  await sleep(300);
+  const onlyA = await record('mix', 3);
+  await Promise.all([set(deck, null, 'xfader.pos', 0.5), set(deck, 1, 'xf', 'THRU'), set(deck, 2, 'xf', 'THRU')]);
+  const db = (x, y, band) => 20 * Math.log10(bandRms(x.wav.mono, x.wav.sr, band) / bandRms(y.wav.mono, y.wav.sr, band));
+  const aDrop = db(onlyB, both, 'low'), bDrop = db(onlyA, both, 'high');
+  t.diagnostic(`at B: A (low band) ${aDrop.toFixed(1)} dB; at A: B (high band) ${bDrop.toFixed(1)} dB`);
+  assert.ok(aDrop < -30, `A drop ${aDrop.toFixed(1)} dB`);
+  assert.ok(bDrop < -30, `B drop ${bDrop.toFixed(1)} dB`);
+  assert.ok(db(onlyA, both, 'low') > -3 && db(onlyB, both, 'high') > -3, 'the selected side stays up');
 });
 
-test('low kill removes the kick from the deck recording', async () => {
+test('low kill cuts the kick in the deck recording by 30 dB or more', async (t) => {
   const on = await record(1, 3);
   set(deck, 1, 'kill.low', true);
   await sleep(200);
   const killed = await record(1, 3);
-  set(deck, 1, 'kill.low', false);
+  await set(deck, 1, 'kill.low', false);
   const drop = 20 * Math.log10(bandRms(killed.wav.mono, killed.wav.sr, 'low') / bandRms(on.wav.mono, on.wav.sr, 'low'));
-  assert.ok(drop < -25, `low drop ${drop.toFixed(1)} dB`);
+  t.diagnostic(`low band ${drop.toFixed(1)} dB`);
+  assert.ok(drop < -30, `low drop ${drop.toFixed(1)} dB`);
   assert.match(path.basename(on.dl.filename), /^JDSamps-D1-Track A 124 BPM-\d{8}-\d{6}.*\.wav$/);
 });
 
-test('the limiter holds the master under -1 dBFS with +12 dB trims', async () => {
+test('the limiter holds the master under -1 dBFS with +12 dB trims', async (t) => {
   set(deck, 1, 'trim', 1); set(deck, 2, 'trim', 1);
   await sleep(500);
+  const grs = [];
+  let polling = true;
+  const poll = (async () => { while (polling) { grs.push((await state(deck)).master.gr); await sleep(100); } })();
   const { wav } = await record('mix', 3); // the mix tap is after the limiter: check every sample
-  set(deck, 1, 'trim', 0.5); set(deck, 2, 'trim', 0.5);
+  polling = false;
+  await poll;
+  await Promise.all([set(deck, 1, 'trim', 0.5), set(deck, 2, 'trim', 0.5)]);
   let peak = 0;
   for (const x of wav.mono) peak = Math.max(peak, Math.abs(x));
+  const gr = Math.min(...grs);
+  t.diagnostic(`peak ${(20 * Math.log10(peak)).toFixed(2)} dBFS, deepest gain reduction ${gr.toFixed(1)} dB`);
   assert.ok(peak <= 10 ** (-1 / 20) + 2 / 32768, `peak ${peak}`);
   assert.ok(peak > 0.8, `peak ${peak} (limiting engaged)`);
-  const gr = Math.min(...(await Promise.all([0, 1, 2, 3, 4].map(() => state(deck)))).map((s) => s.master.gr));
-  assert.ok(gr <= 0, `gr ${gr}`);
+  assert.ok(gr < -3, `gain reduction reported while limiting: ${gr} dB`);
 });
 
 test('player assist refills the reserve on a media-element page', async () => {
   // LIVE leaves ~0.6 s of reserve; deck 1 must run +3.2 %, so assist has to keep it fed.
+  set(deck, null, 'assist.on', true);
+  const lat = await latencies();
   assert.equal((await act(deck, 1, 'live')).ok, true);
   await waitFor(async () => (await tabs.a.evaluate(() => window.__media())).rate > 1.01, 15000, 250);
   const m = await tabs.a.evaluate(() => window.__media());
@@ -140,7 +329,7 @@ test('player assist refills the reserve on a media-element page', async () => {
   const d0 = deckBy(await state(deck), 1);
   assert.equal(d0.assist.active, true);
   assert.ok(d0.reserve < 3, `reserve after LIVE ${d0.reserve}`);
-  await sleep(6000);
+  for (const until = Date.now() + 6000; Date.now() < until; await sleep(200)) { const s = await state(deck); assertBehindLiveEdge(s, deckBy(s, 1), lat[1]); }
   const d1 = deckBy(await state(deck), 1);
   assert.ok(d1.reserve > d0.reserve, `reserve ${d0.reserve} -> ${d1.reserve}`);
   assert.equal(d1.starved, false);
@@ -169,14 +358,16 @@ test('a Web-Audio page with a muted decorative <audio> has no assist and the res
   assert.equal((await act(deck, 3, 'sync', { on: true })).ok, true);
   assert.equal((await act(deck, 3, 'play')).ok, true);
   // Needs +6.7 % with no player to drive: the small LIVE reserve drains, then the deck is held at 1×.
-  await waitFor(async () => deckBy(await state(deck), 3).starved, 20000, 250);
+  const lat = await latencies();
+  await waitFor(async () => { const s = await state(deck), d = deckBy(s, 3); assertBehindLiveEdge(s, d, lat[3]); return d.starved; }, 20000, 250);
   await sleep(600); // the 1x clamp is scheduled ~0.15 s ahead and reported at the heard time
   for (let i = 0; i < 10; i++) {
-    const d = deckBy(await state(deck), 3);
+    const s = await state(deck), d = deckBy(s, 3);
     assert.equal(d.assist.available, false);
     assert.equal(d.playing, true);
     assert.equal(d.starved, true);
-    assert.ok(d.reserve >= 0 && d.engineRate <= 1.0001, JSON.stringify({ reserve: d.reserve, rate: d.engineRate }));
+    assert.ok(d.engineRate <= 1.0001, `rate ${d.engineRate}`);
+    assertBehindLiveEdge(s, d, lat[3]);
     await sleep(200);
   }
   // The muted element was left alone and the tempo/pitch model is untouched.
@@ -206,7 +397,7 @@ test('recordings stopped together are all saved, reported and released', async (
   assert.deepEqual(Object.entries(s).flatMap(([k, v]) => (k === 'dl' ? Object.keys(v) : k.startsWith('dl:') ? [k] : [])), []);
 });
 
-test('reloading the deck page keeps the engine playing', async () => {
+test('reloading the deck page keeps the engine playing; the deck page logged no console errors', async () => {
   const before = deckBy(await state(deck), 2).playhead;
   const t0 = Date.now();
   await deck.reload();
@@ -217,19 +408,23 @@ test('reloading the deck page keeps the engine playing', async () => {
   fs.mkdirSync(ART, { recursive: true });
   await sleep(500);
   await deck.screenshot({ path: path.join(ART, 'e2e-deck.png') });
+  assert.deepEqual(deckPageErrors, []);
 });
 
-test('closing a recording tab saves its recording and frees the master clock', async () => {
+test('closing a recording tab saves its recording and frees the master clock at its tempo', async () => {
   const known = await downloadIds(h);
   assert.equal((await act(deck, 2, 'recStart')).ok, true);
   await sleep(2000);
+  const bpm = (await state(deck)).clock.bpm;
   await tabs.b.close();
   const dl = await waitForDownload(h, known, 15000);
   assert.match(path.basename(dl.filename), /^JDSamps-D2-/);
   const wav = parseWav(fs.readFileSync(dl.filename));
   assert.ok(wav.seconds > 1.5, `seconds ${wav.seconds}`);
   await waitFor(async () => (await state(deck)).decks.length === 2, 8000);
-  assert.equal((await state(deck)).clock.mode, 'free');
+  const c = (await state(deck)).clock;
+  assert.equal(c.mode, 'free');
+  assert.ok(Math.abs(c.bpm - bpm) < 0.2, `clock ${bpm} -> ${c.bpm} BPM`); // the master's readout wobbles ~0.1 BPM
 });
 
 // Inside the engine: wrap AudioWorkletNode to log what each new node is told (port messages and
