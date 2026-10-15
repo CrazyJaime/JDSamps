@@ -12,6 +12,7 @@ let snap = null;
 let selected = null;
 let restored = false;
 let wakeLock = null;
+let wakeLockPending = false;
 
 function toast(text, level = 'info') {
   const box = $('#toasts');
@@ -76,9 +77,24 @@ function onState(s) {
   setText($('#engineText'), `${s.engineState === 'running' ? 'Engine' : `Engine ${s.engineState}`} · ${(s.sampleRate / 1000).toFixed(1)} kHz · ${Math.round(s.outputLatency * 1000)} ms`);
   const n = s.decks.length;
   document.title = n ? `JD Samps — ${n} deck${n > 1 ? 's' : ''}` : 'JD Samps — Deck';
-  if (n && !wakeLock && navigator.wakeLock && document.visibilityState === 'visible') {
-    navigator.wakeLock.request('screen').then((l) => { wakeLock = l; l.addEventListener('release', () => { wakeLock = null; }); }).catch(() => {});
-  } else if (!n && wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+  syncWakeLock();
+}
+
+/** Screen Wake Lock held while decks are loaded (§3.9); the browser drops it whenever the tab is hidden. */
+function syncWakeLock() {
+  if (wakeLock && wakeLock.released) wakeLock = null;
+  if (!(snap && snap.decks.length)) {
+    if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+    return;
+  }
+  if (wakeLock || wakeLockPending || !navigator.wakeLock || document.visibilityState !== 'visible') return;
+  wakeLockPending = true;
+  navigator.wakeLock.request('screen').then((l) => {
+    wakeLockPending = false;
+    l.addEventListener('release', () => { if (wakeLock === l) wakeLock = null; });
+    if (!l.released) wakeLock = l;
+    syncWakeLock();
+  }, () => { wakeLockPending = false; });
 }
 
 function frame() {
@@ -115,11 +131,7 @@ bindKeys({
 window.addEventListener('beforeunload', (e) => {
   if (snap && snap.decks.length) { e.preventDefault(); e.returnValue = ''; }
 });
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible' && snap && snap.decks.length && !wakeLock && navigator.wakeLock) {
-    navigator.wakeLock.request('screen').then((l) => { wakeLock = l; }).catch(() => {});
-  }
-});
+document.addEventListener('visibilitychange', syncWakeLock);
 
 conn.start();
 requestAnimationFrame(frame);
