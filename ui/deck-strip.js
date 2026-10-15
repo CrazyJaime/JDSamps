@@ -1,10 +1,11 @@
 // ui/deck-strip.js — one deck: its column in the board and its row in the waveform stack.
 // All page-derived text goes through textContent; favicons are only set after isSafeIconUrl().
 import { DECK_COLORS, PITCH_RANGES, isSafeIconUrl } from '../shared/protocol.js';
-import { $, $$, clone, setText, toggleAttr, fmtBpm, fmtPct, fmtClock, wallNow } from './util.js';
+import { $, $$, clone, setText, toggleAttr, fmtBpm, fmtPct, fmtClock } from './util.js';
 import { Knob, Fader, bindPad, bindSeg } from './controls.js';
 import { WaveStore, drawWave, beatIndex } from './waveform.js';
 import { VMeter } from './meters.js';
+import { bindHold } from './hold.js';
 
 const RANGE_LABEL = { 0.06: '±6', 0.1: '±10', 0.16: '±16', 0.5: 'WIDE' };
 const STATE_CLASS = { LOCKED: 'ok', SEARCH: '', UNSURE: 'warn', HOLD: 'info' };
@@ -16,6 +17,7 @@ export class DeckStrip {
     this.toast = toast;
     this.d = d;
     this.shownBpm = null;
+    this.rollHeld = [];
     this.store = new WaveStore();
     this.el = clone('tpl-deck');
     this.waveRow = clone('tpl-wave-row');
@@ -34,7 +36,7 @@ export class DeckStrip {
       play: this.q('[data-act="playToggle"]'), playIcon: this.q('[data-play-icon] use'),
       cue: this.q('[data-hold="cue"]'), sync: this.q('[data-act="sync"]'), master: this.q('[data-act="master"]'),
       keyLock: this.q('[data-act="keyLock"]'), syncMode: this.q('[data-act="syncMode"]'), range: this.q('[data-act="range"]'),
-      rec: this.q('[data-act="rec"]'), recTime: this.q('[data-rec-time]'),
+      rec: this.q('[data-act="rec"]'), recLabel: this.q('[data-act="rec"] span'), recTime: this.q('[data-rec-time]'),
       wslot: $('[data-slot]', this.waveRow), wbpm: $('[data-wbpm]', this.waveRow), wave: $('[data-wave]', this.waveRow),
     };
     setText(this.refs.slot, d.slot);
@@ -85,8 +87,8 @@ export class DeckStrip {
     };
     this.rolls = $$('[data-roll]', this.el).map((el) => bindPad(el, {
       latch: false,
-      onDown: () => this.act('rollStart', { beats: Number(el.dataset.roll) }),
-      onUp: () => this.act('rollEnd'),
+      onDown: () => this.rollDown(el, Number(el.dataset.roll)),
+      onUp: () => this.rollUp(el),
     }));
     this.cue = bindPad(this.refs.cue, { latch: false, onDown: () => this.act('cueDown'), onUp: () => this.act('cueUp') });
     for (const [sel, dir] of [['[data-hold="nudge-"]', -1], ['[data-hold="nudge+"]', 1]]) {
@@ -100,7 +102,11 @@ export class DeckStrip {
     on('[data-act="live"]', () => this.act('live'));
     on('[data-act="half"]', () => this.act('mult', { factor: 0.5 }));
     on('[data-act="double"]', () => this.act('mult', { factor: 2 }));
-    on('[data-act="tap"]', (e) => (e.shiftKey ? this.act('tap1') : this.act('tap', { wallMs: wallNow() })));
+    // TAP is stamped at the press: a release-time stamp would put the grid late by the click length.
+    const tapBtn = this.q('[data-act="tap"]');
+    const tap = (e) => (e.shiftKey ? this.act('tap1') : this.act('tap', { wallMs: performance.timeOrigin + e.timeStamp }));
+    tapBtn.addEventListener('pointerdown', (e) => { if (e.button === 0) tap(e); });
+    tapBtn.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); if (!e.repeat) tap(e); } });
     on('[data-act="gridBack"]', (e) => this.act('gridShift', e.shiftKey ? { ms: -10 } : { beats: -0.5 }));
     on('[data-act="gridFwd"]', (e) => this.act('gridShift', e.shiftKey ? { ms: 10 } : { beats: 0.5 }));
     on('[data-act="keyLock"]', () => this.set('keyLock', !this.d.params.keyLock));
@@ -109,18 +115,31 @@ export class DeckStrip {
       const i = PITCH_RANGES.indexOf(this.d.params.range);
       this.set('range', PITCH_RANGES[(i + 1) % PITCH_RANGES.length]);
     });
-    on('[data-act="rec"]', () => this.act(this.d.rec.state === 'recording' ? 'recStop' : 'recStart'));
-    // Eject needs a 500 ms hold: a stray click must never kill a playing deck.
-    const ej = this.q('[data-act="eject"]');
-    let ejTimer = 0;
-    ej.addEventListener('pointerdown', (e) => {
-      e.preventDefault();
-      ejTimer = setTimeout(() => { ejTimer = 0; this.act('eject'); }, 500);
+    // REC starts on one press; stopping needs a 600 ms hold so a slip never splits a recording.
+    this.recHold = bindHold(this.refs.rec, {
+      ms: 600,
+      needsHold: () => this.d.rec.state === 'recording',
+      onPress: () => (this.d.rec.state === 'finalizing' ? this.toast('Still saving the last recording of this deck.', 'info') : this.act('recStart')),
+      onHold: () => this.act('recStop'),
+      onShort: () => this.toast('Hold REC (or R) to stop the deck recording.', 'info'),
     });
-    const cancel = () => { if (ejTimer) { clearTimeout(ejTimer); ejTimer = 0; this.toast('Hold the eject button to unload this deck.', 'info'); } };
-    ej.addEventListener('pointerup', cancel);
-    ej.addEventListener('pointerleave', () => { if (ejTimer) { clearTimeout(ejTimer); ejTimer = 0; } });
-    ej.addEventListener('keydown', (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); this.toast('Hold the eject button to unload this deck.', 'info'); } });
+    // Eject needs a 500 ms hold: a stray click must never kill a playing deck.
+    bindHold(this.q('[data-act="eject"]'), { ms: 500, onHold: () => this.act('eject'), onShort: () => this.toast('Hold the eject button to unload this deck.', 'info') });
+  }
+
+  /** Rolls held by keys and pads, newest last: releasing one falls back to the newest still held. */
+  rollDown(src, beats) {
+    this.rollHeld = this.rollHeld.filter((h) => h.src !== src);
+    this.rollHeld.push({ src, beats });
+    this.act('rollStart', { beats });
+  }
+  rollUp(src) {
+    const i = this.rollHeld.findIndex((h) => h.src === src);
+    if (i < 0) return;
+    const wasNewest = i === this.rollHeld.length - 1;
+    this.rollHeld.splice(i, 1);
+    if (!this.rollHeld.length) this.act('rollEnd');
+    else if (wasNewest) this.act('rollStart', { beats: this.rollHeld[this.rollHeld.length - 1].beats });
   }
 
   /** Keyboard entry points (Task 13 keys.js). */
@@ -175,6 +194,9 @@ export class DeckStrip {
     setText(r.range, RANGE_LABEL[p.range] || '±10');
     const recording = d.rec.state === 'recording';
     toggleAttr(r.rec, 'aria-pressed', recording);
+    const saving = d.rec.state === 'finalizing';
+    if (r.rec.disabled !== saving) r.rec.disabled = saving;
+    setText(r.recLabel, saving ? 'SAVING' : 'REC');
     setText(r.recTime, d.rec.state === 'idle' ? '' : fmtClock(d.rec.seconds));
 
     for (const k of Object.keys(this.knobs)) this.knobs[k].set(p[k]);
