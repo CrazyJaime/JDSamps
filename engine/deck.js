@@ -18,6 +18,7 @@ const OK = { ok: true };
 const fail = (error) => ({ ok: false, error });
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const withTimeout = (p, ms, msg) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
+const CAP_MARGIN = 4; // s of audio always kept behind a playing deck's playhead (covers small backward jumps)
 
 export class Deck {
   constructor(engine, { id, slot, tabId, stream, meta, params }) {
@@ -57,6 +58,7 @@ export class Deck {
     this.meter = { peak: 0, rms: 0, clipUntil: 0 };
     this.error = null;
     this.nextTrim = 0;
+    this.capNotice = null; // latched buffer-cap notice: null | 'near' | 'full'
     this.nextAssist = 0;
     this.nextFxClock = 0;
     this.lastFxBpm = 0;
@@ -458,16 +460,44 @@ export class Deck {
   }
 
   async trim(now, p) {
+    const ts = this.ts, cap = ts.capSec, res = ts.reserveAt(now);
+    // Buffer-cap notices are latched once per episode: until the reserve falls well under the
+    // cap again, or (for the paused 'buffer full' notice) until the deck plays.
+    if (res < 0.8 * cap) this.capNotice = null;
+    else if (this.wantPlay && this.capNotice === 'full') this.capNotice = 'near';
+    // A playing deck slower than its source gains reserve. Near the cap, warn once; at the cap
+    // (5% slack, so a deck played at 1x from a full buffer just keeps playing) skip ahead whole
+    // bars (keeping phase) to half the cap.
+    if (this.wantPlay && !this.previewing && !this.roll) {
+      if (res >= 1.05 * cap) {
+        const T = ts.soon(now), at = ts.posAt(T), g = this.grids.at(at);
+        let skip = res - cap / 2;
+        if (g && this.canBeat()) skip = Math.max(1, Math.round(skip / (4 * g.T))) * 4 * g.T;
+        this.sched(T, { input: ts.clampInput(at + skip) });
+        this.settleUntil = T + 0.3;
+        this.engine.event('warn', `Deck ${this.slot}: buffer full, skipped ahead ${Math.round(skip)} s to keep playing.`, this.id);
+      } else if (res >= 0.9 * cap && !this.capNotice) {
+        this.capNotice = 'near';
+        this.engine.event('warn', `Deck ${this.slot}: buffer almost full. It will skip ahead when full; press LIVE to catch up now.`, this.id);
+      }
+    }
     const keepFrom = Math.min(this.cue - 1, p - this.ts.historySec, this.loop ? this.loop.start - 1 : Infinity);
-    const r = await this.ts.trim(now, keepFrom);
+    // Never drop the audio under (or just behind) a playing deck's playhead.
+    const r = await this.ts.trim(now, keepFrom, this.wantPlay ? p - CAP_MARGIN : Infinity);
     if (!r.dropped || this.disposed) return;
     const hs = this.ts.historyStart;
     this.grids.prune(hs);
     this.src.prune(hs);
-    if (this.cue < hs) this.cue = hs + 0.05;
+    if (this.cue < hs) {
+      const g = this.grids.at(hs + 0.05);
+      this.cue = g && this.canBeat() ? g.t0 + Math.ceil((hs + 0.05 - g.t0) / g.T) * g.T : hs + 0.05;
+    }
     if (!this.wantPlay && this.ts.posAt(this.now()) < hs) {
       this.ts.change(this.now(), this.ts.soon(this.now()), { active: false, input: this.cue });
-      this.engine.event('warn', `Deck ${this.slot}: buffer full, the oldest audio was dropped.`, this.id);
+      if (this.capNotice !== 'full') {
+        this.capNotice = 'full';
+        this.engine.event('warn', `Deck ${this.slot}: buffer full, the oldest audio was dropped.`, this.id);
+      }
     }
   }
 

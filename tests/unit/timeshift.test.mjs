@@ -133,6 +133,17 @@ test('trim keeps at most capSec and reports the new start', async () => {
   assert.equal(r2.dropped, false);
 });
 
+test('trim never drops past the limit it is given, even over the cap', async () => {
+  const { ts, node } = mk({ capSec: 20 });
+  ts.append(...chunk(30));
+  const r = await ts.trim(0, 0, 6);
+  assert.equal(r.dropped, true);
+  assert.ok(near(node.drops[0], 6), `dropped to ${node.drops[0]}`);
+  assert.ok(ts.historyStart <= 6);
+  const r2 = await ts.trim(0, 0, 6.5);
+  assert.equal(r2.dropped, false, 'less than a second to gain');
+});
+
 test('SourceMap and GridMap are piecewise along the input timeline', () => {
   const sm = new SourceMap();
   assert.equal(sm.rateAt(5), 1);
