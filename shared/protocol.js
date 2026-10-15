@@ -10,7 +10,7 @@ export const DECK_COLORS = Object.freeze(['#22d3ee', '#f59e0b', '#e879f9', '#a3e
 export const TARGET = Object.freeze({ HUB: 'hub', ENGINE: 'engine' });
 export const HUB = Object.freeze({
   ENSURE_ENGINE: 'ENSURE_ENGINE', LIST_SOURCES: 'LIST_SOURCES', LOAD_TAB: 'LOAD_TAB', GOTO_TAB: 'GOTO_TAB',
-  DOWNLOAD: 'DOWNLOAD', AGENT_CONNECT: 'AGENT_CONNECT', DECKS_CHANGED: 'DECKS_CHANGED',
+  DOWNLOAD: 'DOWNLOAD', AGENT_CONNECT: 'AGENT_CONNECT', DECKS_CHANGED: 'DECKS_CHANGED', STOP_TAB: 'STOP_TAB',
 });
 export const ENGINE = Object.freeze({
   START: 'START', EJECT: 'EJECT', META: 'META', PING: 'PING', DOWNLOAD_DONE: 'DOWNLOAD_DONE', NOTIFY: 'NOTIFY',
@@ -168,6 +168,11 @@ export function validateAgentMessage(m) {
   if (m.t === 'external-rate') {
     if (typeof m.rate !== 'number' || !Number.isFinite(m.rate) || m.rate <= 0 || m.rate > 16) return null;
     return { t: 'external-rate', rate: m.rate };
+  }
+  if (m.t === 'stopped') {
+    // Answer to an eject's stop: how many heard players the frame's agent paused.
+    if (!Number.isInteger(m.count) || m.count < 0 || m.count >= 1000) return null;
+    return { t: 'stopped', count: m.count };
   }
   return null;
 }

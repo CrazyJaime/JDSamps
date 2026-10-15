@@ -19,10 +19,11 @@ const fail = (error) => ({ ok: false, error });
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const withTimeout = (p, ms, msg) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
 const CAP_MARGIN = 4; // s of audio always kept behind a playing deck's playhead (covers small backward jumps)
-// Player assist: rate match tolerance (steps are 0.25 %), how long the page has to confirm a rate,
-// how long assist stays off after the page refused it, and the keep-alive period (the agent lets
-// go of the page after 3 s without a command).
-const ASSIST_EPS = 1e-4, ASSIST_CONFIRM = 2, ASSIST_OFF = 30, ASSIST_KEEPALIVE = 1;
+// Player assist: rate match tolerance (steps are 0.25 %), how long the page has to confirm a rate
+// before the ramp holds (a background tab Chrome throttles may answer late), how long before an
+// unconfirmed rate counts as refused, how long assist stays off after the page refused it, and the
+// keep-alive period (the agent lets go of the page after 3 s without a command).
+const ASSIST_EPS = 1e-4, ASSIST_CONFIRM = 2, ASSIST_REFUSE = 5, ASSIST_OFF = 30, ASSIST_KEEPALIVE = 1;
 
 export class Deck {
   constructor(engine, { id, slot, tabId, stream, meta, params }) {
@@ -373,6 +374,14 @@ export class Deck {
     return OK;
   }
 
+  /** The deck page went away mid-press: end what only lasts while held (roll, nudge, CUE preview). */
+  async releaseHolds() {
+    if (!this.ts || this.disposed) return;
+    if (this.rollFrom) await this.act('rollEnd');
+    if (this.nudge) await this.act('nudge', { dir: 0 });
+    if (this.previewing) await this.act('cueUp');
+  }
+
   // ------------------------------------------------------------------ manual grid tools
   // A correction acts on what the DJ hears: every grid segment of the track at the heard position
   // (assist steps split a track's grid), plus the tracker when it is still on that track. A track
@@ -541,7 +550,9 @@ export class Deck {
 
   assistTick(now, res) {
     const as = this.assist;
-    if (as.inflight.length && now - as.inflight[0].at > ASSIST_CONFIRM) { this.refuseAssist(now); return; }
+    // A late confirmation is still taken (onAgentStatus); only silence this long refuses.
+    const overdue = as.inflight.length ? now - as.inflight[0].at : 0;
+    if (overdue > ASSIST_REFUSE) { this.refuseAssist(now); return; }
     const enabled = !!this.engine.params['assist.on'];
     const available = this.agentAvailable(now), heard = this.audibleAgent();
     // The heard element went away or moved to another frame: let go, and start again from 1x.
@@ -551,7 +562,9 @@ export class Deck {
       target: as.target, available, playing: this.wantPlay, enabled,
     });
     as.target = st.target;
-    if (Math.abs(st.next - as.sent) > 1e-9) {
+    // While a confirmation is overdue the ramp holds (keep-alives only), so a slow page is not
+    // sent steps ahead of what it has confirmed.
+    if (Math.abs(st.next - as.sent) > 1e-9 && overdue <= ASSIST_CONFIRM) {
       // Committed to the source model only when the page confirms it (onAgentStatus).
       as.sent = st.next;
       as.agent = heard;
@@ -654,8 +667,11 @@ export class Deck {
     const p = this.ts.posAt(now), g = this.grids.at(p), rate = this.ts.rateAt(now), out = this.tempoInfo(p).out;
     if (!out) return null;
     const playing = this.wantPlay && !this.previewing && this.ts.playingAt(now);
-    if (g && rate > 0) return { playing, bpm: out, lastBeat: lastBeatOut(g, p, rate, now), period: g.T / rate };
-    return { playing, bpm: out, lastBeat: now, period: 60 / out };
+    // A starved deck plays slower than its set tempo: publish the tempo of the beat it plays,
+    // so slaves match the same beat their phase lock follows.
+    if (g && rate > 0) return { playing, bpm: this.starved ? (60 * rate) / g.T : out, lastBeat: lastBeatOut(g, p, rate, now), period: g.T / rate };
+    const bpm = this.starved && rate > 0 ? (out * rate) / this.desiredRate(p) : out;
+    return { playing, bpm, lastBeat: now, period: 60 / bpm };
   }
 
   // ------------------------------------------------------------------ agent (player assist)

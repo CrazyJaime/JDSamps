@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  DECK_PARAMS, MASTER_PARAMS, DECK_ACTIONS, MASTER_ACTIONS, defaults, validateValue,
+  DECK_PARAMS, MASTER_PARAMS, DECK_ACTIONS, MASTER_ACTIONS, HUB, defaults, validateValue,
   validateUiMessage, validateAgentMessage, isSafeIconUrl, sanitizeTitle, recordingFilename, timestamp,
 } from '../../shared/protocol.js';
 
@@ -77,6 +77,13 @@ test('validateAgentMessage rejects hostile payloads', () => {
   ]) assert.equal(validateAgentMessage(bad), null, JSON.stringify(bad));
   assert.deepEqual(validateAgentMessage({ t: 'status', hasMedia: true, playing: true, rate: 1, count: 1e9 }).count, 0);
   assert.deepEqual(validateAgentMessage({ t: 'external-rate', rate: 1.25 }), { t: 'external-rate', rate: 1.25 });
+});
+
+test("validateAgentMessage takes an eject's {t:'stopped', count} only with a sane count", () => {
+  assert.deepEqual(validateAgentMessage({ t: 'stopped', count: 0 }), { t: 'stopped', count: 0 });
+  assert.deepEqual(validateAgentMessage({ t: 'stopped', count: 3, extra: 'x' }), { t: 'stopped', count: 3 });
+  for (const count of [undefined, -1, 1.5, 1e9, '2', null, NaN]) assert.equal(validateAgentMessage({ t: 'stopped', count }), null, String(count));
+  assert.equal(HUB.STOP_TAB, 'STOP_TAB');
 });
 
 test('isSafeIconUrl only allows http(s) and data:image', () => {

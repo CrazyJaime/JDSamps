@@ -97,6 +97,13 @@ test('two tabs load as cued decks and start buffering', async () => {
   assert.equal(await deck.locator('.deck').count(), 2);
 });
 
+test('deck tabs are kept from being discarded while they are on a deck', async () => {
+  for (const k of ['a', 'b']) {
+    const t = await h.sw.evaluate((id) => chrome.tabs.get(id), await tabIdFor(h, server.url(k)));
+    assert.equal(t.autoDiscardable, false, `tab ${k}`);
+  }
+});
+
 test('tempo locks on both decks', async () => {
   await waitFor(async () => {
     const s = await state(deck);
@@ -513,9 +520,87 @@ test('ejected and closed deck tabs stop their audio processors (stretcher, input
   }
 });
 
+test("ejecting a deck pauses its tab's player, whether the user or the engine ejects it, even with a slow hub", async () => {
+  // 0: EJECT from the deck. 1: the engine ejects it (the tab stopped sharing audio).
+  // 2: EJECT while the hub answers slowly (a busy machine): the capture still waits for the pause.
+  for (let i = 0; i < 3; i++) {
+    const url = `${server.url('a')}?eject=${i}`;
+    const tab = await h.context.newPage();
+    await tab.goto(url);
+    const tabId = await tabIdFor(h, url);
+    const r = await hubCall(deck, { type: 'LOAD_TAB', tabId });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    const d = await waitFor(async () => (await state(deck)).decks.find((x) => x.tabId === tabId), 8000);
+    await waitFor(() => tab.evaluate(() => { const m = window.__media(); return !m.paused && m.t > 0.3; }), 8000);
+    // Wall-clock times of the page's pause and of the capture being released.
+    await tab.evaluate(() => document.getElementById('a').addEventListener('pause', () => { window.__pausedAt = Date.now(); }));
+    // On a busy machine the hub may mute first (the pause is late); either way the tab is silent.
+    await h.sw.evaluate((id) => { globalThis.__mutedAt = 0; chrome.tabs.onUpdated.addListener((t, info) => {
+      if (t === id && info.mutedInfo && info.mutedInfo.muted && !globalThis.__mutedAt) globalThis.__mutedAt = Date.now(); }); }, tabId);
+    await offscreenEval(h, `(() => { window.__releasedAt = 0; const t = globalThis.__jdsEngine.decks.get(${d.id}).stream.getAudioTracks()[0], stop = t.stop.bind(t);
+      t.stop = () => { window.__releasedAt = Date.now(); stop(); }; return true; })()`);
+    if (i === 2) {
+      await offscreenEval(h, `(() => { const e = globalThis.__jdsEngine, hub = e.hub.bind(e); e.__hub = hub;
+        e.hub = (m) => (m.type === 'STOP_TAB' ? new Promise((r) => setTimeout(r, 700)).then(() => hub(m)) : hub(m)); return true; })()`);
+    }
+    if (i !== 1) assert.equal((await act(deck, d.id, 'eject')).ok, true);
+    else await offscreenEval(h, `globalThis.__jdsEngine.decks.get(${d.id}).stream.getAudioTracks()[0].dispatchEvent(new Event('ended'))`);
+    await waitFor(async () => !(await state(deck)).decks.some((x) => x.tabId === tabId), 8000);
+    await waitFor(() => tab.evaluate(() => window.__media().paused), 1500).catch(() => {});
+    assert.equal((await tab.evaluate(() => window.__media())).paused, true, `eject ${i}: the tab's <audio> is still playing`);
+    const releasedAt = await waitFor(() => offscreenEval(h, 'window.__releasedAt || 0'), 3000);
+    const pausedAt = await tab.evaluate(() => window.__pausedAt);
+    const mutedAt = await h.sw.evaluate(() => globalThis.__mutedAt);
+    // The hub answers only after the page's pause() calls returned, so the capture is released after the
+    // pause; the 'pause' event itself is dispatched a task later, which a starved CPU can delay a few ms.
+    const EVENT_LAG = 100;
+    assert.ok(pausedAt <= releasedAt + EVENT_LAG || (mutedAt && mutedAt <= releasedAt),
+      `eject ${i}: the tab was still playing when the capture was released (paused ${pausedAt - releasedAt} ms after, muted ${mutedAt ? mutedAt - releasedAt : 'never'})`);
+    // Paused in the end, so any mute made while the pause was late is taken back off.
+    await waitFor(async () => !(await h.sw.evaluate((id) => chrome.tabs.get(id), tabId)).mutedInfo.muted, 3000)
+      .catch(() => assert.fail(`eject ${i}: paused, but the tab was left muted`));
+    if (i === 2) await offscreenEval(h, '(() => { const e = globalThis.__jdsEngine; e.hub = e.__hub; delete e.__hub; return true; })()');
+    await tab.close();
+  }
+});
+
 test('stop all ejects everything; no engine errors were reported', async () => {
   assert.equal((await act(deck, null, 'stopAll')).ok, true);
   await waitFor(async () => (await state(deck)).decks.length === 0, 8000);
   const errs = (await events(deck)).filter((e) => e.level === 'error');
   assert.deepEqual(errs, []);
+});
+
+test('ejected tabs may be discarded again', async () => {
+  for (const k of ['a', 'b', 'c']) {
+    const id = await tabIdFor(h, server.url(k));
+    if (id == null) continue; // closed by an earlier test (b): nothing left to give back
+    await waitFor(async () => (await h.sw.evaluate((x) => chrome.tabs.get(x), id)).autoDiscardable === true, 3000);
+  }
+});
+
+test("STOP ALL left every deck's tab silent: players paused at their own rate, the Web-Audio tab muted", async () => {
+  await waitFor(() => tabs.a.evaluate(() => window.__media().paused), 1500).catch(() => {});
+  const m = await tabs.a.evaluate(() => window.__media());
+  assert.deepEqual([m.paused, m.rate, m.pp], [true, 1, true], 'deck 1 (<audio>, assisted earlier)');
+  const cId = await tabIdFor(h, server.url('c'));
+  const mi = await h.sw.evaluate((id) => chrome.tabs.get(id).then((t) => t.mutedInfo), cId);
+  assert.deepEqual([mi.muted, mi.reason, mi.extensionId], [true, 'extension', h.extId], 'Web-Audio tab muted by us');
+  assert.equal(await tabs.c.evaluate(() => document.getElementById('decor').paused), true, 'its muted decor <audio> is paused too');
+  const notes = (await events(deck)).filter((e) => /no pausable player/.test(e.text));
+  assert.equal(notes.length, 1, JSON.stringify(notes));
+  assert.match(notes[0].text, /^Deck \d: the tab has no pausable player, so it was muted\.$/);
+  assert.equal(notes[0].level, 'info');
+});
+
+test('loading a tab we muted unmutes it first, so the deck hears it', async () => {
+  const cId = await tabIdFor(h, server.url('c'));
+  assert.equal((await h.sw.evaluate((id) => chrome.tabs.get(id), cId)).mutedInfo.muted, true, 'muted by the STOP ALL');
+  const r = await hubCall(deck, { type: 'LOAD_TAB', tabId: cId });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal((await h.sw.evaluate((id) => chrome.tabs.get(id), cId)).mutedInfo.muted, false);
+  const d = await waitFor(async () => (await state(deck)).decks.find((x) => x.tabId === cId), 8000);
+  await waitFor(() => offscreenEval(h, `globalThis.__jdsEngine.decks.get(${d.id}).firstAudible != null`), 8000);
+  assert.equal((await act(deck, d.id, 'eject')).ok, true);
+  await waitFor(async () => (await state(deck)).decks.length === 0, 8000);
 });

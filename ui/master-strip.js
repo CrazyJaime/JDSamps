@@ -1,5 +1,5 @@
 // ui/master-strip.js — master meters/limiter/volume, crossfader bar, REC MIX, clock and settings.
-import { $, $$, setText, toggleAttr, fmtBpm, fmtClock } from './util.js';
+import { $, $$, setText, toggleAttr, pageHidden, fmtBpm, fmtClock } from './util.js';
 import { Knob, Fader, bindSeg } from './controls.js';
 import { VMeter } from './meters.js';
 import { bindHold } from './hold.js';
@@ -31,6 +31,7 @@ export class MasterStrip {
       onHold: () => this.mixRec('mixRecStop'),
       onShort: () => toast('Hold REC MIX (or Shift+R) to stop the mix recording.', 'info'),
     });
+    document.addEventListener('visibilitychange', () => { if (this.stale && !pageHidden()) this.render(this.snap); });
   }
 
   setPersisted(key, value) {
@@ -47,10 +48,18 @@ export class MasterStrip {
   nudgeXf(delta) { this.xf.commit(this.xf.value + delta); }
   setXf(v) { this.xf.commit(v); }
 
+  /** Every snapshot is stored; the DOM follows only while the page is visible (and catches up when it shows). */
   update(s) {
+    this.params = s.master.params;
+    this.rec = s.master.rec;
+    this.snap = s;
+    if (pageHidden()) { this.stale = true; return; }
+    this.render(s);
+  }
+
+  render(s) {
+    this.stale = false;
     const m = s.master, p = m.params;
-    this.params = p;
-    this.rec = m.rec;
     this.vol.set(p['master.volume']);
     toggleAttr(this.limiter, 'aria-pressed', p['master.limiter']);
     this.xf.set(p['xfader.pos']);

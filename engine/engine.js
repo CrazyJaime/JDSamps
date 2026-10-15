@@ -4,7 +4,7 @@
 import SignalsmithStretch from '../vendor/signalsmith-stretch/SignalsmithStretch.mjs';
 import {
   PORT_UI, PORT_AGENT, MAX_DECKS, TARGET, HUB, ENGINE, DECK_PARAMS, MASTER_PARAMS, BPM_RANGES,
-  defaults, validateUiMessage,
+  PERSISTED_MASTER_KEYS, defaults, validateUiMessage, validateValue,
 } from '../shared/protocol.js';
 import { createMaster } from './master.js';
 import { Recorder } from './recorder.js';
@@ -15,6 +15,12 @@ const STRETCH_URL = new URL('../vendor/signalsmith-stretch/SignalsmithStretch.js
 SignalsmithStretch.moduleUrl = STRETCH_URL;
 const workletUrl = (f) => new URL(`../worklets/${f}`, import.meta.url).href;
 const withTimeout = (p, ms, msg) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
+// An eject waits at most this long for its tab to stop playing. The hub bounds its own work (pause
+// for 250 ms, else mute), so this only guards against a hub that never answers; on a busy machine
+// a tighter limit would release the capture while the tab is still playing.
+const STOP_TAB_MS = 2500;
+const INSTANCE = crypto.randomUUID(); // snapshot.engineId: the UI restores its settings into each new engine
+const NOTE_TTL = 60000; // a hub notice raised with no deck page open waits this long for one
 
 // Trust: the relay content script runs in every frame of every site, so any renderer can speak
 // as it. Only extension contexts (the service worker, the deck page) may command the engine.
@@ -32,9 +38,12 @@ class Engine {
     this.ctx = new AudioContext({ latencyHint: 'interactive' });
     this.params = defaults(MASTER_PARAMS);
     this.decks = new Map();
+    this.tabStops = new WeakMap(); // deck → its STOP_TAB (sent once)
     this.nextId = 1;
     this.clock = new MasterClock();
     this.ui = new Set();
+    this.holds = new Set(); // 'deckId|key': kills/FX held down in the UI (set with hold:true)
+    this.notes = []; // hub notices waiting for a deck page
     this.serialQ = Promise.resolve();
     this.downloads = new Map();
     this.downloadsSettled = new Set(); // blob URLs already reported: the hub may send DOWNLOAD_DONE twice
@@ -96,7 +105,7 @@ class Engine {
         if (!uiSender(port.sender)) { refuse(); return; }
         this.ui.add(port);
         port.onMessage.addListener((m) => { this.onUi(port, m); });
-        port.onDisconnect.addListener(() => { void chrome.runtime.lastError; this.ui.delete(port); });
+        port.onDisconnect.addListener(() => { void chrome.runtime.lastError; this.ui.delete(port); if (!this.ui.size) this.releaseHolds(); });
       } else if (port.name === PORT_AGENT) {
         const d = agentSender(port.sender) ? this.deckByTab(port.sender.tab.id) : null;
         if (!d) { refuse(); return; }
@@ -124,11 +133,12 @@ class Engine {
     if (m.t === 'hello') {
       this.post(port, { t: 'state', s: this.snapshot(this.ctx.currentTime) });
       for (const d of this.decks.values()) { const w = d.waveBacklog(); if (w) this.post(port, w); }
+      this.flushNotes(port);
       return;
     }
     if (m.t === 'set') {
       if (m.deck === null) this.setMasterParam(m.key, v.value);
-      else { const d = this.decks.get(m.deck); if (d) d.setParam(m.key, v.value); else { reply(false, 'That deck is gone.'); return; } }
+      else { const d = this.decks.get(m.deck); if (d) { d.setParam(m.key, v.value); this.noteHold(m, v.value); } else { reply(false, 'That deck is gone.'); return; } }
       reply(true);
       return;
     }
@@ -136,6 +146,22 @@ class Engine {
     if (m.deck === null) r = await this.masterAct(m.a);
     else { const d = this.decks.get(m.deck); r = d ? await d.act(m.a, v.arg) : { ok: false, error: 'That deck is gone.' }; }
     reply(r.ok, r.error);
+  }
+
+  /** A kill/FX pad held down is sent with hold:true; the next set of that key (release or latch) clears it. */
+  noteHold(m, value) {
+    const k = `${m.deck}|${m.key}`;
+    if (m.hold === true && value === true) this.holds.add(k); else this.holds.delete(k);
+  }
+
+  /** The last deck page went away (reload, close) mid-press: let go of everything held. */
+  releaseHolds() {
+    for (const k of this.holds) {
+      const [id, key] = k.split('|'), d = this.decks.get(Number(id));
+      if (d) d.setParam(key, false);
+    }
+    this.holds.clear();
+    for (const d of this.decks.values()) d.releaseHolds().catch(() => {});
   }
 
   setMasterParam(k, v) {
@@ -174,7 +200,7 @@ class Engine {
   async onHub(msg) {
     await this.ready;
     switch (msg.type) {
-      case ENGINE.START: return this.serial(() => this.startDeck(msg.tabId, msg.streamId, msg.meta || {}));
+      case ENGINE.START: return this.serial(() => { this.applySaved(msg.settings); return this.startDeck(msg.tabId, msg.streamId, msg.meta || {}); });
       case ENGINE.EJECT: { const d = this.deckByTab(msg.tabId); if (d) await this.eject(d.id, msg.reason); return { ok: true }; }
       case ENGINE.META: { const d = this.deckByTab(msg.tabId); if (d) Object.assign(d.meta, msg.meta || {}); return { ok: true }; }
       case ENGINE.PING: return { ok: true, decks: [...this.decks.values()].map((d) => ({ tabId: d.tabId, slot: d.slot })) };
@@ -187,8 +213,30 @@ class Engine {
         else this.event('error', `Saving ${t ? t.filename : 'the recording'} failed: ${msg.error || 'download interrupted'}.`);
         return { ok: true };
       }
-      case ENGINE.NOTIFY: this.event(msg.level === 'error' || msg.level === 'warn' ? msg.level : 'info', String(msg.text || '').slice(0, 300)); return { ok: true };
+      case ENGINE.NOTIFY: this.notify(msg.level === 'error' || msg.level === 'warn' ? msg.level : 'info', String(msg.text || '').slice(0, 300)); return { ok: true };
       default: return { ok: false, error: `Unknown engine message ${msg.type}` };
+    }
+  }
+
+  /** A hub notice (a capture error from the toolbar) waits for the deck page when none is connected. */
+  notify(level, text) {
+    if (this.ui.size) { this.event(level, text); return; }
+    this.notes.push({ level, text, at: Date.now() });
+    if (this.notes.length > 5) this.notes.shift();
+  }
+  flushNotes(port) {
+    const notes = this.notes;
+    this.notes = [];
+    for (const n of notes) if (Date.now() - n.at < NOTE_TTL) this.post(port, { t: 'event', level: n.level, text: n.text });
+  }
+
+  /** The DJ's saved settings, from the hub's first START: a new engine takes them before its first deck. */
+  applySaved(saved) {
+    if (this.savedApplied || !saved || typeof saved !== 'object') return;
+    this.savedApplied = true; // once per engine; afterwards the deck page owns these settings
+    for (const k of PERSISTED_MASTER_KEYS) {
+      const v = k in saved ? validateValue(MASTER_PARAMS[k], saved[k]) : null;
+      if (v && v.ok && v.value !== this.params[k]) this.setMasterParam(k, v.value);
     }
   }
 
@@ -224,7 +272,23 @@ class Engine {
     return { ok: true, deckId: deck.id, slot };
   }
 
+  /** Before a deck's capture goes, stop its tab playing (the hub pauses the page's players, or
+   *  mutes the tab), so the ejected track does not come out of the speakers. Bounded. */
+  stopTab(d) {
+    let p = this.tabStops.get(d);
+    if (!p) {
+      p = withTimeout(this.hub({ type: HUB.STOP_TAB, tabId: d.tabId }), STOP_TAB_MS, 'STOP_TAB timed out').then((r) => {
+        if (r && r.ok && r.muted) this.event('info', `Deck ${d.slot}: the tab has no pausable player, so it was muted.`);
+      }, () => {});
+      this.tabStops.set(d, p);
+    }
+    return p;
+  }
+
   eject(id, reason) {
+    // Stopping the tab starts now, ahead of the queue, so STOP ALL stops every tab in parallel.
+    const d0 = this.decks.get(id);
+    if (d0) this.stopTab(d0);
     return this.serial(async () => {
       const d = this.decks.get(id);
       if (!d) return;
@@ -232,6 +296,7 @@ class Engine {
       this.clock.release(id);
       if (reason) this.event('warn', reason);
       this.hub({ type: HUB.DECKS_CHANGED, decks: [...this.decks.values()].map((x) => ({ tabId: x.tabId, slot: x.slot })) });
+      await this.stopTab(d);
       await d.dispose();
     });
   }
@@ -271,6 +336,7 @@ class Engine {
     const decks = [...this.decks.values()].sort((a, b) => a.slot - b.slot).map((d) => d.state(stamp.ctxTime));
     const cs = this.clock.state();
     return {
+      engineId: INSTANCE,
       ctxTime: stamp.ctxTime, wallMs: stamp.wallMs, sampleRate: this.ctx.sampleRate, engineState: this.ctx.state,
       outputLatency: this.ctx.outputLatency || 0, clock: cs,
       master: {

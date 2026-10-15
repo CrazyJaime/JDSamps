@@ -2,6 +2,13 @@
 // Primary pointer button (captured) or Enter/Space on the focused button; the button carries
 // .holding while the hold runs, and CSS draws the progress over --hold.
 
+// A hold is cancelled when the window loses focus or the page is hidden: the release then goes
+// elsewhere, and a hidden page's (throttled) timer must not finish a hold nobody is watching.
+const running = new Set();
+const cancelAll = () => { for (const cancel of [...running]) cancel(); };
+window.addEventListener('blur', cancelAll);
+document.addEventListener('visibilitychange', () => { if (document.hidden) cancelAll(); });
+
 /**
  * @param {HTMLElement} el
  * @param {{ms:number, onHold:()=>void, onShort?:()=>void, needsHold?:()=>boolean, onPress?:()=>void}} o
@@ -15,10 +22,12 @@ export function bindHold(el, { ms, onHold, onShort, needsHold = () => true, onPr
     if (!needsHold()) { onPress && onPress(); return; }
     el.style.setProperty('--hold', `${ms}ms`);
     el.classList.add('holding');
-    timer = setTimeout(() => { timer = 0; el.classList.remove('holding'); onHold(); }, ms);
+    running.add(cancel);
+    timer = setTimeout(() => { timer = 0; running.delete(cancel); el.classList.remove('holding'); onHold(); }, ms);
   };
   const cancel = (short = false) => {
     if (!timer) return;
+    running.delete(cancel);
     clearTimeout(timer);
     timer = 0;
     el.classList.remove('holding');

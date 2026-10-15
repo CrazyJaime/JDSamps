@@ -1,9 +1,10 @@
 // agent/agent-main.js — JD Samps player-assist agent (page MAIN world, every frame, document_start).
 // Registers media elements the page plays (including detached `new Audio()` objects) and, only
 // when a deck asks, sets their playbackRate (with preservesPitch=false) so the engine can refill a
-// deck's buffer. Silent until its first command. Talks to agent-relay.js through window
-// CustomEvents carrying JSON strings (objects do not cross JS worlds reliably), on a channel name
-// the relay picks at random and hands over at document_start, before any page script runs.
+// deck's buffer, or pauses them all when the deck is ejected. Silent until its first command.
+// Talks to agent-relay.js through window CustomEvents carrying JSON strings (objects do not cross
+// JS worlds reliably), on a channel name the relay picks at random and hands over at
+// document_start, before any page script runs.
 // Leaves no global behind and keeps its wrappers looking native, so pages cannot fingerprint it.
 (() => {
   const HELLO = 'media-channel';
@@ -11,9 +12,11 @@
   // Per element: the page's own settings before a deck touched it, recent rate changes the page
   // made itself, and whether the agent gave the element back to a page that insists on its rate.
   const info = new WeakMap();
-  let refs = [];
-  const st = { active: false, enforcing: false, target: 1, seq: 0, dog: 0 };
-  const out = { last: '', at: -1e9, timer: 0, queued: false };
+  let refs = [], pruneAt = 256;
+  // cmdAt: when the last rate command came (the agent lets go 3 s after it).
+  const st = { active: false, enforcing: false, target: 1, seq: 0, dog: 0, cmdAt: 0 };
+  // Statuses up: the last one sent and when, and whether a newer one is waiting.
+  const out = { last: '', at: -1e9, dirty: false, timer: 0, queued: false };
 
   const live = () => { refs = refs.filter((r) => { const el = r.deref(); return !!el && (el.isConnected || !!el.currentSrc); }); return refs.map((r) => r.deref()); };
   let chan = null;
@@ -33,20 +36,40 @@
     };
   }
 
-  // At most four statuses a second, and only when something changed.
-  function flush() {
-    out.timer = 0; out.queued = false;
+  // Chrome throttles timers in background tabs (to 1 Hz, then once a minute) but not events, so no
+  // status waits on a timer when an event can carry it. A command is answered at once, from its own
+  // message event (send). Other changes (media events) go out at most four times a second: one
+  // inside that window waits for the next event (pump runs on every media event, timeupdate
+  // included, and on every command), and a timer only covers the case where nothing else happens.
+  function send() {
+    out.dirty = false;
     const s = JSON.stringify(status());
     if (s === out.last) return;
     out.last = s; out.at = performance.now();
     emit(s);
   }
-  function report() {
-    if (!st.active || out.timer || out.queued) return;
+  function pump() {
+    if (!out.dirty || out.queued) return;
     const wait = out.at + 250 - performance.now();
-    if (wait > 0) out.timer = setTimeout(flush, wait);
-    else { out.queued = true; queueMicrotask(flush); }
+    if (wait <= 0) { out.queued = true; queueMicrotask(() => { out.queued = false; if (out.dirty) send(); }); }
+    else if (!out.timer) out.timer = setTimeout(() => { out.timer = 0; pump(); }, wait);
   }
+  function report() {
+    if (!st.active) return;
+    out.dirty = true;
+    pump();
+  }
+
+  // The engine re-sends the rate at least every second while it needs it: 3 s without it, let go.
+  // Checked on every event and command, so a throttled timer can only make the release late, and
+  // the timer itself re-checks the clock, so a stale one never lets go of a rate still in use.
+  function watchdog() {
+    if (!st.enforcing) return;
+    const left = st.cmdAt + 3000 - performance.now();
+    if (left <= 0) release();
+    else if (!st.dog) st.dog = setTimeout(() => { st.dog = 0; watchdog(); }, left);
+  }
+  const onEvent = () => { watchdog(); pump(); };
 
   function apply(el) {
     const x = info.get(el);
@@ -66,6 +89,7 @@
 
   function onRate(e) {
     const el = e.currentTarget, x = info.get(el);
+    watchdog();
     if (st.enforcing && x && !x.off && Math.abs(el.playbackRate - st.target) > 1e-6) {
       // The page changed the rate itself. Re-apply (players reset it on load), but give the element
       // back to a page that keeps resetting it instead of fighting it forever.
@@ -87,10 +111,14 @@
     if (!(el instanceof HTMLMediaElement) || info.has(el)) return;
     info.set(el, { base: null, ext: [], off: false });
     refs.push(new WeakRef(el));
+    // Pages that are never decked never call live(): drop collected elements here as well.
+    if (refs.length >= pruneAt) { refs = refs.filter((r) => r.deref() !== undefined); pruneAt = Math.max(256, 2 * refs.length); }
     el.addEventListener('ratechange', onRate);
     for (const ev of ['play', 'playing', 'pause', 'emptied', 'loadedmetadata', 'volumechange']) {
-      el.addEventListener(ev, () => { if (st.enforcing && (ev === 'playing' || ev === 'loadedmetadata')) apply(el); report(); });
+      el.addEventListener(ev, () => { watchdog(); if (st.enforcing && (ev === 'playing' || ev === 'loadedmetadata')) apply(el); report(); });
     }
+    el.addEventListener('timeupdate', onEvent); // about 4 a second while playing, timers or not
+    watchdog();
     if (st.enforcing) apply(el);
     report();
   }
@@ -99,7 +127,7 @@
 
   function release() {
     clearTimeout(st.dog);
-    st.enforcing = false; st.target = 1;
+    st.dog = 0; st.enforcing = false; st.target = 1;
     for (const el of live()) {
       const x = info.get(el);
       if (!x) continue;
@@ -119,7 +147,7 @@
   };
   disguise(asNative);
 
-  const proto = HTMLMediaElement.prototype;
+  const proto = HTMLMediaElement.prototype, nativePause = proto.pause;
   for (const name of ['play', 'pause', 'load']) {
     const orig = proto[name];
     proto[name] = disguise({ [name](...args) { try { register(this); } catch (_) {} return orig.apply(this, args); } }[name]);
@@ -160,29 +188,44 @@
     if (m.t === 'query' || m.t === 'rate' || m.t === 'release') watchPolling();
     if (m.t === 'query') {
       // Always answered, and at once.
+      watchdog();
       st.active = true; scan();
-      clearTimeout(out.timer);
-      Object.assign(out, { last: '', at: -1e9, timer: 0 });
-      report();
+      out.last = '';
+      send();
     } else if (m.t === 'rate') {
       if (typeof m.rate !== 'number' || !Number.isFinite(m.rate) || m.rate < 0.5 || m.rate > 2) return;
       // A new command takes back elements the agent gave up on; a keep-alive (same rate and seq) does not.
       const fresh = m.rate !== st.target || (seq != null && seq !== st.seq);
       st.active = true; st.target = m.rate; st.enforcing = true;
       if (seq != null) st.seq = seq;
-      // The engine re-sends the rate at least every second while it needs it: without that, let go.
-      clearTimeout(st.dog);
-      st.dog = setTimeout(release, 3000);
+      st.cmdAt = performance.now();
+      watchdog();
       scan();
       for (const el of live()) {
         const x = info.get(el);
         if (fresh && x) { x.off = false; x.ext = []; }
         apply(el);
       }
-      report();
+      send(); // the confirmation (it echoes seq), from this event: no timer can hold it back
     } else if (m.t === 'release') {
       if (seq != null) st.seq = seq;
       release();
+      send();
+    } else if (m.t === 'stop') {
+      // The deck is ejecting this tab: once its capture goes, the page plays out of the speakers.
+      // Give the page its own rate back, pause every player, and say how many of them were heard
+      // (0: nothing to pause here, so the tab gets muted instead).
+      if (seq != null) st.seq = seq;
+      release();
+      scan();
+      let count = 0;
+      for (const el of live()) {
+        if (el.paused) continue;
+        const heard = !el.muted && el.volume > 0;
+        try { nativePause.call(el); } catch (_) { continue; }
+        if (heard && el.paused) count++;
+      }
+      emit(JSON.stringify({ t: 'stopped', count }));
     }
   }
 })();

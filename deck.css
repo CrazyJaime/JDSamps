@@ -93,6 +93,8 @@ kbd { font: 0.8rem var(--mono); padding: 0.05rem 0.35rem; border: 1px solid var(
   font: 700 0.75rem var(--sans); letter-spacing: 0.06em; cursor: pointer;
 }
 .kill[aria-pressed="true"] { background: var(--rec); border-color: var(--rec); color: #fff; box-shadow: 0 0 0.8rem rgb(239 68 68 / 0.6); }
+/* Hold pads: a finger that drifts must not start a pan of the deck row (pointercancel ends the hold). */
+[data-hold], .pad, .kill, [data-act="eject"], .btn.rec { touch-action: none; }
 
 .seg { display: inline-flex; border: 1px solid var(--line-2); border-radius: var(--r); overflow: hidden; background: var(--panel-2); }
 .seg button {

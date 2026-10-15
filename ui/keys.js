@@ -13,13 +13,14 @@ export function bindKeys({ getStrip, selectSlot, conn, master, toggleHelp, close
   const latchDown = (code, strip, key) => {
     const wasOn = !!strip.d.params[key];
     held.set(code, { at: performance.now(), wasOn, strip, key });
-    if (!wasOn) strip.set(key, true);
+    if (!wasOn) strip.set(key, true, true); // held until the release decides
   };
   const latchUp = (code) => {
     const h = held.get(code);
     if (!h) return;
     held.delete(code);
     if (h.wasOn || performance.now() - h.at >= 250) h.strip.set(h.key, false);
+    else h.strip.set(h.key, true); // a tap latches it on: no longer held
   };
 
   window.addEventListener('keydown', (e) => {

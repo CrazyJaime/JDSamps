@@ -1,7 +1,7 @@
 import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  prepareExtension, launchExtension, startTrackServer, openExtPage, hubCall, tabIdFor, waitFor, installClient, events, offscreenEval,
+  prepareExtension, launchExtension, startTrackServer, openExtPage, hubCall, tabIdFor, waitFor, installClient, events, offscreenEval, act, state,
 } from './ext-harness.mjs';
 
 let h, server, deck, track, other;
@@ -134,7 +134,63 @@ test('a repeated DOWNLOAD_DONE is reported once', async () => {
   assert.equal(await offscreenEval(h, 'globalThis.__jdsEngine.downloads.size'), 0);
 });
 
+test('closing the deck page mid-press ends held rolls, nudges, kills and FX, but not latched ones', async () => {
+  await installClient(deck);
+  const id = (await state(deck)).decks[0].id;
+  assert.equal((await act(deck, id, 'play')).ok, true);
+  await deck.evaluate((d) => {
+    const p = window.__c.port;
+    p.postMessage({ t: 'set', deck: d, key: 'kill.hi', value: true, hold: true }); // pad held down
+    p.postMessage({ t: 'set', deck: d, key: 'fx.on', value: true, hold: true }); // pad held down
+    p.postMessage({ t: 'set', deck: d, key: 'kill.low', value: true, hold: true }); // pad tapped: latched on release
+    p.postMessage({ t: 'set', deck: d, key: 'kill.low', value: true });
+    p.postMessage({ t: 'set', deck: d, key: 'kill.mid', value: true }); // toggled
+  }, id);
+  assert.equal((await act(deck, id, 'nudge', { dir: 1 })).ok, true);
+  assert.equal((await act(deck, id, 'rollStart', { beats: 1 })).ok, true);
+  const look = `(() => { const d = globalThis.__jdsEngine.decks.get(${id}), p = d.params;
+    return { roll: d.roll, nudge: d.nudge, playing: d.wantPlay, kills: [p['kill.hi'], p['kill.mid'], p['kill.low']], fx: p['fx.on'] }; })()`;
+  assert.deepEqual(await offscreenEval(h, look), { roll: 1, nudge: 1, playing: true, kills: [true, true, true], fx: true });
+  await deck.close();
+  try {
+    await waitFor(async () => (await offscreenEval(h, look)).nudge === 0, 5000);
+    assert.deepEqual(await offscreenEval(h, look), { roll: null, nudge: 0, playing: true, kills: [false, true, true], fx: false });
+  } finally {
+    deck = await openExtPage(h, 'deck.html');
+  }
+  await installClient(deck);
+  assert.equal((await act(deck, id, 'pause')).ok, true);
+});
+
 test('closing the tab ejects its deck', async () => {
   await track.close();
   await waitFor(async () => (await hubCall(deck, { type: 'LIST_SOURCES' })).ok && (await h.sw.evaluate(() => chrome.action.getBadgeText({}))) === '', 8000);
+});
+
+test('a capture warning raised while the deck page is closed is shown when it opens', async () => {
+  await deck.close();
+  await h.sw.evaluate(() => chrome.runtime.sendMessage({ target: 'engine', type: 'NOTIFY', level: 'warn', text: 'Chrome pages can\'t be captured (raised while closed).' }));
+  deck = await openExtPage(h, 'deck.html');
+  await waitFor(async () => (await deck.locator('.toast').allTextContents()).some((t) => /raised while closed/.test(t)), 5000);
+});
+
+test('a new engine applies the saved settings that come with its first START, before making the deck', async () => {
+  await deck.close(); // no deck page: only the hub's START can carry the settings
+  const t = await h.context.newPage();
+  await t.goto(server.url('a'));
+  const tabId = await tabIdFor(h, server.url('a'));
+  const r = await h.sw.evaluate(async (id) => {
+    await chrome.offscreen.closeDocument();
+    await chrome.offscreen.createDocument({ url: 'offscreen.html', reasons: ['USER_MEDIA'], justification: 'test' });
+    const streamId = await new Promise((res, rej) => chrome.tabCapture.getMediaStreamId({ targetTabId: id }, (s) => (chrome.runtime.lastError ? rej(new Error(chrome.runtime.lastError.message)) : res(s))));
+    const settings = { 'pitch.defaultRange': 0.16, 'bpm.range': '78-155', 'rec.format': 'webm', 'master.volume': 0, 'buffer.capSec': 7 };
+    const msg = { target: 'engine', type: 'START', tabId: id, streamId, meta: { title: 'A' }, settings };
+    for (let i = 0; ; i++) {
+      try { return await chrome.runtime.sendMessage(msg); } catch (e) { if (i > 30) throw e; await new Promise((res) => setTimeout(res, 100)); }
+    }
+  }, tabId);
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const got = await offscreenEval(h, `(() => { const e = globalThis.__jdsEngine, d = [...e.decks.values()][0];
+    return { range: d.params.range, bpm: e.params['bpm.range'], rec: e.params['rec.format'], vol: e.params['master.volume'], cap: e.params['buffer.capSec'] }; })()`);
+  assert.deepEqual(got, { range: 0.16, bpm: '78-155', rec: 'webm', vol: 0.5, cap: 240 }, 'persisted keys only, validated');
 });
