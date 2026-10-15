@@ -8,6 +8,7 @@ export const GUARD = 0.5;        // s of reserve below which the deck may not pl
 export const LIVE_RESERVE = 0.6; // s of reserve kept by the LIVE jump
 
 const FIELDS = ['active', 'rate', 'semitones', 'input', 'loopStart', 'loopEnd'];
+const TRANSPORT = ['active', 'input', 'loopStart', 'loopEnd']; // start/pause, jump, loop: intent a rate update must not undo
 
 export class Timeshift {
   constructor(node, { sampleRate, latency, outLatency, capSec = 240, historySec = 60 }) {
@@ -63,14 +64,28 @@ export class Timeshift {
     const seg = { output: T };
     for (const k of FIELDS) seg[k] = fields[k] !== undefined ? fields[k] : base[k];
     if (fields.input === undefined) seg.input = this.posAt(T);
+    seg.transport = TRANSPORT.some((k) => fields[k] !== undefined);
     return seg;
   }
 
-  /** Replace everything planned after `now` with one change at T. */
+  /**
+   * Replace everything planned after `now` with one change at T. A planned transport change
+   * (start, pause, jump, loop) that has not happened yet is folded in rather than lost: the new
+   * change keeps every field it does not restate and lands at the planned time (or at T, if it
+   * jumps and T is later). So a rate update never cancels a pending PLAY or SYNC-PLAY. Only a
+   * change that reverses its play state (PAUSE during a pending start) cancels it.
+   */
   change(now, T, fields) {
+    const planned = this.segs.find((s) => s.output > now && s.transport && (fields.active === undefined || fields.active === s.active));
     this.segs = this.segs.filter((s) => s.output <= now);
     if (!this.segs.length) this.segs = [{ output: -Infinity, input: 0, rate: 1, active: false, semitones: 0, loopStart: 0, loopEnd: 0 }];
     this.queue = [];
+    if (planned) {
+      T = fields.input === undefined ? planned.output : Math.max(T, planned.output);
+      const merged = {};
+      for (const k of FIELDS) merged[k] = fields[k] !== undefined ? fields[k] : planned[k];
+      fields = merged;
+    }
     const seg = this.build(T, fields);
     this.segs.push(seg);
     this.send(seg);
@@ -87,10 +102,16 @@ export class Timeshift {
     return seg;
   }
 
-  bend(now, T, factor, duration) {
+  /**
+   * Bend the rate in effect at T by `factor` for `duration`, then settle at `end` ({rate, semitones};
+   * default: the rate in effect). With `pitchFollows` (vinyl), the pitch bends with the speed.
+   */
+  bend(now, T, factor, duration, end = {}, pitchFollows = false) {
     const base = this.segAt(T);
-    this.change(now, T, { rate: base.rate * factor });
-    this.then(now, T + duration, { rate: base.rate });
+    const bent = { rate: base.rate * factor };
+    if (pitchFollows) bent.semitones = base.semitones + 12 * Math.log2(factor);
+    this.change(now, T, bent);
+    this.then(now, T + duration, { rate: base.rate, ...end });
     return T + duration;
   }
 
@@ -101,7 +122,8 @@ export class Timeshift {
   }
 
   send(seg) {
-    const out = { ...seg };
+    const out = { output: seg.output };
+    for (const k of FIELDS) out[k] = seg[k];
     // A pause becomes audible ~outLatency after its output time: send it that much earlier.
     if (seg.active === false && this.segAt(seg.output - 1e-9).active) out.output = seg.output - this.outLat;
     this.lastSentOut = out.output;

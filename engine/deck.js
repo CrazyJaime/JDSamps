@@ -71,6 +71,7 @@ export class Deck {
     this.nextFxClock = 0;
     this.lastFxBpm = 0;
     this.crossingFor = null;
+    this.crossingSeg = null;
     this.wave = { tStart: null, hop: 0, data: new Uint8Array(0), n: 0 };
     this.disposed = false;
   }
@@ -181,7 +182,8 @@ export class Deck {
 
   desiredRate(p) { return ((1 + this.params.pitch) / this.src.rateAt(p)) * this.nudgeFactor; }
   effRate(p) { const d = this.desiredRate(p); return this.starved ? Math.min(1, d) : d; }
-  semis(p) { const s = this.src.rateAt(p); return engineSemitones(this.params.keyLock, s, (1 + this.params.pitch) / s); }
+  /** Vinyl mode (KEY off) follows the engine rate actually applied: starve clamp and nudge included. */
+  semis(p) { return engineSemitones(this.params.keyLock, this.src.rateAt(p), this.effRate(p)); }
 
   /** Schedule a change at T, always restating rate/semitones so a pending bend can never stick. */
   sched(T, fields) {
@@ -256,10 +258,12 @@ export class Deck {
         if (mb) { start = mb.lastBeat + mb.period; while (start < T) start += mb.period; }
         const wasSync = this.syncOn;
         if (mb && this.canBeat()) this.syncOn = true;
-        const from = this.snapToGrid(this.cue);
+        if (!wasSync && this.syncOn) this.syncTick(now); // tempo first: the start and its alignment use the synced rate
+        // From the cue only when the playhead sits there (fresh, CUE-returned, previewing); else resume in place.
+        const p = this.ts.posAt(start);
+        const from = this.previewing || Math.abs(p - this.cue) < 0.02 ? this.snapToGrid(this.cue) : mb ? this.snapToGrid(p) : p;
         this.startAt(start, this.alignForStart(from, start));
         this.previewing = false;
-        if (!wasSync && this.syncOn) this.syncTick(now);
         return OK;
       }
       case 'cueDown': {
@@ -477,6 +481,9 @@ export class Deck {
         this.sched(ts.soon(now), { input: ts.clampInput(ts.posAt(ts.soon(now)) - 1) });
       }
       this.scheduleCrossing(now, p);
+      this.reconcileRate(now);
+    } else if (this.starved) {
+      this.starved = false; // re-evaluated on the next PLAY
     }
 
     // Post-fader meter.
@@ -502,15 +509,30 @@ export class Deck {
   /** When the playhead reaches an input position where the source rate changed, change the engine rate exactly there. */
   scheduleCrossing(now, p) {
     const next = this.src.nextChangeAfter(p);
-    if (!next || this.crossingFor === next.inPos) return;
+    if (!next) return;
     if (this.ts.pendingUntil() >= now) return;
+    // Planned once already, unless a later change dropped that crossing.
+    if (this.crossingFor === next.inPos && this.ts.segAt(this.crossingSeg.output) === this.crossingSeg) return;
     const rate = this.ts.rateAt(now);
     if (!(rate > 0)) return;
     const tCross = now + (next.inPos - p) / rate;
     if (tCross - now > 0.6) return;
     const T = Math.max(tCross, this.ts.soon(now));
     this.crossingFor = next.inPos;
-    this.ts.change(now, T, { rate: this.effRate(next.inPos + 1e-6), semitones: this.semis(next.inPos + 1e-6) });
+    this.crossingSeg = this.ts.change(now, T, { rate: this.effRate(next.inPos + 1e-6), semitones: this.semis(next.inPos + 1e-6) });
+  }
+
+  /**
+   * Restate rate/semitones when the scheduled ones differ from what the deck wants: an update that
+   * was deferred (syncTick while a change was pending) or dropped. Only while nothing is pending,
+   * so a start, bend or crossing is never cut short.
+   */
+  reconcileRate(now) {
+    const ts = this.ts;
+    if (ts.pendingUntil() >= now || !ts.playingAt(now)) return;
+    const T = ts.soon(now), p = ts.posAt(T), seg = ts.segAt(T);
+    const rate = this.effRate(p);
+    if (Math.abs(seg.rate - rate) > 1e-9 * rate || Math.abs(seg.semitones - this.semis(p)) > 1e-9) this.sched(T, {});
   }
 
   assistTick(now, res) {
@@ -609,7 +631,11 @@ export class Deck {
     // A starved deck cannot keep up; bending faster would only spend the reserve it is protecting.
     if (starved || now < this.settleUntil || this.ts.pendingUntil() >= now) return;
     const plan = planCorrection(e, { audible: this.audible(), keyLock: this.params.keyLock });
-    if (plan.kind === 'bend') this.settleUntil = this.ts.bend(now, T, 1 + plan.bend, plan.duration) + 0.25;
+    if (plan.kind === 'bend') {
+      const pEnd = p + rate * (1 + plan.bend) * plan.duration;
+      const end = { rate: this.effRate(pEnd), semitones: this.semis(pEnd) };
+      this.settleUntil = this.ts.bend(now, T, 1 + plan.bend, plan.duration, end, !this.params.keyLock) + 0.25;
+    }
     else if (plan.kind === 'jump') { this.sched(T, { input: this.ts.clampInput(p + plan.seconds * rate) }); this.settleUntil = T + 0.3; }
   }
 

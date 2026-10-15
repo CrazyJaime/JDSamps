@@ -59,8 +59,17 @@ test('SYNC PLAY matches tempo and phase to the master', async () => {
   assert.equal((await act(deck, 2, 'master')).ok, true);
   assert.equal((await act(deck, 2, 'play')).ok, true);
   await sleep(1000);
-  assert.equal((await act(deck, 1, 'sync', { on: true })).ok, true);
+  // SYNC▶ straight from SYNC off: it must set the tempo before it schedules the start.
+  assert.equal(deckBy(await state(deck), 1).sync.on, false);
   assert.equal((await act(deck, 1, 'syncPlay')).ok, true);
+  // The rate the engine actually scheduled (not params), read as the deck starts, before any phase
+  // bend. Assist steps land at the live edge, seconds ahead of this playhead, so the source rate is 1.
+  // (The master's own BPM estimate still settles for a few seconds, so compare against it, not 128.)
+  const s0 = await waitFor(async () => { const s = await state(deck); return deckBy(s, 1).engineRate > 0 && s; }, 3000, 20);
+  const st = deckBy(s0, 1);
+  assert.equal(st.sync.on, true);
+  assert.ok(Math.abs(st.bpm.out - s0.clock.bpm) < 0.05, `out ${st.bpm.out} vs clock ${s0.clock.bpm} at start`);
+  assert.ok(Math.abs(st.engineRate - (1 + st.params.pitch)) < 0.005, `scheduled rate at start ${st.engineRate}, pitch ${st.params.pitch}`);
   await sleep(6000);
   const s = await state(deck);
   const a = deckBy(s, 1);
