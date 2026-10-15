@@ -107,6 +107,29 @@ test('eject needs a hold', async () => {
   assert.equal((await acts((m) => m.a === 'eject' && m.deck === 3)).length, 1);
 });
 
+test('switching away mid-press lets go of a roll and cancels an eject hold', async () => {
+  await ui.clearSent();
+  const roll = await deckEl(1).locator('[data-roll="0.5"]').boundingBox();
+  await page.mouse.move(roll.x + 5, roll.y + 5);
+  await page.mouse.down();
+  await page.waitForTimeout(80);
+  await page.evaluate(() => window.dispatchEvent(new Event('blur'))); // e.g. Alt+Tab with the button held
+  await page.waitForTimeout(50);
+  assert.deepEqual((await acts((m) => m.deck === 1)).map((m) => m.a), ['rollStart', 'rollEnd']);
+  await page.mouse.up();
+  await ui.clearSent();
+  const ej = await deckEl(2).locator('[data-act="eject"]').boundingBox();
+  await page.mouse.move(ej.x + 5, ej.y + 5);
+  await page.mouse.down();
+  await page.waitForTimeout(200);
+  await page.evaluate(() => window.dispatchEvent(new Event('blur')));
+  await page.waitForTimeout(500);
+  await page.mouse.up();
+  await page.waitForTimeout(50);
+  assert.deepEqual(await acts((m) => m.a === 'eject'), [], 'no eject from a hold the user switched away from');
+  assert.equal(await deckEl(2).locator('[data-act="eject"]').evaluate((el) => el.classList.contains('holding')), false);
+});
+
 test('keyboard shortcuts drive the selected deck and the mixer', async () => {
   await page.locator('body').click({ position: { x: 5, y: 300 } });
   await ui.clearSent();

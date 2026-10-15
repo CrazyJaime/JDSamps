@@ -21,6 +21,13 @@ function arcPath(r, from, to) {
 }
 const svgEl = (tag, attrs) => { const e = document.createElementNS(SVGNS, tag); for (const k in attrs) e.setAttribute(k, attrs[k]); return e; };
 
+// Pads held down and drags in progress end when the window loses focus or the page is hidden:
+// the pointerup or keyup then goes to another window or tab, so it would never arrive here.
+const held = new Set();
+const letGo = () => { for (const end of [...held]) end(); };
+window.addEventListener('blur', letGo);
+document.addEventListener('visibilitychange', () => { if (document.hidden) letGo(); });
+
 class Continuous {
   /** o.wheel = false: no scroll-wheel control; o.reset = false: no double-click reset. */
   constructor(el, o) {
@@ -130,12 +137,14 @@ class Continuous {
         this.commit(this.value + (px / pixelsForRange) * range * (ev.shiftKey ? 0.15 : 1));
       };
       const up = () => {
+        held.delete(up);
         this.dragging = false;
         this.el.classList.remove('active');
         target.removeEventListener('pointermove', move);
         target.removeEventListener('pointerup', up);
         target.removeEventListener('pointercancel', up);
       };
+      held.add(up);
       target.addEventListener('pointermove', move);
       target.addEventListener('pointerup', up);
       target.addEventListener('pointercancel', up);
@@ -205,12 +214,14 @@ export class Fader extends Continuous {
         this.commit(this.value + (px / span) * (this.o.max - this.o.min) * (ev.shiftKey ? 0.15 : 1));
       };
       const up = () => {
+        held.delete(up);
         this.dragging = false;
         el.classList.remove('active');
         el.removeEventListener('pointermove', move);
         el.removeEventListener('pointerup', up);
         el.removeEventListener('pointercancel', up);
       };
+      held.add(up);
       el.addEventListener('pointermove', move);
       el.addEventListener('pointerup', up);
       el.addEventListener('pointercancel', up);
@@ -235,6 +246,7 @@ export function bindPad(el, { onDown, onUp, latch = false }) {
   const press = () => {
     if (active) return;
     active = true;
+    held.add(release);
     downAt = performance.now();
     wasOn = on;
     if (!latch || !on) { on = true; onDown && onDown(); }
@@ -243,8 +255,9 @@ export function bindPad(el, { onDown, onUp, latch = false }) {
   const release = () => {
     if (!active) return;
     active = false;
-    const held = performance.now() - downAt >= 250;
-    if (!latch || held || wasOn) { on = false; onUp && onUp(); }
+    held.delete(release);
+    const long = performance.now() - downAt >= 250;
+    if (!latch || long || wasOn) { on = false; onUp && onUp(); }
     paint();
   };
   const paint = () => { el.classList.toggle('on', on); el.setAttribute('aria-pressed', on ? 'true' : 'false'); };
