@@ -50,6 +50,20 @@ test('mono input is duplicated and missing input counts as silence', () => {
   assert.equal(b.firstAbove, -1);
 });
 
+test('blocks before the capture is connected do not start the input timeline', () => {
+  // Chrome runs the processor as soon as the node exists; the Deck connects the capture only
+  // after its Timeshift exists, so frames counted before that would never reach the buffer.
+  const p = new Proc();
+  for (let s = 0; s < 2048 + 512; s += 128) p.process([[]], [[new Float32Array(128)]], {});
+  assert.equal(msgs(p, 'chunk').length, 0, 'no chunk before the first real input');
+  const L = new Float32Array(2048).map((_, i) => 0.5 * Math.sin(i / 9));
+  runBlocks(p, [L, L]);
+  const [c] = msgs(p, 'chunk');
+  assert.equal(c.start, 0);
+  assert.deepEqual(Array.from(c.L), Array.from(L));
+  assert.equal(c.firstAbove, 1);
+});
+
 test('ODF batches are evenly stamped and drive tempo detection', () => {
   const p = new Proc();
   const { x } = synth({ ...PATTERNS.house, bars: 20 });
