@@ -5,26 +5,44 @@
 // The bands are drawn once into cached tiles at a fixed time scale (appended per hop as audio
 // arrives) and blitted every frame; only the grid, markers and playhead are drawn per frame.
 
+// Hop i (of the deck's input timeline) is at input time t0 + i·hop, where t0 is fixed by the first
+// chunk received (tiles are indexed from it). The store holds hops [start, n): data[0] is hop start.
 export class WaveStore {
-  constructor() { this.hop = 0; this.t0 = 0; this.data = new Uint8Array(0); this.n = 0; this.rev = 0; }
+  constructor() { this.hop = 0; this.t0 = 0; this.start = 0; this.n = 0; this.data = new Uint8Array(0); this.rev = 0; }
 
+  /** Input time of the first hop held. */
+  first() { return this.t0 + this.start * this.hop; }
+
+  /** Data may start before what is held (a backlog after a live chunk): the store grows at the front. */
   add({ tStart, hop, data }) {
     if (!(hop > 0) || !data || !data.length) return;
     if (!this.hop) { this.hop = hop; this.t0 = tStart; }
     const i0 = Math.round((tStart - this.t0) / this.hop);
-    if (i0 < 0) return;
-    if (i0 < this.n) this.rev++; // rewrites audio already drawn: cached tiles are stale
     const count = Math.floor(data.length / 3);
-    const need = (i0 + count) * 3;
-    if (need > this.data.length) {
+    if (!count) return;
+    if (i0 < this.n) this.rev++; // rewrites audio already drawn, or fills in before it: cached tiles are stale
+    if (this.n === this.start) this.start = this.n = i0; // empty
+    const lo = Math.min(this.start, i0), hi = Math.max(this.n, i0 + count);
+    if (lo < this.start || (hi - lo) * 3 > this.data.length) {
       let cap = Math.max(4096, this.data.length);
-      while (cap < need) cap *= 2;
+      while (cap < (hi - lo) * 3) cap *= 2;
       const next = new Uint8Array(cap);
-      next.set(this.data);
+      next.set(this.data.subarray(0, (this.n - this.start) * 3), (this.start - lo) * 3);
       this.data = next;
+      this.start = lo;
     }
-    this.data.set(data.subarray ? data.subarray(0, count * 3) : data.slice(0, count * 3), i0 * 3);
-    this.n = Math.max(this.n, i0 + count);
+    if (i0 > this.n) this.data.fill(0, (this.n - this.start) * 3, (i0 - this.start) * 3); // a gap: no audio there
+    this.data.set(data.subarray ? data.subarray(0, count * 3) : data.slice(0, count * 3), (i0 - this.start) * 3);
+    this.n = hi;
+  }
+
+  /** Forget hops before input time t (the engine no longer buffers them). The tile origin t0 stays. */
+  compact(t) {
+    if (!this.hop) return;
+    const k = Math.min(this.n, Math.floor((t - this.t0) / this.hop));
+    if (k <= this.start) return;
+    this.data.copyWithin(0, (k - this.start) * 3, (this.n - this.start) * 3);
+    this.start = k;
   }
 
   /** Max of each band over [tIn, tIn+span). */
@@ -32,8 +50,8 @@ export class WaveStore {
     if (!this.hop) return null;
     let a = Math.floor((tIn - this.t0) / this.hop);
     let b = Math.max(a + 1, Math.ceil((tIn + span - this.t0) / this.hop));
-    if (b <= 0 || a >= this.n) return null;
-    a = Math.max(0, a); b = Math.min(this.n, b);
+    if (b <= this.start || a >= this.n) return null;
+    a = Math.max(this.start, a) - this.start; b = Math.min(this.n, b) - this.start;
     let l = 0, m = 0, h = 0;
     for (let i = a; i < b; i++) {
       const j = i * 3;
@@ -63,6 +81,8 @@ const levels = new Float32Array(TILE * 3);
  */
 export function drawWave(g, o) {
   const { w, h, store, grid, loop } = o;
+  // Audio the engine no longer buffers is never drawn (1 s kept for the column at the edge).
+  store.compact(o.historyStart - 1);
   const secPerPx = grid ? grid.T / o.pxPerBeat : 1 / o.pxPerSec;
   let c = caches.get(g);
   if (!c) caches.set(g, (c = { view: '', tiles: new Map(), free: [], spp: 0, h: 0, color: '', mid: '', store: null, rev: 0 }));
@@ -86,7 +106,7 @@ export function drawWave(g, o) {
   }
 
   // Waveform from the tile cache, dimmed left of the playhead (already played).
-  const tA = Math.max(tAt(0), o.historyStart, store.t0), tB = Math.min(tAt(w), o.liveEdge, store.t0 + store.n * store.hop);
+  const tA = Math.max(tAt(0), o.historyStart, store.first()), tB = Math.min(tAt(w), o.liveEdge, store.t0 + store.n * store.hop);
   if (store.hop && tB > tA) {
     syncTiles(c, o, secPerPx);
     const span = TILE * c.spp, i0 = Math.floor((tA - store.t0) / span), i1 = Math.floor((tB - store.t0) / span);

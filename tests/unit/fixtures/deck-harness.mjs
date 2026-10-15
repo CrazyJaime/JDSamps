@@ -27,7 +27,7 @@ export function makeEngine(clock) {
     clock: new MasterClock(), decks: new Map(), events: [],
     master: { setAssign() {}, removeDeck() {} },
     event(level, text) { this.events.push({ t: clock.t, level, text }); },
-    broadcast() {}, updateClock(now) {}, wallNow: () => clock.t * 1000, ctxTimeAtWall: (w) => w / 1000, heardTime: () => clock.t,
+    broadcast() {}, broadcastWave() {}, updateClock(now) {}, wallNow: () => clock.t * 1000, ctxTimeAtWall: (w) => w / 1000, heardTime: () => clock.t,
   };
   return engine;
 }

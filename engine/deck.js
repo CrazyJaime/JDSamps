@@ -138,7 +138,7 @@ export class Deck {
       }
       const tStart = m.t0 / this.sr, hop = m.spf / this.sr;
       this.appendWave(tStart, hop, m.bands);
-      this.engine.broadcast({ t: 'wave', deck: this.id, tStart, hop, data: Array.from(m.bands) });
+      this.engine.broadcastWave(this, tStart, hop, m.bands);
     }
   }
 
@@ -152,11 +152,30 @@ export class Deck {
     w.n = Math.max(w.n, need / 3);
   }
 
-  waveBacklog() {
+  waveBacklog() { return this.waveSince(-Infinity); }
+
+  /** Waveform message from input time t (no earlier than historyStart) to the latest hop, or null. */
+  waveSince(t) {
     const w = this.wave;
     if (w.tStart == null || !w.n) return null;
-    const from = Math.max(0, Math.floor((this.ts.historyStart - w.tStart) / w.hop));
+    const from = Math.max(0, Math.floor((this.ts.historyStart - w.tStart) / w.hop), Math.round((t - w.tStart) / w.hop));
+    if (from >= w.n) return null;
     return { t: 'wave', deck: this.id, tStart: w.tStart + from * w.hop, hop: w.hop, data: Array.from(w.data.subarray(from * 3, w.n * 3)) };
+  }
+
+  /** Input time just after the latest waveform hop (-Infinity before the first). */
+  waveEnd() { const w = this.wave; return w.tStart == null ? -Infinity : w.tStart + w.n * w.hop; }
+
+  /** Forget the waveform before input time t (audio no longer buffered). */
+  compactWave(t) {
+    const w = this.wave;
+    if (w.tStart == null) return;
+    const k = Math.min(w.n, Math.floor((t - w.tStart) / w.hop));
+    if (k <= 0) return;
+    w.data.copyWithin(0, k * 3, w.n * 3);
+    w.data.fill(0, (w.n - k) * 3, w.n * 3);
+    w.tStart += k * w.hop;
+    w.n -= k;
   }
 
   // ------------------------------------------------------------------ tempo
@@ -499,14 +518,6 @@ export class Deck {
       this.starved = false; // re-evaluated on the next PLAY
     }
 
-    // Post-fader meter.
-    this.analyser.getFloatTimeDomainData(this.meterBuf);
-    let pk = 0, sq = 0;
-    for (let i = 0; i < this.meterBuf.length; i++) { const x = this.meterBuf[i], a = x < 0 ? -x : x; if (a > pk) pk = a; sq += x * x; }
-    this.meter.peak = pk;
-    this.meter.rms = Math.sqrt(sq / this.meterBuf.length);
-    if (pk >= 0.999) this.meter.clipUntil = now + 2;
-
     if (now >= this.nextAssist) { this.nextAssist = now + 0.25; this.assistTick(now, res); }
     if (now >= this.nextFxClock) {
       this.nextFxClock = now + 0.5;
@@ -517,6 +528,17 @@ export class Deck {
     }
     this.rack.tick(now);
     if (now >= this.nextTrim) { this.nextTrim = now + 2; this.trim(now, p); }
+  }
+
+  /** Post-fader meter over the last 2048 frames; only measured for a state a UI will be sent. */
+  meterTick(now) {
+    if (!this.ts || this.disposed) return;
+    this.analyser.getFloatTimeDomainData(this.meterBuf);
+    let pk = 0, sq = 0;
+    for (let i = 0; i < this.meterBuf.length; i++) { const x = this.meterBuf[i], a = x < 0 ? -x : x; if (a > pk) pk = a; sq += x * x; }
+    this.meter.peak = pk;
+    this.meter.rms = Math.sqrt(sq / this.meterBuf.length);
+    if (pk >= 0.999) this.meter.clipUntil = now + 2;
   }
 
   /** When the playhead reaches an input position where the source rate changed, change the engine rate exactly there. */
@@ -606,6 +628,7 @@ export class Deck {
     const hs = this.ts.historyStart;
     this.grids.prune(hs);
     this.src.prune(hs);
+    this.compactWave(hs);
     if (this.cue < hs) {
       const g = this.grids.at(hs + 0.05);
       this.cue = g && this.canBeat() ? g.t0 + Math.ceil((hs + 0.05 - g.t0) / g.T) * g.T : hs + 0.05;

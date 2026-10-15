@@ -5,6 +5,7 @@ import {
 } from './ext-harness.mjs';
 
 let h, server, deck, track, other;
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 before(async () => {
   server = await startTrackServer();
   h = await launchExtension({ ext: prepareExtension() });
@@ -120,6 +121,120 @@ test('a repeated DOWNLOAD_DONE is reported once', async () => {
   assert.equal(await offscreenEval(h, 'globalThis.__jdsEngine.downloads.size'), 0);
 });
 
+// ---------------------------------------------------------------- UI stream (final review ui/M2, perf)
+/** A raw UI port in the deck page that logs what arrives: state (deck ids) and wave (deck, span). */
+const rawPort = (page, { hello = true } = {}) => page.evaluate((hi) => {
+  if (window.__raw) window.__raw.port.disconnect();
+  const r = { log: [], port: chrome.runtime.connect({ name: 'jds-ui' }) };
+  r.port.onMessage.addListener((m) => {
+    const e = { t: m.t, at: performance.now() };
+    if (m.t === 'state') e.decks = m.s.decks.map((d) => d.id);
+    if (m.t === 'wave') Object.assign(e, { deck: m.deck, tStart: m.tStart, hop: m.hop, n: m.data.length / 3 });
+    r.log.push(e);
+  });
+  if (hi) r.port.postMessage({ t: 'hello' });
+  window.__raw = r;
+}, hello);
+const rawLog = (page) => page.evaluate(() => window.__raw.log);
+const rawSend = (page, m) => page.evaluate((x) => window.__raw.port.postMessage(x), m);
+const rawClose = (page) => page.evaluate(() => { window.__raw.port.disconnect(); window.__raw = null; });
+const deckWave = (id) => offscreenEval(h, `(() => { const d = __jdsEngine.decks.get(${id}); return { tStart: d.wave.tStart, end: d.wave.tStart + d.wave.n * d.wave.hop, hs: d.ts.historyStart }; })()`);
+const waveEnd = (e) => e.tStart + e.n * e.hop;
+
+test('a UI port gets no state or waveform before its hello; then state and the whole waveform backlog', async () => {
+  await rawPort(deck, { hello: false });
+  try {
+    await sleep(500);
+    assert.deepEqual((await rawLog(deck)).filter((e) => e.t === 'state' || e.t === 'wave').map((e) => e.t), []);
+    await rawSend(deck, { t: 'hello' });
+    await waitFor(async () => (await rawLog(deck)).some((e) => e.t === 'wave'), 3000);
+    const log = await rawLog(deck);
+    assert.equal(log[0].t, 'state');
+    const id = log[0].decks[0];
+    const w = log.find((e) => e.t === 'wave' && e.deck === id), ref = await deckWave(id);
+    assert.ok(Math.abs(w.tStart - Math.max(ref.tStart, ref.hs)) < w.hop, `first waveform from ${w.tStart}, buffered from ${ref.tStart}`);
+  } finally { await rawClose(deck); }
+});
+
+test('a deck new to a UI port arrives as a state, then its whole waveform, even when engine ticks run late', async () => {
+  await rawPort(deck);
+  const page = await h.context.newPage();
+  // Hold the engine's ticks (a busy or throttled main thread) from before the deck exists to 500 ms after.
+  await offscreenEval(h, `(() => { const E = __jdsEngine; if (!E.__tick) { E.__tick = E.tick; E.tick = function (m) { if (performance.now() < globalThis.__hold) return; return E.__tick.call(this, m); }; } globalThis.__hold = Infinity; return true; })()`);
+  let id = null;
+  try {
+    await page.goto(server.url('c'));
+    const tabId = await tabIdFor(h, server.url('c'));
+    const r = await hubCall(deck, { type: 'LOAD_TAB', tabId });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    id = await offscreenEval(h, `__jdsEngine.deckByTab(${tabId}).id`);
+    await sleep(500);
+    await offscreenEval(h, 'globalThis.__hold = performance.now() + 300, true');
+    await waitFor(async () => (await rawLog(deck)).some((e) => e.t === 'state' && e.decks.includes(id)), 3000);
+    await sleep(300);
+    const log = await rawLog(deck), s = log.findIndex((e) => e.t === 'state' && e.decks.includes(id));
+    assert.deepEqual(log.slice(0, s).filter((e) => e.t === 'wave' && e.deck === id).map((e) => e.tStart), [], 'waveform before any state lists the deck (the UI has no strip for it yet)');
+    const w = log.slice(s).find((e) => e.t === 'wave' && e.deck === id), ref = await deckWave(id);
+    assert.ok(w && Math.abs(w.tStart - Math.max(ref.tStart, ref.hs)) < w.hop, `first waveform from ${w && w.tStart}, deck's from ${ref.tStart}`);
+    assert.ok(w.n * w.hop > 0.4, `backlog covers ${w.n * w.hop} s`);
+  } finally {
+    await offscreenEval(h, '(() => { const E = __jdsEngine; E.tick = E.__tick; delete E.__tick; return true; })()');
+    if (id != null) await offscreenEval(h, `__jdsEngine.eject(${id}).then(() => true)`);
+    await page.close();
+    await rawClose(deck);
+  }
+});
+
+test('a hidden UI page gets no waveform and state at most twice a second; shown again, a state and the waveform it missed', async () => {
+  await rawPort(deck);
+  try {
+    await waitFor(async () => (await rawLog(deck)).filter((e) => e.t === 'wave').length >= 3, 5000);
+    await rawSend(deck, { t: 'vis', hidden: true });
+    await sleep(150);
+    const mark = (await rawLog(deck)).length;
+    await sleep(1500);
+    let log = await rawLog(deck);
+    const during = log.slice(mark), id = log[0].decks[0];
+    assert.deepEqual(during.filter((e) => e.t === 'wave').map((e) => e.tStart), [], 'no waveform while hidden');
+    const states = during.filter((e) => e.t === 'state');
+    assert.ok(states.length >= 1 && states.length <= 4, `${states.length} states in 1.5 s hidden`);
+    for (let i = 1; i < states.length; i++) assert.ok(states[i].at - states[i - 1].at > 400, `states ${Math.round(states[i].at - states[i - 1].at)} ms apart`);
+    const sentTo = Math.max(...log.filter((e) => e.t === 'wave' && e.deck === id).map(waveEnd));
+    const mark2 = log.length;
+    await rawSend(deck, { t: 'vis', hidden: false });
+    await sleep(400);
+    log = await rawLog(deck);
+    const after = log.slice(mark2), ref = await deckWave(id);
+    assert.equal(after[0] && after[0].t, 'state', 'a full state first');
+    const w = after.find((e) => e.t === 'wave' && e.deck === id);
+    assert.ok(w && Math.abs(w.tStart - sentTo) < w.hop / 2, `waveform resumes at ${w && w.tStart}, last sent up to ${sentTo}`);
+    assert.ok(w.n * w.hop > 1.4, `it covers the hidden time (${(w.n * w.hop).toFixed(2)} s)`);
+    const tail = after.filter((e) => e.t === 'wave' && e.deck === id);
+    assert.ok(Math.abs(waveEnd(tail[tail.length - 1]) - ref.end) < 0.5, 'and live waveform follows');
+    assert.ok(after.filter((e) => e.t === 'state').length >= 6, 'per-tick state again');
+  } finally { await rawClose(deck); }
+});
+
+test('meter ticks that queued up behind a stall run the decks but send one state, for the newest', async () => {
+  const r = await offscreenEval(h, `(() => {
+    const E = __jdsEngine, sr = E.ctx.sampleRate, ds = [...E.decks.values()];
+    let posts = 0, ticks = 0;
+    const post = E.post, dt = ds.map((d) => d.tick);
+    E.post = function (p, m) { if (m && m.t === 'state') posts++; return post.call(this, p, m); };
+    ds.forEach((d, i) => { d.tick = function (now) { ticks++; return dt[i].call(this, now); }; });
+    try {
+      const at = (lag) => ({ ...E.mm, t: 'meter', frame: Math.round(E.ctx.currentTime * sr) - lag });
+      E.tick(at(300));
+      const one = posts; posts = 0; ticks = 0;
+      for (let k = 4; k >= 0; k--) E.tick(at(768 + k * 1536)); // five ticks, all but the last already overtaken
+      return { one, posts, ticks, decks: ds.length };
+    } finally { E.post = post; ds.forEach((d, i) => { d.tick = dt[i]; }); }
+  })()`);
+  assert.ok(r.decks >= 1 && r.one >= 1, JSON.stringify(r));
+  assert.equal(r.ticks, 5 * r.decks, 'every queued tick runs the decks');
+  assert.equal(r.posts, r.one, 'one state broadcast for the five');
+});
+
 test('closing the deck page mid-press ends held rolls, nudges, kills and FX, but not latched ones', async () => {
   await installClient(deck);
   const id = (await state(deck)).decks[0].id;
@@ -151,6 +266,17 @@ test('closing the deck page mid-press ends held rolls, nudges, kills and FX, but
 test('closing the tab ejects its deck', async () => {
   await track.close();
   await waitFor(async () => (await hubCall(deck, { type: 'LIST_SOURCES' })).ok && (await h.sw.evaluate(() => chrome.action.getBadgeText({}))) === '', 8000);
+});
+
+test('with no decks and no UI the engine suspends its AudioContext; a UI hello resumes it', async () => {
+  await offscreenEval(h, '__jdsEngine.idleMs = 300, true');
+  assert.equal(await offscreenEval(h, '__jdsEngine.ctx.state'), 'running');
+  await deck.close();
+  await waitFor(() => offscreenEval(h, '__jdsEngine.ctx.state === "suspended"'), 5000);
+  deck = await openExtPage(h, 'deck.html');
+  await waitFor(() => offscreenEval(h, '__jdsEngine.ctx.state === "running"'), 5000);
+  await waitFor(() => deck.evaluate(() => document.getElementById('engineStatus').dataset.status === 'up' && /^Engine ·/.test(document.getElementById('engineText').textContent)), 5000);
+  await offscreenEval(h, '__jdsEngine.idleMs = 30000, true');
 });
 
 test('a capture warning raised while the deck page is closed is shown when it opens', async () => {
