@@ -102,11 +102,16 @@ export class Timeshift {
     return seg;
   }
 
-  /** Bend the rate in effect at T by `factor` for `duration`, then settle at `endRate` (default: that rate). */
-  bend(now, T, factor, duration, endRate) {
+  /**
+   * Bend the rate in effect at T by `factor` for `duration`, then settle at `end` ({rate, semitones};
+   * default: the rate in effect). With `pitchFollows` (vinyl), the pitch bends with the speed.
+   */
+  bend(now, T, factor, duration, end = {}, pitchFollows = false) {
     const base = this.segAt(T);
-    this.change(now, T, { rate: base.rate * factor });
-    this.then(now, T + duration, { rate: endRate !== undefined ? endRate : base.rate });
+    const bent = { rate: base.rate * factor };
+    if (pitchFollows) bent.semitones = base.semitones + 12 * Math.log2(factor);
+    this.change(now, T, bent);
+    this.then(now, T + duration, { rate: base.rate, ...end });
     return T + duration;
   }
 

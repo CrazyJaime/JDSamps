@@ -161,7 +161,8 @@ export class Deck {
 
   desiredRate(p) { return ((1 + this.params.pitch) / this.src.rateAt(p)) * this.nudgeFactor; }
   effRate(p) { const d = this.desiredRate(p); return this.starved ? Math.min(1, d) : d; }
-  semis(p) { const s = this.src.rateAt(p); return engineSemitones(this.params.keyLock, s, (1 + this.params.pitch) / s); }
+  /** Vinyl mode (KEY off) follows the engine rate actually applied: starve clamp and nudge included. */
+  semis(p) { return engineSemitones(this.params.keyLock, this.src.rateAt(p), this.effRate(p)); }
 
   /** Schedule a change at T, always restating rate/semitones so a pending bend can never stick. */
   sched(T, fields) {
@@ -235,7 +236,9 @@ export class Deck {
         const wasSync = this.syncOn;
         if (mb && this.canBeat()) this.syncOn = true;
         if (!wasSync && this.syncOn) this.syncTick(now); // tempo first: the start and its alignment use the synced rate
-        const from = this.snapToGrid(this.cue);
+        // From the cue only when the playhead sits there (fresh, CUE-returned, previewing); else resume in place.
+        const p = this.ts.posAt(start);
+        const from = this.previewing || Math.abs(p - this.cue) < 0.02 ? this.snapToGrid(this.cue) : mb ? this.snapToGrid(p) : p;
         this.startAt(start, this.alignForStart(from, start));
         this.previewing = false;
         return OK;
@@ -521,7 +524,8 @@ export class Deck {
     const plan = planCorrection(e, { audible: this.audible(), keyLock: this.params.keyLock });
     if (plan.kind === 'bend') {
       const pEnd = p + rate * (1 + plan.bend) * plan.duration;
-      this.settleUntil = this.ts.bend(now, T, 1 + plan.bend, plan.duration, this.effRate(pEnd)) + 0.25;
+      const end = { rate: this.effRate(pEnd), semitones: this.semis(pEnd) };
+      this.settleUntil = this.ts.bend(now, T, 1 + plan.bend, plan.duration, end, !this.params.keyLock) + 0.25;
     }
     else if (plan.kind === 'jump') { this.sched(T, { input: this.ts.clampInput(p + plan.seconds * rate) }); this.settleUntil = T + 0.3; }
   }

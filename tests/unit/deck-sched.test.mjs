@@ -189,19 +189,25 @@ test('a source-rate crossing dropped by a later change is re-planned at the step
   assert.ok(sw && near(sw.input, step, 1e-6), `rate switched at input ${sw && sw.input}, step at ${step}`);
 });
 
-test('Timeshift.bend ends at the rate the caller asks for', () => {
+test('Timeshift.bend ends at the rate the caller asks for; with pitchFollows the pitch bends too', () => {
   const clock = { t: 0 };
   const ts = new Timeshift(new FakeNode(clock), { sampleRate: 48000, latency: 0.12, outLatency: 0.06 });
   ts.liveEdge = 30;
   ts.change(0, 0.2, { active: true, input: 0, rate: 1, semitones: 0 });
   clock.t = 1;
-  assert.ok(near(ts.bend(1, 1.2, 1.04, 0.5, 1.02), 1.7, 1e-12));
+  assert.ok(near(ts.bend(1, 1.2, 1.04, 0.5, { rate: 1.02 }), 1.7, 1e-12));
   assert.ok(near(ts.rateAt(1.3), 1.04, 1e-12), 'bend is relative to the rate in effect');
+  assert.equal(ts.segAt(1.3).semitones, 0, 'key lock: pitch untouched');
   assert.ok(near(ts.rateAt(1.8), 1.02, 1e-12), 'bend ends at the requested rate');
   clock.t = 1.21; ts.flush(1.21);
   clock.t = 2;
   assert.ok(near(ts.bend(2, 2.2, 1.04, 0.5), 2.7, 1e-12));
   assert.ok(near(ts.rateAt(2.8), 1.02, 1e-12), 'without an end rate the bend returns to the rate in effect');
+  clock.t = 2.21; ts.flush(2.21);
+  clock.t = 3;
+  ts.bend(3, 3.2, 0.98, 0.5, { rate: 1.02, semitones: 12 * Math.log2(1.02) }, true);
+  assert.ok(near(ts.segAt(3.3).semitones, 12 * Math.log2(0.98), 1e-12), 'vinyl: pitch bends with the speed');
+  assert.ok(near(ts.segAt(3.8).semitones, 12 * Math.log2(1.02), 1e-12));
 });
 
 test('Timeshift.change folds a later change into a pending start instead of dropping it', () => {
@@ -225,4 +231,82 @@ test('Timeshift.change folds a later change into a pending start instead of drop
   assert.equal(ts.playingAt(1), false);
   assert.equal(node.segAt(1).active, false);
   assert.ok(near(ts.posAt(1), 2.9, 1e-12) && near(node.posAt(1), 2.9, 1e-12));
+});
+
+// ---------------------------------------------------------------- I5: SYNC PLAY resumes in place
+const BEAT = 60 / 124;
+
+test('SYNC PLAY after a pause resumes from the paused position, beat-aligned, not from the cue', async () => {
+  const { d, clock, go } = setup({ master: { bpm: 128 } });
+  await d.act('play');
+  go(10);
+  await d.act('pause');
+  go(1);
+  const paused = d.ts.posAt(clock.t);
+  assert.ok(paused > 11, `paused at ${paused}`);
+  await d.act('syncPlay');
+  const start = d.ts.segs[d.ts.segs.length - 1];
+  assert.ok(start.active && Math.abs(start.input - paused) <= BEAT / 2 + 1e-9, `resumes at ${start.input}, paused at ${paused}`);
+  go(3);
+  assertPlaying(d, clock.t, 128 / 124);
+  assert.ok(d.phaseMs != null && Math.abs(d.phaseMs) < 3, `phase ${d.phaseMs} ms`);
+});
+
+test('SYNC PLAY from the cue (fresh, or returned by CUE) starts at the cue', async () => {
+  const { d, clock, go } = setup({ master: { bpm: 128 } });
+  await d.act('syncPlay');
+  let start = d.ts.segs[d.ts.segs.length - 1];
+  assert.ok(Math.abs(start.input - d.cue) <= BEAT / 2 + 1e-9, `fresh deck starts at ${start.input}, cue ${d.cue}`);
+  go(5);
+  await d.act('cueDown');   // playing: back to the cue and pause
+  go(0.5);
+  assert.ok(near(d.ts.posAt(clock.t), d.cue, 1e-9));
+  await d.act('syncPlay');
+  start = d.ts.segs[d.ts.segs.length - 1];
+  assert.ok(Math.abs(start.input - d.cue) <= BEAT / 2 + 1e-9, `CUE-returned deck starts at ${start.input}, cue ${d.cue}`);
+});
+
+// ---------------------------------------------------------------- M8: vinyl pitch follows the applied rate
+test('vinyl mode: a starved deck clamped to 1x is not detuned', async () => {
+  const { d, clock, go } = setup({ pitch: 0.067 });
+  d.setParam('keyLock', false);
+  d.ts.liveEdge = d.cue + d.ts.lat + 0.45; // Web-Audio-only page, reserve under GUARD
+  await d.act('play');
+  go(1);
+  assert.equal(d.starved, true);
+  assertPlaying(d, clock.t, 1);
+  assert.ok(near(d.node.segAt(clock.t).semitones, 0, 1e-9), `semitones ${d.node.segAt(clock.t).semitones} at 1x`);
+});
+
+test('vinyl mode: a nudge bends the pitch with the speed', async () => {
+  const { d, clock, go } = setup();
+  d.setParam('keyLock', false);
+  await d.act('play');
+  go(1);
+  await d.act('nudge', { dir: 1 });
+  go(0.5);
+  assertPlaying(d, clock.t, 1.04);
+  assert.ok(near(d.node.segAt(clock.t).semitones, 12 * Math.log2(1.04), 1e-9), `semitones ${d.node.segAt(clock.t).semitones}`);
+  await d.act('nudge', { dir: 0 });
+  go(0.5);
+  assert.ok(near(d.node.segAt(clock.t).semitones, 0, 1e-9));
+});
+
+test('vinyl mode: a phase bend moves the pitch with the speed, key lock keeps it', async () => {
+  for (const keyLock of [false, true]) {
+    const { d, clock, go, m } = setup({ master: { bpm: 128 } });
+    d.setParam('keyLock', keyLock);
+    await d.act('syncPlay');
+    go(3);
+    const want = 128 / 124;
+    m.t0 += 0.02;           // the master's beats move 20 ms: the phase loop bends
+    let bent = null;
+    for (let i = 0; i < 200 && !bent; i++) { go(1536 / 48000); const r = d.node.rateAt(clock.t); if (Math.abs(r - want) > 1e-6) bent = d.node.segAt(clock.t); }
+    assert.ok(bent, 'a bend happened');
+    const semis = keyLock ? 0 : 12 * Math.log2(bent.rate);
+    assert.ok(near(bent.semitones, semis, 1e-9), `keyLock=${keyLock}: bent rate ${bent.rate}, semitones ${bent.semitones}`);
+    go(4);
+    assertPlaying(d, clock.t, want);
+    assert.ok(near(d.node.segAt(clock.t).semitones, keyLock ? 0 : 12 * Math.log2(want), 1e-9), 'pitch settles with the rate');
+  }
 });
