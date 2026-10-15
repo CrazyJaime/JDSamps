@@ -140,6 +140,10 @@
         <span class="title" data-title></span>
         <button class="btn ghost icon sm" data-act="eject" aria-label="Eject deck"><svg class="ic"><use href="#i-eject"/></svg></button>
       </header>
+      <div class="deck-assign">
+        <div class="seg xf" data-seg="xf" role="group" aria-label="Crossfader assign"><button data-v="A">A</button><button data-v="THRU">THRU</button><button data-v="B">B</button></div>
+        <button class="btn rec" data-act="rec" aria-pressed="false"><svg class="ic"><use href="#i-dot"/></svg><span>REC</span><span class="mono rec-time" data-rec-time></span></button>
+      </div>
       <div class="deck-tempo">
         <div class="bpm"><span class="bpm-val mono" data-bpm>—</span><span class="bpm-unit">BPM</span></div>
         <div class="tempo-meta">
@@ -148,6 +152,7 @@
           <span class="mono native" data-native></span>
         </div>
         <div class="leds" data-leds aria-hidden="true"><i></i><i></i><i></i><i></i></div>
+        <div class="phase" data-phase hidden title="Phase offset to the master clock"><span data-phase-dot></span></div>
       </div>
       <div class="deck-status">
         <div class="reserve" title="Buffered audio ahead of the playhead (lets the deck play faster than the source)">
@@ -157,7 +162,6 @@
         </div>
         <span class="badge" data-assist hidden>ASSIST</span>
         <span class="badge warn" data-starved hidden>RESERVE EMPTY</span>
-        <div class="phase" data-phase hidden title="Phase offset to the master clock"><span data-phase-dot></span></div>
       </div>
       <div class="transport">
         <button class="btn cue big" data-hold="cue">CUE</button>
@@ -186,12 +190,13 @@
         <div class="knobgrid">
           <div class="knob" data-ctl="trim" data-label="GAIN"></div>
           <div class="knob" data-ctl="filter" data-label="FILTER"></div>
+          <div class="knob" data-ctl="filter.res" data-label="RES"></div>
           <div class="eqcol"><div class="knob" data-ctl="eq.hi" data-label="HI"></div><button class="kill" data-kill="hi">KILL</button></div>
           <div class="eqcol"><div class="knob" data-ctl="eq.mid" data-label="MID"></div><button class="kill" data-kill="mid">KILL</button></div>
           <div class="eqcol"><div class="knob" data-ctl="eq.low" data-label="LOW"></div><button class="kill" data-kill="low">KILL</button></div>
         </div>
         <div class="channel">
-          <canvas class="vmeter" data-meter aria-label="Channel level"></canvas>
+          <button class="meter-btn" data-act="clipReset" aria-label="Channel level: click to clear the clip light" title="Click to clear the clip light"><canvas class="vmeter" data-meter></canvas></button>
           <div class="vfader" data-ctl="fader"></div>
         </div>
       </div>
@@ -207,15 +212,11 @@
         <div class="fx-row">
           <div class="knob sm" data-ctl="fx.level" data-label="LEVEL"></div>
           <button class="pad fxon" data-pad="fx.on" aria-pressed="false">FX ON</button>
+          <div class="rolls" role="group" aria-label="Roll (hold)">
+            <button class="pad" data-roll="0.125">1/8</button><button class="pad" data-roll="0.25">1/4</button><button class="pad" data-roll="0.5">1/2</button><button class="pad" data-roll="1">1</button>
+          </div>
         </div>
       </div>
-      <div class="rolls" role="group" aria-label="Roll (hold)">
-        <button class="pad" data-roll="0.125">1/8</button><button class="pad" data-roll="0.25">1/4</button><button class="pad" data-roll="0.5">1/2</button><button class="pad" data-roll="1">1</button>
-      </div>
-      <footer class="deck-foot">
-        <div class="seg xf" data-seg="xf" role="group" aria-label="Crossfader assign"><button data-v="A">A</button><button data-v="THRU">THRU</button><button data-v="B">B</button></div>
-        <button class="btn rec" data-act="rec" aria-pressed="false"><svg class="ic"><use href="#i-dot"/></svg><span>REC</span><span class="mono rec-time" data-rec-time></span></button>
-      </footer>
     </section>
   </template>
 

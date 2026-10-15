@@ -14,14 +14,30 @@ let restored = false;
 let wakeLock = null;
 let wakeLockPending = false;
 
+const toastTimers = new WeakMap();
+/** Toasts sit top centre (no controls there), click to dismiss; a repeated text bumps a counter. */
 function toast(text, level = 'info') {
   const box = $('#toasts');
-  const t = document.createElement('div');
-  t.className = `toast ${level}`;
-  t.textContent = String(text);
+  const msg = String(text);
+  let t = [...box.children].find((x) => x.dataset.text === msg && x.dataset.level === level);
+  if (t) {
+    t.dataset.count = String(Number(t.dataset.count) + 1);
+    setText(t.lastElementChild, `×${t.dataset.count}`);
+    clearTimeout(toastTimers.get(t));
+  } else {
+    t = document.createElement('div');
+    t.className = `toast ${level}`;
+    t.title = `${msg} (click to dismiss)`;
+    Object.assign(t.dataset, { text: msg, level, count: '1' });
+    const body = document.createElement('span'), count = document.createElement('span');
+    body.textContent = msg;
+    count.className = 'toast-count mono';
+    t.append(body, count);
+    t.addEventListener('click', () => t.remove());
+  }
   box.append(t);
-  while (box.children.length > 4) box.firstElementChild.remove();
-  setTimeout(() => t.remove(), level === 'error' ? 8000 : 4000);
+  while (box.children.length > 3) box.firstElementChild.remove();
+  toastTimers.set(t, setTimeout(() => t.remove(), level === 'error' ? 8000 : 4000));
 }
 
 const persist = (key, value) => { try { chrome.storage.local.set({ [key]: value }); } catch (_) {} };
@@ -73,6 +89,8 @@ function onState(s) {
   if (!strips.has(selected)) select(s.decks.length ? s.decks[0].id : null);
   else select(selected);
   $('#empty').hidden = s.decks.length > 0;
+  document.body.dataset.decks = String(s.decks.length); // deck.css: wave row height, compact decks above 3
+  document.body.classList.toggle('compact', s.decks.length > 3);
   master.update(s);
   setText($('#engineText'), `${s.engineState === 'running' ? 'Engine' : `Engine ${s.engineState}`} · ${(s.sampleRate / 1000).toFixed(1)} kHz · ${Math.round(s.outputLatency * 1000)} ms`);
   const n = s.decks.length;

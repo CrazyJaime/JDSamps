@@ -64,6 +64,7 @@ export class DeckStrip {
       'eq.mid': knob('eq.mid', { format: (v) => db(v, 6) }),
       'eq.low': knob('eq.low', { format: (v) => db(v, 6) }),
       filter: knob('filter', { min: -1, max: 1, def: 0, bipolar: true, format: (v) => (Math.abs(v) < 0.04 ? 'OFF' : v < 0 ? `LP ${Math.round(-v * 100)}` : `HP ${Math.round(v * 100)}`) }),
+      'filter.res': knob('filter.res', { def: 0.3, format: (v) => `${Math.round(v * 100)}%` }),
       'fx.level': knob('fx.level', { def: 0.5, format: (v) => `${Math.round(v * 100)}%` }),
     };
     // On-air fader: no wheel (a stray scroll must not cut a deck) and no double-click jump to full.
@@ -92,7 +93,13 @@ export class DeckStrip {
     }));
     this.cue = bindPad(this.refs.cue, { latch: false, onDown: () => this.act('cueDown'), onUp: () => this.act('cueUp') });
     for (const [sel, dir] of [['[data-hold="nudge-"]', -1], ['[data-hold="nudge+"]', 1]]) {
-      bindPad(this.q(sel), { latch: false, onDown: () => this.act('nudge', { dir, fine: false }), onUp: () => this.act('nudge', { dir: 0 }) });
+      // Shift = fine ±1% (spec §3.3), like the arrow keys. Registered before bindPad so the press sees it.
+      const el = this.q(sel);
+      let fine = false;
+      const shift = (e) => { fine = e.shiftKey; };
+      el.addEventListener('pointerdown', shift);
+      el.addEventListener('keydown', shift);
+      bindPad(el, { latch: false, onDown: () => this.act('nudge', { dir, fine }), onUp: () => this.act('nudge', { dir: 0 }) });
     }
     const on = (sel, fn) => this.q(sel).addEventListener('click', fn);
     on('[data-act="playToggle"]', () => this.act('playToggle'));
@@ -111,6 +118,7 @@ export class DeckStrip {
     on('[data-act="gridFwd"]', (e) => this.act('gridShift', e.shiftKey ? { ms: 10 } : { beats: 0.5 }));
     on('[data-act="keyLock"]', () => this.set('keyLock', !this.d.params.keyLock));
     on('[data-act="syncMode"]', () => this.set('syncMode', this.d.params.syncMode === 'BEAT' ? 'TEMPO' : 'BEAT'));
+    on('[data-act="clipReset"]', () => this.act('clipReset')); // deck meter: clear its clip light (spec §3.7)
     on('[data-act="range"]', () => {
       const i = PITCH_RANGES.indexOf(this.d.params.range);
       this.set('range', PITCH_RANGES[(i + 1) % PITCH_RANGES.length]);
