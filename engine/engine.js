@@ -15,7 +15,10 @@ const STRETCH_URL = new URL('../vendor/signalsmith-stretch/SignalsmithStretch.js
 SignalsmithStretch.moduleUrl = STRETCH_URL;
 const workletUrl = (f) => new URL(`../worklets/${f}`, import.meta.url).href;
 const withTimeout = (p, ms, msg) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
-const STOP_TAB_MS = 400; // an eject waits at most this long for its tab to stop playing
+// An eject waits at most this long for its tab to stop playing. The hub bounds its own work (pause
+// for 250 ms, else mute), so this only guards against a hub that never answers; on a busy machine
+// a tighter limit would release the capture while the tab is still playing.
+const STOP_TAB_MS = 2500;
 
 // Trust: the relay content script runs in every frame of every site, so any renderer can speak
 // as it. Only extension contexts (the service worker, the deck page) may command the engine.

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { openUi } from './ui-harness.mjs';
-import { threeDecks, makeState, makeWave } from './fixtures/mock-state.mjs';
+import { deck, threeDecks, makeState, makeWave } from './fixtures/mock-state.mjs';
 
 const ART = path.resolve(path.dirname(fileURLToPath(import.meta.url)), 'artifacts');
 const SOURCES = {
@@ -230,6 +230,122 @@ test('during a CUE preview the PLAY button offers Play, not Pause', async () => 
   await page.waitForTimeout(50);
 });
 
+test('the track-title tooltip sits on the title only, not over the whole deck', async () => {
+  assert.equal(await deckEl(1).getAttribute('title'), null);
+  assert.equal(await deckEl(1).locator('[data-title]').getAttribute('title'), 'Daft Punk — One More Time');
+  assert.equal(await deckEl(1).locator('[data-ctl="fader"]').evaluate((e) => e.closest('[title]')), null);
+});
+
+test('screen readers get deck-specific names: sections, kills, knobs and faders; labelled canvases are images', async () => {
+  assert.equal(await deckEl(1).getAttribute('aria-label'), 'Deck 1: Daft Punk — One More Time');
+  assert.equal(await deckEl(3).getAttribute('aria-label'), 'Deck 3: <img src=x onerror="window.pwned=1"> Bandcamp exclusive');
+  const kills = await deckEl(2).locator('[data-kill]').evaluateAll((els) => els.map((e) => e.getAttribute('aria-label')));
+  assert.deepEqual(kills, ['Kill high', 'Kill mid', 'Kill low']);
+  const sliders = await deckEl(2).locator('[role="slider"]').evaluateAll((els) => els.map((e) => e.getAttribute('aria-label')));
+  assert.ok(sliders.length >= 9, JSON.stringify(sliders));
+  for (const name of sliders) assert.match(name, /^Deck 2 \S/);
+  assert.ok(sliders.includes('Deck 2 tempo') && sliders.includes('Deck 2 channel fader'), JSON.stringify(sliders));
+  assert.equal(await deckEl(2).locator('[data-ctl="trim"] .k-label').textContent(), 'GAIN', 'the visible label is unchanged');
+  const canvases = await page.locator('canvas[aria-label]').evaluateAll((els) => els.map((e) => [e.id, e.getAttribute('role')]));
+  assert.ok(canvases.length >= 2);
+  for (const [id, role] of canvases) assert.equal(role, 'img', id);
+  assert.equal(await page.evaluate(() => window.pwned), undefined);
+});
+
+test('hold pads take no touch panning (CUE, rolls, KILL, FX ON, nudge, eject, REC)', async () => {
+  const sel = '[data-hold="cue"], [data-roll], [data-kill], [data-pad="fx.on"], [data-hold^="nudge"], [data-act="eject"], [data-act="rec"], #mixRecBtn';
+  const r = await page.locator(sel).evaluateAll((els) => els.map((e) => [e.dataset.hold || e.dataset.roll || e.dataset.kill || e.dataset.pad || e.dataset.act || e.id, getComputedStyle(e).touchAction]));
+  assert.ok(r.length >= 3 * 13 + 1, `found ${r.length}`);
+  assert.deepEqual(r.filter(([, ta]) => ta !== 'none'), []);
+});
+
+test('the CUE light follows the engine only: lit while previewing or paused at the cue, never painted by the press', async () => {
+  const cue = deckEl(3).locator('[data-hold="cue"]');
+  const lit = () => cue.evaluate((e) => e.classList.contains('on'));
+  const push = async (over) => { const s = threeDecks(); Object.assign(s.decks[2], over); await ui.push({ t: 'state', s }); await page.waitForTimeout(30); };
+  await push({ playing: true, previewing: true, playhead: 2.4 });
+  assert.equal(await lit(), true, 'previewing from the cue');
+  await push({ playing: true, previewing: false, playhead: 10 });
+  assert.equal(await lit(), false, 'playing');
+  const b = await cue.boundingBox();
+  await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2);
+  await page.mouse.down();
+  await page.waitForTimeout(30);
+  assert.equal(await lit(), false, 'the press alone does not light CUE');
+  await push({ playing: true, previewing: true, playhead: 2.1 });
+  assert.equal(await lit(), true, 'held and previewing');
+  await push({ playing: true, previewing: true, playhead: 2.5 });
+  assert.equal(await lit(), true, 'still held and previewing');
+  await page.mouse.up();
+  await push({ playing: false, previewing: false, playhead: 2.0 });
+  assert.equal(await lit(), true, 'back at the cue');
+  await push({ playing: false, previewing: false, playhead: 7 });
+  assert.equal(await lit(), false, 'paused away from the cue');
+  await ui.push({ t: 'state', s: threeDecks() });
+  await page.waitForTimeout(30);
+});
+
+test('during a roll the extrapolated playhead stays inside the loop', async () => {
+  // Snapshots stalled: the UI extrapolates the full 250 ms. A 1/8-beat loop in beat 0 of a bar.
+  const T = 60 / 124, start = 2.0 + 40.5 * T, L = T / 8;
+  const litLed = async (loop) => {
+    const s = threeDecks();
+    s.wallMs = Date.now() - 1000;
+    Object.assign(s.decks[0], { playhead: start + 0.01, loop, roll: loop ? 0.125 : null });
+    await ui.push({ t: 'state', s });
+    await page.waitForTimeout(80);
+    return deckEl(1).locator('[data-leds] i').evaluateAll((els) => els.findIndex((e) => e.classList.contains('on')));
+  };
+  assert.equal(await litLed(null), 1, 'without a loop the extrapolation crosses into the next beat');
+  assert.equal(await litLed({ start, end: start + L }), 0, 'with a loop it wraps back into the loop');
+  await ui.push({ t: 'state', s: threeDecks() });
+  await page.waitForTimeout(30);
+});
+
+test('while the page is hidden snapshots touch no deck or master DOM; showing the page applies the latest one', async () => {
+  const setVis = (hidden) => page.evaluate((h) => {
+    if (h) {
+      Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+      Object.defineProperty(document, 'hidden', { configurable: true, get: () => true });
+    } else { delete document.visibilityState; delete document.hidden; }
+    document.dispatchEvent(new Event('visibilitychange'));
+  }, hidden);
+  await setVis(true);
+  try {
+    await page.evaluate(() => {
+      window.__recs = [];
+      window.__mo = new MutationObserver((r) => window.__recs.push(...r));
+      for (const el of document.querySelectorAll('.deck, .wave-row, #master, .xfader-bar, #mixRecBtn, .clock')) window.__mo.observe(el, { subtree: true, attributes: true, childList: true, characterData: true });
+    });
+    for (let i = 0; i < 5; i++) {
+      const s = threeDecks();
+      s.decks[0].title = `Hidden update ${i}`;
+      s.decks[0].bpm = { ...s.decks[0].bpm, out: 130 + i };
+      s.decks[1].params.trim = 0.2;
+      s.decks[2].rec = { state: 'recording', format: 'wav', seconds: 10 + i };
+      s.master.params['master.volume'] = 0.8;
+      s.clock = { mode: 'deck', deckId: 1, bpm: 130 + i };
+      await ui.push({ t: 'state', s });
+    }
+    await page.waitForTimeout(60);
+    const writes = await page.evaluate(() => {
+      const r = [...window.__recs, ...window.__mo.takeRecords()];
+      window.__mo.disconnect();
+      return [...new Set(r.map((m) => `${m.type} ${m.target.nodeName}.${m.target.getAttribute ? m.target.getAttribute('class') || '' : ''} ${m.attributeName || ''}`))];
+    });
+    assert.deepEqual(writes, [], 'no DOM writes while hidden');
+  } finally { await setVis(false); }
+  await page.waitForTimeout(30);
+  assert.equal(await deckEl(1).locator('[data-title]').textContent(), 'Hidden update 4');
+  assert.equal(await deckEl(1).locator('[data-bpm]').textContent(), '134.0');
+  assert.equal(await deckEl(2).locator('[data-ctl="trim"]').getAttribute('aria-valuenow'), '0.200');
+  assert.equal(await deckEl(3).locator('[data-rec-time]').textContent(), '00:14');
+  assert.equal(await page.locator('#masterVol').getAttribute('aria-valuenow'), '0.800');
+  assert.equal(await page.locator('#clockBpm').textContent(), '134.0');
+  await ui.push({ t: 'state', s: threeDecks() });
+  await page.waitForTimeout(30);
+});
+
 test('no console errors', () => { assert.deepEqual(ui.errors, []); });
 
 test('empty state is shown with no decks', async () => {
@@ -241,6 +357,110 @@ test('empty state is shown with no decks', async () => {
     fs.mkdirSync(ART, { recursive: true });
     await u2.page.screenshot({ path: path.join(ART, 'deck-ui-empty.png') });
   } finally { await u2.close(); }
+});
+
+// Spec §3.9: DOM nodes are updated only when their values change.
+test('six decks: an unchanged snapshot writes nothing to the deck or master DOM', async () => {
+  const decks = Array.from({ length: 6 }, (_, i) => deck({
+    id: i + 1, slot: i + 1, tabId: 100 + i, title: `Track ${i + 1}`, favIconUrl: i === 0 ? 'data:image/gif;base64,R0lGODlhAQABAAAAACw=' : '',
+    ...(i === 1 ? { sync: { on: false, mode: 'BEAT', isMaster: true, outOfRange: false, phaseMs: null }, rec: { state: 'recording', format: 'wav', seconds: 73.4 } } : {}),
+    ...(i === 2 ? { starved: true, reserve: 0.4, engineRate: 1.06, assist: { available: true, active: true, sourceRate: 1.06 } } : {}),
+    ...(i === 3 ? { playing: false, playhead: 2.0, sync: { on: true, mode: 'BEAT', isMaster: false, outOfRange: true, phaseMs: null } } : {}),
+    ...(i === 4 ? { bpm: { state: 'SEARCH', native: null, out: null, conf: 0.1, mult: 1, tapped: false }, params: { 'kill.low': true, 'fx.on': true } } : {}),
+  }));
+  const state = makeState({ decks });
+  const u = await openUi({ state, viewport: { width: 1920, height: 1080 } });
+  try {
+    await u.page.waitForSelector('.deck >> nth=5');
+    await u.page.waitForTimeout(100);
+    const r = await u.page.evaluate((s) => {
+      const mo = new MutationObserver(() => {});
+      for (const el of document.querySelectorAll('.deck, .wave-row, #master, .xfader-bar, #mixRecBtn, .clock')) mo.observe(el, { subtree: true, attributes: true, childList: true, characterData: true });
+      window.__fake.push({ t: 'state', s });
+      mo.takeRecords();
+      const N = 10;
+      for (let i = 0; i < N; i++) window.__fake.push({ t: 'state', s });
+      const recs = mo.takeRecords();
+      mo.disconnect();
+      const what = [...new Set(recs.map((m) => `${m.type} ${m.target.nodeName}.${m.target.getAttribute ? m.target.getAttribute('class') || '' : ''} ${m.attributeName || ''}`))];
+      return { perSnapshot: recs.length / N, what };
+    }, state);
+    console.log(`DOM writes per unchanged 6-deck snapshot: ${r.perSnapshot}`);
+    assert.deepEqual(r, { perSnapshot: 0, what: [] });
+    assert.deepEqual(u.errors, []);
+  } finally { await u.close(); }
+});
+
+describe('sources drawer refresh', () => {
+  let su, sp;
+  const list = (over = {}) => ({ ok: true, tabs: SOURCES.tabs.map((t) => ({ ...t, ...(over[t.id] || {}) })) });
+  const setReply = (r) => sp.evaluate((x) => { window.__fake.hubReplies.LIST_SOURCES = x; }, r);
+  const listCalls = async () => (await su.hubCalls()).filter((c) => c.type === 'LIST_SOURCES').length;
+  const clearCalls = () => sp.evaluate(() => { window.__fake.hubCalls.length = 0; });
+  const setVis = (hidden) => sp.evaluate((h) => {
+    if (h) Object.defineProperty(document, 'visibilityState', { configurable: true, get: () => 'hidden' });
+    else delete document.visibilityState;
+    document.dispatchEvent(new Event('visibilitychange'));
+  }, hidden);
+
+  before(async () => {
+    su = await openUi({ state: threeDecks(), hubReplies: { LIST_SOURCES: list() } });
+    sp = su.page;
+    await sp.waitForSelector('.deck >> nth=2');
+  });
+  after(async () => { await su?.close(); });
+
+  test('rows are updated in place: the same row survives a refresh and a focused button keeps focus', async () => {
+    await sp.locator('#sourcesBtn').click();
+    await sp.waitForSelector('#sourceList li >> nth=2');
+    await sp.evaluate(() => document.querySelectorAll('#sourceList li').forEach((li, i) => { li.__mark = i + 1; }));
+    const go = sp.locator('#sourceList li').nth(2).locator('[data-goto]');
+    await go.focus();
+    await setReply(list({ 201: { title: 'Mixcloud — Saturday set', audible: false } }));
+    await sp.waitForFunction(() => document.querySelectorAll('#sourceList li')[1].querySelector('[data-title]').textContent === 'Mixcloud — Saturday set', null, { timeout: 2500 });
+    const r = await sp.evaluate(() => ({
+      marks: [...document.querySelectorAll('#sourceList li')].map((li) => li.__mark),
+      focus: document.activeElement === document.querySelectorAll('#sourceList li')[2].querySelector('[data-goto]'),
+      audible: document.querySelectorAll('#sourceList li')[1].querySelector('[data-audible]').hidden,
+    }));
+    assert.deepEqual(r, { marks: [1, 2, 3], focus: true, audible: true });
+    // A tab that gains a deck switches its action in place; a closed tab's row goes away.
+    await setReply({ ok: true, tabs: [SOURCES.tabs[0], { ...SOURCES.tabs[1], deckSlot: 2 }] });
+    await sp.waitForFunction(() => document.querySelectorAll('#sourceList li').length === 2, null, { timeout: 2500 });
+    const r2 = await sp.evaluate(() => {
+      const li = document.querySelectorAll('#sourceList li')[1];
+      const on = li.querySelector('[data-ondeck]');
+      return { mark: li.__mark, onDeck: on.hidden ? null : on.textContent, load: li.querySelector('[data-load]').hidden };
+    });
+    assert.deepEqual(r2, { mark: 2, onDeck: 'ON DECK 2', load: true });
+    await setReply(list());
+  });
+
+  test('a failing tab list toasts once, not on every refresh', async () => {
+    await sp.evaluate(() => document.getElementById('toasts').replaceChildren());
+    await setReply({ ok: false });
+    await sp.waitForTimeout(3400);
+    const t = await sp.evaluate(() => [...document.querySelectorAll('.toast')].map((x) => [x.dataset.text, x.dataset.count]));
+    assert.deepEqual(t, [['Could not list browser tabs.', '1']]);
+    await setReply(list());
+  });
+
+  test('no refresh while the page is hidden or the drawer is closed; showing the page refreshes at once', async () => {
+    assert.equal(await sp.locator('#sources').isVisible(), true);
+    await setVis(true);
+    await clearCalls();
+    await sp.waitForTimeout(1700);
+    assert.equal(await listCalls(), 0, 'hidden page');
+    await setVis(false);
+    await sp.waitForTimeout(50);
+    assert.ok((await listCalls()) >= 1, 'refreshed on show');
+    await sp.locator('#sources [data-close]').click();
+    await clearCalls();
+    await sp.waitForTimeout(1700);
+    assert.equal(await listCalls(), 0, 'closed drawer');
+  });
+
+  test('no console errors (sources)', () => { assert.deepEqual(su.errors, []); });
 });
 
 // A fake engine with a real round trip: a message is applied 2 ms after it is posted, the engine
