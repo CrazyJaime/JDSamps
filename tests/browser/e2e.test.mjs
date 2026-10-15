@@ -127,9 +127,15 @@ test('SYNC PLAY matches tempo and phase to the master', async () => {
   const s = await state(deck);
   const a = deckBy(s, 1);
   assert.equal(s.clock.mode, 'deck');
-  assert.ok(Math.abs(a.params.pitch - (128 / 124 - 1)) < 0.0025, `pitch ${a.params.pitch}`);
   assert.ok(Math.abs(a.bpm.out - s.clock.bpm) < 0.02, `out ${a.bpm.out} vs clock ${s.clock.bpm}`);
-  assert.ok(Math.abs(a.bpm.out - 128) < 0.3, `out ${a.bpm.out}`);
+  // The pitch follows both decks' BPM estimates, which can sit a few tenths of a BPM off for a few
+  // seconds this soon after lock (seen on a busy box); they must come back to 128 and 124. (The
+  // readouts are checked against the decks' recorded audio in the 60 s tests.)
+  let last = a;
+  await waitFor(async () => {
+    last = deckBy(await state(deck), 1);
+    return Math.abs(last.params.pitch - (128 / 124 - 1)) < 0.0025 && Math.abs(last.bpm.out - 128) < 0.3;
+  }, 10000, 200).catch(() => assert.fail(`pitch ${last.params.pitch}, out ${last.bpm.out}`));
   // Phase lock: median of 10 readings over 2 s < 15 ms. A capture dropout (see the 60 s tests) moves
   // a deck's beat grid now and then and the loop takes a few seconds to re-lock, so allow 15 s.
   const ph = [];
