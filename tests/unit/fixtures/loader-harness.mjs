@@ -171,6 +171,27 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
     if (to) setTimeout(() => { if (tab.deck) Object.assign(tab.deck.meta, { url: to }); }, metaAfter);
   };
   /**
+   * A single-page site moves on to another track in place (history.pushState): the address changes, which the hub
+   * tells the engine (META) at once (a real page's pieces take far longer than that word), but the page and its agents
+   * stay. Its player plays the other track from then on: its length is `duration` (when given), a drive appends
+   * nothing more of the first, and appendAfter ms later it appends `rendition` (init and every piece) on a SourceBuffer
+   * of its own, which the tap says feeds it now.
+   */
+  tab.moveInPlace = ({ to, rendition: r2 = null, duration, appendAfter = 10 } = {}) => {
+    if (tab.deck) Object.assign(tab.deck.meta, { url: to });
+    for (const fr of tab.frames) {
+      if (fr.left) continue;
+      if (fr.pg.rendition) fr.pg.rendition.segs.forEach((_, k) => fr.appended.add(k));
+      if (duration !== undefined) fr.duration = duration;
+      if (r2) {
+        setTimeout(() => {
+          fr.progress({ sbs: [1], mimes: [r2.mime] });
+          fr.emit({ t: 'tap-ready', parts: [r2.init, ...r2.segs].map((x, k) => ({ blobUrl: mint(x.bytes), mime: r2.mime, kind: k ? 'media' : 'init', sb: 1, seq: fr.seq++ })), duration: fr.duration });
+        }, appendAfter);
+      }
+    }
+  };
+  /**
    * The tab is closed: its page goes as on a navigation, its capture ends endAfter ms later (null: not yet), and the
    * hub's EJECT for it reaches the engine ejectAfter ms later (null: never).
    */

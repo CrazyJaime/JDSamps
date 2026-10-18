@@ -68,7 +68,8 @@ async function startRecServer() {
  * Pages with two players, on another origin. The track (A) is an MSE player of the model track (opus-hi), fed from
  * its HLS playlist 16 s ahead. The other player (B) is a 24 s 440 Hz tone (Opus fMP4, made here): a muted, looping
  * one in the top frame with the track in an iframe of /m/mse (/dur), or one that starts appending when the page's
- * window.__startB() is called: paused beside the track (/two-same) or playing muted in an iframe (/two-sub).
+ * window.__startB() is called: paused beside the track (/two-same) or playing muted in an iframe (/two-sub). /spa
+ * has the track alone, for a single-page site that moves on to the tone in place (nextTrack).
  */
 async function startMultiServer() {
   const tone = path.join(tmp, 'tone.mp4');
@@ -80,12 +81,13 @@ async function startMultiServer() {
   const mse = `async function mse(el, list) {
   const text = await (await fetch(list)).text(), base = new URL(list, location.href), segs = []; let init = null, n = 0, played = false;
   for (const l of text.split('\\n')) { const m = /URI="([^"]+)"/.exec(l); if (m) init = new URL(m[1], base).href; else if (l && l[0] !== '#') segs.push(new URL(l, base).href); }
-  const ms = new MediaSource(); el.src = URL.createObjectURL(ms);
+  const ms = new MediaSource(), src = el.src = URL.createObjectURL(ms);
   await new Promise((r) => ms.addEventListener('sourceopen', r, { once: true }));
   const sb = ms.addSourceBuffer('audio/mp4; codecs="opus"'), app = (b) => new Promise((r) => { sb.addEventListener('updateend', r, { once: true }); sb.appendBuffer(b); });
   ms.duration = ${rep.segs.at(-1).t1};
   await app(await (await fetch(init)).arrayBuffer());
   for (;;) {
+    if (el.src !== src) return; // the player plays something else now
     const end = sb.buffered.length ? sb.buffered.end(sb.buffered.length - 1) : 0;
     if (n < segs.length && end < el.currentTime + 16) { await app(await (await fetch(segs[n++])).arrayBuffer()); if (!played) { played = true; el.play().catch(() => {}); } continue; }
     if (n >= segs.length) { try { ms.endOfStream(); } catch (_) {} return; }
@@ -107,6 +109,7 @@ window.__media = () => { const a = document.querySelector('audio'); return { t: 
     '/two-same': html('Two players', '<audio id="a"></audio><audio id="b"></audio>', `mse(document.getElementById('a'), '/media/opus-hi.m3u8'); window.__startB = () => tone(document.getElementById('b'));`),
     '/two-sub': html('Two frames', '<audio id="a"></audio><iframe src="/bframe" allow="autoplay"></iframe>', `mse(document.getElementById('a'), '/media/opus-hi.m3u8');`),
     '/bframe': html('Another player', '<audio id="b" muted></audio>', `window.__startB = async () => { const b = document.getElementById('b'); await tone(b); await b.play(); };`),
+    '/spa': html('Track A', '<audio id="a"></audio>', `mse(document.getElementById('a'), '/media/opus-hi.m3u8');`),
   };
   const srv = http.createServer((req, res) => {
     const u = new URL(req.url, 'http://x');
@@ -114,7 +117,8 @@ window.__media = () => { const a = document.querySelector('audio'); return { t: 
     if (u.pathname === '/media/opus-hi.m3u8') { res.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' }); res.end(m3u8); return; }
     const f = u.pathname === '/tone.mp4' ? tone : /^\/media\/(opus-hi\/[\w.-]+)$/.test(u.pathname) ? path.join(SITES, u.pathname.slice(7)) : null;
     if (!f || !fs.existsSync(f)) { res.writeHead(404); res.end(); return; }
-    res.writeHead(200, { 'content-type': 'audio/mp4', 'cache-control': 'no-store' });
+    // The tone is fetched by pages on other origins too, as a single-page site's next track (nextTrack).
+    res.writeHead(200, { 'content-type': 'audio/mp4', 'cache-control': 'no-store', ...(f === tone ? { 'access-control-allow-origin': '*' } : {}) });
     res.end(fs.readFileSync(f));
   });
   await new Promise((r) => srv.listen(0, '127.0.0.1', r));
@@ -609,7 +613,7 @@ async function drivenLoad() {
   await site.tab.click('#play');
   await deckWhere((x) => x.id === r.deckId && /running the player/.test(x.load.strategy || ''), 15000);
   await waitFor(async () => (await player(site.tab)).muted, 5000); // muted while driven
-  return { site, deckId: r.deckId };
+  return { site, deckId: r.deckId, cdp };
 }
 
 test('ejected mid-drive: within 1 s the page has its player back, the capture is released, the blob URLs revoked, and no command follows', async () => {
@@ -700,6 +704,78 @@ test('the page moving on to another page mid-load: the deck goes with one error,
     assert.deepEqual(said.map((e) => [e.level, e.text.replace(/^Deck \d/, 'Deck N')]),
       [['error', 'Deck N: the page moved on to something else before the track was in. Add the tab again.']]);
     assert.equal(await h.sw.evaluate(() => chrome.action.getBadgeText({})), '', 'the hub forgot the tab');
+  } finally { await tidy(); }
+});
+
+/**
+ * A single-page site moving on to its next track, as YouTube, SoundCloud and Mixcloud do: the address changes with no
+ * page load (the page and its agents stay), then the same <audio> plays the next track (the 24 s tone, fetched over the
+ * network) on a MediaSource of its own. Answers once the engine has the new address for the deck (the hub's META, in
+ * milliseconds, where a real page's pieces take seconds).
+ */
+const nextTrack = async (tab, to, deckId) => {
+  await tab.evaluate(({ to: path, tone }) => {
+    history.pushState(null, '', path);
+    document.title = 'Track B';
+    (async () => {
+      const a = document.querySelector('audio'), b = await (await fetch(tone)).arrayBuffer(), ms = new MediaSource();
+      a.src = URL.createObjectURL(ms);
+      await new Promise((r) => ms.addEventListener('sourceopen', r, { once: true }));
+      const sb = ms.addSourceBuffer('audio/mp4; codecs="opus"');
+      await new Promise((r) => { sb.addEventListener('updateend', r, { once: true }); sb.appendBuffer(b); });
+      try { ms.endOfStream(); } catch (_) {}
+      a.play().catch(() => {});
+    })();
+  }, { to, tone: `${multi.origin}/tone.mp4` });
+  await waitFor(() => engine(`const d = e.decks.get(${deckId}); return !d || new URL(d.meta.url).pathname === ${JSON.stringify(to)};`), 5000);
+};
+/** The deck's end: 'gone', or the kind it took instead ('live', 'resident'). */
+const endOf = (deckId, ms = 30000) => waitFor(async () => {
+  const k = await engine(`const d = e.decks.get(${deckId}); return d ? d.kind : 'gone';`);
+  return k === 'loading' ? null : k;
+}, ms, 20);
+/**
+ * What a deck that went because its page moved on leaves: one error, never a word of playing live or of a loaded track,
+ * nothing promoted, the hub's tab forgotten. (Its eject stops the tab as every eject does: a player caught between two
+ * tracks has nothing to pause, so the tab is muted, and that is said.)
+ */
+async function assertMovedOn(deckId, seen) {
+  await sleep(500);
+  const said = (await events(deck)).slice(seen);
+  assert.deepEqual(said.filter((e) => e.level !== 'info').map((e) => [e.level, e.text.replace(/^Deck \d/, 'Deck N')]),
+    [['error', 'Deck N: the page moved on to something else before the track was in. Add the tab again.']]);
+  assert.deepEqual(said.filter((e) => /plays live|^Loaded/.test(e.text)), []);
+  assert.equal(await engine(`return e.__pcm.has(${deckId});`), false, 'nothing was promoted');
+  assert.equal(await h.sw.evaluate(() => chrome.action.getBadgeText({})), '', 'the hub forgot the tab');
+}
+
+test('a single-page site moving on to another track while its pieces are fetched again: the deck goes with one error, and never plays it live', async () => {
+  const url = `${multi.origin}/spa`, tab = await h.context.newPage();
+  try {
+    await tab.goto(url);
+    const tabId = await tabIdFor(h, url);
+    await playing(tab);
+    const cdp = await h.context.newCDPSession(tab);
+    await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 100, downloadThroughput: 40 * 1024, uploadThroughput: -1 });
+    const seen = (await events(deck)).length;
+    const r = await hubCall(deck, { type: 'LOAD_TAB', tabId });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    await deckWhere((x) => x.id === r.deckId && /fetching the track's pieces/.test(x.load.strategy || ''), 20000);
+    await nextTrack(tab, '/spa/b', r.deckId);
+    await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
+    assert.equal(await endOf(r.deckId), 'gone');
+    await assertMovedOn(r.deckId, seen);
+  } finally { await tidy(); await tab.close(); }
+});
+
+test('a single-page site moving on to another track while its player is driven: the deck goes with one error, and the other track never becomes the deck', async () => {
+  try {
+    const { site, deckId, cdp } = await drivenLoad();
+    const seen = (await events(deck)).length;
+    await nextTrack(site.tab, '/m/opaque/b', deckId);
+    await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
+    assert.equal(await endOf(deckId), 'gone');
+    await assertMovedOn(deckId, seen);
   } finally { await tidy(); }
 });
 

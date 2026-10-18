@@ -204,6 +204,7 @@ export class Loader extends Job {
     this.batch = 0;
     this.tapping = false;
     this.gone = null;          // the page went away mid-load
+    this.inPlace = false;      // it moved on with the track's frame still there (a single-page site's next track, until that frame goes)
     this.pinned = null;        // the frame whose player is the track, once the page has been looked at
     this.looked = false;       // past the first look: a decisive tap error ends the load wherever it is
     this.have = false;         // every byte of the track is in hand: the page going away no longer matters
@@ -324,17 +325,23 @@ export class Loader extends Job {
   }
 
   // ---------------------------------------------------------------- waiting
-  /** Waits give way to a decisive tap error once the page has been looked at, and to the page going away. */
-  urgent() { return (this.looked && !!this.decisive()) || (!!this.gone && !this.have); }
+  /**
+   * The tab shows another page than the one this load began on (the hub's META; a hash is the same page): a navigation,
+   * or a single-page site's move to its next track, which leaves the page and its agents in place.
+   */
+  moved() { const page = (u) => String(u || '').split('#')[0]; return page(this.deck.meta && this.deck.meta.url) !== page(this.url0); }
+  /** Waits give way to a decisive tap error once the page has been looked at, and to the page going away or moving on. */
+  urgent() { return (this.looked && !!this.decisive()) || ((!!this.gone || this.moved()) && !this.have); }
   /**
    * After every await: stop if the load was cancelled or the deck is gone; go live, with its one message, on a decisive
-   * tap error (protected, in a worker, a preview, a stream) whenever the page reports it; stop if the page went away,
-   * unless every byte of the track is in hand already.
+   * tap error (protected, in a worker, a preview, a stream) whenever the page reports it; stop if the page went away or
+   * moved on, unless every byte of the track is in hand already.
    */
   check() {
     if (this.signal.aborted || this.engine.decks.get(this.deck.id) !== this.deck) throw new Stop('cancel', 'Loading was cancelled.');
     const why = this.looked && this.decisive();
     if (why) throw new Stop('live', LIVE[why]);
+    if (!this.gone && !this.have && this.moved()) { this.gone = 'the page moved on'; this.inPlace = true; }
     if (this.gone && !this.have) throw new Stop('away', this.gone);
     if (this.big) throw new Stop('live', LIVE.big);
   }
@@ -716,6 +723,9 @@ export class Loader extends Job {
    * not matter then), else null. Pieces still being read are waited for; one the page took with it fails to read.
    */
   async inHand() {
+    // A page that moved on in place (a single-page site: its frame and agent stay) may have handed over its next track's
+    // pieces as the track's: what is in is kept only if the track's frame goes too (another document).
+    if (this.inPlace && !(await this.frameGone())) return null;
     while (this.inflight.size) await Promise.all([...this.inflight]);
     const T = this.target(), parts = this.parts();
     if (T == null || !parts.length) return null;
@@ -828,6 +838,16 @@ export class Loader extends Job {
     }
   }
 
+  /** The track's frame has gone, or goes within a moment (word of a page's new address can come before its agent goes). */
+  async frameGone() {
+    for (const t0 = now(); ;) {
+      const f = this.held();
+      if (!f || f.left) return true;
+      if (this.signal.aborted || now() - t0 >= this.t.away) return false;
+      await new Promise((r) => setTimeout(r, Math.min(50, this.t.away / 4)));
+    }
+  }
+
   /** The tab's capture has ended: the tab closed, or its audio went away otherwise. */
   ended() { const s = this.deck.stream; return !s || s.getAudioTracks().every((t) => t.readyState === 'ended'); }
 
@@ -838,12 +858,11 @@ export class Loader extends Job {
    * meanwhile cancels the load, and says why itself.
    */
   async fate() {
-    const t0 = now(), page = (u) => String(u || '').split('#')[0];
+    const t0 = now();
     for (;;) {
       if (this.signal.aborted || this.engine.decks.get(this.deck.id) !== this.deck) throw new Stop('cancel', 'Loading was cancelled.');
-      const url = this.deck.meta && this.deck.meta.url;
-      if (page(url) !== page(this.url0)) {
-        this.rep.steps.push({ name: 'page', outcome: 'moved', why: `the tab shows ${short(url)} now`, ms: now() - t0 });
+      if (this.moved()) {
+        this.rep.steps.push({ name: 'page', outcome: 'moved', why: `the tab shows ${short(this.deck.meta.url)} now`, ms: now() - t0 });
         return 'moved';
       }
       if (now() - t0 >= this.t.away) break;
@@ -858,7 +877,8 @@ export class Loader extends Job {
     const d = this.deck, e = this.engine;
     this.quiet();
     let away = null;
-    if (this.gone && !this.signal.aborted && e.decks.get(d.id) === d) {
+    // A page that moved on in place says so only by its address: looked at here too, whatever ended the load.
+    if ((this.gone || this.moved()) && !this.signal.aborted && e.decks.get(d.id) === d) {
       try { away = await this.fate(); } catch (x) { err = x; }
     }
     const cancelled = (err instanceof Stop && err.kind === 'cancel') || this.signal.aborted || e.decks.get(d.id) !== d;

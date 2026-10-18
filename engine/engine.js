@@ -230,7 +230,11 @@ class Engine {
         await this.eject(d.id, msg.reason);
         return { ok: true };
       }
-      case ENGINE.META: { const d = this.deckByTab(msg.tabId); if (d) Object.assign(d.meta, msg.meta || {}); return { ok: true }; }
+      case ENGINE.META: {
+        const d = this.deckByTab(msg.tabId);
+        if (d) { Object.assign(d.meta, msg.meta || {}); if (d.loader) d.loader.poke(); } // a load waits on no page that moved on
+        return { ok: true };
+      }
       case ENGINE.PING: return { ok: true, decks: [...this.decks.values()].map((d) => ({ tabId: d.tabId, slot: d.slot })) };
       case ENGINE.DOWNLOAD_DONE: {
         if (this.downloadsSettled.has(msg.url)) return { ok: true };

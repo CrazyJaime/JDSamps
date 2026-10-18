@@ -567,6 +567,43 @@ test('a page that moves on while a link it gave decodes badly is ejected, never 
   assert.deepEqual(called(engine, 'failLoadingToLive'), []);
   assert.deepEqual(engine.events.filter((e) => /^Deck 1: /.test(e.text)), [{ level: 'error', text: MOVED }]);
 });
+
+// A single-page site (YouTube, SoundCloud, Mixcloud) moves on to another track in place: the address changes, the page
+// and its agents stay, and the same player plays the other track.
+test('a single-page site moving on to another track while a link it gave decodes badly is ejected, never played live', async () => {
+  const link = 'https://site.example/t.mp3';
+  const { result, engine } = await load({ kind: 'progressive', src: link, files: { [link]: file('t', 120.0065) } }, {
+    before: ({ tab, loader }) => { loader.d.decodeFile = async () => { tab.moveInPlace({ to: OTHER }); await new Promise((r) => setTimeout(r, 5)); throw new Error('Unable to decode audio data'); }; },
+  });
+  assert.deepEqual(result, { ok: false, error: MOVED }, JSON.stringify(engine.events));
+  assert.deepEqual(called(engine, 'failLoadingToLive'), []);
+  assert.deepEqual(called(engine, 'startResidentDeck'), []);
+  assert.deepEqual(engine.events.filter((e) => /^Deck 1: /.test(e.text)), [{ level: 'error', text: MOVED }]);
+});
+
+test('a single-page site moving on to another track while its player is driven is ejected: the other track never becomes the deck', async () => {
+  // The other track (80 s, the low rendition's pieces) is appended whole a moment after the address changed.
+  const { result, engine, tab } = await load({ kind: 'mse', rendition: hi(), preTap: 0, playing: 1 }, {
+    before: ({ tab: t }) => { t.hooks.push((m) => { if (m.t === 'drive' && m.mode === 'seekhop') t.moveInPlace({ to: OTHER, rendition: rendition('opus-lo'), duration: 80 }); }); },
+  });
+  await settle(30);
+  assert.deepEqual(result, { ok: false, error: MOVED }, JSON.stringify([engine.calls, engine.events]));
+  assert.deepEqual(called(engine, 'startResidentDeck'), []);
+  assert.deepEqual(called(engine, 'failLoadingToLive'), []);
+  assert.equal(called(engine, 'eject').length, 1);
+  assert.deepEqual(engine.events.filter((e) => /^Deck 1: /.test(e.text)), [{ level: 'error', text: MOVED }]);
+  assert.ok(tab.kinds().includes('drive stop'), 'the page has its player back');
+});
+
+test('a single-page site moving on to another track while its pieces are fetched again is ejected, never played live or resident', async () => {
+  const { result, engine } = await load({ kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true },
+    atFetch(2, ({ tab: t }) => t.moveInPlace({ to: OTHER, rendition: rendition('opus-lo'), duration: 80 })));
+  await settle(30);
+  assert.deepEqual(result, { ok: false, error: MOVED }, JSON.stringify([engine.calls, engine.events]));
+  assert.deepEqual(called(engine, 'startResidentDeck'), []);
+  assert.deepEqual(called(engine, 'failLoadingToLive'), []);
+  assert.deepEqual(engine.events.filter((e) => /^Deck 1: /.test(e.text)), [{ level: 'error', text: MOVED }]);
+});
 for (const [what, page, opts] of [
   ['its pieces fetched, while the beat is found', { kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true },
     { before: ({ tab, engine }) => { const f = engine.analyse.bind(engine); engine.analyse = async (p, s) => { tab.navigate({ to: OTHER }); await settle(5); return f(p, s); }; } }],
@@ -575,6 +612,14 @@ for (const [what, page, opts] of [
   // Checked only when the drive says it is done, so the page goes before the loader has looked at what it holds.
   ['all its pieces captured from the player, before the loader looked', { kind: 'mse', rendition: hi(), preTap: 0, playing: 1 },
     { times: { ...FAST, check: 1000 }, before: ({ tab }) => { tab.hooks.push((m) => { if (m.t === 'drive' && m.mode === 'seekhop') setTimeout(() => tab.navigate({ to: OTHER }), 2); }); } }],
+  // The hub's word of the new page (META) can come before the old page's agents have gone.
+  ['all its pieces captured from the player, before the loader looked, word of the new page coming before its agents go', { kind: 'mse', rendition: hi(), preTap: 0, playing: 1 },
+    { times: { ...FAST, check: 1000 }, before: ({ tab }) => { tab.hooks.push((m) => { if (m.t === 'drive' && m.mode === 'seekhop') setTimeout(() => { tab.deck.meta.url = OTHER; setTimeout(() => tab.navigate(), 20); }, 2); }); } }],
+  // A single-page site moving on in place: its agents stay, and its player goes on to another track.
+  ['its pieces fetched, while the beat is found, on a single-page site that moves on in place', { kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true },
+    { before: ({ tab, engine }) => { const f = engine.analyse.bind(engine); engine.analyse = async (p, s) => { tab.moveInPlace({ to: OTHER }); await new Promise((r) => setTimeout(r, 5)); return f(p, s); }; } }],
+  ['its link read, while it is decoded, on a single-page site that moves on in place', { kind: 'progressive', src: 'https://site.example/t.mp3', files: { 'https://site.example/t.mp3': file('t', 120.0065) } },
+    { before: ({ tab, loader }) => { loader.d.decodeFile = async (ctx, buf) => { tab.moveInPlace({ to: OTHER }); await new Promise((r) => setTimeout(r, 5)); return decoders.decodeFile(ctx, buf); }; } }],
 ]) {
   test(`a page that moves on once every byte of its track is in, ${what}: the deck goes resident and lets go of the tab`, async () => {
     const { result, engine, deck } = await load(page, opts);
