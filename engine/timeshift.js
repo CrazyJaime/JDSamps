@@ -21,6 +21,7 @@ export class Timeshift {
     this.historySec = historySec;
     this.liveEdge = 0;
     this.historyStart = 0;
+    this.whole = false; // a resident deck's whole track: nothing comes after the live edge, which is its end
     this.segs = [{ output: -Infinity, input: 0, rate: 1, active: false, semitones: 0, loopStart: 0, loopEnd: 0 }];
     this.queue = [];
     this.lastSentOut = -Infinity;
@@ -30,6 +31,13 @@ export class Timeshift {
   append(L, R) {
     this.liveEdge += L.length / this.sr;
     this.node.addBuffers([L, R], [L.buffer, R.buffer]);
+    return this.liveEdge;
+  }
+
+  /** Audio the deck keeps (a resident track), copied to the node so the caller's arrays stay readable. */
+  hold(L, R) {
+    this.liveEdge += L.length / this.sr;
+    this.node.addBuffers([L, R]);
     return this.liveEdge;
   }
 
@@ -61,8 +69,10 @@ export class Timeshift {
   rateAt(t) { return this.segAt(t).rate; }
   reserveAt(t) { return Math.max(0, this.liveEdge - this.lat - this.posAt(t)); }
 
+  /** A playable input position: behind a live edge by the latency and a margin, or up to a whole track's last frame. */
   clampInput(x) {
-    return Math.min(Math.max(x, this.historyStart + 0.01), Math.max(this.historyStart + 0.01, this.liveEdge - this.lat - 0.3));
+    const end = this.whole ? this.liveEdge - 1 / this.sr : this.liveEdge - this.lat - 0.3;
+    return Math.min(Math.max(x, this.historyStart + 0.01), Math.max(this.historyStart + 0.01, end));
   }
 
   /** Output time of the last planned change (pending or queued), or -Infinity. */

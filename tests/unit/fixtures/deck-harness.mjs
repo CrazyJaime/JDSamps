@@ -5,8 +5,8 @@ import { Timeshift } from '../../../engine/timeshift.js';
 import { MasterClock, lastBeatOut, phaseError } from '../../../engine/sync.js';
 
 export class FakeNode {
-  constructor(clock) { this.clock = clock; this.map = [{ active: false, input: 0, output: 0, rate: 1, loopStart: 0, loopEnd: 0 }]; this.log = []; }
-  addBuffers() { return 0; }
+  constructor(clock) { this.clock = clock; this.map = [{ active: false, input: 0, output: 0, rate: 1, loopStart: 0, loopEnd: 0 }]; this.log = []; this.adds = []; }
+  addBuffers(bufs) { this.adds.push(bufs[0].length); return 0; }
   schedule(obj) {
     const wNow = this.clock.t + 0.003; // worklet slightly ahead of main thread
     while (this.map.length && this.map[this.map.length - 1].output >= wNow) this.map.pop();
@@ -52,23 +52,27 @@ export function fakeTempo({ bpm, t0 = 0.0, canBeat = true }) {
   };
 }
 
+/** opts.resident = {L, R, sampleRate}: a tabless deck built through initResident against the fake node (returns a Promise of it). */
 export function makeDeck(engine, clock, { id = 2, slot = 2, bpm = 124, pitch = 0, liveEdge = 30, lat = 0.12,
-  t0 = 0, range = 0.1, keyLock = true, syncMode = 'BEAT', canBeat = true, capSec = 240 } = {}) {
-  const d = new Deck(engine, { id, slot, tabId: id * 10, stream: { getTracks: () => [], getAudioTracks: () => [] }, meta: { title: 't' + id },
+  t0 = 0, range = 0.1, keyLock = true, syncMode = 'BEAT', canBeat = true, capSec = 240, resident = null } = {}) {
+  const stream = resident ? null : { getTracks: () => [], getAudioTracks: () => [] };
+  const d = new Deck(engine, { id, slot, tabId: resident ? null : id * 10, stream, meta: { title: 't' + id },
     params: { pitch, range, keyLock, syncMode, fader: 1, xf: 'THRU', 'fx.type': 'ECHO', 'fx.beats': 0.5, 'fx.level': 0.5, 'fx.on': false } });
   const node = new FakeNode(clock);
   d.node = node;
   d.ts = new Timeshift(node, { sampleRate: 48000, latency: lat, outLatency: lat / 2, capSec });
-  d.ts.liveEdge = liveEdge;
-  d.tempo = fakeTempo({ bpm, t0, canBeat });
-  d.grids.update(d.tempo.get().grid);
+  if (!resident) {
+    d.ts.liveEdge = liveEdge;
+    d.tempo = fakeTempo({ bpm, t0, canBeat });
+    d.grids.update(d.tempo.get().grid);
+  }
   d.analyser = { getFloatTimeDomainData() {} };
   d.meterBuf = new Float32Array(16);
   d.rack = { setClock() {}, tick() {}, setFx() {}, setFilter() {} };
   d.xfGain = { gain: { value: 1 } };
   d.recorder = { state: 'idle' };
   engine.decks.set(id, d);
-  return d;
+  return resident ? d.initResident(resident).then(() => d) : d;
 }
 
 /** advance by dt in 1536-frame ticks, growing every deck's live edge in real time */
