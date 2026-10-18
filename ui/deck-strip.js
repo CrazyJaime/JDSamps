@@ -68,7 +68,7 @@ export class DeckStrip {
       keyLock: this.q('[data-act="keyLock"]'), syncMode: this.q('[data-act="syncMode"]'), range: this.q('[data-act="range"]'),
       rec: this.q('[data-act="rec"]'), recLabel: this.q('[data-act="rec"] span'), recTime: this.q('[data-rec-time]'),
       wslot: $('[data-slot]', this.waveRow), wbpm: $('[data-wbpm]', this.waveRow), wave: $('[data-wave]', this.waveRow),
-      kind: this.q('[data-kind]'), kindWord: this.q('[data-kind-word]'), kindPct: this.q('[data-kind-pct]'), loadLine: this.q('[data-load-line]'), cancel: this.q('[data-act="loadCancel"]'),
+      kind: this.q('[data-kind]'), kindWord: this.q('[data-kind-word]'), kindPct: this.q('[data-kind-pct]'), loadRow: this.q('[data-load-row]'), loadLine: this.q('[data-load-line]'), cancel: this.q('[data-act="loadCancel"]'),
       report: this.q('[data-report]'), reportBtn: this.q('[data-report-btn]'), reportMenu: this.q('[data-report-menu]'), recWhole: this.q('[data-record-whole]'),
       copyNow: this.q('.deck-status [data-copy-report]'), jump: this.q('.jump'), time: this.q('[data-time]'),
       live: this.q('[data-act="live"]'), bar1: this.q('[data-act="bar1"]'),
@@ -204,9 +204,9 @@ export class DeckStrip {
     });
     // Eject needs a 500 ms hold: a stray click must never kill a playing deck.
     bindHold(this.q('[data-act="eject"]'), { ms: 500, onHold: () => this.act('eject'), onShort: () => this.toast('Hold the eject button to unload this deck.', 'info') });
-    // A loading deck is inert but for its header (eject, cancel, load report): a press on anything else
+    // A loading deck is inert but for its header (eject, load report) and its cancel: a press on anything else
     // stops here, before the control's own handlers (keys are stopped in act() and set()).
-    this.inertEls = [...$$('button, [role="slider"], [role="button"]', this.el).filter((el) => !el.closest('.deck-head') && !el.hasAttribute('data-copy-report')), this.refs.ov, this.refs.wave];
+    this.inertEls = [...$$('button, [role="slider"], [role="button"]', this.el).filter((el) => !el.closest('.deck-head, [data-load-row]') && !el.hasAttribute('data-copy-report')), this.refs.ov, this.refs.wave];
     const guard = (e) => {
       if (!this.inert || !(e.target instanceof Element) || !e.target.closest('[aria-disabled="true"]')) return;
       e.stopPropagation();
@@ -578,10 +578,9 @@ export class DeckStrip {
     setClass(r.kind, `badge kind ${cls}`);
     setAttr(r.kind, 'title', tip);
     const line = failed ? load.error || 'The track could not be loaded.' : kind === 'loading' ? load.strategy || 'starting' : '';
-    setHidden(r.loadLine, !line);
+    setHidden(r.loadRow, kind !== 'loading');
     setText(r.loadLine, line);
     setAttr(r.loadLine, 'title', line);
-    setHidden(r.cancel, kind !== 'loading');
     setHidden(r.report, !load.report || failed); // a failed deck shows the copy button itself
     setHidden(r.recWhole, kind !== 'live');
     if (r.report.hidden) this.closeReportMenu();

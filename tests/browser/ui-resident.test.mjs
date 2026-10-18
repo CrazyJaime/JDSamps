@@ -58,18 +58,18 @@ before(async () => {
 after(async () => { await ui?.close(); });
 
 // ---------------------------------------------------------------- what each deck is
-test('each deck says what it is in its header: TRACK, LIVE, or LOADING with its progress and what it is doing', async () => {
+test('each deck says what it is in its header: TRACK, LIVE, or LOADING with its progress, and what the load is doing beside it', async () => {
   await show(kinds());
   const head = (slot) => deckEl(slot).locator('.deck-head');
   assert.equal(await text(head(1).locator('[data-kind]')), 'LIVE');
   assert.equal(await text(head(2).locator('[data-kind]')), 'TRACK');
   assert.equal(await text(head(3).locator('[data-kind]')), 'LOADING · 42%');
-  assert.equal(await head(3).locator('[data-load-line]').textContent(), 'fetching the link');
-  for (const slot of [1, 2]) assert.equal(await head(slot).locator('[data-load-line]').isHidden(), true, `deck ${slot}`);
+  assert.equal(await deckEl(3).locator('[data-load-line]').textContent(), 'fetching the link');
+  for (const slot of [1, 2]) assert.equal(await deckEl(slot).locator('[data-load-line]').isHidden(), true, `deck ${slot}`);
   // Progress and strategy follow the snapshot.
   await show(kinds((s) => { Object.assign(s.decks[2].load, { progress: 0.8, strategy: 'finding the beat' }); }));
   assert.equal(await text(head(3).locator('[data-kind]')), 'LOADING · 80%');
-  assert.equal(await head(3).locator('[data-load-line]').textContent(), 'finding the beat');
+  assert.equal(await deckEl(3).locator('[data-load-line]').textContent(), 'finding the beat');
   // A deck with no tab and no title is named after its slot, never "Tab null".
   await show(kinds((s) => { s.decks[1].title = ''; }));
   assert.equal(await deckEl(2).locator('[data-title]').textContent(), 'Deck 2');
@@ -114,11 +114,13 @@ test('a loading deck is inert but for eject and cancel: the rest is dimmed and a
   assert.ok(r.dimmed && r.n > 40, JSON.stringify(r));
   for (const slot of [1, 2]) assert.equal(await deckEl(slot).locator('[aria-disabled="true"]').count(), 0, `deck ${slot}`);
   assert.equal(await row(3).locator('[data-overview]').getAttribute('aria-disabled'), 'true');
+  // Its A/THRU/B and REC give their place to what the load is doing.
+  for (const sel of ['[data-seg="xf"] button[data-v="A"]', '[data-act="rec"]']) assert.equal(await d3.locator(sel).isVisible(), false, sel);
 
   await ui.clearSent();
   for (const sel of ['[data-act="playToggle"]', '[data-act="sync"]', '[data-act="master"]', '[data-act="syncPlay"]', '[data-act="live"]', '[data-act="half"]',
-    '[data-act="tap"]', '[data-act="gridFwd"]', '[data-act="keyLock"]', '[data-act="syncMode"]', '[data-act="jumpFwd"]', '[data-act="range"]', '[data-act="rec"]',
-    '[data-seg="xf"] button[data-v="A"]', '[data-seg="fx.type"] button[data-v="GATE"]', '[data-kill="low"]', '[data-pad="fx.on"]', '[data-roll="0.5"]',
+    '[data-act="tap"]', '[data-act="gridFwd"]', '[data-act="keyLock"]', '[data-act="syncMode"]', '[data-act="jumpFwd"]', '[data-act="range"]',
+    '[data-seg="fx.type"] button[data-v="GATE"]', '[data-kill="low"]', '[data-pad="fx.on"]', '[data-roll="0.5"]',
     '[data-hold="cue"]', '[data-hold="nudge+"]', '[data-bpm]', '[data-native]', '[data-act="clipReset"]']) {
     await d3.locator(sel).click({ force: true }); // past Playwright's own aria-disabled check: the page must ignore it
   }
@@ -278,7 +280,7 @@ const offenders = () => page.evaluate(() => {
   const vw = document.documentElement.clientWidth, vh = document.documentElement.clientHeight;
   const out = [];
   for (const el of document.querySelectorAll('.board [data-act], .board button, .board [role="slider"], .xfader-bar button, .xfader-bar [role="slider"]')) {
-    if (el.closest('[hidden]')) continue;
+    if (el.closest('[hidden]') || getComputedStyle(el).visibility === 'hidden') continue;
     const b = el.getBoundingClientRect();
     const name = `${el.closest('.deck') ? `deck${[...document.querySelectorAll('.deck')].indexOf(el.closest('.deck')) + 1} ` : ''}${el.dataset.act || el.dataset.ctl || el.dataset.v || el.className}`;
     if (b.width < 1 || b.height < 1) { out.push(`${name}: not rendered`); continue; }
@@ -289,16 +291,16 @@ const offenders = () => page.evaluate(() => {
   const d = document.getElementById('decks');
   if (d.scrollHeight > d.clientHeight + 1) out.push(`decks scroll vertically ${d.scrollHeight} > ${d.clientHeight}`);
   if (d.scrollWidth > d.clientWidth + 1) out.push(`decks scroll horizontally ${d.scrollWidth} > ${d.clientWidth}`);
-  // The kind badge and the load line sit inside the header, and its two lines are no taller than its buttons.
+  // The kind badge sits inside the header, whose two lines are no taller than its buttons; the load line takes the A/THRU/B and REC row.
   for (const [i, dk] of [...document.querySelectorAll('.deck')].entries()) {
-    const head = dk.querySelector('.deck-head').getBoundingClientRect(), ej = dk.querySelector('[data-act="eject"]').getBoundingClientRect();
+    const ej = dk.querySelector('[data-act="eject"]').getBoundingClientRect();
     const lines = dk.querySelector('.head-text').getBoundingClientRect();
     if (lines.height > ej.height + 0.5) out.push(`deck${i + 1} header text ${lines.height.toFixed(1)} px, taller than its buttons (${ej.height.toFixed(1)})`);
-    for (const sel of ['[data-kind]', '[data-load-line]']) {
-      const el = dk.querySelector(sel);
+    for (const [sel, box] of [['[data-kind]', '.deck-head'], ['[data-load-line]', '.deck-assign']]) {
+      const el = dk.querySelector(sel), r = dk.querySelector(box).getBoundingClientRect();
       if (el.closest('[hidden]')) continue;
       const b = el.getBoundingClientRect();
-      if (b.top < head.top - 0.5 || b.bottom > head.bottom + 0.5 || b.left < head.left - 0.5 || b.right > head.right + 0.5) out.push(`deck${i + 1} ${sel} outside its header`);
+      if (b.top < r.top - 0.5 || b.bottom > r.bottom + 0.5 || b.left < r.left - 0.5 || b.right > r.right + 0.5) out.push(`deck${i + 1} ${sel} outside ${box}`);
     }
   }
   return out;
@@ -322,7 +324,7 @@ const badLabels = () => page.evaluate(() => {
   return [...new Set(out)];
 });
 
-test('six decks of every kind fit at laptop sizes: nothing off screen, covered or under 32 px, the badge and load line in the header', async () => {
+test('six decks of every kind fit at laptop sizes: nothing off screen, covered or under 32 px, the badge in the header and the load line in its row', async () => {
   const long = (i) => `Track number ${i} with a fairly long title here`;
   const six = makeState({
     decks: [
@@ -350,6 +352,49 @@ test('six decks of every kind fit at laptop sizes: nothing off screen, covered o
     await show(makeState({ decks: six.decks.slice(0, n) }));
     assert.deepEqual(await offenders(), [], `${n} decks`);
   }
+});
+
+/** The last deck's badge and load line: the badge clear of every button and unclipped, the line's width and what is on top of it. */
+const loadGeometry = () => page.evaluate(() => {
+  const dk = [...document.querySelectorAll('.deck')].at(-1), kind = dk.querySelector('[data-kind]'), b = kind.getBoundingClientRect();
+  const out = [];
+  for (const el of dk.querySelectorAll('button')) {
+    if (el.closest('[hidden]') || getComputedStyle(el).visibility === 'hidden') continue;
+    const r = el.getBoundingClientRect(), ox = Math.min(b.right, r.right) - Math.max(b.left, r.left), oy = Math.min(b.bottom, r.bottom) - Math.max(b.top, r.top);
+    if (ox > 0.5 && oy > 0.5) out.push(`badge under ${el.getAttribute('aria-label') || el.dataset.act || el.className} by ${ox.toFixed(1)} px`);
+  }
+  const shown = [...kind.children].filter((s) => s.getClientRects().length);
+  for (const s of [kind, ...shown]) if (s.scrollWidth > s.clientWidth + 0.5) out.push(`badge text "${s.textContent}" clipped`);
+  const hit = document.elementFromPoint(b.right - 3, (b.top + b.bottom) / 2);
+  if (!kind.contains(hit)) out.push(`badge end covered by ${hit ? (hit.closest('button') || hit).getAttribute('aria-label') || hit.getAttribute('class') : 'nothing'}`);
+  const ln = dk.querySelector('[data-load-line]'), l = ln.getBoundingClientRect();
+  if (l.width < 40) out.push(`load line "${ln.textContent}" ${l.width.toFixed(1)} px wide`);
+  else if (!ln.contains(document.elementFromPoint(l.left + 20, (l.top + l.bottom) / 2))) out.push('load line covered');
+  return { out, badge: shown.map((s) => s.textContent).join('') };
+});
+
+test('with one to six decks, a loading or failed deck says what it is doing in at least 40 px, its badge clear of its buttons', async () => {
+  const long = (i) => `Track number ${i} with a fairly long title here`;
+  const others = [deck({ id: 1, tabId: 101 }), residentDeck({ id: 2 }), deck({ id: 4, tabId: 104 }), residentDeck({ id: 5 }), deck({ id: 6, tabId: 106 })];
+  const states = {
+    loading: { strategy: 'reading the file' },
+    'loading with a report': { strategy: 'reading the file', report: REPORT },
+    failed: { state: 'error', strategy: null, error: ERROR, report: REPORT },
+  };
+  const problems = [];
+  for (const [w, h] of [[1280, 720], [1440, 900], [1920, 1080]]) {
+    for (const [name, load] of Object.entries(states)) {
+      for (let n = 1; n <= 6; n++) {
+        const decks = [...others.slice(0, n - 1), loadingDeck({ id: 3, load })].map((d, i) => ({ ...d, slot: i + 1, title: long(i + 1) }));
+        await show(makeState({ decks }), { width: w, height: h });
+        const g = await loadGeometry();
+        const want = name === 'failed' ? ['FAILED'] : ['LOADING · 42%', '42%'];
+        if (!want.includes(g.badge)) g.out.push(`badge shows "${g.badge}"`);
+        for (const o of [...g.out, ...await offenders()]) problems.push(`${w}x${h} ${name}, ${n} deck${n > 1 ? 's' : ''}: ${o}`);
+      }
+    }
+  }
+  assert.deepEqual(problems, []);
 });
 
 // ---------------------------------------------------------------- drop a file, load a link

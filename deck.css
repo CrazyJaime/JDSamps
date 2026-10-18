@@ -192,14 +192,21 @@ body.dropping .board::after {
 .deck > .deck-head { flex: 999 1 10rem; }
 .deck > .deck-assign { flex: 1 0 auto; }
 .deck.selected { border-color: color-mix(in srgb, var(--deck) 55%, var(--line)); box-shadow: 0 0 0 1px color-mix(in srgb, var(--deck) 35%, transparent), 0 0.4rem 1.6rem rgb(0 0 0 / 0.45); }
-/* Header: slot, then the title over what the deck is (TRACK / LIVE / LOADING · n % and its load line), then cancel, ⓘ, eject. */
-.deck-head { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto auto; align-items: center; gap: 0.45rem; }
-.head-text { display: flex; flex-direction: column; gap: 0.1rem; min-width: 0; line-height: 1.15; }
+/* Header: slot, then the title over what the deck is (TRACK / LIVE / LOADING · n %), then ⓘ and eject. */
+.deck-head { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 0.45rem; }
+.head-text { display: flex; flex-direction: column; gap: 0.1rem; min-width: 0; line-height: 1.15; container: head / inline-size; }
 .head-line { display: flex; align-items: center; gap: 0.35rem; min-width: 0; }
-.badge.kind { flex: none; min-height: 0; padding: 0 0.3rem; line-height: 1.15; white-space: pre; }
-/* Five or six decks: a loading badge is just its percentage, so the load line beside it has room. */
-@container deck (max-width: 240px) { [data-kind-word]:has(+ :not(:empty)) { display: none; } }
-.load-line { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.75rem; color: var(--muted); }
+/* The badge never runs past its column (under the buttons): its word gives way first, then the percentage alone. */
+.badge.kind { flex: 0 1 auto; min-width: 0; min-height: 0; padding: 0 0.3rem; overflow: hidden; line-height: 1.15; white-space: pre; }
+[data-kind-word] { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+[data-kind-pct] { flex: none; }
+@container head (max-width: 7.6rem) { [data-kind-word]:has(+ :not(:empty)) { display: none; } }
+/* A loading deck's A/THRU/B and REC are inert: what the load is doing, and its cancel, take their place
+   (the same row, beside the header with up to three decks, under it with more). */
+.deck-assign { position: relative; }
+.deck[data-kind="loading"] .deck-assign > :not(.load-row) { visibility: hidden; }
+.load-row { position: absolute; inset: 0; display: flex; align-items: center; gap: 0.35rem; }
+.load-line { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.75rem; color: var(--muted); }
 .deck[data-kind="loading"] .load-line { color: var(--txt); }
 .report { position: relative; }
 .menu { position: absolute; top: calc(100% + 0.2rem); right: 0; z-index: 15; padding: 0.25rem; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: var(--r); box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 0.5); }

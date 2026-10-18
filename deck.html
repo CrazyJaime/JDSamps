@@ -161,9 +161,8 @@
         <span class="slot" data-slot></span>
         <div class="head-text">
           <div class="head-line"><img class="fav" data-fav alt="" width="16" height="16" /><span class="title" data-title></span></div>
-          <div class="head-line"><span class="badge kind" data-kind><span data-kind-word></span><span data-kind-pct></span></span><span class="load-line" data-load-line hidden></span></div>
+          <div class="head-line"><span class="badge kind" data-kind><span data-kind-word></span><span data-kind-pct></span></span></div>
         </div>
-        <button class="btn ghost icon sm" data-act="loadCancel" aria-label="Cancel loading" title="Cancel loading" hidden><svg class="ic"><use href="#i-x"/></svg></button>
         <div class="report" data-report hidden>
           <button class="btn ghost icon sm" data-report-btn aria-label="Load report" title="Load report" aria-haspopup="menu" aria-expanded="false"><svg class="ic"><use href="#i-info"/></svg></button>
           <div class="menu" role="menu" data-report-menu hidden><button class="btn sm" role="menuitem" data-copy-report>Copy load report</button><button class="btn sm" role="menuitem" data-record-whole hidden>Record whole track (2×, reduced highs)</button></div>
@@ -173,6 +172,7 @@
       <div class="deck-assign">
         <div class="seg xf" data-seg="xf" role="group" aria-label="Crossfader assign"><button data-v="A">A</button><button data-v="THRU">THRU</button><button data-v="B">B</button></div>
         <button class="btn rec" data-act="rec" aria-pressed="false"><svg class="ic"><use href="#i-dot"/></svg><span>REC</span><span class="mono rec-time" data-rec-time></span></button>
+        <div class="load-row" data-load-row hidden><span class="load-line" data-load-line></span><button class="btn ghost icon sm" data-act="loadCancel" aria-label="Cancel loading" title="Cancel loading"><svg class="ic"><use href="#i-x"/></svg></button></div>
       </div>
       <div class="deck-tempo">
         <div class="bpm"><span class="bpm-val mono tempo-entry" data-bpm role="button" tabindex="0" title="Click to type the tempo to play at">—</span><span class="bpm-unit">BPM</span></div>
