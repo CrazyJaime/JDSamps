@@ -3,7 +3,7 @@
 import { PORT_UI, TARGET, HUB, DECK_PARAMS, MASTER_PARAMS } from '../shared/protocol.js';
 
 // A load answers once its track is decoded and analysed (seconds for a long file); its deck shows the progress meanwhile.
-const ACT_MS = { loadFile: 120000, loadUrl: 120000 };
+export const ACT_MS = { loadFile: 120000, loadUrl: 120000 }; // exported for tests
 
 export class EngineConnection {
   constructor({ onState, onWave, onEvent, onStatus }) {
@@ -94,11 +94,20 @@ export class EngineConnection {
     this.sets.clear();
   }
 
-  act(deck, a, arg) {
+  /**
+   * late(): asked when the act's time is up. Nothing: it timed out. A promise: the act settles with its
+   * result instead, unless the engine's answer comes first.
+   */
+  act(deck, a, arg, { late } = {}) {
     return new Promise((resolve) => {
       const id = this.nextId++;
       if (!this.post({ t: 'act', deck, a, arg: arg ?? {}, id })) { resolve({ ok: false, error: 'Audio engine is not connected' }); return; }
-      const timer = setTimeout(() => { this.pending.delete(id); resolve({ ok: false, error: 'The audio engine did not answer' }); }, ACT_MS[a] || 4000);
+      const timer = setTimeout(() => {
+        const wait = late && late();
+        if (wait) { wait.then((r) => { if (this.pending.delete(id)) resolve(r); }); return; }
+        this.pending.delete(id);
+        resolve({ ok: false, error: 'The audio engine did not answer' });
+      }, ACT_MS[a] || 4000);
       this.pending.set(id, { resolve, timer });
     });
   }

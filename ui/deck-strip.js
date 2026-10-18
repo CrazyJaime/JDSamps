@@ -30,10 +30,12 @@ const LOADING_ACTS = new Set(['eject', 'loadCancel']);
 const navSpan = (d) => (d.kind === 'resident' && d.duration > 0 ? [0, d.duration] : [d.historyStart, d.liveEdge]);
 
 export class DeckStrip {
-  constructor(d, { conn, toast, onSelect }) {
+  constructor(d, { conn, toast, onSelect, onLeave = () => {} }) {
     this.id = d.id;
     this.conn = conn;
     this.toast = toast;
+    this.onLeave = onLeave;
+    this.leaving = false; // ✕ or eject sent: the deck is on its way out
     this.d = d;
     this.shownBpm = null;
     this.rollHeld = [];
@@ -157,12 +159,12 @@ export class DeckStrip {
     on('[data-act="master"]', () => this.act('master'));
     on('[data-act="syncPlay"]', () => this.act('syncPlay'));
     on('[data-act="live"]', () => this.act('live'));
-    on('[data-act="loadCancel"]', () => this.act('loadCancel'));
+    on('[data-act="loadCancel"]', () => this.leave('loadCancel'));
     // The whole-track analysis's bar 1, offered while the grid has none: TAP 1 there.
     on('[data-act="bar1"]', () => { const b = this.d.analysis && this.d.analysis.bar1; if (b) this.act('tap1', { t: b.t }); });
-    for (const el of $$('[data-copy-report]', this.el)) el.addEventListener('click', () => { this.closeReportMenu(); this.copyReport(); });
+    for (const el of $$('[data-copy-report]', this.el)) el.addEventListener('click', () => { this.closeReportMenu(true); this.copyReport(); });
     // A live deck whose bytes could not be had: record the track from the tab at 2× instead (spec §4.4), only when asked.
-    this.refs.recWhole.addEventListener('click', () => { this.closeReportMenu(); this.act('recordWhole'); });
+    this.refs.recWhole.addEventListener('click', () => { this.closeReportMenu(true); this.act('recordWhole'); });
     this.bindReportMenu();
     on('[data-act="half"]', () => this.act('mult', { factor: 0.5 }));
     on('[data-act="double"]', () => this.act('mult', { factor: 2 }));
@@ -203,7 +205,7 @@ export class DeckStrip {
       onShort: () => this.toast('Hold REC (or R) to stop the deck recording.', 'info'),
     });
     // Eject needs a 500 ms hold: a stray click must never kill a playing deck.
-    bindHold(this.q('[data-act="eject"]'), { ms: 500, onHold: () => this.act('eject'), onShort: () => this.toast('Hold the eject button to unload this deck.', 'info') });
+    bindHold(this.q('[data-act="eject"]'), { ms: 500, onHold: () => this.leave('eject'), onShort: () => this.toast('Hold the eject button to unload this deck.', 'info') });
     // A loading deck is inert but for its header (eject, load report) and its cancel: a press on anything else
     // stops here, before the control's own handlers (keys are stopped in act() and set()).
     this.inertEls = [...$$('button, [role="slider"], [role="button"]', this.el).filter((el) => !el.closest('.deck-head, [data-load-row]') && !el.hasAttribute('data-copy-report')), this.refs.ov, this.refs.wave];
@@ -215,22 +217,49 @@ export class DeckStrip {
     for (const type of ['pointerdown', 'click', 'dblclick', 'wheel', 'keydown']) this.el.addEventListener(type, guard, true);
   }
 
-  /** The ⓘ menu of a deck with a load report: one item, Copy load report. Escape, a click elsewhere or using it closes it. */
+  /** ✕ or a held eject, which the DJ asked for: once, as a second press would only hear that the deck is gone. */
+  async leave(a) {
+    if (this.leaving) return;
+    this.leaving = true;
+    this.onLeave(this.id);
+    const r = await this.act(a);
+    if (!r.ok) this.leaving = false;
+  }
+
+  /**
+   * The ⓘ menu of a deck with a load report: a plain list of buttons (the page has no role="menu" menus).
+   * Escape, a click elsewhere, focus leaving it or using one of its buttons closes it; Escape and a button give focus back to the ⓘ.
+   */
   bindReportMenu() {
     const r = this.refs;
     this.onMenuAway = (e) => {
       if (e.type === 'keydown' ? e.key === 'Escape' : !r.report.contains(e.target)) this.closeReportMenu(e.type === 'keydown');
     };
     r.reportBtn.addEventListener('click', () => (r.reportMenu.hidden ? this.openReportMenu() : this.closeReportMenu()));
+    r.report.addEventListener('focusout', (e) => { if (!r.report.contains(e.relatedTarget)) this.closeReportMenu(); });
   }
 
   openReportMenu() {
     const r = this.refs;
     setHidden(r.reportMenu, false);
+    this.placeReportMenu();
     setAttr(r.reportBtn, 'aria-expanded', 'true');
-    r.reportMenu.querySelector('[role="menuitem"]').focus();
+    r.reportMenu.querySelector('button').focus();
     document.addEventListener('pointerdown', this.onMenuAway, true);
     document.addEventListener('keydown', this.onMenuAway, true);
+  }
+
+  /**
+   * The menu hangs from the ⓘ's right edge; where that would run off the left of the deck row (the leftmost
+   * deck) it hangs from its left edge instead, and it is kept inside the row and the window either way.
+   */
+  placeReportMenu() {
+    const m = this.refs.reportMenu, row = this.el.parentElement || document.documentElement;
+    m.style.translate = '';
+    const b = m.getBoundingClientRect(), rb = row.getBoundingClientRect(), x0 = rb.left + row.clientLeft;
+    const lo = Math.max(0, x0) + 4, hi = Math.min(document.documentElement.clientWidth, x0 + row.clientWidth) - 4;
+    const left = clamp(b.left < lo ? this.refs.report.getBoundingClientRect().left : b.left, lo, Math.max(lo, hi - b.width));
+    if (Math.abs(left - b.left) > 0.5) m.style.translate = `${left - b.left}px 0`;
   }
 
   closeReportMenu(refocus = false) {

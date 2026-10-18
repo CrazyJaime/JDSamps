@@ -2,6 +2,8 @@
 // (the Sources drawer's field, or one pasted on the board). Each goes onto a new resident deck; the
 // engine answers once the track is decoded and analysed, and the deck shows its progress meanwhile.
 
+// Once a load's answer time is up and its deck has gone, how long its answer still has to say why.
+const GONE_MS = 2000;
 const AUDIO_EXT = /\.(mp3|wav|wave|ogg|oga|opus|flac|m4a|mp4|aac|webm|weba|aif|aiff|caf)$/i;
 
 /** An audio file by its type, or by its extension when the system gives none (or a video type for an audio container). */
@@ -18,24 +20,79 @@ export class TrackLoader {
   constructor({ conn, toast }) {
     this.conn = conn;
     this.toast = toast;
+    this.loads = []; // loads waiting for their answer, oldest first: {after, deckId, cancelled, settle}
+    this.decks = []; // the latest snapshot's decks
+    this.maxId = 0;  // the newest deck id seen
+    this.engineId = undefined;
   }
 
   /** The engine fetches the file through a blob: URL made here, revoked once its load has settled either way. */
   async loadFile(file) {
     const blobUrl = URL.createObjectURL(file);
     try {
-      return this.said(await this.conn.act(null, 'loadFile', { name: file.name, blobUrl }));
+      return await this.load('loadFile', { name: file.name, blobUrl });
     } finally {
       URL.revokeObjectURL(blobUrl);
     }
   }
 
-  async loadLink(url) { return this.said(await this.conn.act(null, 'loadUrl', { url })); }
+  loadLink(url) { return this.load('loadUrl', { url }); }
 
-  said(r) {
-    if (!r.ok && r.error) this.toast(r.error, 'warn');
-    return r;
+  /** A cancel the DJ asked for (✕, eject, STOP ALL) is not an error: the load onto that deck ends without a word. */
+  async load(a, arg) {
+    const l = { after: this.maxId, deckId: null, cancelled: false, settle: null };
+    this.loads.push(l);
+    try {
+      const r = await this.conn.act(null, a, arg, { late: () => this.late(l) });
+      if (!r.ok && r.error && !l.cancelled) this.toast(r.error, 'warn');
+      return r;
+    } finally {
+      this.loads.splice(this.loads.indexOf(l), 1);
+    }
   }
+
+  /**
+   * Each snapshot: a load's deck is the oldest deck without a tab that is newer than any deck seen when it was
+   * asked for, and than the deck of every earlier load (the engine makes them in that order, with rising ids).
+   */
+  update(s) {
+    if (s.engineId !== this.engineId) { this.engineId = s.engineId; this.maxId = 0; } // a new engine numbers its decks from 1
+    let floor = 0;
+    for (const l of this.loads) {
+      l.after = Math.max(l.after, floor);
+      if (l.deckId == null) {
+        const d = s.decks.filter((x) => x.id > l.after && x.tabId == null).sort((x, y) => x.id - y.id)[0];
+        if (d) l.deckId = d.id;
+      }
+      if (l.deckId != null) floor = Math.max(floor, l.deckId);
+    }
+    for (const d of s.decks) this.maxId = Math.max(this.maxId, d.id);
+    this.decks = s.decks;
+    for (const l of this.loads) if (l.settle) this.follow(l);
+  }
+
+  /**
+   * A load's answer time is up. With no deck of its own yet, the engine did not answer. Otherwise it waits while
+   * its deck loads (a slow link can take minutes) and settles from the deck: resident is done, gone is settled.
+   */
+  late(l) {
+    if (l.deckId == null) return null;
+    return new Promise((resolve) => { l.settle = resolve; this.follow(l); });
+  }
+
+  follow(l) {
+    const d = this.decks.find((x) => x.id === l.deckId);
+    if (d && d.kind === 'loading') return;
+    const settle = l.settle;
+    l.settle = null;
+    if (d) settle({ ok: true });
+    else setTimeout(() => settle({ ok: false }), GONE_MS);
+  }
+
+  /** The DJ asked for deck `id` to go (✕ or eject). */
+  cancelled(id) { for (const l of this.loads) if (l.deckId === id) l.cancelled = true; }
+  /** STOP ALL: every deck goes. */
+  cancelledAll() { for (const l of this.loads) l.cancelled = true; }
 
   /** Each audio file onto a deck of its own; the rest are named and left alone. */
   drop(files) {

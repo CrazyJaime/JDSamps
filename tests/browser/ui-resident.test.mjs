@@ -117,34 +117,57 @@ test('a loading deck is inert but for eject and cancel: the rest is dimmed and a
   // Its A/THRU/B and REC give their place to what the load is doing.
   for (const sel of ['[data-seg="xf"] button[data-v="A"]', '[data-act="rec"]']) assert.equal(await d3.locator(sel).isVisible(), false, sel);
 
-  await ui.clearSent();
+  // Each press is checked right after it, before the next one could undo what it did (a later click closes a tempo
+  // entry the last one opened): nothing sent for the deck, no tempo entry, no toast, and the deck looks the same.
+  const look = () => d3.evaluate((el) => [el.textContent, ...[...el.querySelectorAll('[aria-pressed], [aria-valuenow], [data-bpm], [data-native]')]
+    .map((x) => `${x.getAttribute('aria-pressed')}|${x.getAttribute('aria-valuenow')}|${x.hidden}`)].join('\n'));
+  const before = await look();
+  const press = async (what, fn) => {
+    await ui.clearSent();
+    await fn();
+    await wait(40); // a slider's value goes out on the next frame
+    assert.deepEqual((await ui.sent()).filter((m) => (m.t === 'act' || m.t === 'set') && m.deck === 3), [], `${what}: sent to the engine`);
+    assert.equal(await page.locator('input.tempo-edit').count(), 0, `${what}: a tempo entry opened`);
+    assert.deepEqual(await toasts(), [], `${what}: toast`);
+    assert.ok((await look()) === before, `${what}: the deck changed`);
+  };
   for (const sel of ['[data-act="playToggle"]', '[data-act="sync"]', '[data-act="master"]', '[data-act="syncPlay"]', '[data-act="live"]', '[data-act="half"]',
-    '[data-act="tap"]', '[data-act="gridFwd"]', '[data-act="keyLock"]', '[data-act="syncMode"]', '[data-act="jumpFwd"]', '[data-act="range"]',
+    '[data-act="tap"]', '[data-act="gridFwd"]', '[data-act="keyLock"]', '[data-act="syncMode"]', '[data-act="jumpFwd"]', '[data-act="jumpSize"]', '[data-act="range"]',
     '[data-seg="fx.type"] button[data-v="GATE"]', '[data-kill="low"]', '[data-pad="fx.on"]', '[data-roll="0.5"]',
     '[data-hold="cue"]', '[data-hold="nudge+"]', '[data-bpm]', '[data-native]', '[data-act="clipReset"]']) {
-    await d3.locator(sel).click({ force: true }); // past Playwright's own aria-disabled check: the page must ignore it
+    await press(sel, () => d3.locator(sel).click({ force: true })); // past Playwright's own aria-disabled check: the page must ignore it
   }
   for (const ctl of ['[data-ctl="eq.hi"] svg', '[data-ctl="pitch"]', '[data-ctl="fader"]']) {
     const b = await d3.locator(ctl).boundingBox();
-    await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2);
-    await page.mouse.down();
-    await page.mouse.move(b.x + b.width / 2 + 30, b.y + b.height / 2 - 30, { steps: 4 });
-    await page.mouse.up();
-    await page.mouse.wheel(0, -120);
+    await press(`drag ${ctl}`, async () => {
+      await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2);
+      await page.mouse.down();
+      await page.mouse.move(b.x + b.width / 2 + 30, b.y + b.height / 2 - 30, { steps: 4 });
+      await page.mouse.up();
+    });
+    await press(`wheel ${ctl}`, () => page.mouse.wheel(0, -120));
   }
-  await page.keyboard.press('Digit3');
-  for (const k of ['Space', 'KeyS', 'Shift+KeyS', 'KeyQ', 'KeyF', 'KeyT', 'Shift+KeyT', 'KeyK', 'ArrowUp', 'Comma', 'Period', 'KeyV', 'KeyC', 'ArrowRight', 'KeyR']) await page.keyboard.press(k);
-  const ov = await row(3).locator('[data-overview]').boundingBox();
-  await page.mouse.click(ov.x + ov.width / 2, ov.y + ov.height / 2);
-  const wv = await row(3).locator('[data-wave]').boundingBox();
-  await page.mouse.move(wv.x + wv.width / 2, wv.y + wv.height / 2);
-  await page.mouse.down();
-  await page.mouse.move(wv.x + wv.width / 2 - 100, wv.y + wv.height / 2, { steps: 4 });
-  await page.mouse.up();
-  await wait(100);
-  assert.deepEqual((await ui.sent()).filter((m) => (m.t === 'act' || m.t === 'set') && m.deck === 3), []);
-  assert.equal(await page.locator('input.tempo-edit').count(), 0, 'no tempo entry opened');
-  assert.deepEqual(await toasts(), []);
+  const blur = () => page.evaluate(() => document.activeElement && document.activeElement.blur());
+  await blur();
+  for (const k of ['Digit3', 'Space', 'KeyS', 'Shift+KeyS', 'KeyQ', 'KeyF', 'KeyT', 'Shift+KeyT', 'KeyK', 'ArrowUp', 'Comma', 'Period', 'KeyV', 'KeyC', 'ArrowRight', 'KeyR']) {
+    await press(k, () => page.keyboard.press(k));
+  }
+  // A focused control's own keys.
+  for (const [sel, k] of [['[data-bpm]', 'Enter'], ['[data-ctl="eq.hi"]', 'ArrowUp'], ['[data-kill="low"]', 'Enter']]) {
+    await press(`${k} on ${sel}`, async () => { await d3.locator(sel).focus(); await page.keyboard.press(k); });
+  }
+  await blur();
+  await press('click the overview', async () => {
+    const ov = await row(3).locator('[data-overview]').boundingBox();
+    await page.mouse.click(ov.x + ov.width / 2, ov.y + ov.height / 2);
+  });
+  await press('drag the waveform', async () => {
+    const wv = await row(3).locator('[data-wave]').boundingBox();
+    await page.mouse.move(wv.x + wv.width / 2, wv.y + wv.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(wv.x + wv.width / 2 - 100, wv.y + wv.height / 2, { steps: 4 });
+    await page.mouse.up();
+  });
 });
 
 test('the cancel ✕ sends loadCancel at once; a held eject still ejects a loading deck', async () => {
@@ -156,13 +179,15 @@ test('the cancel ✕ sends loadCancel at once; a held eject still ejects a loadi
   await x.click();
   await wait(50);
   assert.deepEqual((await sent('act', (m) => m.deck === 3)).map((m) => [m.a, m.arg]), [['loadCancel', {}]]);
+  // That deck is gone now; the next loading deck takes a held eject.
+  await show(kinds((s) => { s.decks[2].id = 9; }));
   await ui.clearSent();
   const b = await deckEl(3).locator('[data-act="eject"]').boundingBox();
   await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2);
   await page.mouse.down();
   await wait(600);
   await page.mouse.up();
-  assert.deepEqual((await sent('act', (m) => m.deck === 3)).map((m) => m.a), ['eject']);
+  assert.deepEqual((await sent('act', (m) => m.deck === 9)).map((m) => m.a), ['eject']);
 });
 
 // ---------------------------------------------------------------- failed loads, load reports
@@ -202,7 +227,7 @@ test('any deck with a load report offers Copy load report from its ⓘ menu', as
   await info.click();
   assert.equal(await menu.isVisible(), true);
   assert.equal(await info.getAttribute('aria-expanded'), 'true');
-  await menu.getByRole('menuitem', { name: 'Copy load report' }).click();
+  await menu.getByRole('button', { name: 'Copy load report' }).click();
   await wait(50);
   assert.deepEqual(await copied(), [REPORT]);
   assert.equal(await menu.isHidden(), true, 'closes once used');
@@ -221,12 +246,63 @@ test('a live deck whose whole-track load failed offers to record the whole track
   await ui.clearSent();
   const menu = deckEl(1).locator('[data-report-menu]');
   await deckEl(1).locator('[data-report-btn]').click();
-  const rec = menu.getByRole('menuitem', { name: 'Record whole track (2×, reduced highs)' });
+  const rec = menu.getByRole('button', { name: 'Record whole track (2×, reduced highs)' });
   assert.equal(await rec.isVisible(), true);
   await rec.click();
   await wait(50);
   assert.deepEqual((await sent('act', (m) => m.deck === 1)).map((m) => m.a), ['recordWhole']);
   assert.equal(await menu.isHidden(), true);
+});
+
+test('the ⓘ menu is a plain list of buttons, like the rest of the page: used from the keyboard, focus goes back to the ⓘ; Tab out closes it', async () => {
+  await stubClipboard();
+  await show(kinds((s) => { s.decks[0].load.report = REPORT; }));
+  const info = deckEl(1).locator('[data-report-btn]'), menu = deckEl(1).locator('[data-report-menu]');
+  assert.equal(await page.locator('[role="menu"], [role="menuitem"], [aria-haspopup="menu"], [aria-haspopup="true"]').count(), 0, 'no menu roles anywhere');
+  const focused = (loc) => loc.evaluate((el) => document.activeElement === el);
+  for (const [name, tabs] of [['Copy load report', 0], ['Record whole track (2×, reduced highs)', 1]]) {
+    await info.focus();
+    await page.keyboard.press('Enter');
+    assert.equal(await menu.isVisible(), true, name);
+    for (let i = 0; i < tabs; i++) await page.keyboard.press('Tab');
+    assert.equal(await focused(menu.getByRole('button', { name })), true, `${name} focused`);
+    await page.keyboard.press('Enter');
+    await wait(50);
+    assert.equal(await menu.isHidden(), true, `${name}: closed once used`);
+    assert.equal(await focused(info), true, `${name}: focus back on the ⓘ`);
+  }
+  await info.focus();
+  await page.keyboard.press('Enter');
+  await page.keyboard.press('Tab');
+  await page.keyboard.press('Tab');
+  assert.equal(await menu.isHidden(), true, 'Tab past its last button closes it');
+  assert.equal(await info.getAttribute('aria-expanded'), 'false');
+});
+
+test('the ⓘ menu opens inside the window on the leftmost and the rightmost of six decks at 1280×720', async () => {
+  const decks = [1, 2, 3, 4, 5, 6].map((i) => deck({ id: i, slot: i, tabId: 100 + i, title: `Track number ${i} with a fairly long title here`, load: { report: REPORT } }));
+  await show(makeState({ decks }), { width: 1280, height: 720 });
+  for (const slot of [1, 6]) {
+    await deckEl(slot).locator('[data-report-btn]').click();
+    const menu = deckEl(slot).locator('[data-report-menu]');
+    assert.equal(await menu.isVisible(), true, `deck ${slot}`);
+    const out = await menu.evaluate((m) => {
+      const vw = document.documentElement.clientWidth, vh = document.documentElement.clientHeight, b = m.getBoundingClientRect(), o = [];
+      if (b.left < 0 || b.top < 0 || b.right > vw || b.bottom > vh) o.push(`menu ${Math.round(b.left)}..${Math.round(b.right)} x ${Math.round(b.top)}..${Math.round(b.bottom)} outside ${vw}x${vh}`);
+      // Each item whole and on top, at both ends: not cut off by the deck row's scroll box either.
+      for (const it of m.querySelectorAll('button')) {
+        if (it.hidden) continue;
+        const r = it.getBoundingClientRect(), y = (r.top + r.bottom) / 2;
+        for (const x of [r.left + 2, r.right - 2]) if (!it.contains(document.elementFromPoint(x, y))) o.push(`"${it.textContent}" cut off at x=${Math.round(x)}`);
+      }
+      const d = document.getElementById('decks');
+      if (d.scrollWidth > d.clientWidth + 1) o.push(`decks scroll horizontally ${d.scrollWidth} > ${d.clientWidth}`);
+      return o;
+    });
+    assert.deepEqual(out, [], `deck ${slot}`);
+    await page.keyboard.press('Escape');
+    assert.equal(await menu.isHidden(), true);
+  }
 });
 
 // ---------------------------------------------------------------- bar 1, navigation
@@ -492,6 +568,144 @@ test('the Sources drawer loads a link to an audio file; anything but a web link 
   await page.locator('#sources [data-close]').click();
 });
 
+/** A link loaded from the Sources drawer: its loadUrl act. */
+async function loadLink(url) {
+  await page.locator('#sourcesBtn').click();
+  await page.locator('#loadLink').fill(url);
+  await page.locator('#loadLink').press('Enter');
+  await page.locator('#sources [data-close]').click();
+  await wait(30);
+  return (await loadActs('loadUrl')).find((m) => m.arg.url === url);
+}
+/** kinds() with more decks after the first three, each loading the way loadFile/loadUrl's deck does (no tab). Engine
+ *  deck ids only ever rise, so theirs are above any an earlier test showed. */
+const withLoading = (...more) => kinds((s) => { s.decks.push(...more.map((o) => loadingDeck({ title: 'long', url: '', ...o }))); });
+const lastAct = async (a, deckId) => (await sent('act', (m) => m.a === a && m.deck === deckId)).at(-1);
+
+test('a cancel the DJ asked for is not an error: no warning after ✕, a held eject or STOP ALL, and a second ✕ is ignored', async () => {
+  await show(kinds());
+  await spyRevoke();
+  await manual(true);
+  await ui.clearSent();
+  await clearToasts();
+  try {
+    // ✕, twice in quick succession: one loadCancel, and the link's "Loading was cancelled." says nothing.
+    const link = await loadLink('https://example.com/long.mp3');
+    await show(withLoading({ id: 91, slot: 4, url: 'https://example.com/long.mp3' }));
+    await deckEl(4).locator('[data-act="loadCancel"]').dblclick();
+    await wait(50);
+    const cancels = await sent('act', (m) => m.a === 'loadCancel');
+    assert.deepEqual(cancels.map((m) => m.deck), [91], 'one loadCancel');
+    await reply(cancels[0].id, true);
+    await show(kinds());
+    await reply(link.id, false, 'Loading was cancelled.');
+    await wait(50);
+    assert.deepEqual(await toasts(), []);
+    // A held eject on a dropped file's loading deck.
+    await drop('.board', [{ name: 'b.mp3', type: 'audio/mpeg' }]);
+    await wait(30);
+    const file = (await loadActs('loadFile')).at(-1);
+    await show(withLoading({ id: 92, slot: 4 }));
+    const b = await deckEl(4).locator('[data-act="eject"]').boundingBox();
+    await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2);
+    await page.mouse.down();
+    await wait(600);
+    await page.mouse.up();
+    await reply((await lastAct('eject', 92)).id, true);
+    await show(kinds());
+    await reply(file.id, false, 'Loading was cancelled.');
+    await wait(50);
+    assert.deepEqual(await toasts(), []);
+    assert.deepEqual(await revoked(), [file.arg.blobUrl]);
+    // STOP ALL, confirmed.
+    const all = await loadLink('https://example.com/all.mp3');
+    await show(withLoading({ id: 93, slot: 4, url: 'https://example.com/all.mp3' }));
+    page.once('dialog', (d) => d.accept());
+    await page.locator('#stopAllBtn').click();
+    await wait(50);
+    await reply((await lastAct('stopAll', null)).id, true);
+    await show(kinds());
+    await reply(all.id, false, 'Loading was cancelled.');
+    await wait(50);
+    assert.deepEqual(await toasts(), []);
+    // A load nobody cancelled still says why it failed.
+    const bad = await loadLink('https://example.com/missing.mp3');
+    await show(withLoading({ id: 94, slot: 4, url: 'https://example.com/missing.mp3' }));
+    await show(kinds());
+    await reply(bad.id, false, ERROR);
+    await wait(50);
+    assert.deepEqual(await toasts(), [ERROR]);
+  } finally { await manual(false); }
+});
+
+test('a load still loading after the engine\'s answer time keeps waiting, and settles from its deck: resident is done, gone is settled', async () => {
+  // The answer time of a load (120 s) is cut to 300 ms here.
+  const answerMs = (v) => page.evaluate(async (x) => {
+    const { ACT_MS } = await import('/ui/connection.js');
+    const old = ACT_MS.loadFile;
+    ACT_MS.loadFile = ACT_MS.loadUrl = x;
+    return old;
+  }, v);
+  const late = 700; // past the answer time, twice over
+  await show(kinds());
+  await spyRevoke();
+  await manual(true);
+  await ui.clearSent();
+  await clearToasts();
+  const was = await answerMs(300);
+  const resident = (o) => kinds((s) => { s.decks.push(residentDeck({ title: 'long', ...o })); });
+  try {
+    // A link whose deck loads past the answer time, then turns into a whole track: never a warning.
+    const link = await loadLink('https://example.com/slow-link.mp3');
+    await show(withLoading({ id: 101, slot: 4, url: 'https://example.com/slow-link.mp3' }));
+    await wait(late);
+    assert.deepEqual(await toasts(), [], 'no time-out while its deck loads');
+    await show(resident({ id: 101, slot: 4 }));
+    await reply(link.id, true);
+    await wait(50);
+    assert.deepEqual(await toasts(), []);
+    // A dropped file: its blob: URL lives while the deck loads, and goes once the deck holds the track, answer or not.
+    await drop('.board', [{ name: 'long.mp3', type: 'audio/mpeg' }]);
+    await wait(30);
+    const file = (await loadActs('loadFile')).at(-1);
+    await show(withLoading({ id: 102, slot: 5 }));
+    await wait(late);
+    assert.deepEqual(await revoked(), [], 'still loading');
+    await show(resident({ id: 102, slot: 5 }));
+    await wait(50);
+    assert.deepEqual(await revoked(), [file.arg.blobUrl], 'resident: done');
+    await reply(file.id, true); // a late answer changes nothing
+    // Its deck gone: settled, quietly, once its answer has had a moment to say why.
+    await drop('.board', [{ name: 'gone.mp3', type: 'audio/mpeg' }]);
+    await wait(30);
+    const gone = (await loadActs('loadFile')).at(-1);
+    await show(withLoading({ id: 103, slot: 4 }));
+    await wait(late);
+    await show(kinds());
+    await wait(2200);
+    assert.deepEqual((await revoked()).at(-1), gone.arg.blobUrl, 'gone: settled');
+    // A deck gone with its answer close behind: the answer says why.
+    const bad = await loadLink('https://example.com/bad.mp3');
+    await show(withLoading({ id: 104, slot: 4, url: 'https://example.com/bad.mp3' }));
+    await wait(late);
+    await show(kinds());
+    await reply(bad.id, false, '“bad” is not audio this browser can play.');
+    await wait(50);
+    assert.deepEqual(await toasts(), ['“bad” is not audio this browser can play.']);
+    // No deck ever came: the engine did not answer, and the blob goes.
+    await clearToasts();
+    await drop('.board', [{ name: 'lost.mp3', type: 'audio/mpeg' }]);
+    await wait(30);
+    const lost = (await loadActs('loadFile')).at(-1);
+    await wait(late);
+    assert.deepEqual(await toasts(), ['The audio engine did not answer']);
+    assert.deepEqual((await revoked()).at(-1), lost.arg.blobUrl);
+  } finally {
+    await answerMs(was);
+    await manual(false);
+  }
+});
+
 /** A paste (Ctrl/Cmd+V) of text on the element matching sel, or on the page itself. */
 const paste = (sel, t) => page.evaluate(([s, x]) => {
   const dt = new DataTransfer();
@@ -568,6 +782,26 @@ test('the settings drawer sets and keeps the resident track limit and 2× whole-
   await wait(50);
   assert.deepEqual(await lastSet('resident.auto'), [false]);
   await page.locator('#settings [data-close]').click();
+});
+
+test('Escape closes the Sources or Settings drawer from its text field too; a tempo entry keeps Escape to itself', async () => {
+  await show(kinds());
+  await page.locator('#sourcesBtn').click();
+  await page.locator('#loadLink').fill('https://exa');
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('#sources').isHidden(), true, 'from the Load link field');
+  await page.locator('#settingsBtn').click();
+  await page.locator('#residentLimit').focus();
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('#settings').isHidden(), true, 'from the limit field');
+  await page.locator('#sourcesBtn').click();
+  await deckEl(1).locator('[data-bpm]').click();
+  assert.equal(await page.locator('input.tempo-edit').count(), 1);
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('input.tempo-edit').count(), 0, 'the entry closed');
+  assert.equal(await page.locator('#sources').isVisible(), true, 'the drawer stays');
+  await page.locator('#sources [data-close]').click();
+  await page.locator('#loadLink').evaluate((el) => { el.value = ''; });
 });
 
 test('the top bar warns quietly once decks hold more than 1.5 GiB of audio', async () => {
