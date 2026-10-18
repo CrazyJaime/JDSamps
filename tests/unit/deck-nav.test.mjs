@@ -106,6 +106,18 @@ test('a quantized seek on a deck SYNCed in BEAT keeps it in phase with the maste
   assert.ok(Math.abs(landed - (before + 7.3)) <= 0.25, `landed ${landed}, asked ${before + 7.3}: within half a beat`);
 });
 
+test('the master a BEAT-synced deck follows keeps its own beat phase when it seeks, so the follower stays locked', async () => {
+  const { clock, engine, m, s } = await synced();
+  const b0 = trueBeatOut(m, clock.t);
+  assert.deepEqual(await m.act('seek', { pos: m.ts.posAt(clock.t) + 5.3 }), { ok: true });
+  run(engine, clock, 0.4);
+  const b1 = trueBeatOut(m, clock.t);
+  const e = wrapToHalf(b1.lastBeat - b0.lastBeat, b0.period) * 1000;
+  assert.ok(Math.abs(e) < 0.5, `the master's beat moved ${e.toFixed(2)} ms`);
+  run(engine, clock, 1);
+  assert.ok(Math.abs(clockErrMs(engine, s, clock.t)) < 2, `follower ${clockErrMs(engine, s, clock.t).toFixed(2)} ms off`);
+});
+
 test('quantize on an unsynced playing deck moves it whole beats: its own beat phase is kept', async () => {
   const { clock, d, go } = rig();
   await d.act('play');
