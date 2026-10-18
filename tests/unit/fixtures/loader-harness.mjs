@@ -30,12 +30,19 @@ export function rendition(rep = 'opus-hi', origin = 'https://cdn.example') {
     segs: r.segs.map((s) => ({ url: `${origin}/media/${s.path}`, t0: s.t0, t1: s.t1, bytes: read(s.path) })),
   };
 }
-/** The rendition's HLS media playlist, its links relative to it (as the model sites write them). */
-export function playlist(r) {
+/**
+ * The rendition's HLS media playlist, its links relative to it (as the model sites write them). ts: the playlist an
+ * MPEG-TS stream has instead (no init, .ts pieces), whose player transmuxes each piece before it appends it.
+ */
+export function playlist(r, { ts = false } = {}) {
   const rel = (u) => u.slice(r.list.lastIndexOf('/') + 1);
+  if (ts) return ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-TARGETDURATION:4', '#EXT-X-PLAYLIST-TYPE:VOD',
+    ...r.segs.flatMap((s) => [`#EXTINF:${(s.t1 - s.t0).toFixed(6)},`, rel(tsUrl(s.url))]), '#EXT-X-ENDLIST', ''].join('\n');
   return ['#EXTM3U', '#EXT-X-VERSION:7', '#EXT-X-TARGETDURATION:4', '#EXT-X-PLAYLIST-TYPE:VOD', `#EXT-X-MAP:URI="${rel(r.init.url)}"`,
     ...r.segs.flatMap((s) => [`#EXTINF:${(s.t1 - s.t0).toFixed(6)},`, rel(s.url)]), '#EXT-X-ENDLIST', ''].join('\n');
 }
+/** A piece's link in an MPEG-TS playlist. */
+export const tsUrl = (u) => u.replace(/\.m4s$/, '.ts');
 const enc = (s) => { const b = Buffer.from(s); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); };
 /** A whole "file" the stand-in decoder reads: `seconds` of audio coded `audio`. */
 export const file = (audio, seconds) => enc(JSON.stringify({ audio, seconds }));
@@ -60,13 +67,14 @@ export const code = (s) => Math.fround([...String(s)].reduce((n, c) => (n * 31 +
  *   status (the frame agent's status, over a heard playing player's), framePages ([{...}]: frame i's page, over this one),
  *   other ({rendition, sb, n}: another player's SourceBuffer in the frame, appending its init and first n segments at tap on),
  *   sbs (the SourceBuffers the tap says feed the heard player: default [0] for 'mse', [] for 'progressive'; null: not said),
- *   evicts (the player lets go of what it held from before the tap while it is driven: a later drive appends that again)
+ *   evicts (the player lets go of what it held from before the tap while it is driven: a later drive appends that again),
+ *   ts (the playlist is MPEG-TS: no init, .ts pieces)
  * }
  */
 export function makeTab({ tabId = 7, url = 'https://site.example/track', frames = 1, ...page } = {}) {
   const blobs = new Map(), log = [], net = new Map(Object.entries(page.files || {}));
   for (const r of [page, ...(page.framePages || [])].flatMap((p) => [p.rendition, p.other && p.other.rendition])) {
-    if (r) { net.set(r.list, enc(playlist(r))); net.set(r.init.url, r.init.bytes); for (const s of r.segs) net.set(s.url, s.bytes); }
+    if (r) { net.set(r.list, enc(playlist(r, { ts: page.ts }))); net.set(r.init.url, r.init.bytes); for (const s of r.segs) net.set(page.ts ? tsUrl(s.url) : s.url, s.bytes); }
   }
   const tab = { tabId, url, page, blobs, log, net, frames: [], deck: null, hooks: [] };
   const mint = (bytes) => { const u = `blob:${new URL(url).origin}/${crypto.randomUUID()}`; blobs.set(u, bytes); return u; };

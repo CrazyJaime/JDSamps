@@ -86,8 +86,9 @@ const short = (u) => { try { const x = new URL(u); return `${x.host}${x.pathname
 const uniq = (xs) => [...new Set(xs)];
 
 /**
- * An HLS playlist: {variants: [{bw, url}]} for a master playlist, {init, segs: [{url, t0, t1}]} for a media
- * playlist, or null (not HLS, encrypted segments, or byte ranges of one file, none of which are read here).
+ * An HLS playlist: {variants: [{bw, url}]} for a master playlist, {init, segs: [{url, t0, t1}], ts?} for a media
+ * playlist, or null (not HLS, encrypted segments, or byte ranges of one file, none of which are read here). ts:
+ * its pieces are MPEG-TS (no init, and .ts pieces or an mp2t hint), which decodeAudioData cannot read (§4.2).
  */
 export function parseHls(text, base) {
   const s = String(text);
@@ -108,7 +109,9 @@ export function parseHls(text, base) {
     }
   } catch (_) { return null; }
   if (variants.length) return { variants };
-  return segs.length ? { init, segs } : null;
+  if (!segs.length) return null;
+  const ts = !init && (segs.some((x) => /\.ts$/i.test(new URL(x.url).pathname)) || /mp2t/i.test(s));
+  return ts ? { init, segs, ts } : { init, segs };
 }
 
 /**
@@ -407,7 +410,7 @@ export class Loader extends Job {
       if (got) return got;
     }
     // Links the player asked for while it was driven: one more pass at them.
-    if (order.includes('refetch') && this.mseFrame() && this.wanted(this.plan).urls.length) {
+    if (order.includes('refetch') && this.mseFrame() && !(this.plan && this.plan.ts) && this.wanted(this.plan).urls.length) {
       const got = await this.step('refetch', (e) => this.refetch(e));
       if (got) return got;
     }
@@ -524,6 +527,8 @@ export class Loader extends Job {
       this.plan = null;
       for (const url of lists.slice(0, 4)) { this.plan = await this.readList(url); if (this.plan) break; }
     }
+    // A player of MPEG-TS transmuxes each piece before it appends it: fetched as they are, the pieces would not decode.
+    if (this.plan && this.plan.ts) return { outcome: 'skipped', why: "the playlist's pieces are MPEG-TS, which cannot be decoded directly" };
     let fetched = 0, failed = 0;
     const counts = () => `${fetched} pieces fetched${failed ? `, ${failed} failed` : ''}`;
     for (let round = 0; round < 3; round++) {

@@ -43,6 +43,26 @@ test('an HLS playlist is read: a master names its variants, a media playlist its
   assert.equal(parseHls('#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="k"\n#EXTINF:4,\ns0.ts\n', 'https://c.example/x.m3u8'), null, 'encrypted segments cannot be decoded');
 });
 
+test('an HLS playlist of MPEG-TS pieces is told apart: no init, and .ts pieces or an mp2t hint', () => {
+  const at = 'https://c.example/m/a.m3u8', list = (lines) => parseHls(['#EXTM3U', ...lines, '#EXT-X-ENDLIST', ''].join('\n'), at);
+  assert.equal(list(['#EXTINF:4,', 's0.ts', '#EXTINF:4,', 's1.ts?tok=1']).ts, true);
+  assert.equal(list(['#EXTINF:4,', 'seg?n=0&mime=video%2Fmp2t']).ts, true);
+  assert.equal(list(['#EXTINF:4,', 'seg?n=0', '#EXT-X-MEDIA-TYPE:video/mp2t']).ts, true);
+  assert.equal(list(['#EXT-X-MAP:URI="init.mp4"', '#EXTINF:4,', 's0.m4s']).ts, undefined, 'fMP4 pieces with their init');
+  assert.equal(list(['#EXTINF:4,', 's0.aac', '#EXTINF:4,', 's1.aac']).ts, undefined, 'packed audio (ADTS) decodes as it is');
+  assert.equal(list(['#EXTINF:4,', 's0.mp3']).ts, undefined);
+});
+
+test('an MSE page whose playlist is MPEG-TS skips fetching its pieces again (they cannot be decoded), says so, and drives the player', async () => {
+  const r = hi();
+  const { result, tab, deck, engine } = await load({ kind: 'mse', rendition: r, preTap: 0, playing: 1, list: true, ts: true });
+  assert.equal(result.kind, 'resident', JSON.stringify(called(engine, 'failLoadingToLive')));
+  assert.deepEqual(asked(tab), ['tap on', 'readTralbum', 'fetch', 'drive seekhop']);
+  assert.deepEqual(tab.sent().find((m) => m.t === 'fetch').urls, [r.list], 'the playlist only: no piece is fetched');
+  assert.match(deck.load.report, /refetch \(fetching the track's pieces\): skipped in \d+\.\d s — the playlist's pieces are MPEG-TS, which cannot be decoded directly/);
+  assert.equal(deck.load.report.match(/^ +refetch/gm).length, 1, 'not tried again after the drive');
+});
+
 // ---------------------------------------------------------------- the ladder
 test('a Bandcamp-like page loads from its own track link: readTralbum, and nothing else', async () => {
   const link = 'https://site.example/stream/track.mp3';
