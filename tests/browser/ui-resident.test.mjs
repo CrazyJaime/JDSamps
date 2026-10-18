@@ -638,6 +638,74 @@ test('a cancel the DJ asked for is not an error: no warning after ✕, a held ej
   } finally { await manual(false); }
 });
 
+test('a load still loading after the engine\'s answer time keeps waiting, and settles from its deck: resident is done, gone is settled', async () => {
+  // The answer time of a load (120 s) is cut to 300 ms here.
+  const answerMs = (v) => page.evaluate(async (x) => {
+    const { ACT_MS } = await import('/ui/connection.js');
+    const old = ACT_MS.loadFile;
+    ACT_MS.loadFile = ACT_MS.loadUrl = x;
+    return old;
+  }, v);
+  const late = 700; // past the answer time, twice over
+  await show(kinds());
+  await spyRevoke();
+  await manual(true);
+  await ui.clearSent();
+  await clearToasts();
+  const was = await answerMs(300);
+  const resident = (o) => kinds((s) => { s.decks.push(residentDeck({ title: 'long', ...o })); });
+  try {
+    // A link whose deck loads past the answer time, then turns into a whole track: never a warning.
+    const link = await loadLink('https://example.com/slow-link.mp3');
+    await show(withLoading({ id: 101, slot: 4, url: 'https://example.com/slow-link.mp3' }));
+    await wait(late);
+    assert.deepEqual(await toasts(), [], 'no time-out while its deck loads');
+    await show(resident({ id: 101, slot: 4 }));
+    await reply(link.id, true);
+    await wait(50);
+    assert.deepEqual(await toasts(), []);
+    // A dropped file: its blob: URL lives while the deck loads, and goes once the deck holds the track, answer or not.
+    await drop('.board', [{ name: 'long.mp3', type: 'audio/mpeg' }]);
+    await wait(30);
+    const file = (await loadActs('loadFile')).at(-1);
+    await show(withLoading({ id: 102, slot: 5 }));
+    await wait(late);
+    assert.deepEqual(await revoked(), [], 'still loading');
+    await show(resident({ id: 102, slot: 5 }));
+    await wait(50);
+    assert.deepEqual(await revoked(), [file.arg.blobUrl], 'resident: done');
+    await reply(file.id, true); // a late answer changes nothing
+    // Its deck gone: settled, quietly, once its answer has had a moment to say why.
+    await drop('.board', [{ name: 'gone.mp3', type: 'audio/mpeg' }]);
+    await wait(30);
+    const gone = (await loadActs('loadFile')).at(-1);
+    await show(withLoading({ id: 103, slot: 4 }));
+    await wait(late);
+    await show(kinds());
+    await wait(2200);
+    assert.deepEqual((await revoked()).at(-1), gone.arg.blobUrl, 'gone: settled');
+    // A deck gone with its answer close behind: the answer says why.
+    const bad = await loadLink('https://example.com/bad.mp3');
+    await show(withLoading({ id: 104, slot: 4, url: 'https://example.com/bad.mp3' }));
+    await wait(late);
+    await show(kinds());
+    await reply(bad.id, false, '“bad” is not audio this browser can play.');
+    await wait(50);
+    assert.deepEqual(await toasts(), ['“bad” is not audio this browser can play.']);
+    // No deck ever came: the engine did not answer, and the blob goes.
+    await clearToasts();
+    await drop('.board', [{ name: 'lost.mp3', type: 'audio/mpeg' }]);
+    await wait(30);
+    const lost = (await loadActs('loadFile')).at(-1);
+    await wait(late);
+    assert.deepEqual(await toasts(), ['The audio engine did not answer']);
+    assert.deepEqual((await revoked()).at(-1), lost.arg.blobUrl);
+  } finally {
+    await answerMs(was);
+    await manual(false);
+  }
+});
+
 /** A paste (Ctrl/Cmd+V) of text on the element matching sel, or on the page itself. */
 const paste = (sel, t) => page.evaluate(([s, x]) => {
   const dt = new DataTransfer();
