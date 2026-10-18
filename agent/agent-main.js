@@ -691,7 +691,7 @@
   // its sound), from (it starts at that place) and hold (it waits there, paused, for the next
   // accelerate), so the recording starts with the track.
   // flush: a player that was playing before the tap holds media the tap never saw, and would never
-  // fetch it again (see "flush"): its buffer is emptied first, then it is driven from 0.
+  // fetch it again (see "flush"): its buffer is emptied first, then it is driven from near 0.
   const HOP_WAIT = 3000, END_TOL = 0.3, START_TOL = 0.2;
   const drv = { mode: null, el: null, base: null, state: '', cursor: 0, hop: 0, since: 0, timer: 0, gen: 0, flushing: false, told: false, unflushed: '' };
   // MP3 and ADTS carry no timestamps: their appends can only be placed in order, so no seek-hop.
@@ -791,10 +791,17 @@
   // from before the tap. Real players decide what to fetch from what their buffers hold, the way they
   // fetch again a range dropped under memory pressure. Only while the drive holds the player (muted,
   // rate in hand): stop gives back its place and playing state, and it buffers again by itself.
+  // In two steps, so a player that never fetches a piece twice is not left with nothing to play: first
+  // what lies behind the place stop gives back (all but its last KEEP s), and the player is sent to 0;
+  // only once it has fetched some of that again, the rest. One that has not within PROBE_WAIT keeps the
+  // rest and plays on from its place after stop: said 'sticky'. One at the very start has nothing behind
+  // its place to try this on: not flushed, said 'start'. A player that empties its buffer itself on that
+  // seek (shaka, while it holds anything) has let go of all it held from before the tap: the rest is not
+  // taken from it, which would leave it a hole it never fetches.
   // A MediaSource that has ended is left alone: a remove would reopen it and fire sourceopen, which a
   // player may take for a fresh start, and nothing would end the stream again. Said in tap-progress:
   // drive.state 'flushed' once, or drive.unflushed (why not) while the drive goes on without it.
-  const sbRemove = window.SourceBuffer ? SourceBuffer.prototype.remove : null, FLUSH_WAIT = 3000;
+  const sbRemove = window.SourceBuffer ? SourceBuffer.prototype.remove : null, FLUSH_WAIT = 3000, PROBE_WAIT = 3000, KEEP = 1, MIN_CUT = 0.25;
   /** The driven player's MediaSource and its sound SourceBuffers, or {why} it cannot be flushed. */
   function flushable(el) {
     let src = '';
@@ -819,23 +826,53 @@
       await new Promise((r) => setTimeout(r, 0));
     }
   }
+  /** Remove [from, to) from sb once it is free, if it holds anything there. -> false if the drive moved on meanwhile. */
+  async function cut(sb, from, to, gen) {
+    await free(sb);
+    if (gen !== drv.gen) return false;
+    const b = sb.buffered;
+    if (!(to > from) || !b.length || b.start(0) >= to || b.end(b.length - 1) <= from) return true;
+    sbRemove.call(sb, from, to);
+    await free(sb);
+    return gen === drv.gen;
+  }
+  const holdsAt = (sb, t) => { try { const b = sb.buffered; for (let i = 0; i < b.length; i++) if (b.start(i) <= t && b.end(i) > t) return true; } catch (_) {} return false; };
+  /** Until one of `list` holds media before t again (looked at as each append ends), or `wait` ms. -> whether it does. */
+  function fetchedBelow(list, t, wait) {
+    const below = () => list.some((sb) => { try { const b = sb.buffered; return b.length > 0 && b.start(0) < t - 0.1; } catch (_) { return false; } });
+    return new Promise((res) => {
+      const check = () => { if (below()) end(true); };
+      const end = (v) => { clearTimeout(timer); for (const sb of list) unlisten.call(sb, 'updateend', check); res(v); };
+      for (const sb of list) listen.call(sb, 'updateend', check);
+      const timer = setTimeout(() => end(below()), wait);
+    });
+  }
   async function flush(el, go) {
-    const gen = drv.gen, f = flushable(el);
+    const gen = drv.gen, f = flushable(el), at = drv.base.t - Math.min(KEEP, drv.base.t / 2);
+    if (!f.why && !(at >= MIN_CUT)) f.why = 'start';
     if (f.why) { drv.unflushed = f.why; go(); return; }
     drv.flushing = true;
     try {
+      const ends = []; // where what each held from before the tap ends
       for (const sb of f.list) {
-        await free(sb);
-        if (gen !== drv.gen) return;
-        let end = f.ms.duration;
-        if (!Number.isFinite(end)) { const b = sb.buffered; end = b.length ? b.end(b.length - 1) : 0; }
-        if (!(end > 0) || !sb.buffered.length) continue;
-        sbRemove.call(sb, 0, end);
-        await free(sb);
-        if (gen !== drv.gen) return;
+        if (!(await cut(sb, 0, at, gen))) return;
+        const b = sb.buffered;
+        ends.push(b.length ? b.end(b.length - 1) : 0);
       }
-      drv.told = true;
       try { el.currentTime = 0; } catch (_) {}
+      const again = await fetchedBelow(f.list, at, PROBE_WAIT);
+      if (gen !== drv.gen) return;
+      if (!again) drv.unflushed = 'sticky';
+      else {
+        for (let i = 0; i < f.list.length; i++) {
+          const sb = f.list[i];
+          if (!(ends[i] > at) || !holdsAt(sb, ends[i] - 0.1)) continue; // it let go of that itself
+          let end = f.ms.duration;
+          if (!Number.isFinite(end)) { const b = sb.buffered; end = b.length ? b.end(b.length - 1) : 0; }
+          if (!(await cut(sb, at, end, gen))) return;
+        }
+        drv.told = true;
+      }
     } catch (_) {
       if (gen !== drv.gen) return;
       drv.unflushed = 'none'; // the player took its buffer back meanwhile, or the remove failed

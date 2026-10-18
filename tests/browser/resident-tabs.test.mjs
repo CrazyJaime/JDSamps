@@ -348,8 +348,13 @@ test('a YouTube-like page whose player never fetches a piece twice (?sticky=1), 
   const site = await openSite('opaque', 'autoplay=1&sticky=1');
   await waitFor(() => site.tab.evaluate(() => { const m = window.__media(); return !m.paused && m.t > 5; }), 20000);
   const d = await loadTab(site.tabId);
+  // The live deck plays from the tab: its player was left what it holds around its place, and plays on.
+  const p0 = await player(site.tab);
+  await waitFor(async () => (await player(site.tab)).t > p0.t + 1.5, 5000)
+    .catch(async () => assert.fail(`the tab does not play on after the live fallback: ${JSON.stringify(p0)} -> ${JSON.stringify(await site.tab.evaluate(() => window.__media()))}`));
+  assert.deepEqual([p0.paused, p0.muted, p0.rate], [false, false, 1]);
   const why = /the player would not fetch the start again after a flush: 0\.0–2\d\.\d s came before the deck could read it/;
-  assert.match(d.load.report, new RegExp(`drive \\(seek-hop after a flush, then accelerate 8×\\): failed in \\d+\\.\\d s — ${why.source}`));
+  assert.match(d.load.report, new RegExp(`drive \\(seek-hop\\): failed in \\d+\\.\\d s — ${why.source}`));
   assert.deepEqual(await engine(`const has = e.__pcm.has(${d.id}); e.__loaders.delete(${d.id}); return has;`), false, 'never promoted');
   await assertLive(d, site, why);
 });

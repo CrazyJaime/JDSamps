@@ -63,9 +63,10 @@ export const code = (s) => Math.fround([...String(s)].reduce((n, c) => (n * 31 +
  *   sbs (the SourceBuffers the tap says feed the heard player: default [0] for 'mse', [] for 'progressive'; null: not said),
  *   evicts (the player lets go of what it held from before the tap while it is driven: a later drive appends that again),
  *   flush (how a drive {flush: true} is answered; unset: the flush is ignored, as an agent that does not know it would):
- *     'refetch' (flushed; the player fetches again what left its buffer), 'sticky' (flushed; it never fetches a piece
- *     twice, so it is left with nothing and fetches nothing more), 'ended' | 'video' | 'none' (refused, said in
- *     drive.unflushed, and the drive goes on without it)
+ *     'refetch' (flushed; the player fetches again what left its buffer), 'sticky' (it did not fetch again what was
+ *     taken from behind its place, so the rest is left it: said in drive.unflushed, and nothing more comes), 'dry' (flushed,
+ *     and then it fetches nothing more), 'ended' | 'video' | 'none' | 'start' (refused, said in drive.unflushed, and the
+ *     drive goes on without it)
  * }
  */
 export function makeTab({ tabId = 7, url = 'https://site.example/track', frames = 1, ...page } = {}) {
@@ -103,14 +104,14 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
         fr.trickle.unref();
         return;
       }
-      const unflushed = m.flush === true && ['ended', 'video', 'none'].includes(pg.flush) ? { unflushed: pg.flush } : {};
-      if (m.flush === true && (pg.flush === 'refetch' || pg.flush === 'sticky')) {
+      const unflushed = m.flush === true && ['ended', 'video', 'none', 'start', 'sticky'].includes(pg.flush) ? { unflushed: pg.flush } : {};
+      if (m.flush === true && (pg.flush === 'refetch' || pg.flush === 'dry')) {
         fr.flushed = pg.flush;
         if (pg.flush === 'refetch') for (let k = 0; k < (pg.preTap || 0); k++) fr.appended.delete(k);
         progress({ drive: { mode, state: 'flushed', at: 0 } });
       } else if (unflushed.unflushed) progress({ drive: { mode, state: 'running', at: 0, ...unflushed } });
-      if (fr.flushed === 'sticky') { // emptied, and it never fetches a piece twice: nothing comes
-        setTimeout(() => progress({ drive: { mode, state: mode === 'seekhop' ? 'stalled' : 'running', at: 0 } }), 5);
+      if (fr.flushed === 'dry' || pg.flush === 'sticky') { // it fetches nothing more: nothing comes
+        setTimeout(() => progress({ drive: { mode, state: mode === 'seekhop' ? 'stalled' : 'running', at: 0, ...unflushed } }), 5);
         return;
       }
       if (pg.appends) {

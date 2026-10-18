@@ -220,8 +220,9 @@ export const TAP_ERRORS = Object.freeze(['drm', 'worker', 'preview', 'live', 'no
 const TAP_KINDS = ['init', 'media', 'file'];
 const TAP_DRIVES = ['seekhop', 'accelerate'], TAP_DRIVE_STATES = ['running', 'done', 'stalled', 'refused', 'flushed'];
 // Why a drive asked to flush did not (and drove on unflushed): the player holds pictures only, its media source has
-// ended (a remove would reopen it), or it has no media source the tap can flush.
-const TAP_UNFLUSHED = ['video', 'ended', 'none'];
+// ended (a remove would reopen it), it has no media source the tap can flush, it had only just started (nothing behind
+// its place to try a flush on), or it did not fetch again what was taken from behind its place (sticky: the rest is left it).
+const TAP_UNFLUSHED = ['video', 'ended', 'none', 'start', 'sticky'];
 const isCount = (n, max = Number.MAX_SAFE_INTEGER) => Number.isSafeInteger(n) && n >= 0 && n <= max;
 const tapDuration = (d) => (typeof d === 'number' && Number.isFinite(d) && d > 0 ? d : null);
 const isMime = (s) => typeof s === 'string' && s.length <= 256;

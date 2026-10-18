@@ -549,8 +549,20 @@ test('flushed, a player that fetches again what left its buffer gives the whole 
   assert.match(deck.load.report, /drive \(seek-hop after a flush\): ok in \d+\.\d s/);
 });
 
-test('flushed, a player that never fetches a piece twice ends live, the report naming the start it would not fetch again', async () => {
+test('a player that did not fetch again what the flush took from behind its place ends live at once, the report naming the start it would not fetch again', async () => {
   const { result, engine, deck, tab } = await load({ kind: 'mse', rendition: hi(), preTap: 6, playing: 1, flush: 'sticky' });
+  assert.equal(result.kind, 'live');
+  assert.deepEqual(called(engine, 'startResidentDeck'), []);
+  const why = /the player would not fetch the start again after a flush: 0\.0–24\.0 s came before the deck could read it/;
+  assert.match(called(engine, 'failLoadingToLive')[0].reason, why);
+  assert.match(deck.load.report, new RegExp(`drive \\(seek-hop\\): failed in \\d+\\.\\d s — ${why.source}`));
+  assert.doesNotMatch(deck.load.report, /not flushed/);
+  assert.deepEqual(drives(tab).map((m) => m.mode), ['seekhop'], 'no accelerate: nothing more is to be had');
+  assert.ok(tab.kinds().lastIndexOf('drive stop') > tab.kinds().lastIndexOf('drive seekhop'), 'the drive is stopped');
+});
+
+test('flushed, a player that then fetches nothing more ends live, the report naming the start it would not fetch again', async () => {
+  const { result, engine, deck, tab } = await load({ kind: 'mse', rendition: hi(), preTap: 6, playing: 1, flush: 'dry' });
   assert.equal(result.kind, 'live');
   assert.deepEqual(called(engine, 'startResidentDeck'), []);
   const why = /the player would not fetch the start again after a flush: 0\.0–24\.0 s came before the deck could read it/;
@@ -558,6 +570,12 @@ test('flushed, a player that never fetches a piece twice ends live, the report n
   assert.match(deck.load.report, new RegExp(`drive \\(seek-hop after a flush, then accelerate 8×\\): failed in \\d+\\.\\d s — ${why.source}`));
   assert.match(deck.load.report, new RegExp(`First failure: drive: ${why.source}`));
   assert.ok(tab.kinds().lastIndexOf('drive stop') > tab.kinds().lastIndexOf('drive accelerate'), 'the drive is stopped');
+});
+
+test('a player at the very start of the track is not flushed (nothing behind its place to try it on): noted, and the drive goes on as before', async () => {
+  const { result, deck } = await load({ kind: 'mse', rendition: hi(), preTap: 6, playing: 1, flush: 'start' });
+  assert.equal(result.kind, 'live');
+  assert.match(deck.load.report, /note: the player was not flushed: it had only just started, with nothing behind its place to try a flush on/);
 });
 
 test('a flush the player refuses (it has ended its stream) is noted in the report, and the drive goes on as it did before', async () => {

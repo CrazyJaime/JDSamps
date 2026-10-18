@@ -67,6 +67,8 @@ const UNFLUSHED = {
   ended: 'it had loaded the whole track and ended its stream, which a flush would reopen',
   video: 'it holds pictures only',
   none: 'its media source could not be flushed',
+  start: 'it had only just started, with nothing behind its place to try a flush on',
+  sticky: 'it would not fetch again what was taken from behind its place',
 };
 const DECISIVE = ['drm', 'worker', 'preview', 'live'];
 const NO_LENGTH = "the page's player has not said how long the track is";
@@ -633,6 +635,8 @@ export class Loader extends Job {
         if (f.bytes !== bytes) { bytes = f.bytes; fresh = now(); }
         const d = f.prog && f.prog.drive, st = d && d.mode === mode && !(pass && f.prog === pass.prog) ? d.state : 'running';
         stalled = st === 'stalled' ? stalled || now() : 0;
+        // It did not fetch again what the flush took from behind its place (so it was left the rest): the start is not to be had.
+        if (g0 && d && d.unflushed === 'sticky') { out = { outcome: 'failed', why: unfetched }; break; }
         if (d && d.unflushed && !unflushed) { unflushed = true; this.rep.notes.push(`the player was not flushed: ${UNFLUSHED[d.unflushed]}`); }
         if (st === 'done' || now() - checked >= this.t.check) {
           checked = now();

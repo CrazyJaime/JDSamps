@@ -41,7 +41,7 @@ test('a drive asked to flush says flushed once it has, or why it would not (and 
     const drive = { mode, state: 'flushed', at: 0 };
     assert.deepEqual(validateAgentMessage({ ...m, drive }), { ...m, drive });
   }
-  for (const unflushed of ['video', 'ended', 'none']) {
+  for (const unflushed of ['video', 'ended', 'none', 'start', 'sticky']) {
     const drive = { mode: 'seekhop', state: 'running', at: 3, unflushed };
     assert.deepEqual(validateAgentMessage({ ...m, drive }), { ...m, drive });
   }

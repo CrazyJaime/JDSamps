@@ -978,7 +978,9 @@ describe('flushing the player before a drive', { concurrency: 3 }, () => {
     const states = await driveStates(p);
     assert.equal(states.filter((s) => s === 'flushed').length, 1, `flushed said once: ${states}`);
     assert.ok(states.indexOf('flushed') < states.lastIndexOf('done'), `${states}`);
-    assert.deepEqual(await removes(p), [[MIME, 0, 180]], 'the sound SourceBuffer emptied once, to the length of the track');
+    const rm = await removes(p);
+    assert.ok(rm.length === 2 && rm.every((r) => r[0] === MIME) && rm[0][1] === 0 && rm[0][2] > 0.25 && rm[0][2] < t0 && rm[1][1] === rm[0][2] && rm[1][2] === 180,
+      `what lies behind its place, then (once it fetched that again) the rest, to the length of the track: ${JSON.stringify(rm)} (at ${t0})`);
     await waitFor(async () => (await partsOf(p)).length >= 46, 3000);
     const got = await blobShas(p, (await partsOf(p)).map((x) => x.blobUrl)), want = [fx.long.init, ...fx.long.segs.slice(0, 45)].map(sha);
     assert.deepEqual(want.filter((h) => !got.includes(h)), [], 'every piece from 0 to the end of the 3:00');
@@ -994,6 +996,30 @@ describe('flushing the player before a drive', { concurrency: 3 }, () => {
     await p.close();
   });
 
+  test('a playing player that never fetches a piece twice is left what it holds around its place: said sticky, and after stop it plays on from there', async () => {
+    const p = await tapPage(LONG, { init: [REMOVE_SPY] }); // no &buf: it fetches each segment once, whatever its buffer holds
+    await connect(p);
+    await p.run("window.__go().then(() => document.getElementById('a').play())");
+    await waitFor(async () => { const m = await media(p); return !m.paused && m.t > 2; }, 8000);
+    await bufferedTo(p, 20);
+    await send(p, { t: 'tap', on: true });
+    const t0 = (await media(p)).t;
+    await send(p, { t: 'drive', mode: 'seekhop', flush: true });
+    await waitFor(async () => { const d = (await lastProgress(p))?.drive; return d && (d.unflushed || d.state === 'flushed'); }, 8000);
+    await send(p, { t: 'drive', mode: 'stop' });
+    const m = await media(p);
+    assert.deepEqual([m.paused, m.muted, m.rate], [false, false, 1]);
+    assert.ok(m.t >= t0 && m.t < t0 + 1.5, `back where it was: ${m.t} (drive at ${t0})`);
+    await waitFor(async () => (await media(p)).t > m.t + 1, 5000)
+      .catch(async () => assert.fail(`it does not play again: ${JSON.stringify(await media(p))}, buffered ${JSON.stringify(await sbRanges(p))}`));
+    const said = (await posted(p, 'tap-progress')).filter((g) => g.drive).map((g) => g.drive);
+    assert.ok(said.some((d) => d.unflushed === 'sticky') && !said.some((d) => d.state === 'flushed'), JSON.stringify(said));
+    const rm = await removes(p);
+    assert.ok(rm.length === 1 && rm[0][0] === MIME && rm[0][1] === 0 && rm[0][2] > 0.25 && rm[0][2] < t0, `only what lies behind its place: ${JSON.stringify(rm)} (at ${t0})`);
+    await checkPosted(p);
+    await p.close();
+  });
+
   test('flush never empties a SourceBuffer of pictures: beside a sound one only the sound is flushed; with pictures only it is refused, said, and the drive goes on', async () => {
     const both = await tapPage(`${LONG}&buf&video`, { init: [REMOVE_SPY] });
     await connect(both);
@@ -1004,11 +1030,12 @@ describe('flushing the player before a drive', { concurrency: 3 }, () => {
     }))`);
     const held = await sbRanges(both, '__vsb');
     assert.ok(held.length === 1 && held[0][0] < 0.05 && held[0][1] > 7.5, `pictures held: ${JSON.stringify(held)}`);
-    await waitFor(async () => (await sbRanges(both)).length > 0, 5000);
+    await both.run("document.getElementById('a').currentTime = 6"); // something behind its place to flush first
+    await waitFor(async () => { const b = await sbRanges(both); return b.length === 1 && b[0][1] > 25.9; }, 5000);
     await send(both, { t: 'tap', on: true });
     await send(both, { t: 'drive', mode: 'seekhop', flush: true });
-    await waitFor(async () => (await driveStates(both)).includes('flushed'), 5000);
-    assert.deepEqual(await removes(both), [[MIME, 0, 180]], 'only the sound');
+    await waitFor(async () => (await driveStates(both)).includes('flushed'), 8000);
+    assert.deepEqual(await removes(both), [[MIME, 0, 5], [MIME, 5, 180]], 'only the sound');
     assert.deepEqual(await sbRanges(both, '__vsb'), held, 'the pictures kept');
     await send(both, { t: 'drive', mode: 'stop' });
     await checkPosted(both);
@@ -1025,6 +1052,23 @@ describe('flushing the player before a drive', { concurrency: 3 }, () => {
     await send(pics, { t: 'drive', mode: 'stop' });
     await checkPosted(pics);
     await pics.close();
+  });
+
+  test('a player at the very start (nothing behind its place to try a flush on) is not flushed: said, nothing removed, and the drive goes on', async () => {
+    const p = await tapPage(`${LONG}&buf`, { init: [REMOVE_SPY] });
+    await connect(p);
+    await p.run('window.__go()'); // paused at 0, 20 s held
+    await bufferedTo(p, 20);
+    await send(p, { t: 'tap', on: true });
+    await send(p, { t: 'drive', mode: 'seekhop', flush: true });
+    await waitFor(async () => { const d = (await lastProgress(p))?.drive; return d && d.unflushed === 'start'; }, 3000);
+    await waitFor(async () => (await driveState(p)) === 'done', 15000);
+    assert.ok(!(await driveStates(p)).includes('flushed'));
+    assert.deepEqual(await removes(p), []);
+    await send(p, { t: 'drive', mode: 'stop' });
+    assert.deepEqual([(await media(p)).t, (await media(p)).muted], [0, false]);
+    await checkPosted(p);
+    await p.close();
   });
 
   test('flush on a MediaSource that has ended is refused (a remove would reopen it): said, nothing removed, no sourceopen, the buffer kept; the drive goes on', async () => {
