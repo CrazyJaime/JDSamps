@@ -10,6 +10,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { validateAgentMessage } from '../../../shared/protocol.js';
 import { gapsFor, AssemblyError } from '../../../engine/assemble.js';
+import { mp3Frames } from '../../../engine/bmff.js';
 import { Loader } from '../../../engine/loader.js';
 
 const SITES = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../fixtures/sites');
@@ -38,6 +39,12 @@ export function playlist(r) {
 const enc = (s) => { const b = Buffer.from(s); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); };
 /** A whole "file" the stand-in decoder reads: `seconds` of audio coded `audio`. */
 export const file = (audio, seconds) => enc(JSON.stringify({ audio, seconds }));
+/** A real MP3 frame stream, `seconds` long (MPEG-2.5 Layer III, 8 kb/s at 8 kHz, mono: 72 bytes and 72 ms a frame). */
+export function mp3(seconds) {
+  const n = Math.ceil(seconds / 0.072 - 1e-9), u8 = new Uint8Array(n * 72);
+  for (let i = 0; i < n; i++) u8.set([0xFF, 0xE3, 0x18, 0xC0], i * 72);
+  return u8.buffer;
+}
 /** The code decoded PCM carries for a source (its first sample). */
 export const code = (s) => Math.fround([...String(s)].reduce((n, c) => (n * 31 + c.charCodeAt(0)) % 997, 7) / 1000);
 
@@ -213,7 +220,11 @@ export const decoders = {
   async decodeFile(ctx, buf) {
     await turn();
     let o;
-    try { o = JSON.parse(new TextDecoder().decode(buf)); } catch (_) { throw new Error('Unable to decode audio data'); }
+    try { o = JSON.parse(new TextDecoder().decode(buf)); } catch (_) {
+      const w = mp3Frames(buf); // an MP3 frame stream decodes to as long as its frames
+      if (!w.frames || w.midJunk) throw new Error('Unable to decode audio data');
+      o = { audio: 'mp3', seconds: w.samples / w.sampleRate };
+    }
     if (!o || typeof o.seconds !== 'number') throw new Error('Unable to decode audio data');
     const L = new Float32Array(Math.round(o.seconds * ctx.sampleRate)).fill(code(o.audio));
     return { L, R: L.slice(), sampleRate: ctx.sampleRate };

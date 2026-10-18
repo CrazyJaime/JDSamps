@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SITES, firstRung, parseHls, findStart } from '../../engine/loader.js';
 import { defaults, MASTER_PARAMS, PERSISTED_MASTER_KEYS, validateUiMessage } from '../../shared/protocol.js';
-import { load, rendition, file, code, DUR, SR, OPUS, makeTab, makeEngine, loaderFor, fetcher, settle, turn } from './fixtures/loader-harness.mjs';
+import { load, rendition, file, mp3, code, DUR, SR, OPUS, makeTab, makeEngine, loaderFor, fetcher, settle, turn, decoders } from './fixtures/loader-harness.mjs';
 
 const hi = () => rendition('opus-hi');
 const called = (engine, fn) => engine.calls.filter((c) => c.fn === fn);
@@ -286,6 +286,47 @@ test('a track longer than the resident limit loads its first part: only those pi
   assert.equal(engine.notes.length, 1);
   assert.match(engine.notes[0].text, /^Deck 1: this track is 2 minutes long: the deck holds its first 1 minute \(the resident track limit\)\.$/);
   assert.match(deck.load.report, /Limit: this track is 2 minutes long/);
+});
+
+/** load() with the stand-in decoder's input sizes recorded. */
+const loadSeen = (page, opts = {}) => {
+  const sizes = [];
+  return load(page, { ...opts, deps: { decodeFile: (ctx, buf) => { sizes.push(buf.byteLength); return decoders.decodeFile(ctx, buf); } } }).then((r) => ({ ...r, sizes }));
+};
+
+for (const [name, page] of [
+  ['behind a progressive player', (link, S) => ({ kind: 'progressive', src: link, duration: S, files: { [link]: mp3(S) } })],
+  ['on a Bandcamp-like page', (link, S) => ({ kind: 'progressive', src: link, duration: S, tralbum: { url: link, duration: S }, files: { [link]: mp3(S) } })],
+]) {
+  test(`an MP3 mix ${name} longer than twice the resident limit loads its first part: only that part is decoded, said once and reported`, async () => {
+    for (const minutes of [40, 74]) {
+      const link = 'https://site.example/media/mix.mp3', S = minutes * 60;
+      const { result, engine, deck, sizes } = await loadSeen(page(link, S));
+      assert.equal(result.kind, 'resident', `${minutes} min: ${called(engine, 'failLoadingToLive').map((c) => c.reason)}`);
+      assert.equal(called(engine, 'startResidentDeck')[0].frames, 15 * 60 * SR);
+      assert.equal(engine.notes.length, 1);
+      assert.match(engine.notes[0].text, new RegExp(`^Deck 1: this track is ${minutes} minutes long: the deck holds its first 15 minutes \\(the resident track limit\\)\\.$`));
+      assert.match(deck.load.report, new RegExp(`Limit: this track is ${minutes} minutes long`));
+      // Cut a frame past the limit and a second: the decoder never sees the rest.
+      assert.equal(sizes.length, 1);
+      assert.ok(sizes[0] <= Math.ceil((15 * 60 + 1) / 0.072 + 1) * 72 && sizes[0] >= (15 * 60 + 1) / 0.072 * 72, `${minutes} min: decoded ${sizes[0]} bytes of ${mp3(S).byteLength}`);
+    }
+  });
+}
+
+test('a long MP3 whose own frames do not give the player\'s length is not cut and taken: live, saying why', async () => {
+  const link = 'https://site.example/media/mix.mp3';
+  const { result, engine } = await load({ kind: 'progressive', src: link, duration: 74 * 60, files: { [link]: mp3(30 * 60) } });
+  assert.equal(result.kind, 'live');
+  assert.match(called(engine, 'failLoadingToLive')[0].reason, /holds 1800\.0 s, but the page's player says 4440\.0 s/);
+});
+
+test('a file longer than twice the limit in a format that cannot be cut at a frame is not decoded whole: live, saying why', async () => {
+  const link = 'https://site.example/media/mix.m4a', S = 74 * 60;
+  const { result, engine, sizes } = await loadSeen({ kind: 'progressive', src: link, duration: S, files: { [link]: file('mix', S) } });
+  assert.equal(result.kind, 'live');
+  assert.deepEqual(sizes, []);
+  assert.match(called(engine, 'failLoadingToLive')[0].reason, /74 minutes long, too long to decode whole/);
 });
 
 test('a recording from the page starts at the first sound after the page was held silent', () => {

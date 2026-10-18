@@ -13,6 +13,7 @@
 import { HUB } from '../shared/protocol.js';
 import { placeParts, gapsFor, decodePlaced, AssemblyError } from './assemble.js';
 import { decodeTo, limitPcm, fetchArrayBuffer, resample } from './decode.js';
+import { mp3Frames, adtsFrames } from './bmff.js';
 
 /** Site table (§4.6): host suffix -> first rung. The only per-site knowledge there is. */
 export const SITES = Object.freeze({
@@ -104,6 +105,17 @@ export function parseHls(text, base) {
   } catch (_) { return null; }
   if (variants.length) return { variants };
   return segs.length ? { init, segs } : null;
+}
+
+/**
+ * A whole file's MP3 or ADTS frames, walked (cut: the first frame boundary at or past `until` s), or null for any
+ * other format: those have a layout of their own and cannot be cut short at a frame.
+ */
+function framesOf(bytes, until) {
+  const u = new Uint8Array(bytes, 0, Math.min(8, bytes.byteLength)), head = String.fromCharCode(...u.subarray(0, 4)), box = String.fromCharCode(...u.subarray(4, 8));
+  if (/^(ftyp|moov|styp|moof)$/.test(box) || /^(\x1aE\xdf\xa3|OggS|RIFF|fLaC)$/.test(head)) return null;
+  for (const walk of [mp3Frames, adtsFrames]) { const w = walk(bytes, { until }); if (w.frames && !w.midJunk) return w; }
+  return null;
 }
 
 /** A placement cut to the segments that start before `until` (the resident limit). */
@@ -392,20 +404,27 @@ export class Loader extends Job {
     return this.wholeFile(bytes, f.fileDuration || this.duration(), "the page's track link");
   }
 
-  /** A whole media file, decoded and checked against the length the page gives (`expect`, s). */
+  /**
+   * A whole media file, decoded and checked against the length the page gives (`expect`, s). Longer than the resident
+   * limit, an MP3 or ADTS file is cut at the frame a second past it, and only that part is decoded; a file in any other
+   * format is decoded whole, so only up to twice the limit.
+   */
   async wholeFile(bytes, expect, what) {
-    if (expect && expect > 2 * this.limitSec()) return { outcome: 'failed', why: `${what} is ${minutes(expect / 60)} long, too long to decode whole` };
+    const L = this.limitSec(), w = framesOf(bytes, L + 1), own = w ? w.samples / w.sampleRate : null;
+    const off = (got, want) => Math.abs(got - want) > Math.max(0.5, 0.01 * want);
+    if (own && expect && off(own, expect)) return { outcome: 'failed', why: `${what} holds ${own.toFixed(1)} s, but the page's player says ${expect.toFixed(1)} s` };
+    const cut = own > L + 0.5 && w.cut ? w.cut : null, part = cut && cut.samples / w.sampleRate;
+    if (!own && expect && expect > 2 * L) return { outcome: 'failed', why: `${what} is ${minutes(expect / 60)} long, too long to decode whole` };
     this.say(this.progress, SAY.decode);
     const t0 = now();
     let pcm;
-    try { pcm = await this.d.decodeFile(this.engine.ctx, bytes); } catch (_) { this.check(); return { outcome: 'failed', why: `${what} is not audio this browser can play` }; }
+    try { pcm = await this.d.decodeFile(this.engine.ctx, cut ? bytes.slice(0, cut.end) : bytes); } catch (_) { this.check(); return { outcome: 'failed', why: `${what} is not audio this browser can play` }; }
     this.check();
-    this.rep.steps.push({ name: 'decode', outcome: 'ok', why: what, ms: now() - t0 });
+    this.rep.steps.push({ name: 'decode', outcome: 'ok', why: cut ? `${what}, its first ${part.toFixed(1)} s` : what, ms: now() - t0 });
     const got = pcm.L.length / pcm.sampleRate;
-    if (expect && Math.abs(got - expect) > Math.max(0.5, 0.01 * expect)) {
-      return { outcome: 'failed', why: `${what} holds ${got.toFixed(1)} s, but the page's player says ${expect.toFixed(1)} s` };
-    }
-    return { done: this.limited(pcm, got) };
+    if (cut && off(got, part)) return { outcome: 'failed', why: `the first ${part.toFixed(1)} s of ${what} decoded to ${got.toFixed(1)} s` };
+    if (!cut && expect && off(got, expect)) return { outcome: 'failed', why: `${what} holds ${got.toFixed(1)} s, but the page's player says ${expect.toFixed(1)} s` };
+    return { done: this.limited(pcm, cut ? own : got) };
   }
 
   /** {pcm, notice}: the track, or its first part when it is longer than the resident limit (said once). */

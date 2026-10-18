@@ -25,21 +25,30 @@ const decks = async () => (await state(deck)).decks;
 const deckWhere = (fn, ms = 60000) => waitFor(async () => (await decks()).find(fn), ms, 150);
 const engine = (body) => offscreenEval(h, `(async () => { const e = globalThis.__jdsEngine; ${body} })()`);
 
-/** 16 s MP3s behind <audio src> pages (/rec: 124 BPM kick, /rec2: 128 BPM click), served with byte ranges (so their players know their length). */
+/**
+ * MP3s behind <audio src> pages, served with byte ranges (so their players know their length): 16 s at /rec (124 BPM
+ * kick) and /rec2 (128 BPM click); 150 s at /long, and behind a Bandcamp-like page (data-tralbum) at /bc-long.
+ */
 async function startRecServer() {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'jds-rec-'));
   const mp3s = {};
-  for (const [name, opts] of [['rec', { bpm: 124, kind: 'low' }], ['rec2', { bpm: 128, kind: 'high' }]]) {
-    fs.writeFileSync(path.join(tmp, `${name}.wav`), makeTrackWav({ ...opts, seconds: 16 }));
-    execFileSync('/usr/bin/ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', path.join(tmp, `${name}.wav`), '-codec:a', 'libmp3lame', '-b:a', '192k', path.join(tmp, `${name}.mp3`)]);
+  for (const [name, opts, rate] of [['rec', { bpm: 124, kind: 'low', seconds: 16 }, '192k'], ['rec2', { bpm: 128, kind: 'high', seconds: 16 }, '192k'], ['long', { bpm: 124, kind: 'low', seconds: 150 }, '64k']]) {
+    fs.writeFileSync(path.join(tmp, `${name}.wav`), makeTrackWav(opts));
+    execFileSync('/usr/bin/ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', path.join(tmp, `${name}.wav`), '-codec:a', 'libmp3lame', '-b:a', rate, path.join(tmp, `${name}.mp3`)]);
     mp3s[name] = fs.readFileSync(path.join(tmp, `${name}.mp3`));
   }
+  const media = `<script>window.__media = () => { const a = document.getElementById('a'); return { t: a.currentTime, rate: a.playbackRate, pp: a.preservesPitch, paused: a.paused, duration: a.duration }; };</script>`;
   const srv = http.createServer((req, res) => {
-    const u = new URL(req.url, 'http://x'), page = /^\/(rec2?)$/.exec(u.pathname), file = /^\/(rec2?)\.mp3$/.exec(u.pathname);
+    const u = new URL(req.url, 'http://x'), page = /^\/(rec2?|long)$/.exec(u.pathname), file = /^\/(rec2?|long)\.mp3$/.exec(u.pathname);
     if (page) {
       res.writeHead(200, { 'content-type': 'text/html' });
-      res.end(`<!doctype html><title>Short track ${page[1]}</title><audio id="a" src="/${page[1]}.mp3" autoplay></audio>
-<script>window.__media = () => { const a = document.getElementById('a'); return { t: a.currentTime, rate: a.playbackRate, pp: a.preservesPitch, paused: a.paused, duration: a.duration }; };</script>`);
+      res.end(`<!doctype html><title>Track ${page[1]}</title><audio id="a" src="/${page[1]}.mp3" autoplay></audio>${media}`);
+      return;
+    }
+    if (u.pathname === '/bc-long') {
+      const tralbum = JSON.stringify({ trackinfo: [{ file: { 'mp3-128': '/long.mp3' }, duration: 150 }] }).replace(/"/g, '&quot;');
+      res.writeHead(200, { 'content-type': 'text/html' });
+      res.end(`<!doctype html><title>Long track on a Bandcamp-like page</title><div id="t" data-tralbum="${tralbum}"></div><audio id="a" src="/long.mp3" autoplay></audio>${media}`);
       return;
     }
     if (!file) { res.writeHead(404); res.end(); return; }
@@ -232,6 +241,34 @@ test('a page that fights playbackRate ends resident from the link it requested, 
   assert.match(d.load.report, /refetch \(fetching the track\): ok/);
   assert.doesNotMatch(d.load.report, /^ +drive/m);
   await assertReleased(d, site);
+});
+
+test('a track longer than twice the resident limit, behind <audio src> or on a Bandcamp-like page, loads its first part: said once and reported', async () => {
+  set(deck, null, 'resident.limitMin', 1);
+  await waitFor(async () => (await state(deck)).master.params['resident.limitMin'] === 1);
+  try {
+    for (const page of ['long', 'bc-long']) {
+      const site = { tab: await h.context.newPage(), url: `${rec.origin}/${page}` };
+      await site.tab.goto(site.url);
+      site.tabId = await tabIdFor(h, site.url);
+      await playing(site.tab);
+      const d = await loadTab(site.tabId);
+      assert.equal(d.kind, 'resident', `${page}: ${JSON.stringify(d.load)}`);
+      assert.ok(Math.abs(d.duration - 60) < 0.015, `${page}: deck ${d.duration} s`);
+      const c = await compare(d.id, [`${rec.origin}/long.mp3`]);
+      assert.ok(c.refSeconds > 149.9, `the MP3 is ${c.refSeconds} s`);
+      assert.ok(c.maxd < 1e-4, `${page}: ${JSON.stringify(c)}`);
+      assert.match(d.load.report, /Limit: this track is 2\.5 minutes long: the deck holds its first 1 minute/);
+      if (page === 'bc-long') assert.match(d.load.report, /file \(reading the page's track link\): ok/);
+      const notice = () => events(deck).then((es) => es.slice(d.seen).filter((e) => e.text === `Deck ${d.slot}: this track is 2.5 minutes long: the deck holds its first 1 minute (the resident track limit).`));
+      await waitFor(async () => (await notice()).length > 0, 5000).catch(() => {});
+      assert.equal((await notice()).length, 1, JSON.stringify((await events(deck)).slice(d.seen)));
+      await assertReleased(d, site);
+    }
+  } finally {
+    set(deck, null, 'resident.limitMin', 15);
+    await waitFor(async () => (await state(deck)).master.params['resident.limitMin'] === 15);
+  }
 });
 
 // ---------------------------------------------------------------- live, with one message
