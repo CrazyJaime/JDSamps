@@ -24,6 +24,8 @@ export function bindKeys({ getStrip, selectSlot, conn, master, toggleHelp, close
   };
 
   window.addEventListener('keydown', (e) => {
+    // A drawer's own text field (Load link, a number setting) still lets Escape close it.
+    if (e.code === 'Escape' && typing(e.target) && e.target.closest('.drawer, .overlay')) { closePanels(); return; }
     if (typing(e.target) || e.ctrlKey || e.metaKey || e.altKey) return;
     // A focused knob or fader keeps its own arrow/Home/End/Page keys.
     if (SLIDER_KEYS.has(e.key) && e.target instanceof Element && e.target.closest('[role="slider"]')) return;

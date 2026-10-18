@@ -691,6 +691,26 @@ test('the settings drawer sets and keeps the resident track limit and 2× whole-
   await page.locator('#settings [data-close]').click();
 });
 
+test('Escape closes the Sources or Settings drawer from its text field too; a tempo entry keeps Escape to itself', async () => {
+  await show(kinds());
+  await page.locator('#sourcesBtn').click();
+  await page.locator('#loadLink').fill('https://exa');
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('#sources').isHidden(), true, 'from the Load link field');
+  await page.locator('#settingsBtn').click();
+  await page.locator('#residentLimit').focus();
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('#settings').isHidden(), true, 'from the limit field');
+  await page.locator('#sourcesBtn').click();
+  await deckEl(1).locator('[data-bpm]').click();
+  assert.equal(await page.locator('input.tempo-edit').count(), 1);
+  await page.keyboard.press('Escape');
+  assert.equal(await page.locator('input.tempo-edit').count(), 0, 'the entry closed');
+  assert.equal(await page.locator('#sources').isVisible(), true, 'the drawer stays');
+  await page.locator('#sources [data-close]').click();
+  await page.locator('#loadLink').evaluate((el) => { el.value = ''; });
+});
+
 test('the top bar warns quietly once decks hold more than 1.5 GiB of audio', async () => {
   const warn = page.locator('#memWarn');
   await show(kinds((s) => { s.master.residentBytes = 1.5 * 2 ** 30; }));
