@@ -25,21 +25,25 @@ const decks = async () => (await state(deck)).decks;
 const deckWhere = (fn, ms = 60000) => waitFor(async () => (await decks()).find(fn), ms, 150);
 const engine = (body) => offscreenEval(h, `(async () => { const e = globalThis.__jdsEngine; ${body} })()`);
 
-/** A 16 s MP3 behind an <audio src> page, served with byte ranges (so its player knows its length). */
+/** 16 s MP3s behind <audio src> pages (/rec: 124 BPM kick, /rec2: 128 BPM click), served with byte ranges (so their players know their length). */
 async function startRecServer() {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'jds-rec-'));
-  fs.writeFileSync(path.join(tmp, 'rec.wav'), makeTrackWav({ bpm: 124, seconds: 16 }));
-  execFileSync('/usr/bin/ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', path.join(tmp, 'rec.wav'), '-codec:a', 'libmp3lame', '-b:a', '192k', path.join(tmp, 'rec.mp3')]);
-  const mp3 = fs.readFileSync(path.join(tmp, 'rec.mp3'));
+  const mp3s = {};
+  for (const [name, opts] of [['rec', { bpm: 124, kind: 'low' }], ['rec2', { bpm: 128, kind: 'high' }]]) {
+    fs.writeFileSync(path.join(tmp, `${name}.wav`), makeTrackWav({ ...opts, seconds: 16 }));
+    execFileSync('/usr/bin/ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', path.join(tmp, `${name}.wav`), '-codec:a', 'libmp3lame', '-b:a', '192k', path.join(tmp, `${name}.mp3`)]);
+    mp3s[name] = fs.readFileSync(path.join(tmp, `${name}.mp3`));
+  }
   const srv = http.createServer((req, res) => {
-    const u = new URL(req.url, 'http://x');
-    if (u.pathname === '/rec') {
+    const u = new URL(req.url, 'http://x'), page = /^\/(rec2?)$/.exec(u.pathname), file = /^\/(rec2?)\.mp3$/.exec(u.pathname);
+    if (page) {
       res.writeHead(200, { 'content-type': 'text/html' });
-      res.end(`<!doctype html><title>Short track</title><audio id="a" src="/rec.mp3" autoplay></audio>
+      res.end(`<!doctype html><title>Short track ${page[1]}</title><audio id="a" src="/${page[1]}.mp3" autoplay></audio>
 <script>window.__media = () => { const a = document.getElementById('a'); return { t: a.currentTime, rate: a.playbackRate, pp: a.preservesPitch, paused: a.paused, duration: a.duration }; };</script>`);
       return;
     }
-    if (u.pathname !== '/rec.mp3') { res.writeHead(404); res.end(); return; }
+    if (!file) { res.writeHead(404); res.end(); return; }
+    const mp3 = mp3s[file[1]];
     const head = { 'content-type': 'audio/mpeg', 'accept-ranges': 'bytes', 'cache-control': 'no-store' };
     const r = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range || '');
     if (!r) { res.writeHead(200, { ...head, 'content-length': mp3.length }); res.end(mp3); return; }
@@ -77,6 +81,8 @@ async function openSite(name, query = 'autoplay=1') {
   await tab.goto(url);
   return { tab, url, tabId: await tabIdFor(h, url) };
 }
+/** The page's <audio> as it is now (model pages' __media() has no mute). */
+const player = (tab) => tab.evaluate(() => { const a = document.querySelector('audio'); return { t: a.currentTime, paused: a.paused, muted: a.muted, rate: a.playbackRate, pp: a.preservesPitch }; });
 const playing = (tab) => waitFor(() => tab.evaluate(() => { const m = window.__media(); return !!m && !m.paused && m.t > 0.3; }), 15000);
 
 /** LOAD_TAB, then wait until the deck is no longer loading. */
@@ -339,6 +345,109 @@ test('recording a whole track from a media page: its player run at 2× from the 
   const m = await site.tab.evaluate(() => window.__media());
   assert.deepEqual([m.paused, m.rate, m.pp], [true, 1, true]);
   assert.equal((await act(deck, r.id, 'eject')).ok, true);
+  await waitFor(async () => !(await decks()).length, 8000);
+  await site.tab.close();
+});
+
+// ---------------------------------------------------------------- races, ejects, the page going away (Review Focus 1, 2, 5)
+test('two loads racing on two tabs: each deck gets its own track, checked by its audio', async () => {
+  const sites = [];
+  for (const name of ['rec', 'rec2']) {
+    const tab = await h.context.newPage(), url = `${rec.origin}/${name}`;
+    await tab.goto(url);
+    sites.push({ tab, url, tabId: await tabIdFor(h, url) });
+  }
+  await Promise.all(sites.map((x) => playing(x.tab)));
+  const [ra, rb] = await Promise.all(sites.map((x) => hubCall(deck, { type: 'LOAD_TAB', tabId: x.tabId })));
+  assert.ok(ra.ok && rb.ok, JSON.stringify([ra, rb]));
+  const [da, db] = await Promise.all([ra, rb].map((r) => deckWhere((x) => x.id === r.deckId && x.kind === 'resident' && x.tabId === null, 30000)));
+  // Each deck's audio against both sources: its own matches, the other tab's does not.
+  const c = await engine(`
+    const ref = async (u) => (await e.ctx.decodeAudioData(await (await fetch(u)).arrayBuffer())).getChannelData(0);
+    const srcs = [await ref('${rec.origin}/rec.mp3'), await ref('${rec.origin}/rec2.mp3')];
+    const corr = (a, b) => { let ab = 0, aa = 0, bb = 0; const n = Math.min(a.length, b.length, 4 * e.ctx.sampleRate); for (let i = 0; i < n; i++) { ab += a[i] * b[i]; aa += a[i] * a[i]; bb += b[i] * b[i]; } return ab / Math.sqrt(aa * bb); };
+    const out = [${da.id}, ${db.id}].map((id) => srcs.map((s) => corr(e.__pcm.get(id).L, s)));
+    for (const id of [${da.id}, ${db.id}]) e.__pcm.delete(id);
+    return out;
+  `);
+  assert.ok(c[0][0] > 0.99 && c[1][1] > 0.99, `own tracks: ${JSON.stringify(c)}`);
+  assert.ok(Math.abs(c[0][1]) < 0.2 && Math.abs(c[1][0]) < 0.2, `crossed: ${JSON.stringify(c)}`);
+  assert.ok(Math.abs(da.bpm.native - 124) < 0.5 && Math.abs(db.bpm.native - 128) < 0.5, `${da.bpm.native}, ${db.bpm.native}`);
+  for (const d of [da, db]) assert.equal((await act(deck, d.id, 'eject')).ok, true);
+  await waitFor(async () => !(await decks()).length, 8000);
+  for (const x of sites) await x.tab.close();
+});
+
+/**
+ * A YouTube-like page loading on a deck, its player being driven: the page, the deck and the loader's sends and
+ * parts, recorded. Its network is slowed (about 60 kB/s), so the drive takes several seconds, as on a real site.
+ */
+async function drivenLoad() {
+  const site = await openSite('opaque', '');
+  const cdp = await h.context.newCDPSession(site.tab);
+  await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 100, downloadThroughput: 60 * 1024, uploadThroughput: -1 });
+  const r = await hubCall(deck, { type: 'LOAD_TAB', tabId: site.tabId });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  await waitFor(() => engine(`const l = e.loads.get(${r.deckId}); return !!l && l.loader.tapping;`), 15000);
+  await engine(`const l = e.loads.get(${r.deckId}).loader, send = l.send.bind(l), tap = l.onTap.bind(l);
+    l.log = []; l.blobs = []; window.__s = e.decks.get(${r.deckId}).stream;
+    l.send = (f, m) => { l.log.push({ at: performance.now(), m }); return send(f, m); };
+    l.onTap = (id, m) => { if (m.t === 'tap-ready') for (const p of m.parts) l.blobs.push(p.blobUrl); return tap(id, m); };
+    window.__l = l; return true;`);
+  await site.tab.click('#play');
+  await deckWhere((x) => x.id === r.deckId && /running the player/.test(x.load.strategy || ''), 15000);
+  await waitFor(async () => (await player(site.tab)).muted, 5000); // muted while driven
+  return { site, deckId: r.deckId };
+}
+
+test('ejected mid-drive: within 1 s the page has its player back, the capture is released, the blob URLs revoked, and no command follows', async () => {
+  const { site, deckId } = await drivenLoad();
+  const t0 = await engine(`window.__ejectAt = performance.now(); e.eject(${deckId}); return window.__ejectAt;`);
+  await waitFor(async () => { const x = await player(site.tab); return x.paused && !x.muted && x.rate === 1 && x.pp; }, 1000)
+    .catch(async () => assert.fail(`after 1 s: ${JSON.stringify(await player(site.tab))}`));
+  const m = await player(site.tab);
+  assert.ok(m.t < 8, `the player is back where it was before the drive, not where it was driven to: ${m.t}`);
+  await waitFor(async () => !(await decks()).some((x) => x.id === deckId), 3000);
+  await sleep(1500);
+  const after = await engine(`return { ended: window.__s.getTracks().every((t) => t.readyState === 'ended'), late: window.__l.log.filter((x) => x.at > ${t0}).map((x) => x.m), blobs: window.__l.blobs.slice(0, 3) };`);
+  assert.equal(after.ended, true, 'the held capture is stopped');
+  for (const x of after.late) assert.ok((x.t === 'drive' && x.mode === 'stop') || (x.t === 'tap' && x.on === false), `sent after the eject: ${JSON.stringify(x)}`);
+  assert.ok(after.blobs.length > 0);
+  assert.deepEqual(await site.tab.evaluate((us) => Promise.all(us.map((u) => fetch(u).then(() => 'readable', () => 'revoked'))), after.blobs), after.blobs.map(() => 'revoked'));
+  await site.tab.close();
+});
+
+test('ejected while the beat is being found: the analysis Worker is terminated and no deck is left', async () => {
+  await engine(`if (!window.__W) { const W = window.__W = globalThis.Worker; window.__workers = { made: 0, ended: 0 };
+    globalThis.Worker = class extends W { constructor(...a) { super(...a); window.__workers.made++; } terminate() { window.__workers.ended++; return super.terminate(); } }; }
+    window.__workers = { made: 0, ended: 0 };
+    const f = e.analyse.bind(e); e.__analyse = f;
+    e.analyse = (pcm, signal) => { const p = f(pcm, signal); const id = [...e.loads.keys()][0]; e.eject(id); return p; };
+    return true;`);
+  try {
+    const site = await openSite('progressive');
+    await playing(site.tab);
+    const r = await hubCall(deck, { type: 'LOAD_TAB', tabId: site.tabId });
+    assert.equal(r.ok, true);
+    await waitFor(async () => !(await decks()).some((x) => x.id === r.deckId), 30000);
+    await waitFor(() => engine('return window.__workers.made > 0 && window.__workers.made === window.__workers.ended;'), 3000)
+      .catch(async () => assert.fail(JSON.stringify(await engine('return window.__workers;'))));
+    assert.deepEqual(await engine('return [...e.__pcm.keys()];'), [], 'nothing was promoted');
+    await site.tab.close();
+  } finally { await engine('e.analyse = e.__analyse; delete e.__analyse; return true;'); }
+});
+
+test('the page navigating away mid-load: the deck plays the tab live, saying so once, with no error', async () => {
+  const { site, deckId } = await drivenLoad();
+  const seen = (await events(deck)).length;
+  await site.tab.goto(`${server.origin}/m/progressive?autoplay=1`);
+  const d = await deckWhere((x) => x.id === deckId && x.kind === 'live', 15000);
+  assert.equal(d.tabId, site.tabId);
+  const said = (await events(deck)).slice(seen);
+  assert.equal(said.filter((e) => /^Deck \d: the page changed while the track was loading/.test(e.text)).length, 1, JSON.stringify(said));
+  assert.deepEqual(said.filter((e) => e.level === 'error'), []);
+  assert.match(d.load.report, /First failure: (drive: )?.*(page went away|page changed)/);
+  assert.equal((await act(deck, deckId, 'eject')).ok, true);
   await waitFor(async () => !(await decks()).length, 8000);
   await site.tab.close();
 });

@@ -676,6 +676,7 @@ export class Loader extends Job {
     const d = this.deck, e = this.engine;
     if (e.decks.get(d.id) !== d) return;
     await e.stopTab(d);
+    if (e.decks.get(d.id) !== d) return; // ejected meanwhile: the eject lets go of all of it
     if (d.stream) { for (const t of d.stream.getTracks()) t.stop(); d.stream = null; }
     for (const a of d.agents.values()) { try { a.port.postMessage({ t: 'tap', on: false, forget: true }); a.port.disconnect(); } catch (_) {} }
     d.agents.clear();
@@ -733,6 +734,13 @@ export class Loader extends Job {
     d.setLoad({ report: this.report() });
     const own = e.loads.get(d.id);
     if (own && own.loader === this) e.loads.delete(d.id); // failLoadingToLive aborts the load it finds
+    // A tab whose audio has gone too (closed, or its capture ended) would make a silent live deck: the deck goes.
+    if (!d.stream || d.stream.getAudioTracks().every((t) => t.readyState === 'ended')) {
+      const error = `Deck ${d.slot}: the tab's audio went away while the track was loading.`;
+      e.event('error', error, d.id);
+      e.eject(d.id);
+      return { ok: false, error };
+    }
     const r = await e.failLoadingToLive(d.id, reason);
     if (!r.ok) {
       if (e.decks.get(d.id) === d) e.eject(d.id);

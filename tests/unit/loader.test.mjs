@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SITES, firstRung, parseHls, findStart } from '../../engine/loader.js';
 import { defaults, MASTER_PARAMS, PERSISTED_MASTER_KEYS, validateUiMessage } from '../../shared/protocol.js';
-import { load, rendition, file, code, DUR, SR, OPUS } from './fixtures/loader-harness.mjs';
+import { load, rendition, file, code, DUR, SR, OPUS, makeTab, makeEngine, loaderFor, fetcher, settle, turn } from './fixtures/loader-harness.mjs';
 
 const hi = () => rendition('opus-hi');
 const called = (engine, fn) => engine.calls.filter((c) => c.fn === fn);
@@ -286,6 +286,136 @@ test('a recording from the page starts at the first sound after the page was hel
   assert.equal(findStart(L, R, 1000, 4000), 2500 + 1);              // sin(0) is silent: the first audible sample
   assert.equal(findStart(L, R, 1000, 2400), -1, 'nothing yet');
   assert.equal(findStart(L, R, 0, 4000), 1, 'from where it is asked');
+});
+
+// ---------------------------------------------------------------- races, cancellation, the page going away (R4.3)
+test('two loads racing on two tabs: each deck gets its own track, and no tab hears the other load', async () => {
+  const pageA = { tabId: 11, url: 'https://a.example/x', kind: 'mse', rendition: rendition('opus-hi', 'https://a.example'), preTap: 6, playing: 2, list: true, segUrls: true };
+  const pageB = { tabId: 12, url: 'https://b.example/y', kind: 'mse', rendition: rendition('opus-lo', 'https://b.example'), preTap: 0, playing: 1 };
+  const a = makeTab(pageA), b = makeTab(pageB), engine = makeEngine({ tabs: [a, b] }), fetchBytes = fetcher([a, b]);
+  const la = loaderFor(a, engine, { deckId: 1, slot: 1, fetchBytes }), lb = loaderFor(b, engine, { deckId: 2, slot: 2, fetchBytes });
+  const [ra, rb] = await Promise.all([la.loader.run(), lb.loader.run()]);
+  await settle();
+  assert.equal(ra.kind, 'resident'); assert.equal(rb.kind, 'resident');
+  const by = Object.fromEntries(called(engine, 'startResidentDeck').map((c) => [c.deckId, c.code]));
+  assert.equal(by[1], code(pageA.rendition.segs[0].bytes.byteLength), "deck 1 holds tab A's audio");
+  assert.equal(by[2], code(pageB.rendition.segs[0].bytes.byteLength), "deck 2 holds tab B's audio");
+  assert.notEqual(by[1], by[2]);
+  assert.ok(a.kinds().includes('fetch') && !b.kinds().includes('fetch'), 'A was re-fetched, B driven: each its own ladder');
+  assert.ok(b.kinds().includes('drive seekhop') && !a.kinds().includes('drive seekhop'));
+  for (const t of [a, b]) for (const m of t.sent()) if (m.t === 'fetch') for (const u of m.urls) assert.ok(u.startsWith(new URL(t.url).origin), `${u} asked of the wrong tab`);
+});
+
+/** Run a load, ejecting its deck at the k-th thing it does (a command, a hub or engine call, a read); null when it did fewer. */
+async function ejectAt(k, page) {
+  const tab = makeTab(page), engine = makeEngine({ tabs: [tab] });
+  let n = 0, at = null;
+  const { deck, loader } = loaderFor(tab, engine, { fetchBytes: (u, o) => { tick(`read ${u.slice(0, 12)}`); return fetcher([tab])(u, o); } });
+  const order = [];
+  function tick(what) {
+    order.push(what);
+    if (n++ === k && at == null) { at = { what, sent: tab.log.length }; engine.eject(deck.id); }
+  }
+  tab.hooks.push((m) => tick(`send ${m.t}${m.mode ? ` ${m.mode}` : ''}`));
+  for (const fn of ['hub', 'stopTab', 'analyse', 'startResidentDeck', 'failLoadingToLive']) {
+    const f = engine[fn].bind(engine);
+    engine[fn] = (...a) => { tick(fn); return f(...a); };
+  }
+  const result = await loader.run();
+  await settle(30);
+  return { result, at, tab, engine, deck, order };
+}
+
+for (const [name, page] of [
+  ['re-fetched', { kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true }],
+  ['driven', { kind: 'mse', rendition: rendition(), preTap: 0, playing: 1 }],
+  ['read from its own link', { kind: 'progressive', src: 'https://site.example/t.mp3', tralbum: { url: 'https://site.example/t.mp3' }, files: { 'https://site.example/t.mp3': file('t', 120.0065) } }],
+]) {
+  test(`ejected at every step of a load ${name}: cancelled, nothing promoted or sent live, the page given back, then silence`, async () => {
+    let k = 0;
+    for (;; k++) {
+      const { result, at, tab, engine, deck, order } = await ejectAt(k, page);
+      if (!at) { assert.ok(k > 5, `only ${k} steps`); break; }
+      const where = `ejected at step ${k} (${at.what}) of ${order.join(', ')}`;
+      if (order.slice(0, k).includes('startResidentDeck')) {
+        // Ejected while the tab was being released: the load had finished, and the eject takes the resident deck.
+        assert.equal(result.kind, 'resident', where);
+        assert.equal(engine.calls.filter((c) => c.fn === 'startResidentDeck').length, 1, where);
+        continue;
+      }
+      assert.deepEqual(result, { ok: false, error: 'Loading was cancelled.' }, where);
+      const after = engine.calls.slice(engine.calls.findIndex((c) => c.fn === 'eject') + 1);
+      // A promotion already on its way finds the deck gone; none is started after the eject.
+      assert.notEqual(deck.kind, 'resident', where);
+      assert.ok(after.filter((c) => c.fn === 'startResidentDeck').length <= (at.what === 'startResidentDeck' ? 1 : 0), where);
+      assert.ok(after.filter((c) => c.fn === 'failLoadingToLive').length <= (at.what === 'failLoadingToLive' ? 1 : 0), where);
+      assert.equal(engine.hubLog.filter((m) => m.type === 'DECKS_CHANGED' || m.type === 'STOP_TAB').length, 0, `${where}: no release of an ejected deck`);
+      const late = tab.log.slice(at.sent).map((x) => x.m).filter((m) => !(m.t === 'drive' && m.mode === 'stop') && !(m.t === 'tap' && m.on === false));
+      // The command that was being sent when the eject came is the only other one.
+      assert.ok(late.length <= (at.what.startsWith('send') ? 1 : 0), `${where}: sent after the eject: ${JSON.stringify(late)}`);
+      if (tab.log.some((x) => x.m.t === 'tap' && x.m.on)) assert.deepEqual(tab.sent().at(-1), { t: 'tap', on: false, forget: true }, `${where}: the tap is left off`);
+      if (tab.kinds().some((x) => /drive (seekhop|accelerate)/.test(x))) assert.ok(tab.kinds().lastIndexOf('drive stop') > tab.kinds().findLastIndex((x) => /drive (seekhop|accelerate)/.test(x)), `${where}: the drive was stopped`);
+    }
+  });
+}
+
+test('the analysis is told to stop when the deck is ejected while the beat is being found', async () => {
+  const link = 'https://site.example/t.mp3';
+  let signal = null;
+  const { result } = await load({ kind: 'progressive', src: link, files: { [link]: file('t', 120.0065) } }, {
+    before: ({ engine, deck }) => { const f = engine.analyse.bind(engine); engine.analyse = (pcm, s) => { signal = s; engine.eject(deck.id); return f(pcm, s); }; },
+  });
+  assert.deepEqual(result, { ok: false, error: 'Loading was cancelled.' });
+  assert.equal(signal && signal.aborted, true, 'the Worker\'s signal is aborted (analyseTrack terminates it)');
+});
+
+test('the page navigating away mid-load goes live with one message: no half-built deck, nothing unhandled', async () => {
+  const unhandled = [];
+  const on = (e) => unhandled.push(e);
+  process.on('unhandledRejection', on);
+  try {
+    const { result, engine, tab } = await load({ kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true }, {
+      before: ({ tab: t }) => { let n = 0; t.hooks.push((m) => { if (m.t === 'fetch' && ++n === 2) setImmediate(() => t.navigate()); }); },
+    });
+    await settle(30);
+    assert.equal(result.kind, 'live');
+    assert.deepEqual(called(engine, 'startResidentDeck'), []);
+    const f = called(engine, 'failLoadingToLive');
+    assert.equal(f.length, 1);
+    assert.match(f[0].reason, /the page changed while the track was loading/);
+    assert.equal(engine.events.filter((e) => /^Deck 1: /.test(e.text)).length, 1);
+    assert.ok(tab.frames[0].left);
+  } finally { process.off('unhandledRejection', on); }
+  assert.deepEqual(unhandled, []);
+});
+
+test('the page going away with the tab\'s audio gone too ejects the deck with one error, never a silent live deck', async () => {
+  const { result, engine } = await load({ kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true }, {
+    before: ({ tab: t, deck }) => { t.hooks.push((m) => { if (m.t === 'fetch') setImmediate(() => { for (const x of deck.tracks) x.stop(); t.navigate(); }); }); },
+  });
+  assert.equal(result.ok, false);
+  assert.match(result.error, /audio/);
+  assert.deepEqual(called(engine, 'failLoadingToLive'), []);
+  assert.equal(called(engine, 'eject').length, 1);
+  assert.equal(engine.events.filter((e) => e.level === 'error' && /^Deck 1: .*audio/.test(e.text)).length, 1);
+});
+
+test('a length not known at first is waited for; then the track loads', async () => {
+  const { result, engine } = await load({ kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true, duration: null }, {
+    before: ({ tab: t }) => { setTimeout(() => { t.frames[0].duration = DUR; t.frames[0].progress(); }, 60); },
+  });
+  assert.equal(result.kind, 'resident');
+  assert.ok(near(called(engine, 'startResidentDeck')[0].frames / SR, 120, 0.02));
+});
+
+test('a length that grows mid-load is never taken at its first value: the rest is fetched and the whole track loads', async () => {
+  const { result, engine, tab } = await load({ kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true, duration: 60 }, {
+    before: ({ tab: t }) => { let n = 0; t.hooks.push((m) => { if (m.t === 'fetch' && ++n === 2) setImmediate(() => { t.frames[0].duration = DUR; t.frames[0].progress(); }); }); },
+  });
+  assert.equal(result.kind, 'resident');
+  const [s] = called(engine, 'startResidentDeck');
+  assert.ok(near(s.frames / SR, 120, 0.02), `resident at ${s.frames / SR} s`);
+  assert.ok(tab.sent().filter((m) => m.t === 'fetch').length >= 3, 'the pieces past 60 s were fetched too');
 });
 
 test('the opus pieces this harness serves are what the model sites serve', () => {
