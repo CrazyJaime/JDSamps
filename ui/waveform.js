@@ -167,6 +167,70 @@ export function drawWave(g, o) {
   g.fillRect(cx - 1, 0, 2, h);
 }
 
+const ovCaches = new WeakMap(); // overview canvas context -> last drawn view
+let ovTop = new Float32Array(0);
+
+/**
+ * The whole buffer in one strip: historyStart at the left edge, the live edge at the right (a deck
+ * that holds a whole track shows all of it). A coarse envelope of the audio, played history dimmed,
+ * the reserve ahead of the playhead lit, the cue, a roll's loop, the playhead and the live edge.
+ * Redrawn only when a marker moves a pixel, the buffer grows or new audio arrives.
+ * opts: {w, h (device px), store, playhead, cue, liveEdge, historyStart, loop, color, playing}
+ */
+export function drawOverview(g, o) {
+  const { w, h, store } = o, hs = o.historyStart, span = o.liveEdge - hs;
+  const xAt = (t) => ((t - hs) / span) * w;
+  const px = (t) => Math.round(xAt(t));
+  let c = ovCaches.get(g);
+  if (!c) ovCaches.set(g, (c = { view: '' }));
+  // Drawn again once anything moves a pixel: a growing buffer rescales (log span), a full one slides (hs).
+  const view = span > 0
+    ? `${w},${h},${px(o.playhead)},${px(o.cue)},${Math.round(Math.log(span) * w)},${Math.round((hs / span) * w)},${o.loop ? `${px(o.loop.start)},${px(o.loop.end)}` : '-'},${o.color},${o.playing},${store.rev},${Math.floor(store.n / 32)}`
+    : `${w},${h},empty`;
+  if (view === c.view) return;
+  c.view = view;
+  g.fillStyle = '#05060a';
+  g.fillRect(0, 0, w, h);
+  if (!(span > 0)) return;
+  const xp = Math.max(0, Math.min(w, xAt(o.playhead)));
+  // The reserve: what is buffered ahead of the playhead.
+  g.fillStyle = o.color;
+  g.globalAlpha = 0.16;
+  g.fillRect(xp, 0, w - xp, h);
+  g.globalAlpha = 1;
+  // Envelope (loudest band per column), one path: mirrored around the middle.
+  const mid = h / 2, step = span / w;
+  if (store.hop) {
+    g.beginPath();
+    g.moveTo(0, mid);
+    if (ovTop.length < w) ovTop = new Float32Array(w);
+    const top = ovTop;
+    for (let x = 0; x < w; x++) {
+      top[x] = store.at(hs + x * step, step, tmp) ? lvl(Math.max(tmp[0], tmp[1], tmp[2])) * (mid - 1) : 0;
+      g.lineTo(x + 0.5, mid - top[x]);
+    }
+    for (let x = w - 1; x >= 0; x--) g.lineTo(x + 0.5, mid + top[x]);
+    g.closePath();
+    g.fillStyle = mixWhite(o.color, 0.2);
+    g.fill();
+  }
+  // Played history, dimmed.
+  g.fillStyle = 'rgba(5,6,10,0.55)';
+  g.fillRect(0, 0, xp, h);
+  if (o.loop) {
+    g.fillStyle = 'rgba(255,255,255,0.25)';
+    g.fillRect(xAt(o.loop.start), 0, Math.max(1, xAt(o.loop.end) - xAt(o.loop.start)), h);
+  }
+  // Live edge: the right end.
+  g.fillStyle = 'rgba(251,191,36,0.85)';
+  g.fillRect(w - 2, 0, 2, h);
+  // Cue: an amber tick from the top.
+  const xc = xAt(o.cue);
+  if (xc >= 0 && xc <= w) { g.fillStyle = '#f59e0b'; g.fillRect(Math.round(xc) - 1, 0, 2, Math.ceil(h * 0.45)); }
+  g.fillStyle = o.playing ? '#ffffff' : '#f59e0b';
+  g.fillRect(Math.round(xp) - 1, 0, 2, h);
+}
+
 /** Drop the tiles when what they show changed: new store, rewritten audio, size, colour or scale. */
 function syncTiles(c, o, spp) {
   const { store } = o;
