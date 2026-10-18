@@ -64,7 +64,7 @@ function blur(x, W, k, out) {
 }
 
 const rel = (a, b) => Math.abs(a / b - 1);
-const RELATED = [1, 2, 0.5, 1.5, 2 / 3, 3, 1 / 3]; // tempo ratios that count as the same beat
+export const RELATED = [1, 2, 0.5, 1.5, 2 / 3, 3, 1 / 3]; // tempo ratios that count as the same beat
 /** The ratio in RELATED that takes tempo `a` to tempo `b`, or 0 when the two are unrelated. */
 function relatedFactor(b, a) {
   for (const f of RELATED) if (f !== 1 && Math.abs(b / (a * f) - 1) < 0.04) return f;
@@ -121,7 +121,7 @@ export class TempoTracker {
   constructor(fps, opts = {}) {
     this.o = { ...DEFAULTS, ...opts };
     this.fps = fps;
-    const cap = Math.ceil(12 * fps);
+    const cap = Math.ceil((opts.capSec || 12) * fps); // capSec: whole-track analysis holds the whole track
     this.full = new Ring(cap);
     this.low = new Ring(cap);
     // Scratch for the octave evidence: built once so evaluate() stays allocation-light.
@@ -489,6 +489,32 @@ export class DeckTempo {
     return h ? { t0: h.t0 / this.sr, T: h.T / this.sr, bar1: this.bar1 == null ? null : this.bar1 / this.sr } : null;
   }
 
+  /**
+   * Lock to a whole-track analysis (engine/analysis.js) instead of tracking the live edge: a resident
+   * deck holds its whole track, so its grid is known everywhere from the start. The clock is the grid
+   * of the analysis's last segment (the deck writes the clock into its grid map's last segment, as for
+   * a live edge; the grid map holds the rest), tempo and confidence are the analysis's, canBeatAt
+   * answers from each segment's confidence, and evaluate() never runs again, so nothing resets it.
+   * TAP, ½× / 2×, GRID and TAP 1 work on it as on a live lock.
+   */
+  seed(a) {
+    const segs = a.segments || [], last = segs[segs.length - 1], tr = this.tracker, sr = this.sr;
+    const bpm = last ? 60 / last.grid.T : 0, conf = a.conf || 0, octConf = a.octConf || 0;
+    tr.resetFine(); tr.cand = null; tr.candCount = 0; tr.holdUntil = 0;
+    tr.state = bpm ? 'locked' : 'search'; tr.bpm = bpm; tr.conf = conf; tr.octConf = octConf;
+    this.snap = { state: tr.state, bpm, coarse: bpm, conf, octConf };
+    this.mult = 1; this.tapped = null; this.taps = []; this.bar1 = null; this.gridOffset = 0; this.hist = [];
+    this.clock = new BeatClock();
+    if (last) { this.clock.t0 = last.grid.t0 * sr; this.clock.T = last.grid.T * sr; }
+    this.vouch = [];
+    for (const s of segs) {
+      const ok = (s.conf ?? conf) >= 0.5;
+      if (!this.vouch.length || this.vouch[this.vouch.length - 1].ok !== ok) this.vouch.push({ t: s.from * sr, ok });
+    }
+    if (!this.vouch.length) this.vouch.push({ t: 0, ok: false });
+    this.seeded = true;
+  }
+
   pushBatch({ t0, spf, full, low }) { for (let i = 0; i < full.length; i++) this.pushFrame(full[i], low[i], t0 + i * spf); }
 
   pushFrame(full, low, t) {
@@ -506,6 +532,7 @@ export class DeckTempo {
   }
 
   evaluate() {
+    if (this.seeded) return; // a whole-track analysis holds the grid; nothing at the live edge may move it
     const prev = this.snap.coarse;
     if (this.clock.t0 != null && this.clock.T > 0) this.remember();
     this.snap = this.tracker.update(this.tracker.estimate());
@@ -656,7 +683,8 @@ export class DeckTempo {
       if (next < 0.25 || next > 4) return false;
       this.mult = next;
       this.gridOffset = 0;
-      this.clock = new BeatClock();
+      // A live tracker re-phases a fresh clock; a seeded one never evaluates, so it keeps its anchor beat.
+      if (this.seeded) this.clock.T /= factor; else this.clock = new BeatClock();
     }
     this.tracker.resetFine();
     for (const h of this.hist) h.T /= factor;
