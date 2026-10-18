@@ -481,6 +481,26 @@ test('the track length is the heard player\'s, not that of a player in a frame w
   }
 });
 
+test('another player\'s appends never become the track: one beside it in its frame, or in another frame', async () => {
+  const r = hi(), lo = rendition('opus-lo', 'https://ads.example');
+  const track = { kind: 'mse', rendition: r, preTap: 6, playing: 2, list: true, segUrls: true };
+  for (const [where, page] of [
+    ['beside it, on its own SourceBuffer', { ...track, other: { rendition: lo, sb: 1, n: 5 } }],
+    ['in another frame, muted', { frames: 2, framePages: [track, { kind: 'mse', rendition: lo, preTap: 0, playing: 5, status: { audible: 0, muted: true } }] }],
+  ]) {
+    const { result, loader, engine } = await load(page);
+    assert.equal(result.kind, 'resident', `${where}: ${JSON.stringify(called(engine, 'failLoadingToLive'))}`);
+    assert.ok(near(called(engine, 'startResidentDeck')[0].frames / SR, 120, 0.02), where);
+    // Every piece the deck was decoded from is the track's own piece for that time.
+    for (const run of loader.rep.placed.runs) {
+      for (const s of run.segs) {
+        const own = r.segs.find((x) => Math.abs(x.t0 - s.t0) < 1e-6);
+        assert.ok(own && own.bytes.byteLength === s.bytes.byteLength, `${where}: the audio at ${s.t0.toFixed(1)} s is another player's`);
+      }
+    }
+  }
+});
+
 test('the opus pieces this harness serves are what the model sites serve', () => {
   const r = hi();
   assert.equal(r.mime, OPUS);

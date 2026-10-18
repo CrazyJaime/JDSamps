@@ -725,7 +725,7 @@ function LOOK() {
     'get currentTime': d(HTMLMediaElement.prototype, 'currentTime').get, 'get paused': d(HTMLMediaElement.prototype, 'paused').get,
     appendBuffer: SourceBuffer.prototype.appendBuffer, addSourceBuffer: MediaSource.prototype.addSourceBuffer,
     fetch: window.fetch, open: XMLHttpRequest.prototype.open, send: XMLHttpRequest.prototype.send, setRequestHeader: XMLHttpRequest.prototype.setRequestHeader,
-    requestMediaKeySystemAccess: Navigator.prototype.requestMediaKeySystemAccess, toString: Function.prototype.toString,
+    requestMediaKeySystemAccess: Navigator.prototype.requestMediaKeySystemAccess, toString: Function.prototype.toString, createObjectURL: URL.createObjectURL,
   };
   const look = (fn) => [
     Function.prototype.toString.call(fn), String(fn), fn.toString.toString(), fn.name, fn.length, Object.getOwnPropertyNames(fn),
@@ -736,7 +736,7 @@ function LOOK() {
   return JSON.stringify({
     fns: Object.fromEntries(Object.entries(fns).map(([k, f]) => [k, look(f)])),
     descs: [d(window, 'fetch'), d(Function.prototype, 'toString'), d(SourceBuffer.prototype, 'appendBuffer'), d(MediaSource.prototype, 'addSourceBuffer'),
-      d(XMLHttpRequest.prototype, 'send'), d(Navigator.prototype, 'requestMediaKeySystemAccess'), d(HTMLMediaElement.prototype, 'srcObject')].map(attrs),
+      d(XMLHttpRequest.prototype, 'send'), d(Navigator.prototype, 'requestMediaKeySystemAccess'), d(HTMLMediaElement.prototype, 'srcObject'), d(URL, 'createObjectURL')].map(attrs),
   });
 }
 

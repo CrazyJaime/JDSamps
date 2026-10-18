@@ -203,7 +203,7 @@ export class Loader extends Job {
   // ---------------------------------------------------------------- the deck's agents
   onAttach(frameId, a) {
     if (this.done || this.gone) return;
-    const f = { id: frameId, n: this.frames.size + 1, a, on: false, left: false, parts: [], reqs: [], errors: [], prog: null, bytes: 0, fetch: null, asked: false, answer: null, file: null, fileDuration: null };
+    const f = { id: frameId, n: this.frames.size + 1, a, on: false, left: false, parts: [], reqs: [], errors: [], prog: null, own: null, bytes: 0, fetch: null, asked: false, answer: null, file: null, fileDuration: null };
     this.frames.set(frameId, f);
     if (this.tapping) this.tapOn(f);
     this.poke();
@@ -224,6 +224,7 @@ export class Loader extends Job {
     if (m.t === 'tap-progress') {
       f.prog = m;
       for (const x of m.mimes) this.rep.mimes.add(x);
+      if (m.sbs) { f.own = f.own || new Set(); for (const i of m.sbs) f.own.add(i); } // its player's SourceBuffers, as the tap says
     } else if (m.t === 'tap-urls') {
       for (const r of m.reqs) if (f.reqs.length < 2000) f.reqs.push({ ...r, frame: f });
     } else if (m.t === 'tap-ready') {
@@ -286,8 +287,13 @@ export class Loader extends Job {
   }
   reqs() { const f = this.track(); return f ? f.reqs : []; }
   mimes() { return [...this.rep.mimes]; }
-  /** The track's frame, when its player uses Media Source (the tap saw a SourceBuffer there, or what it appended). */
-  mseFrame() { const f = this.track(); return f && ((f.prog && f.prog.mimes.length) || f.parts.length) ? f : null; }
+  /**
+   * The track's frame, when its player uses Media Source: it is fed by a SourceBuffer, as the tap says (or, when it
+   * cannot tell, the tap saw one in that frame, or what one appended).
+   */
+  mseFrame() { const f = this.track(); return f && (f.own ? f.own.size > 0 : (f.prog && f.prog.mimes.length) || f.parts.length) ? f : null; }
+  /** A frame's captured appends: only those of the SourceBuffers feeding its player, when the tap says which. */
+  own(f) { return f.own ? f.parts.filter((p) => f.own.has(p.sb - f.n * 1000)) : f.parts; }
   /** How long the track's player says the track is. */
   duration() { const f = this.track(); return f && f.prog ? f.prog.duration : null; }
   limitSec() { return (this.engine.params['resident.limitMin'] || 15) * 60; }
@@ -542,7 +548,7 @@ export class Loader extends Job {
   /** The latest init segment the player appended (its Media Source frame's, highest seq). */
   ownInit() {
     const f = this.mseFrame();
-    const inits = f ? f.parts.filter((p) => p.kind === 'init') : [];
+    const inits = f ? this.own(f).filter((p) => p.kind === 'init') : [];
     return inits.sort((a, b) => b.seq - a.seq)[0] || null;
   }
 
@@ -631,11 +637,11 @@ export class Loader extends Job {
       this.send(f, { t: 'drive', mode: 'stop' }); // always: the player gets back its rate, pitch, mute and place
     }
     if (out) return out;
-    return { why: `${f.parts.length} pieces captured from the player`, ...(await this.decodeOr(placed)) };
+    return { why: `${this.own(f).length} pieces captured from the player`, ...(await this.decodeOr(placed)) };
   }
 
   // ---------------------------------------------------------------- assembly
-  parts() { const f = this.track(); return [...(f ? f.parts : []), ...this.fetched]; }
+  parts() { const f = this.track(); return [...(f ? this.own(f) : []), ...this.fetched]; }
 
   /** The placement of everything captured and fetched when it covers the track (re-checked against the latest length), else null. */
   async complete() {

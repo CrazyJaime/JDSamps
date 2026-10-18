@@ -57,12 +57,14 @@ export const code = (s) => Math.fround([...String(s)].reduce((n, c) => (n * 31 +
  *   src (a progressive element source URL), tralbum ({url, duration}), files ({url: bytes}, served to the page and the engine),
  *   errors (reasons reported at tap on), seekhop ('ok' | 'stall' | 'refuse'), accelerate ('ok' | 'refuse'), mimes (override),
  *   appends (MSE parts as {bytes} the player appends on a drive, in order, for a stream with no timestamps),
- *   status (the frame agent's status, over a heard playing player's), framePages ([{...}]: frame i's page, over this one)
+ *   status (the frame agent's status, over a heard playing player's), framePages ([{...}]: frame i's page, over this one),
+ *   other ({rendition, sb, n}: another player's SourceBuffer in the frame, appending its init and first n segments at tap on),
+ *   sbs (the SourceBuffers the tap says feed the heard player: default [0] for 'mse', [] for 'progressive'; null: not said)
  * }
  */
 export function makeTab({ tabId = 7, url = 'https://site.example/track', frames = 1, ...page } = {}) {
   const blobs = new Map(), log = [], net = new Map(Object.entries(page.files || {}));
-  for (const r of [page, ...(page.framePages || [])].map((p) => p.rendition)) {
+  for (const r of [page, ...(page.framePages || [])].flatMap((p) => [p.rendition, p.other && p.other.rendition])) {
     if (r) { net.set(r.list, enc(playlist(r))); net.set(r.init.url, r.init.bytes); for (const s of r.segs) net.set(s.url, s.bytes); }
   }
   const tab = { tabId, url, page, blobs, log, net, frames: [], deck: null, hooks: [] };
@@ -76,8 +78,9 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
       if (!v) throw new Error(`the fake agent sent an invalid message: ${JSON.stringify(m)}`);
       setImmediate(() => { const d = tab.deck; if (!fr.left && d && d.agents.get(fr.id) === fr.a && d.loader) d.loader.onTap(fr.id, v); });
     };
+    const sbs = pg.sbs !== undefined ? pg.sbs : pg.kind === 'mse' ? [0] : pg.kind === 'progressive' ? [] : null;
     const progress = (extra = {}) => emit({ t: 'tap-progress', bytes: 0, buffered: [], duration: Number.isFinite(fr.duration) ? fr.duration : null,
-      mimes: pg.mimes || (pg.kind === 'mse' ? [r ? r.mime : OPUS] : []), ...extra });
+      mimes: pg.mimes || (pg.kind === 'mse' ? [r ? r.mime : OPUS] : []), ...(sbs ? { sbs } : {}), ...extra });
     const append = (ks) => {
       const parts = [];
       for (const k of ks) if (!fr.appended.has(k) && r.segs[k]) { fr.appended.add(k); parts.push({ blobUrl: mint(r.segs[k].bytes), mime: r.mime, kind: 'media', sb: 0, seq: fr.seq++ }); }
@@ -109,6 +112,11 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
         if (pg.kind === 'mse' && pg.playing) {
           if (pg.preTap === 0 || pg.preTap == null) emit({ t: 'tap-ready', parts: [{ blobUrl: mint(r.init.bytes), mime: r.mime, kind: 'init', sb: 0, seq: fr.seq++ }], duration: fr.duration });
           append(Array.from({ length: pg.playing }, (_, k) => (pg.preTap || 0) + k));
+        }
+        const o = pg.other;
+        if (o) {
+          const bytes = [o.rendition.init.bytes, ...o.rendition.segs.slice(0, o.n).map((x) => x.bytes)];
+          emit({ t: 'tap-ready', parts: bytes.map((b, k) => ({ blobUrl: mint(b), mime: o.rendition.mime, kind: k ? 'media' : 'init', sb: o.sb, seq: fr.seq++ })), duration: Number.isFinite(fr.duration) ? fr.duration : null });
         }
       } else if (m.t === 'readTralbum') {
         const t = pg.tralbum;

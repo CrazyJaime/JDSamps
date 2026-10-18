@@ -299,8 +299,9 @@
   const CAP = 600 * 2 ** 20; // bytes held per frame; past it the tap gives up rather than grow
   const INIT_MAX = 256 * 1024; // the largest init segment kept while dormant
   const tap = { on: false, bytes: 0, seq: 0, nsb: 0, gen: 0, reqs: 0, infAt: 0, told: new Set(), mimes: new Set(), srcs: new Set() };
-  const sbs = new WeakMap(); // SourceBuffer -> { i, mime, skip, init }
+  const sbs = new WeakMap(); // SourceBuffer -> { i, mime, skip, init, ms }
   let known = [], knownAt = 32; // WeakRefs to the SourceBuffers in sbs, for the tap to find them
+  const msUrls = new Map(); // a MediaSource's blob: URL -> WeakRef to it: an element's source leads to its SourceBuffers
   const wiredEls = new Set(), watched = new Set(); // what carries a tap listener this session
   const handed = new Set(); // blob: URLs handed to the engine: its to read until it says forget
   const xhrs = new WeakMap();
@@ -340,7 +341,7 @@
   function recOf(sb, mime = '') {
     let rec = sbs.get(sb);
     if (!rec) {
-      rec = { i: tap.nsb++, mime, skip: videoMime(mime), init: null };
+      rec = { i: tap.nsb++, mime, skip: videoMime(mime), init: null, ms: null };
       sbs.set(sb, rec);
       if (known.length >= knownAt) { known = known.filter((r) => r.deref() !== undefined); knownAt = Math.max(32, 2 * known.length); }
       known.push(new WeakRef(sb));
@@ -421,10 +422,34 @@
       const sb = orig.apply(this, arguments);
       try {
         const rec = recOf(sb, String(type).slice(0, 256));
+        rec.ms = this;
         if (tap.on && !rec.skip) { tap.mimes.add(rec.mime); watchSb(sb); tapDirty(); }
       } catch (_) {}
       return sb;
     } }.addSourceBuffer, orig);
+    // A player attaches its MediaSource by a blob: URL: noted (dormant or not), so the tap can tell which
+    // SourceBuffers feed the player it reports on, and keep another player's appends apart.
+    URL_.createObjectURL = disguise({ createObjectURL(obj) {
+      const u = mkUrl.apply(this, arguments);
+      try {
+        if (tagOf(obj) === '[object MediaSource]') {
+          if (msUrls.size >= 64) for (const [k, r] of msUrls) if (!r.deref() || msUrls.size >= 64) msUrls.delete(k);
+          msUrls.set(u, new WeakRef(obj));
+        }
+      } catch (_) {}
+      return u;
+    } }.createObjectURL, mkUrl);
+  }
+  /** The numbers of the SourceBuffers feeding el: [] when it plays a plain web source, null when that is not known. */
+  function sbsOf(el) {
+    let src = '';
+    try { src = el ? el.currentSrc || el.src || '' : ''; } catch (_) {}
+    if (!/^blob:/i.test(src)) return /^https?:/i.test(src) ? [] : null;
+    const r = msUrls.get(src), ms = r && r.deref();
+    if (!ms) return null; // a blob of bytes, or a MediaSource made before the agent was there
+    const out = [];
+    for (const w of known) { const sb = w.deref(), rec = sb && sbs.get(sb); if (rec && rec.ms === ms && !rec.skip && out.length < 64) out.push(rec.i); }
+    return out;
   }
 
   // The URL layer: media (and manifest) requests the page makes with fetch or XMLHttpRequest,
@@ -617,6 +642,8 @@
     checkPage();
     const el = mainEl();
     const msg = { t: 'tap-progress', bytes: tap.bytes, buffered: rangesOf(el), duration: durOf(el), mimes: [...tap.mimes].slice(0, 16) };
+    const own = sbsOf(el);
+    if (own) msg.sbs = own;
     if (drv.mode) msg.drive = { mode: drv.mode, state: drv.state, at: Math.max(0, drv.mode === 'seekhop' ? drv.cursor : el.currentTime) };
     const s = JSON.stringify(msg);
     if (s === tp.last) return;

@@ -410,6 +410,29 @@ test('the track length is the heard player\'s: a muted player in the top frame b
   await assertReleased(d, site);
 });
 
+test('another player in the tab, beside the track or muted in an iframe, never puts its audio in the deck', async () => {
+  for (const where of ['same', 'sub']) {
+    const site = { tab: await h.context.newPage(), url: `${multi.origin}/two-${where}` };
+    await site.tab.goto(site.url);
+    site.tabId = await tabIdFor(h, site.url);
+    await playing(site.tab);
+    const other = () => (where === 'same' ? site.tab.mainFrame() : site.tab.frames().find((f) => f.url().endsWith('/bframe')));
+    await waitFor(() => other() && other().evaluate(() => typeof window.__startB === 'function'), 15000);
+    const d = await loadTab(site.tabId, {
+      // It starts once the deck is reading the page, so all it appends is captured: a 440 Hz tone at 0–24 s.
+      during: async (r) => {
+        await waitFor(() => engine(`const l = e.loads.get(${r.deckId}); return !!l && l.loader.tapping;`), 15000);
+        await other().evaluate(() => window.__startB());
+      },
+    });
+    assert.equal(d.kind, 'resident', `${where}: ${JSON.stringify(d.load)}`);
+    assert.ok(Math.abs(d.duration - OPUS_END) < 0.015, `${where}: duration ${d.duration}`);
+    const c = await compare(d.id, opusUrls());
+    assert.ok(c.corr > 0.9999 && c.maxd < 1e-3, `${where}: ${JSON.stringify(c)}`);
+    await assertReleased(d, site);
+  }
+});
+
 // ---------------------------------------------------------------- recording a whole track (opt-in)
 /** A live deck of the page at `url`: tabs load live while resident.auto is off. */
 async function liveDeck(url) {
