@@ -133,6 +133,7 @@ kbd { font: 0.8rem var(--mono); padding: 0.05rem 0.35rem; border: 1px solid var(
 .engine .led { width: 0.55rem; height: 0.55rem; border-radius: 50%; background: var(--dim); }
 .engine[data-status="up"] .led { background: var(--play); box-shadow: 0 0 0.5rem var(--play); }
 .engine[data-status="down"] .led { background: var(--rec); box-shadow: 0 0 0.5rem var(--rec); }
+.mem-warn { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.75rem; color: var(--warn); }
 .banner { padding: 0.45rem 0.8rem; background: #3a1414; color: #fecaca; font-weight: 600; border-bottom: 1px solid #5f1d1d; }
 
 /* ---------- waveform stack ---------- */
@@ -168,7 +169,12 @@ body[data-decks="5"] .wave-bpm, body[data-decks="6"] .wave-bpm { font-size: 0.75
 .wave:hover ~ .jog-hint, .wave-row.dragging .jog-hint { visibility: visible; }
 
 /* ---------- board ---------- */
-.board { display: grid; grid-template-columns: 1fr auto; min-height: 0; }
+.board { position: relative; display: grid; grid-template-columns: 1fr auto; min-height: 0; }
+/* Files dragged over the page: the whole board takes them. */
+body.dropping .board::after {
+  content: "Drop audio files to load them as whole tracks"; position: absolute; inset: 0.5rem; z-index: 5; display: grid; place-items: center;
+  border: 2px dashed var(--sync); border-radius: 0.8rem; background: rgb(7 8 11 / 0.7); font-weight: 700; pointer-events: none;
+}
 .decks { display: flex; gap: 0.5rem; padding: 0.5rem; overflow-x: auto; overflow-y: auto; min-height: 0; }
 .empty { margin: auto; max-width: 34rem; padding: 1.6rem 1.8rem; border: 1px dashed var(--line-2); border-radius: 0.8rem; background: var(--panel); }
 .empty h2 { font-size: 1.25rem; margin-bottom: 0.6rem; }
@@ -382,6 +388,12 @@ body[data-decks="5"] .wave-bpm, body[data-decks="6"] .wave-bpm { font-size: 0.75
 .source .host { font-size: 0.75rem; color: var(--muted); }
 .source .audible { color: var(--play); }
 .setting { display: flex; flex-direction: column; gap: 0.35rem; font-size: 0.8rem; color: var(--muted); }
+.setting input.num { width: 6rem; }
+.load-link { display: flex; flex-direction: column; gap: 0.35rem; font-size: 0.8rem; color: var(--muted); }
+.load-link-row { display: flex; gap: 0.4rem; }
+.load-link-row input { flex: 1; }
+.drawer input { min-width: 0; min-height: max(32px, 1.9rem); padding: 0 0.5rem; border: 1px solid var(--line-2); border-radius: var(--r); background: var(--bg); color: var(--txt); font: 0.85rem var(--sans); user-select: text; }
+.drawer input:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
 .overlay { position: fixed; inset: 0; z-index: 30; display: grid; place-items: center; background: rgb(3 4 6 / 0.72); }
 .overlay-card { width: min(46rem, 94vw); padding: 1rem 1.2rem; border-radius: 0.8rem; background: var(--panel); border: 1px solid var(--line-2); }
 .keys { width: 100%; border-collapse: collapse; font-size: 0.85rem; }

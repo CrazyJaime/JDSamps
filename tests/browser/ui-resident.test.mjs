@@ -48,7 +48,7 @@ const stubClipboard = () => page.evaluate(() => {
 const copied = () => page.evaluate(() => window.__copied);
 
 before(async () => {
-  ui = await openUi({ state: kinds(), viewport: { width: 1280, height: 720 } });
+  ui = await openUi({ state: kinds(), hubReplies: { LIST_SOURCES: { ok: true, tabs: [] } }, viewport: { width: 1280, height: 720 } });
   page = ui.page;
   await page.waitForSelector('.deck >> nth=2');
   await ui.push(makeWave(1, 63, 124));
@@ -336,6 +336,190 @@ test('six decks of every kind fit at laptop sizes: nothing off screen, covered o
     await show(makeState({ decks: six.decks.slice(0, n) }));
     assert.deepEqual(await offenders(), [], `${n} decks`);
   }
+});
+
+// ---------------------------------------------------------------- drop a file, load a link
+/** Drop files ({name, type}) on the element matching sel, as a drag from the desktop does. over: dragenter/dragover only. */
+const drop = (sel, files, { over = false } = {}) => page.evaluate(([s, list, o]) => {
+  const dt = new DataTransfer();
+  for (const f of list) dt.items.add(new File([new Uint8Array(64)], f.name, { type: f.type || '' }));
+  const el = document.querySelector(s);
+  for (const type of o ? ['dragenter', 'dragover'] : ['dragenter', 'dragover', 'drop']) el.dispatchEvent(new DragEvent(type, { dataTransfer: dt, bubbles: true, cancelable: true }));
+}, [sel, files, over]);
+/** URL.revokeObjectURL, recorded in window.__revoked. */
+const spyRevoke = () => page.evaluate(() => {
+  window.__revoked = [];
+  if (!window.__revokeSpied) { window.__revokeSpied = true; const rv = URL.revokeObjectURL.bind(URL); URL.revokeObjectURL = (u) => { window.__revoked.push(u); rv(u); }; }
+});
+const revoked = () => page.evaluate(() => window.__revoked);
+/** The fake engine answers only when told (reply). */
+const manual = (on) => page.evaluate((v) => { window.__fake.autoReply = !v; }, on);
+const reply = (id, ok, error) => page.evaluate(([i, o, e]) => window.__fake.reply(i, o, e), [id, ok, error]);
+const loadActs = (a) => sent('act', (m) => m.a === a);
+
+test('an audio file dropped on the board loads onto a whole-track deck; its blob: URL lives until the load settles', async () => {
+  await show(kinds());
+  await spyRevoke();
+  await manual(true);
+  await ui.clearSent();
+  await clearToasts();
+  try {
+    await drop('.board', [{ name: 'kick.mp3', type: 'audio/mpeg' }], { over: true });
+    assert.equal(await page.evaluate(() => document.body.classList.contains('dropping')), true, 'the page shows where a drop goes');
+    await drop('.board', [{ name: 'kick.mp3', type: 'audio/mpeg' }]);
+    await wait(50);
+    assert.equal(await page.evaluate(() => document.body.classList.contains('dropping')), false);
+    const [m, more] = await loadActs('loadFile');
+    assert.equal(more, undefined);
+    assert.equal(m.deck, null);
+    assert.equal(m.arg.name, 'kick.mp3');
+    assert.match(m.arg.blobUrl, /^blob:/);
+    // The engine answers once the track is decoded and analysed (seconds): no time-out meanwhile, and the blob stays readable.
+    await wait(4300);
+    assert.deepEqual(await revoked(), []);
+    assert.ok(!(await toasts()).some((t) => /did not answer/.test(t)), (await toasts()).join('|'));
+    assert.equal(await page.evaluate((u) => fetch(u).then((r) => r.ok), m.arg.blobUrl), true);
+    await reply(m.id, true);
+    await wait(50);
+    assert.deepEqual(await revoked(), [m.arg.blobUrl]);
+  } finally { await manual(false); }
+});
+
+test('files dropped on a deck load too, each onto its own deck; a refused load is said; anything not audio is refused in the page', async () => {
+  await show(kinds());
+  await spyRevoke();
+  await manual(true);
+  await ui.clearSent();
+  await clearToasts();
+  try {
+    await drop('#decks section.deck:nth-of-type(2)', [{ name: 'Mix.FLAC', type: '' }, { name: 'b.ogg', type: 'audio/ogg' }]);
+    await wait(50);
+    const acts = await loadActs('loadFile');
+    assert.deepEqual(acts.map((m) => m.arg.name), ['Mix.FLAC', 'b.ogg'], 'known by its extension when the system gives no type');
+    await reply(acts[0].id, false, '“Mix” is not audio this browser can play.');
+    await reply(acts[1].id, true);
+    await wait(50);
+    assert.match((await toasts()).join('|'), /not audio this browser can play/);
+    assert.deepEqual((await revoked()).sort(), acts.map((m) => m.arg.blobUrl).sort());
+    await ui.clearSent();
+    await clearToasts();
+    await drop('.board', [{ name: 'notes.txt', type: 'text/plain' }, { name: 'cover.jpg', type: 'image/jpeg' }]);
+    await wait(50);
+    assert.deepEqual(await loadActs('loadFile'), []);
+    assert.match((await toasts()).join('|'), /not an audio file: “notes\.txt”, “cover\.jpg”/i);
+  } finally { await manual(false); }
+});
+
+test('the Sources drawer loads a link to an audio file; anything but a web link is refused', async () => {
+  await show(kinds());
+  await ui.clearSent();
+  await clearToasts();
+  await page.locator('#sourcesBtn').click();
+  const field = page.locator('#loadLink'), go = page.locator('#loadLinkBtn');
+  assert.equal(await field.isVisible(), true);
+  assert.equal(await text(go), 'Load link');
+  for (const bad of ['javascript:alert(1)', 'ftp://example.com/a.mp3', 'example.com/a.mp3', '']) {
+    await field.fill(bad);
+    await go.click();
+  }
+  await wait(50);
+  assert.deepEqual(await loadActs('loadUrl'), []);
+  assert.match((await toasts()).join('|'), /web link/i);
+  await field.fill('  https://example.com/a.mp3  ');
+  await field.press('Enter');
+  await wait(50);
+  assert.deepEqual((await loadActs('loadUrl')).map((m) => [m.deck, m.arg]), [[null, { url: 'https://example.com/a.mp3' }]]);
+  assert.equal(await field.inputValue(), '', 'cleared once sent');
+  await page.locator('#sources [data-close]').click();
+});
+
+/** A paste (Ctrl/Cmd+V) of text on the element matching sel, or on the page itself. */
+const paste = (sel, t) => page.evaluate(([s, x]) => {
+  const dt = new DataTransfer();
+  dt.setData('text/plain', x);
+  (s ? document.querySelector(s) : document.body).dispatchEvent(new ClipboardEvent('paste', { clipboardData: dt, bubbles: true, cancelable: true }));
+}, [sel, t]);
+
+test('a link pasted on the board is offered for loading; a paste into a text field, or of other text, is not', async () => {
+  await show(kinds());
+  await ui.clearSent();
+  await clearToasts();
+  await paste(null, 'hello there');
+  await paste(null, 'javascript:alert(1)');
+  await page.locator('#sourcesBtn').click();
+  await paste('#loadLink', 'https://example.com/in-the-field.mp3');
+  await page.locator('#sources [data-close]').click();
+  await wait(50);
+  assert.deepEqual(await toasts(), []);
+  await paste(null, 'https://example.com/b.mp3');
+  await wait(50);
+  const offer = page.locator('.toast', { hasText: 'Load this link?' });
+  assert.equal(await offer.count(), 1);
+  assert.match(await offer.textContent(), /https:\/\/example\.com\/b\.mp3/);
+  assert.deepEqual(await loadActs('loadUrl'), [], 'nothing loads until asked');
+  await offer.getByRole('button', { name: 'Load' }).click();
+  await wait(50);
+  assert.deepEqual((await loadActs('loadUrl')).map((m) => m.arg), [{ url: 'https://example.com/b.mp3' }]);
+  assert.equal(await offer.count(), 0, 'the offer goes once taken');
+});
+
+// ---------------------------------------------------------------- settings, memory
+test('the settings drawer sets and keeps the resident track limit and 2× whole-track recording', async () => {
+  await show(kinds());
+  await ui.clearSent();
+  await page.locator('#settingsBtn').click();
+  const settings = page.locator('#settings');
+  for (const label of ['Resident track limit (minutes)', 'Record whole track at 2× when bytes are unavailable']) assert.equal(await settings.getByText(label, { exact: true }).isVisible(), true, label);
+  const limit = page.locator('#residentLimit');
+  assert.equal(await limit.inputValue(), '15');
+  const lastSet = async (key) => (await sent('set', (m) => m.deck === null && m.key === key)).map((m) => m.value);
+  await limit.fill('20');
+  await limit.press('Enter');
+  await wait(50);
+  assert.deepEqual(await lastSet('resident.limitMin'), [20]);
+  assert.equal(await page.evaluate(() => window.__fake.storage['resident.limitMin']), 20, 'kept for the next start');
+  // Whole minutes, 1 to 60.
+  for (const [typed, want] of [['0', 1], ['99', 60], ['7.6', 8]]) {
+    await ui.clearSent();
+    await limit.fill(typed);
+    await limit.press('Enter');
+    await wait(50);
+    assert.deepEqual(await lastSet('resident.limitMin'), [want], typed);
+    assert.equal(await limit.inputValue(), String(want));
+  }
+  // The engine's value shows once it changes, unless the field is being edited.
+  await show(kinds((s) => { s.master.params['resident.limitMin'] = 30; }));
+  assert.equal(await limit.inputValue(), '30');
+  await ui.clearSent();
+  await settings.locator('[data-setting="resident.recordWhole"] button[data-v="true"]').click();
+  await wait(50);
+  assert.deepEqual(await lastSet('resident.recordWhole'), [true]);
+  assert.equal(await page.evaluate(() => window.__fake.storage['resident.recordWhole']), true);
+  await show(kinds((s) => { s.master.params['resident.recordWhole'] = true; }));
+  assert.equal(await settings.locator('[data-setting="resident.recordWhole"] button[data-v="true"]').getAttribute('aria-pressed'), 'true');
+  // "Load tabs as whole tracks" appears once the engine has that setting.
+  const auto = page.locator('#residentAutoSetting');
+  assert.equal(await auto.isHidden(), true);
+  await show(kinds((s) => { s.master.params['resident.auto'] = true; }));
+  assert.equal(await auto.isVisible(), true);
+  assert.equal(await auto.getByText('Load tabs as whole tracks', { exact: true }).isVisible(), true);
+  assert.equal(await auto.locator('button[data-v="true"]').getAttribute('aria-pressed'), 'true');
+  await ui.clearSent();
+  await auto.locator('button[data-v="false"]').click();
+  await wait(50);
+  assert.deepEqual(await lastSet('resident.auto'), [false]);
+  await page.locator('#settings [data-close]').click();
+});
+
+test('the top bar warns quietly once decks hold more than 1.5 GiB of audio', async () => {
+  const warn = page.locator('#memWarn');
+  await show(kinds((s) => { s.master.residentBytes = 1.5 * 2 ** 30; }));
+  assert.equal(await warn.isHidden(), true);
+  await show(kinds((s) => { s.master.residentBytes = 1.7e9; }));
+  assert.equal(await warn.isVisible(), true);
+  assert.equal(await text(warn), 'Decks hold 1.7 GB of audio; eject some to free memory');
+  await show(kinds());
+  assert.equal(await warn.isHidden(), true);
 });
 
 test('no console errors', () => { assert.deepEqual(ui.errors, []); });

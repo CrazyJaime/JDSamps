@@ -37,6 +37,7 @@
       <span class="clock-mode" id="clockMode">no master</span>
     </div>
     <div class="spacer"></div>
+    <span class="mem-warn" id="memWarn" role="status" hidden></span>
     <button id="mixRecBtn" class="btn rec" aria-pressed="false"><svg class="ic"><use href="#i-dot"/></svg><span>REC MIX</span><span class="mono rec-time" id="mixRecTime"></span></button>
     <button id="settingsBtn" class="btn ghost icon" aria-label="Settings" aria-haspopup="dialog" aria-controls="settings"><svg class="ic"><use href="#i-gear"/></svg></button>
     <button id="helpBtn" class="btn ghost icon" aria-label="Keyboard shortcuts" aria-haspopup="dialog" aria-controls="help"><svg class="ic"><use href="#i-help"/></svg></button>
@@ -56,6 +57,7 @@
           <li>Open a track on YouTube, SoundCloud, Bandcamp or Mixcloud.</li>
           <li>Click the <strong>JD Samps</strong> icon on that tab, press <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd>, or right-click → <em>Add this tab to JD Samps</em>.</li>
           <li>The deck loads <strong>cued</strong> and starts buffering. Press <strong>PLAY</strong> when you're ready.</li>
+          <li>Or drop an audio file here, or paste a link to one, to load the whole track.</li>
         </ol>
         <button class="btn" id="emptySourcesBtn"><svg class="ic"><use href="#i-list"/></svg><span>Open sources</span></button>
       </div>
@@ -81,6 +83,11 @@
 
   <aside class="drawer" id="sources" role="dialog" aria-modal="false" aria-labelledby="sourcesTitle" hidden>
     <header class="drawer-head"><h2 id="sourcesTitle">Sources</h2><button class="btn ghost icon" data-close aria-label="Close"><svg class="ic"><use href="#i-x"/></svg></button></header>
+    <form class="load-link" id="loadLinkForm" novalidate>
+      <label for="loadLink">Link to an audio file</label>
+      <div class="load-link-row"><input id="loadLink" type="url" inputmode="url" placeholder="https://…/track.mp3" autocomplete="off" spellcheck="false" /><button class="btn sm" id="loadLinkBtn" type="submit">Load link</button></div>
+      <p class="hint">The whole track loads onto a new deck. You can also drop an audio file anywhere on this page.</p>
+    </form>
     <p class="hint">Chrome only lets an extension capture a tab after you invoke it there. Use <strong>Go to tab</strong>, then click the JD Samps icon or press <kbd>Alt</kbd>+<kbd>Shift</kbd>+<kbd>A</kbd>.</p>
     <ul class="source-list" id="sourceList"></ul>
   </aside>
@@ -93,6 +100,11 @@
     <div class="setting"><span>Deck buffer</span><div class="seg" data-setting="buffer.capSec"><button data-v="120">2 min</button><button data-v="240">4 min</button><button data-v="480">8 min</button></div></div>
     <div class="setting"><span>Player assist</span><div class="seg" data-setting="assist.on"><button data-v="true">ON</button><button data-v="false">OFF</button></div></div>
     <p class="hint">Player assist briefly speeds up a tab's own player to refill a deck's reserve while it plays faster than the original. Sync itself always works on the audio.</p>
+    <!-- resident.auto arrives with the tab loader: the row shows once the engine's settings have it. -->
+    <div class="setting" id="residentAutoSetting" hidden><span>Load tabs as whole tracks</span><div class="seg" data-setting="resident.auto"><button data-v="true">ON</button><button data-v="false">OFF</button></div></div>
+    <div class="setting"><label for="residentLimit">Resident track limit (minutes)</label><input class="num" id="residentLimit" type="number" min="1" max="60" step="1" inputmode="numeric" data-setting-num="resident.limitMin" /></div>
+    <div class="setting"><span>Record whole track at 2× when bytes are unavailable</span><div class="seg" data-setting="resident.recordWhole"><button data-v="true">ON</button><button data-v="false">OFF</button></div></div>
+    <p class="hint">A whole track takes about 22 MB of memory per minute; a longer one loads its first part. Recording at 2× is for pages whose audio cannot be read: it plays the tab through at double speed and loses the highest frequencies.</p>
   </aside>
 
   <div class="overlay" id="help" role="dialog" aria-modal="true" aria-labelledby="helpTitle" hidden>
@@ -111,6 +123,7 @@
           <tr><td><kbd>V</kbd> <kbd>B</kbd> <kbd>N</kbd> <kbd>M</kbd></td><td>Roll 1/8, 1/4, 1/2, 1 (hold)</td><td><kbd>[</kbd> <kbd>]</kbd> <kbd>\</kbd></td><td>Crossfader left / right / centre</td></tr>
           <tr><td><kbd>R</kbd></td><td>Record deck (hold to stop)</td><td><kbd>Shift</kbd>+<kbd>R</kbd></td><td>Record mix (hold to stop)</td></tr>
           <tr><td><kbd>Shift</kbd>+<kbd>T</kbd></td><td>Mark beat 1 (downbeat)</td><td>Shift-click GRID</td><td>Shift the grid by 10 ms</td></tr>
+          <tr><td>Drop an audio file</td><td>Load the whole track</td><td><kbd>Ctrl</kbd>+<kbd>V</kbd> a link</td><td>Offer to load it</td></tr>
           <tr><td><kbd>?</kbd></td><td>This help</td><td><kbd>Esc</kbd></td><td>Close panels</td></tr>
         </tbody>
       </table>
