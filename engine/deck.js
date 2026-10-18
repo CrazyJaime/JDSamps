@@ -523,7 +523,7 @@ export class Deck {
       case 'recStart':
         try { this.recorder.start(this.engine.params['rec.format']); return OK; } catch (err) { return fail(`Could not start recording: ${err.message}`); }
       case 'recStop': this.recorder.stop(); return OK;
-      case 'recordWhole': return fail('Recording a whole track from the page is not available yet.');
+      case 'recordWhole': return this.engine.recordWhole(this.id);
       case 'clipReset': this.meter.clipUntil = 0; return OK;
       default: return fail(`Unknown action ${a}`);
     }

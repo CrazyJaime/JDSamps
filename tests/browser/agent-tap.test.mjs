@@ -817,6 +817,28 @@ describe('driving the player', { concurrency: 3 }, () => {
     await p.close();
   });
 
+  test('drive accelerate from a place, held and audible (recording a whole track): paused there with its sound, then played; stop puts it back', async () => {
+    const p = await tapPage(LONG);
+    await connect(p);
+    await send(p, { t: 'tap', on: true });
+    await p.run("window.__go().then(() => { const a = document.getElementById('a'); a.volume = 0.6; a.currentTime = 12; return a.play(); })");
+    await waitFor(async () => { const m = await media(p); return !m.paused && m.t > 12.2; }, 5000);
+    await send(p, { t: 'drive', mode: 'accelerate', rate: 2, from: 0, hold: true, audible: true });
+    await waitFor(() => p.run("!document.getElementById('a').seeking"), 3000);
+    let m = await media(p);
+    assert.deepEqual([m.t, m.paused, m.rate, m.pp, m.muted], [0, true, 2, false, false], 'held at 0, at 2x, with its sound');
+    await send(p, { t: 'drive', mode: 'accelerate', rate: 2, audible: true });
+    await waitFor(async () => { const x = await media(p); return !x.paused && x.t > 0.3; }, 5000);
+    m = await media(p);
+    assert.deepEqual([m.rate, m.pp, m.muted], [2, false, false]);
+    await send(p, { t: 'drive', mode: 'stop' });
+    m = await media(p);
+    assert.deepEqual([m.paused, m.rate, m.pp, m.muted, m.volume], [false, 1, true, false, 0.6]);
+    assert.ok(Math.abs(m.t - 12.2) < 1, `back near where it was: ${m.t}`);
+    await checkPosted(p);
+    await p.close();
+  });
+
   test('drive accelerate at 8x captures the track through playback with pitch unlocked, for as long as it takes', async () => {
     const p = await tapPage(LONG);
     await connect(p);

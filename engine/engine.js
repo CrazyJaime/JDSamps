@@ -12,7 +12,7 @@ import { MasterClock } from './sync.js';
 import { Deck } from './deck.js';
 import { fetchArrayBuffer, decodeTo, resample, limitPcm } from './decode.js';
 import { analyseTrack, applyAnalysis } from './analysis.js';
-import { Loader } from './loader.js';
+import { Loader, Recording } from './loader.js';
 
 const STRETCH_URL = new URL('../vendor/signalsmith-stretch/SignalsmithStretch.js', import.meta.url).href;
 SignalsmithStretch.moduleUrl = STRETCH_URL;
@@ -309,6 +309,32 @@ class Engine {
       if (deck.loader === loader) deck.loader = null;
       return r;
     });
+  }
+
+  /**
+   * Record a live tab deck's whole track from the page's sound at 2× (§4.4: opt-in, highs above a quarter of the
+   * media's rate lost) onto a new deck, which becomes resident; the live deck is then let go. Answers once the
+   * recording has started: the new deck shows its progress.
+   */
+  async recordWhole(id) {
+    const live = this.decks.get(id);
+    if (!live) return { ok: false, error: 'That deck is gone.' };
+    if (live.kind !== 'live' || live.tabId == null || !live.source) return { ok: false, error: 'Only a deck playing a tab live can record its whole track.' };
+    if (live.loader) return { ok: false, error: `Deck ${live.slot} is being recorded already.` };
+    if (live.wantPlay) return { ok: false, error: 'Pause the deck first: recording runs its page at 2×.' };
+    if (!Recording.agentOf(live)) return { ok: false, error: "This page can't be sped up, so it would record in real time." };
+    const meta = { title: `${live.meta.title || 'Tab'} (recorded from the page — reduced highs)`, url: live.meta.url, favIconUrl: live.meta.favIconUrl };
+    const r = await this.serial(() => this.startLoadingDeck({ meta }));
+    if (!r.ok) return r;
+    const deck = this.decks.get(r.deckId), ac = new AbortController();
+    const job = new Recording({ engine: this, live, deck, signal: ac.signal }), load = { abort: () => ac.abort(), loader: job };
+    this.loads.set(deck.id, load);
+    live.loader = job; // the live deck's agents' tap messages go to the recording
+    job.run().then(() => {
+      if (this.loads.get(deck.id) === load) this.loads.delete(deck.id);
+      if (live.loader === job) live.loader = null;
+    });
+    return { ok: true };
   }
 
   /** Why no new deck can start now (the tab is on a deck already, or every slot is taken), or null; wakes the context. */

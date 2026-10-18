@@ -2,7 +2,7 @@
 // ladder a page gets, every refusal, monotonic progress, the promotion and the release of the tab.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SITES, firstRung, parseHls } from '../../engine/loader.js';
+import { SITES, firstRung, parseHls, findStart } from '../../engine/loader.js';
 import { defaults, MASTER_PARAMS, PERSISTED_MASTER_KEYS, validateUiMessage } from '../../shared/protocol.js';
 import { load, rendition, file, code, DUR, SR, OPUS } from './fixtures/loader-harness.mjs';
 
@@ -226,6 +226,66 @@ test('MSE that carries no timestamps (MP3) is never seek-hopped: the player is r
   const { result, tab } = await load({ kind: 'mse', mimes: ['audio/mpeg'], appends, preTap: 0, duration: 120 });
   assert.equal(result.kind, 'resident', JSON.stringify(result));
   assert.deepEqual(asked(tab), ['tap on', 'readTralbum', 'drive accelerate']);
+});
+
+// ---------------------------------------------------------------- the load report (R4.2)
+test('a resident load leaves a plain-text report: host, every rung and how it ended, mimes, counts, bytes, timings, no failure', async () => {
+  const { deck } = await load({ kind: 'mse', rendition: hi(), preTap: 6, playing: 3, list: true, segUrls: true });
+  const r = deck.load.report;
+  assert.equal(typeof r, 'string');
+  assert.match(r, /^JD Samps load report\n/);
+  assert.match(r, /Page: site\.example \(generic site: file, refetch, drive, then live\)/);
+  assert.match(r, /Result: resident, 119\.99\d s/, 'the Opus delay at the end of the last piece is trimmed');
+  assert.match(r, /Track length: 120\.007 s/);
+  assert.match(r, /file \(reading the page's track link\): skipped in \d+\.\d s — the page has no track link of its own/);
+  assert.match(r, /refetch \(fetching the track's pieces\): ok in \d+\.\d s — 29 pieces fetched/);
+  assert.doesNotMatch(r, /^ +drive/m, 'a rung never reached is not listed');
+  assert.match(r, /Media types: audio\/mp4; codecs="opus"/);
+  assert.match(r, /Runs: 1, segments: 30, gaps: none/);
+  assert.match(r, /Requests seen: 7 media, 1 playlist/);
+  assert.match(r, /Bytes: \d+ kB captured from the player, \d+ kB fetched again/);
+  assert.match(r, /First failure: none/);
+  assert.match(r, /Total: \d+\.\d s/);
+  assert.doesNotMatch(r, /undefined|NaN|\[object/);
+});
+
+test('a load that ends live leaves a report naming the rung that failed first, and why', async () => {
+  const { deck } = await load({ kind: 'mse', rendition: hi(), preTap: 6, playing: 1 });
+  const r = deck.load.report;
+  assert.match(r, /Result: live: the whole track could not be read/);
+  assert.match(r, /refetch \(fetching the track's pieces\): skipped in \d+\.\d s — the player fetched nothing that can be fetched again/);
+  assert.match(r, /drive \(seek-hop\): failed in \d+\.\d s — the player buffered the whole track, but 0\.0–24\.0 s came before the deck could read it/);
+  assert.match(r, /gaps: 0\.0–24\.0 s/);
+  assert.match(r, /First failure: drive: the player buffered the whole track/);
+});
+
+test('a refusal leaves a report too, its reason as the first failure', async () => {
+  const { deck } = await load({ kind: 'mse', rendition: hi(), errors: ['drm'] });
+  assert.match(deck.load.report, /Result: live: this page's audio is protected/);
+  assert.match(deck.load.report, /look: drm in \d+\.\d s/);
+  assert.match(deck.load.report, /First failure: this page's audio is protected/);
+  const web = await load({ kind: 'none' });
+  assert.match(web.deck.load.report, /connect: none in \d+\.\d s — 0 frames with a player/);
+});
+
+test('a track longer than the resident limit loads its first part: only those pieces are fetched, it is said once and reported', async () => {
+  const { result, tab, engine, deck } = await load({ kind: 'mse', rendition: hi(), preTap: 6, playing: 1, list: true, segUrls: true }, { limitMin: 1 });
+  assert.equal(result.kind, 'resident');
+  const names = tab.sent().filter((m) => m.t === 'fetch')[1].urls.map((u) => u.split('/').pop());
+  assert.ok(!names.includes('seg-016.m4s') && names.includes('seg-014.m4s'), names.join(' '));
+  assert.equal(called(engine, 'startResidentDeck')[0].frames, 60 * SR);
+  assert.equal(engine.notes.length, 1);
+  assert.match(engine.notes[0].text, /^Deck 1: this track is 2 minutes long: the deck holds its first 1 minute \(the resident track limit\)\.$/);
+  assert.match(deck.load.report, /Limit: this track is 2 minutes long/);
+});
+
+test('a recording from the page starts at the first sound after the page was held silent', () => {
+  const L = new Float32Array(4000), R = new Float32Array(4000);
+  for (let i = 0; i < 900; i++) L[i] = 0.5 * Math.sin(i / 3);      // the page playing before it was held
+  for (let i = 2500; i < 4000; i++) R[i] = 0.2 * Math.sin((i - 2500) / 5); // the track from its start (right channel only)
+  assert.equal(findStart(L, R, 1000, 4000), 2500 + 1);              // sin(0) is silent: the first audible sample
+  assert.equal(findStart(L, R, 1000, 2400), -1, 'nothing yet');
+  assert.equal(findStart(L, R, 0, 4000), 1, 'from where it is asked');
 });
 
 test('the opus pieces this harness serves are what the model sites serve', () => {

@@ -656,6 +656,9 @@
   // assist rate machinery (and its back-off), pitch unlocked. Either mutes the player; stop puts
   // back its rate, pitch, mute, volume, position and playing state. Progress goes up in
   // tap-progress.drive: running, done (all of it buffered), stalled or refused.
+  // Recording a whole track from the tab's sound runs accelerate with audible (the player keeps
+  // its sound), from (it starts at that place) and hold (it waits there, paused, for the next
+  // accelerate), so the recording starts with the track.
   const HOP_WAIT = 3000, END_TOL = 0.3, START_TOL = 0.2;
   const drv = { mode: null, el: null, base: null, state: '', cursor: 0, hop: 0, since: 0, timer: 0 };
   // MP3 and ADTS carry no timestamps: their appends can only be placed in order, so no seek-hop.
@@ -680,13 +683,16 @@
     drv.mode = m.mode; drv.since = performance.now();
     if (m.mode === 'seekhop' && [...tap.mimes].some((x) => NO_STAMPS.test(x))) { drv.state = 'refused'; tapDirty(); return; }
     drv.state = 'running';
-    try { el.muted = true; } catch (_) {}
+    try { el.muted = m.audible === true ? drv.base.muted : true; } catch (_) {}
     if (m.mode === 'seekhop') {
       const t = el.currentTime, step = typeof m.step === 'number' && m.step >= 0.5 && m.step <= 600 ? m.step : 0;
       drv.hop = step || Math.max(1, bufEnd(el, t) - t); // the player's buffering goal, as it shows now
       drv.cursor = 0;
       hop();
-    } else accelerate(typeof m.rate === 'number' && m.rate > 1 && m.rate <= 16 ? m.rate : 8);
+    } else {
+      if (typeof m.from === 'number' && Number.isFinite(m.from) && m.from >= 0) { try { nativePause.call(el); el.currentTime = m.from; } catch (_) {} }
+      accelerate(typeof m.rate === 'number' && m.rate > 1 && m.rate <= 16 ? m.rate : 8, m.hold === true);
+    }
     tapDirty();
   }
   function hop() {
@@ -713,12 +719,12 @@
     if (e >= Math.min(dur - END_TOL, drv.cursor + drv.hop)) hop();
     else if (late) { if (moved) hop(); else stall(); } // slower than its goal: move on
   }
-  function accelerate(rate) {
+  function accelerate(rate, hold) {
     st.target = rate; st.enforcing = true; st.letGo = 0;
     scan();
     for (const el of live()) { const x = info.get(el); if (x) { x.off = false; x.ext = []; } apply(el); }
     const el = drv.el, refused = () => { if (drv.mode === 'accelerate') { drv.state = 'refused'; tapDirty(); } };
-    if (!el.paused) return;
+    if (hold || !el.paused) return;
     let p;
     try { p = nativePlay.call(el); } catch (_) { refused(); return; }
     if (p && typeof p.then === 'function') p.then(null, refused);
