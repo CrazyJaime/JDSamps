@@ -627,10 +627,12 @@ export class Loader extends Job {
           this.check();
           placed = await this.complete();
           if (placed) break;
-          const why = `the player buffered the whole track, but ${this.gapsNow().map(span).join(', ')} came before the deck could read it`;
+          const gaps = this.gapsNow();
+          if (!gaps.length) { out = { outcome: 'failed', why: NO_LENGTH }; break; } // the player no longer gives a length
+          const why = `the player buffered the whole track, but ${gaps.map(span).join(', ')} came before the deck could read it`;
           // A player keeps only so much behind its playhead: what it held from before the tap may be gone from it by
           // now, and run once more from the first gap it fetches that again (never for appends placed in order only).
-          if (!pass && !stampless) { pass = { why, prog: f.prog }; go('accelerate', this.gapsNow()[0][0]); fresh = now(); continue; }
+          if (!pass && !stampless) { pass = { why, prog: f.prog }; go('accelerate', gaps[0][0]); fresh = now(); continue; }
           out = { outcome: 'failed', why: pass ? pass.why : why };
           break;
         }

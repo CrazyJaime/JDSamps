@@ -141,6 +141,15 @@ test('a player that has let go of the start it buffered before the tap is run on
   assert.match(deck.load.report, /drive \(seek-hop, then accelerate 8× from 0\.0 s\): ok/);
 });
 
+test('a player that stops saying how long its track is while it is driven ends live with a plain reason', async () => {
+  const lost = { t: 'tap-progress', bytes: 0, buffered: [], duration: null, mimes: [OPUS], sbs: [0], drive: { mode: 'seekhop', state: 'done', at: 120 } };
+  const { result, engine } = await load({ kind: 'mse', rendition: hi(), preTap: 6, playing: 1, seekhop: 'stall' }, {
+    before: ({ tab }) => { tab.hooks.push((m) => { if (m.t === 'drive' && m.mode === 'seekhop') setImmediate(() => { tab.frames[0].duration = null; tab.frames[0].emit(lost); }); }); },
+  });
+  assert.equal(result.kind, 'live');
+  assert.doesNotMatch(called(engine, 'failLoadingToLive')[0].reason, /undefined|Cannot read|TypeError/);
+});
+
 // ---------------------------------------------------------------- straight to live
 for (const [reason, re] of [['drm', /protected/], ['worker', /worker/], ['preview', /SoundCloud only gives a 30-second preview of this track\./]]) {
   test(`${reason}: live at once, with its one message, and no slow rung tried`, async () => {
