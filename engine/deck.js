@@ -499,6 +499,7 @@ export class Deck {
     else if (!g || (60 * factor) / g.T < MANUAL_BPM[0] || (60 * factor) / g.T > MANUAL_BPM[1]) return false;
     this.grids.editTrack(this.grids.trackAt(p), (x) => ({ ...x, T: x.T / factor }));
     this.followTempo();
+    this.syncMult = null; // as for a typed tempo: a synced deck chooses its octave of the master again
     return true;
   }
 

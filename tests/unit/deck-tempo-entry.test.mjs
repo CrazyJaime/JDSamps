@@ -298,6 +298,25 @@ test('a synced deck whose tempo is corrected re-chooses its half/double against 
   assert.ok(near(playedBpm(b, s.clock.t), 128, 1e-3), `B plays ${playedBpm(b, s.clock.t)} BPM`);
 });
 
+test('a synced deck doubled with 2× re-chooses its half/double against the master', async () => {
+  // Same correction as above, made with 2× instead of a typed tempo.
+  const s = pair(62);
+  const b = s.b;
+  b.tempo.multiply = function (f) { this.bpm *= f; this.grid = { ...this.grid, T: this.grid.T / f }; return true; };
+  await s.a.act('master');
+  await s.a.act('play');
+  s.go(1);
+  await b.act('sync', { on: true });
+  await b.act('play');
+  s.go(2);
+  assert.equal(b.syncMult, 0.5, 'premise: half time');
+  assert.deepEqual(await b.act('mult', { factor: 2 }), { ok: true });
+  s.go(2);
+  assert.equal(b.syncMult, 1, 'the octave is chosen again');
+  assert.equal(b.outOfRange, false, 'and the deck is not left pinned at the end of its range');
+  assert.ok(near(playedBpm(b, s.clock.t), 128, 1e-3), `B plays ${playedBpm(b, s.clock.t)} BPM`);
+});
+
 // ------------------------------------------------------------------ protocol
 
 test('setBpm / setNativeBpm arguments are validated', () => {
