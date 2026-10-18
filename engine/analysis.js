@@ -11,7 +11,8 @@
 //   a bar-1 suggestion, only when one beat of the bar clearly stands out; the waveform bands.
 // analyseTrackSync runs the same pipeline inline, for Node tests. applyAnalysis puts it on a deck.
 import { OdfCore } from '../worklets/odf-core.js';
-import { TempoTracker, DEFAULTS, RELATED } from './tempo.js';
+import { BPM_RANGES } from '../shared/protocol.js';
+import { TempoTracker, DeckTempo, DEFAULTS, RELATED } from './tempo.js';
 
 const WIN = 10, HOP = 5;  // s: phase-comb windows, and how far apart they start
 const BLOCK = 20;         // s: blocks a coarse tempo is read from, to find tempo changes
@@ -343,4 +344,25 @@ export function analyseTrack(pcm, { lo, hi, signal } = {}) {
 /** The same analysis inline, without a Worker (Node tests). */
 export function analyseTrackSync(pcm, { lo, hi } = {}) {
   return analyseMono(downmix(pcm), pcm.sampleRate, { lo, hi });
+}
+
+/**
+ * Put a whole-track analysis on a resident deck: every analysed segment into its grid map (replacing
+ * what was there), its tempo seeded from the analysis (made first, at the analysis rate and the deck's
+ * BPM range, if the deck has none: no input worklet ever announced one), and the whole waveform into
+ * its wave store and out to the pages, as the live input path stores and sends each batch. Bar 1 is
+ * left for the DJ: the analysis only suggests it.
+ */
+export function applyAnalysis(deck, a) {
+  const w = a.wave;
+  if (!deck.tempo) {
+    const [lo, hi] = BPM_RANGES[deck.engine.params['bpm.range']] || BPM_RANGES.AUTO;
+    deck.tempo = new DeckTempo({ sampleRate: deck.sr, fps: deck.sr / Math.round(w.hop * deck.sr), lo, hi });
+  }
+  a.segments.forEach((s, i) => deck.grids.split(i ? s.from : -Infinity, { t0: s.grid.t0, T: s.grid.T, bar1: null }));
+  deck.tempo.seed(a);
+  if (w.data.length) {
+    deck.appendWave(w.tStart, w.hop, w.data);
+    deck.engine.broadcastWave(deck, w.tStart, w.hop, w.data);
+  }
 }
