@@ -11,6 +11,7 @@ import { Recorder } from './recorder.js';
 import { MasterClock } from './sync.js';
 import { Deck } from './deck.js';
 import { fetchArrayBuffer, decodeTo, resample, limitPcm } from './decode.js';
+import { analyseTrack, applyAnalysis } from './analysis.js';
 
 const STRETCH_URL = new URL('../vendor/signalsmith-stretch/SignalsmithStretch.js', import.meta.url).href;
 SignalsmithStretch.moduleUrl = STRETCH_URL;
@@ -346,9 +347,10 @@ class Engine {
   /**
    * A deck holding a whole decoded track, pcm {L, R, sampleRate}: a new deck, or the loading deck
    * deckId promoted (a failed promotion leaves it loading, for its loader to decide). Its beat grid
-   * comes from gridResident() before it is reported ready.
+   * comes from gridResident() before it is reported ready: from `analysis` when given (null: none),
+   * else from analysing pcm here.
    */
-  async startResidentDeck({ deckId = null, tabId = null, pcm, meta = {}, analysis = null } = {}) {
+  async startResidentDeck({ deckId = null, tabId = null, pcm, meta = {}, analysis } = {}) {
     if (!pcm || !(pcm.L && pcm.L.length) || !pcm.R || pcm.R.length !== pcm.L.length) return { ok: false, error: 'There is no audio to load.' };
     let deck = null;
     if (deckId != null) {
@@ -383,8 +385,25 @@ class Engine {
     return { ok: true, deckId: deck.id, slot: deck.slot };
   }
 
-  /** Whole-track analysis fits a resident deck's beat grid here (given as `analysis`, or run on `pcm`). */
-  async gridResident(deck, pcm, analysis) {}
+  /**
+   * A resident deck's beat grid, tempo and whole waveform, from whole-track analysis (given, null for
+   * none, or run on pcm). The automatic cue moves to the first beat, as a live deck's does.
+   */
+  async gridResident(deck, pcm, analysis) {
+    if (analysis === undefined) analysis = await this.analyse(pcm);
+    if (!analysis || deck.disposed) return;
+    applyAnalysis(deck, analysis);
+    deck.analysis = { bpm: analysis.bpm, conf: analysis.conf, octConf: analysis.octConf, bar1: analysis.bar1, residuals: analysis.residuals };
+    const first = deck.firstAudible ?? 0;
+    if (deck.canBeat(first)) deck.snapAutoCue(deck.grids.at(first));
+    else this.event('info', `Deck ${deck.slot}: no steady beat found in “${deck.meta.title || 'the track'}”. TAP it if it has one.`, deck.id);
+  }
+
+  /** Whole-track analysis of pcm in a worker, over the BPM range in force. Rejects when signal aborts. */
+  analyse(pcm, signal) {
+    const [lo, hi] = BPM_RANGES[this.params['bpm.range']] || BPM_RANGES.AUTO;
+    return analyseTrack(pcm, { lo, hi, signal });
+  }
 
   /** A loading deck holding a tab's capture plays it live after all; the reason is said once. */
   async failLoadingToLive(deckId, reason) {
@@ -448,10 +467,20 @@ class Engine {
       return refuse(`“${meta.title}” is not audio this browser can play.`);
     }
     if (gone()) return refuse();
-    this.loads.delete(deck.id);
     const lim = limitPcm(pcm, this.params['resident.limitMin']);
     pcm = null;
-    const res = await this.serial(() => this.startResidentDeck({ deckId: deck.id, pcm: lim.pcm }));
+    // Found here rather than in startResidentDeck, so other decks' starts and ejects never queue behind it.
+    deck.setLoad({ progress: 0.8, strategy: 'finding the beat' });
+    let analysis = null;
+    try {
+      analysis = await this.analyse(lim.pcm, ac.signal);
+    } catch (err) {
+      if (gone()) return refuse();
+      this.event('warn', `Deck ${deck.slot}: no beat grid from the whole track (${err.message}). TAP the beat.`, deck.id);
+    }
+    if (gone()) return refuse();
+    this.loads.delete(deck.id);
+    const res = await this.serial(() => this.startResidentDeck({ deckId: deck.id, pcm: lim.pcm, analysis }));
     if (!res.ok) return refuse(res.error);
     if (lim.notice) this.notify('warn', `Deck ${deck.slot}: ${lim.notice}`); // waits for a deck page, if none is open
     return res;
