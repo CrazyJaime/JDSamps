@@ -750,6 +750,69 @@ test('a tab load that turns tabless (released) between two file loads never take
   }
 });
 
+test('a tab loaded from the Sources drawer is followed to its whole track: said once when it holds it, and not at all after a cancel the DJ asked for', async () => {
+  const TAB = { id: 55, title: 'A tab', url: 'https://a.example/x', favIconUrl: '', audible: true, granted: true, deckSlot: null };
+  await show(kinds());
+  await manual(true);
+  await ui.clearSent();
+  await clearToasts();
+  // LOAD_TAB answers when the test says (window.__tabReply).
+  await page.evaluate((t) => {
+    window.__fake.hubReplies.LIST_SOURCES = { ok: true, tabs: [t] };
+    window.__fake.hubReplies.LOAD_TAB = () => new Promise((r) => { window.__tabReply = r; });
+  }, TAB);
+  const loadTab = async () => {
+    await page.locator('#sourcesBtn').click();
+    await page.locator('#sourceList [data-load]').first().click();
+    await page.locator('#sources [data-close]').click();
+    await wait(30);
+  };
+  const answer = (r) => page.evaluate((x) => window.__tabReply(x), r);
+  const tabDeck = (id, make = loadingDeck) => make({ id, slot: 4, tabId: make === loadingDeck ? 55 : null, title: 'A tab', url: TAB.url, load: make === loadingDeck ? { strategy: 'running the player through the track' } : {} });
+  const cancel = async (id) => {
+    await deckEl(4).locator('[data-act="loadCancel"]').click();
+    await wait(50);
+    await reply((await lastAct('loadCancel', id)).id, true);
+    await show(kinds());
+  };
+  try {
+    // A hub that answers once the whole track is in: ✕ on the loading deck, and its "Loading was cancelled." says nothing.
+    await loadTab();
+    await show(kinds((s) => { s.decks.push(tabDeck(511)); }));
+    await cancel(511);
+    await answer({ ok: false, error: 'Loading was cancelled.' });
+    await wait(50);
+    assert.deepEqual(await toasts(), []);
+    // A hub that answers once the deck is made: nothing is said while it loads, nor after the DJ cancels it.
+    await loadTab();
+    await answer({ ok: true, deckId: 512, slot: 4 });
+    await show(kinds((s) => { s.decks.push(tabDeck(512)); }));
+    await wait(50);
+    assert.deepEqual(await toasts(), [], 'nothing said while the track loads');
+    await cancel(512);
+    await wait(50);
+    assert.deepEqual(await toasts(), []);
+    // One that loads: said once, when its deck holds the track (and has let its tab go).
+    await loadTab();
+    await answer({ ok: true, deckId: 513, slot: 4 });
+    await show(kinds((s) => { s.decks.push(tabDeck(513)); }));
+    await wait(50);
+    assert.deepEqual(await toasts(), []);
+    await show(kinds((s) => { s.decks.push(tabDeck(513, residentDeck)); }));
+    await wait(50);
+    assert.deepEqual(await toasts(), ['Loaded onto a deck. It is cued: press PLAY when ready.']);
+    // A load the hub refuses still says why.
+    await clearToasts();
+    await loadTab();
+    await answer({ ok: false, error: 'That tab is already on deck 2.' });
+    await wait(50);
+    assert.deepEqual(await toasts(), ['That tab is already on deck 2.']);
+  } finally {
+    await page.evaluate(() => { window.__fake.hubReplies.LIST_SOURCES = { ok: true, tabs: [] }; delete window.__fake.hubReplies.LOAD_TAB; });
+    await manual(false);
+  }
+});
+
 /** A paste (Ctrl/Cmd+V) of text on the element matching sel, or on the page itself. */
 const paste = (sel, t) => page.evaluate(([s, x]) => {
   const dt = new DataTransfer();

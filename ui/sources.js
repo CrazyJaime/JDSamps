@@ -7,6 +7,7 @@ export class SourcesDrawer {
   constructor({ conn, toast, loader }) {
     this.conn = conn;
     this.toast = toast;
+    this.loader = loader;
     this.el = $('#sources');
     this.list = $('#sourceList');
     this.timer = 0;
@@ -67,12 +68,11 @@ export class SourcesDrawer {
     const li = clone('tpl-source-row');
     const q = (sel) => li.querySelector(sel);
     const row = { li, title: q('[data-title]'), host: q('[data-host]'), fav: q('[data-fav]'), audible: q('[data-audible]'), onDeck: q('[data-ondeck]'), load: q('[data-load]'), go: q('[data-goto]') };
+    // The load is followed to its whole track and said once (ui/load.js); a cancel the DJ asked for says nothing.
     row.load.addEventListener('click', async () => {
       row.load.disabled = true;
-      const res = await this.conn.hub(HUB.LOAD_TAB, { tabId }).catch((e) => ({ ok: false, error: e.message }));
+      await this.loader.loadTab(tabId);
       row.load.disabled = false;
-      if (res && res.ok) this.toast('Loaded onto a deck. It is cued: press PLAY when ready.', 'info');
-      else this.toast((res && res.error) || 'Could not load that tab.', 'warn');
       this.refresh();
     });
     row.go.addEventListener('click', () => this.conn.hub(HUB.GOTO_TAB, { tabId }));
