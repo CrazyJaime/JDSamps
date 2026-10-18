@@ -694,6 +694,25 @@ describe('the URL and element layers', { concurrency: 2 }, () => {
     await checkPosted(q);
     await q.close();
   });
+
+  test("only a heard player's source is reported; one holding 30 s on a page whose JSON flags a snippet reports tap-error preview", async () => {
+    const p = await tapPage('', { page: '/blank.html' });
+    await connect(p);
+    await p.run(`(() => { const a = document.getElementById('a'); a.muted = true; a.src = '/fx/mp3/track.mp3'; return new Promise((r) => { a.onloadedmetadata = r; }); })()`);
+    await send(p, { t: 'tap', on: true });
+    await waitFor(async () => !!(await lastProgress(p)), 5000);
+    await p.waitForTimeout(400);
+    assert.deepEqual((await posted(p, 'tap-urls')).flatMap((m) => m.reqs).map((r) => r.url), [], 'a muted player is not the track');
+    assert.deepEqual(await errorsOf(p), [], 'no snippet flag on the page yet');
+    await send(p, { t: 'tap', on: false, forget: true });
+    await p.run(`(() => { const s = document.createElement('script'); s.type = 'application/json';
+      s.textContent = JSON.stringify({ title: 'x', policy: 'SNIP', snipped: true }); document.body.append(s); document.getElementById('a').muted = false; })()`);
+    await send(p, { t: 'tap', on: true });
+    await waitFor(async () => (await errorsOf(p)).some((e) => e.reason === 'preview'), 5000);
+    assert.ok((await posted(p, 'tap-urls')).flatMap((m) => m.reqs).some((r) => r.url === `${server.origin}/fx/mp3/track.mp3` && r.past), 'heard: its source is reported');
+    await checkPosted(p);
+    await p.close();
+  });
 });
 
 // ---------------------------------------------------------------- disguise

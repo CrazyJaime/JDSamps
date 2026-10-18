@@ -99,7 +99,10 @@ async function capture(tabId) {
         : `Chrome refused to capture that tab: ${err.message}`,
     };
   }
-  const r = await toEngine({ type: ENGINE.START, tabId, streamId, meta: { title: tab.title || '', url: tab.url || '', favIconUrl: tab.favIconUrl || '' }, settings: await savedSettings() });
+  const settings = await savedSettings();
+  // A tab is loaded as its whole track (resident), unless the DJ has set tabs to play live.
+  const mode = settings['resident.auto'] === false ? 'live' : 'resident';
+  const r = await toEngine({ type: ENGINE.START, tabId, streamId, mode, meta: { title: tab.title || '', url: tab.url || '', favIconUrl: tab.favIconUrl || '' }, settings });
   if (r && r.ok) { await keepTab(tabId, 'deck'); autoStart(tabId, r.slot); }
   return r;
 }

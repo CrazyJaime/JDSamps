@@ -553,22 +553,38 @@
     try { const b = el.buffered; for (let i = 0; i < b.length && i < 64; i++) out.push([b.start(i), b.end(i)]); } catch (_) {}
     return out;
   };
-  /** What the page shows without a hook: keys, worker handles, an endless stream, element sources. */
+  /** What the page shows without a hook: keys, worker handles, an endless stream, element sources, a preview. */
   function checkPage() {
     for (const el of live()) {
       try {
         if (el.mediaKeys) tapFail('drm', 'the player uses protected media');
         noteWorker(el.srcObject);
+        // Only a player the user hears is the track: a muted decorative <audio> is not.
         const src = el.currentSrc;
-        if (/^https?:/i.test(src) && !tap.srcs.has(src)) { tap.srcs.add(src); const u = absUrl(src); if (u) noteReq(u, 'GET', null, null, '', true); }
+        if ((heard(el) || el === drv.el) && /^https?:/i.test(src) && !tap.srcs.has(src)) { tap.srcs.add(src); const u = absUrl(src); if (u) noteReq(u, 'GET', null, null, '', true); }
       } catch (_) {}
     }
+    previewCheck(mainEl());
     // An MSE player shows Infinity for a moment after its init segment, until it sets the length
     // from its manifest: only one that keeps saying so is a stream with no end.
+    // Looked at again once the 3 s are up, in case nothing else happens on the page meanwhile.
     const el = mainEl(), now = performance.now();
     if (!el || el.duration !== Infinity) tap.infAt = 0;
-    else if (!tap.infAt) tap.infAt = now;
+    else if (!tap.infAt) { tap.infAt = now; setTimeout(tapDirty, 3100); }
     else if (now - tap.infAt >= 3000) tapFail('live', 'the player reports no end');
+  }
+
+  // A preview: the player holds about 30 s, and the page says it is a snippet in its own JSON (as
+  // SoundCloud does: policy SNIP, snipped) or in the media's path. Looked for once a session, when
+  // a length in that range first shows.
+  const SNIP = /"policy"\s*:\s*"SNIP"|"snipped"\s*:\s*true/;
+  function previewCheck(el) {
+    const d = durOf(el);
+    if (tap.snip || !d || d < 25 || d > 35) return;
+    tap.snip = true;
+    let flagged = /\/preview\//i.test(el.currentSrc || '');
+    try { for (const sc of document.querySelectorAll('script')) { if (flagged) break; const t = sc.textContent; if (t.length <= 4e6 && SNIP.test(t)) flagged = true; } } catch (_) {}
+    if (flagged) tapFail('preview', 'the page offers a 30-second preview only');
   }
 
   // Up: parts and requests as soon as the task that made them is over (one microtask, so a burst
@@ -624,7 +640,7 @@
 
   function tapOn() {
     if (tap.on) { tapDirty(); return; }
-    Object.assign(tap, { on: true, bytes: 0, reqs: 0, infAt: 0, told: new Set(), mimes: new Set(), srcs: new Set() });
+    Object.assign(tap, { on: true, bytes: 0, reqs: 0, infAt: 0, snip: false, told: new Set(), mimes: new Set(), srcs: new Set() });
     tp.last = '';
     activate(); scan(); watchPolling();
     for (const el of live()) wireTap(el);

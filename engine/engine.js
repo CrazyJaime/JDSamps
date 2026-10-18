@@ -12,6 +12,7 @@ import { MasterClock } from './sync.js';
 import { Deck } from './deck.js';
 import { fetchArrayBuffer, decodeTo, resample, limitPcm } from './decode.js';
 import { analyseTrack, applyAnalysis } from './analysis.js';
+import { Loader } from './loader.js';
 
 const STRETCH_URL = new URL('../vendor/signalsmith-stretch/SignalsmithStretch.js', import.meta.url).href;
 SignalsmithStretch.moduleUrl = STRETCH_URL;
@@ -219,7 +220,7 @@ class Engine {
   async onHub(msg) {
     await this.ready;
     switch (msg.type) {
-      case ENGINE.START: return this.serial(() => { this.applySaved(msg.settings); return this.startDeck(msg.tabId, msg.streamId, msg.meta || {}); });
+      case ENGINE.START: return this.startTab(msg);
       case ENGINE.EJECT: { const d = this.deckByTab(msg.tabId); if (d) await this.eject(d.id, msg.reason); return { ok: true }; }
       case ENGINE.META: { const d = this.deckByTab(msg.tabId); if (d) Object.assign(d.meta, msg.meta || {}); return { ok: true }; }
       case ENGINE.PING: return { ok: true, decks: [...this.decks.values()].map((d) => ({ tabId: d.tabId, slot: d.slot })) };
@@ -279,6 +280,35 @@ class Engine {
     this.hub({ type: HUB.AGENT_CONNECT, tabId });
     this.event('info', `Loaded “${meta.title || 'tab'}” on deck ${deck.slot}. It is cued: press PLAY when you're ready.`, deck.id);
     return { ok: true, deckId: deck.id, slot: deck.slot };
+  }
+
+  /**
+   * A tab from the hub: by default a loading deck whose Loader goes for the whole track (outside serial(), so
+   * other decks never queue behind it), falling back to live; mode 'live' or resident.auto off: a live deck.
+   */
+  async startTab(msg) {
+    const meta = msg.meta || {};
+    let resident = false;
+    const r = await this.serial(() => {
+      this.applySaved(msg.settings);
+      resident = msg.mode !== 'live' && this.params['resident.auto'] !== false;
+      return resident ? this.startLoadingDeck({ tabId: msg.tabId, streamId: msg.streamId, meta }) : this.startDeck(msg.tabId, msg.streamId, meta);
+    });
+    if (r.ok && resident) this.loadTab(this.decks.get(r.deckId));
+    return r;
+  }
+
+  /** Run a loading tab deck's Loader. Its agents' tap messages reach it through deck.loader while it runs. */
+  loadTab(deck) {
+    const ac = new AbortController(), loader = new Loader({ engine: this, deck, tabId: deck.tabId, signal: ac.signal });
+    const load = { abort: () => ac.abort(), loader };
+    this.loads.set(deck.id, load);
+    deck.loader = loader;
+    return loader.run().then((r) => {
+      if (this.loads.get(deck.id) === load) this.loads.delete(deck.id);
+      if (deck.loader === loader) deck.loader = null;
+      return r;
+    });
   }
 
   /** Why no new deck can start now (the tab is on a deck already, or every slot is taken), or null; wakes the context. */

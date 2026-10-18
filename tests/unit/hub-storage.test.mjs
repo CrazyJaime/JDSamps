@@ -511,6 +511,18 @@ test('a capture passes the saved settings to the engine with START', async () =>
   assert.deepEqual(start.settings, { 'pitch.defaultRange': 0.16, 'bpm.range': '78-155', 'rec.format': 'webm' });
 });
 
+test('a capture asks the engine for a whole-track (resident) load, or a live one when resident.auto is saved off', async () => {
+  chrome.action.onClicked.fire(tabs[0]);
+  await settle();
+  assert.equal(toEngineOf('START')[0].mode, 'resident');
+  sent = []; local = { 'resident.auto': false };
+  chrome.action.onClicked.fire(tabs[1]);
+  await settle();
+  const [start] = toEngineOf('START');
+  assert.equal(start.mode, 'live');
+  assert.equal(start.settings['resident.auto'], false);
+});
+
 // ---------------------------------------------------------------- incognito (platform/M6)
 test('the extension never runs in incognito, so incognito tabs cannot reach Sources or the download history', async () => {
   const { readFile } = await import('node:fs/promises');
