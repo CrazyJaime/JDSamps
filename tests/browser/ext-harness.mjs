@@ -171,8 +171,8 @@ async function appendTo(sb, data, offset = null) {
  * The tiny player: keeps `ahead` s buffered past now(), one segment at a time. Segment n spans
  * times[n % N], one period later per lap when `loop`. A change of rep appends that rep's init first.
  * The next segment is chosen as hls.js chooses it, from the SourceBuffer's buffered ranges: the one
- * at the end of the range holding the playhead (holes under HOLE ignored, TOL for a range that ends a
- * few ms short of its last segment), or the playhead's own when no range holds it. So whatever leaves
+ * at the end of the range holding the playhead (to within HOLE, and holes under HOLE ignored; TOL for a
+ * range that ends a few ms short of its last segment), or the playhead's own when none does. So whatever leaves
  * the buffer (a remove, an eviction) is fetched again. `sticky`: a player that fetches each segment
  * once and never again, whatever its buffer holds.
  */
@@ -195,7 +195,7 @@ function pump({ ms, sb, now, times, fetchInit, fetchSeg, repOf = () => '', ahead
   };
   const next = (t) => {
     if (sticky) { let n = index(t); while (have.has(n)) n++; return n; }
-    const r = ranges().find(([s, e]) => s <= t + HOLE && e > t);
+    const r = ranges().find(([s, e]) => s <= t + HOLE && e > t - HOLE);
     return r ? index(r[1] + TOL) : index(t);
   };
   const full = () => (sticky ? have.size === N : ranges().some(([s, e]) => s <= HOLE && e >= period - TOL));

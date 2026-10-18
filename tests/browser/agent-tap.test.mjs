@@ -88,8 +88,10 @@ function fixtures() {
 // A tiny MSE player. ?set=short|long &n=<segments> &dur=<s> &ahead=<s> (0: append everything)
 // &manual (wait for __go()) &snap (keep its own copy of appendBuffer, taken before any tap)
 // &xhr (load with XMLHttpRequest) &raw (open a SourceBuffer and append nothing: __push does)
-// &prog (also a progressive <audio src>). Event handlers are on* properties, never
-// addEventListener, so the dormancy test can count every listener the agent adds.
+// &prog (also a progressive <audio src>) &buf (choose what to fetch from the SourceBuffer's buffered
+// ranges, as real players do, not from what it has appended: what is removed is fetched again)
+// &video (a second, empty SourceBuffer of pictures on the same MediaSource). Event handlers are on*
+// properties, never addEventListener, so the dormancy test can count every listener the agent adds.
 const PLAYER = `<!doctype html><title>player</title><body><audio id="a"></audio><script>
 (() => {
   const q = new URLSearchParams(location.search);
@@ -103,29 +105,41 @@ const PLAYER = `<!doctype html><title>player</title><body><audio id="a"></audio>
     ? new Promise((res, rej) => { const x = new XMLHttpRequest(); x.open('GET', u); x.responseType = 'arraybuffer'; x.onload = () => res(x.response); x.onerror = rej; x.send(); })
     : fetch(u).then((r) => r.arrayBuffer());
   let ms = null, sb = null, have = new Set(), chain = Promise.resolve();
-  const push = (buf) => new Promise((res, rej) => {
-    sb.onupdateend = () => res(); sb.onerror = () => rej(new Error('append failed'));
-    (q.has('snap') ? APPEND : sb.appendBuffer).call(sb, buf);
-  });
+  const BUF = q.has('buf');
+  const push = async (buf) => {
+    if (BUF) while (sb.updating) await new Promise((r) => setTimeout(r, 5)); // someone else's remove
+    return new Promise((res, rej) => {
+      sb.onupdateend = () => res(); sb.onerror = () => rej(new Error('append failed'));
+      (q.has('snap') ? APPEND : sb.appendBuffer).call(sb, buf);
+    });
+  };
   window.__push = (buf) => push(buf);
   window.__fx = { appended: [] };
+  // &buf: the segment at the end of the buffered range holding t (within 0.1 s of it; 0.25 s for a range a few ms
+  // short of its last segment), else t's own.
+  const next = (t) => {
+    const b = sb.buffered;
+    for (let i = 0; i < b.length; i++) if (b.start(i) <= t + 0.1 && b.end(i) > t - 0.1) return Math.floor((b.end(i) + 0.25) / SEG) + 1;
+    return Math.floor(t / SEG) + 1;
+  };
+  const full = () => { const b = sb.buffered; return b.length === 1 && b.start(0) <= 0.1 && b.end(0) >= Math.min(N * SEG, DUR || 1e9) - 0.3; };
   // One pass at a time, each to the buffering goal; a pass left over from an earlier __go() stops.
   async function pass() {
     const s = sb;
     if (!s) return;
-    for (;;) {
-      const t = a.currentTime, from = Math.floor(t / SEG) + 1;
+    for (let last = 0; ;) {
+      const t = a.currentTime, from = BUF ? next(t) : Math.floor(t / SEG) + 1;
       const to = Math.min(AHEAD ? Math.min(N, Math.ceil((t + AHEAD) / SEG)) : N, Math.ceil((window.__limit || 1e9) / SEG));
       let k = from;
-      while (k <= to && have.has(k)) k++;
-      if (k > to || sb !== s) break;
-      have.add(k);
+      if (!BUF) while (k <= to && have.has(k)) k++;
+      if (k > to || k === last || sb !== s) break;
+      have.add(k); last = k;
       const buf = await get(name(k));
       if (sb !== s) return;
       await push(buf);
       window.__fx.appended.push(k);
     }
-    if (sb === s && have.size === N && ms.readyState === 'open' && !sb.updating) ms.endOfStream();
+    if (sb === s && (BUF ? full() : have.size === N) && ms.readyState === 'open' && !sb.updating) ms.endOfStream();
   }
   const pump = () => (chain = chain.then(pass, pass));
   window.__pump = pump; // __limit (s): a player that will not buffer past it
@@ -135,6 +149,7 @@ const PLAYER = `<!doctype html><title>player</title><body><audio id="a"></audio>
     await new Promise((r) => { ms.onsourceopen = r; });
     sb = ms.addSourceBuffer(q.get('mime') || ${JSON.stringify(MIME)});
     window.__sb = sb; window.__ms = ms;
+    if (q.has('video')) window.__vsb = ms.addSourceBuffer('video/webm; codecs="vp9"');
     if (q.has('raw')) { if (DUR) ms.duration = DUR; return; }
     await push(await get('/fx/' + SET + '/init.mp4'));
     if (DUR) ms.duration = DUR;
@@ -191,6 +206,14 @@ function FETCH_SPY() {
     p.then(done, done);
     return p;
   };
+}
+
+// SourceBuffer.remove as the agent finds it at document_start: each call logged with the buffer's type.
+function REMOVE_SPY() {
+  const types = new WeakMap(), log = window.__removes = [];
+  const add = MediaSource.prototype.addSourceBuffer, rm = SourceBuffer.prototype.remove;
+  MediaSource.prototype.addSourceBuffer = function addSourceBuffer(type) { const sb = add.call(this, type); types.set(sb, type); return sb; };
+  SourceBuffer.prototype.remove = function remove(a, b) { log.push([types.get(this), a, b]); return rm.call(this, a, b); };
 }
 
 // ---------------------------------------------------------------- the engine's end of the port
@@ -927,6 +950,92 @@ describe('driving the player', { concurrency: 3 }, () => {
       assert.deepEqual(await blobShas(p, urls), urls.map(() => 'unreadable'), end);
       await p.close();
     }
+  });
+});
+
+// ---------------------------------------------------------------- follow-up: a player that was playing before the tap
+const removes = (p) => p.run('JSON.stringify(window.__removes)').then(JSON.parse);
+const driveStates = async (p) => (await posted(p, 'tap-progress')).filter((g) => g.drive).map((g) => g.drive.state);
+const sbRanges = (p, v = '__sb') => p.run(`(() => { const b = window.${v}.buffered, o = []; for (let i = 0; i < b.length; i++) o.push([b.start(i), b.end(i)]); return JSON.stringify(o); })()`).then(JSON.parse);
+
+describe('flushing the player before a drive', { concurrency: 3 }, () => {
+  test('drive with flush: what a playing player held from before the tap is removed, fetched again and captured byte for byte; stop gives it back playing', async () => {
+    const p = await tapPage(`${LONG}&buf`, { init: [REMOVE_SPY] });
+    await connect(p);
+    // The DJ hears it first: playing, about 20 s held ahead, none of it captured (only its init is kept).
+    await p.run("window.__go().then(() => document.getElementById('a').play())");
+    await waitFor(async () => { const m = await media(p); return !m.paused && m.t > 1; }, 5000);
+    await bufferedTo(p, 20);
+    await send(p, { t: 'tap', on: true });
+    await waitFor(async () => (await partsOf(p)).length >= 1, 3000);
+    const t0 = (await media(p)).t;
+    await send(p, { t: 'drive', mode: 'seekhop', flush: true });
+    await waitFor(async () => (await driveState(p)) === 'done', 15000, 100)
+      .catch(async () => assert.fail(`not done: ${JSON.stringify(await lastProgress(p))}, appended ${await p.run('JSON.stringify(window.__fx.appended)')}`));
+    const states = await driveStates(p);
+    assert.equal(states.filter((s) => s === 'flushed').length, 1, `flushed said once: ${states}`);
+    assert.ok(states.indexOf('flushed') < states.lastIndexOf('done'), `${states}`);
+    assert.deepEqual(await removes(p), [[MIME, 0, 180]], 'the sound SourceBuffer emptied once, to the length of the track');
+    await waitFor(async () => (await partsOf(p)).length >= 46, 3000);
+    const got = await blobShas(p, (await partsOf(p)).map((x) => x.blobUrl)), want = [fx.long.init, ...fx.long.segs.slice(0, 45)].map(sha);
+    assert.deepEqual(want.filter((h) => !got.includes(h)), [], 'every piece from 0 to the end of the 3:00');
+    assert.deepEqual(got.filter((h) => !want.includes(h)), [], 'byte for byte the files served');
+    const g = await lastProgress(p);
+    assert.ok(g.buffered.length === 1 && g.buffered[0][0] < 0.05 && g.buffered[0][1] > 179.9, JSON.stringify(g.buffered));
+    await send(p, { t: 'drive', mode: 'stop' });
+    const m = await media(p);
+    assert.deepEqual([m.paused, m.muted, m.rate, m.pp], [false, false, 1, true]);
+    assert.ok(m.t >= t0 && m.t < t0 + 1.5, `back where it was: ${m.t} (drive at ${t0})`);
+    await waitFor(async () => (await media(p)).t > m.t + 0.5, 5000).catch(async () => assert.fail(`it does not play again: ${JSON.stringify(await media(p))}`));
+    await checkPosted(p);
+    await p.close();
+  });
+
+  test('flush never empties a SourceBuffer of pictures: beside a sound one only the sound is flushed; with pictures only it is refused, said, and the drive goes on', async () => {
+    const both = await tapPage(`${LONG}&buf&video`, { init: [REMOVE_SPY] });
+    await connect(both);
+    await both.run('window.__go()');
+    await waitFor(async () => (await sbRanges(both)).length > 0, 5000);
+    await send(both, { t: 'tap', on: true });
+    await send(both, { t: 'drive', mode: 'seekhop', flush: true });
+    await waitFor(async () => (await driveStates(both)).includes('flushed'), 5000);
+    assert.deepEqual(await removes(both), [[MIME, 0, 180]], 'only the sound');
+    await send(both, { t: 'drive', mode: 'stop' });
+    await checkPosted(both);
+    await both.close();
+
+    const pics = await tapPage('set=short&dur=30&manual&raw&mime=video/webm;%20codecs%3D%22vp9%22', { init: [REMOVE_SPY] });
+    await connect(pics);
+    await pics.run('window.__go()');
+    await send(pics, { t: 'tap', on: true });
+    await send(pics, { t: 'drive', mode: 'seekhop', flush: true });
+    await waitFor(async () => { const d = (await lastProgress(pics))?.drive; return d && d.unflushed === 'video'; }, 3000);
+    assert.ok(!(await driveStates(pics)).includes('flushed'));
+    assert.deepEqual(await removes(pics), []);
+    await send(pics, { t: 'drive', mode: 'stop' });
+    await checkPosted(pics);
+    await pics.close();
+  });
+
+  test('flush on a MediaSource that has ended is refused (a remove would reopen it): said, nothing removed, no sourceopen, the buffer kept; the drive goes on', async () => {
+    const p = await tapPage('set=short&n=8&dur=30&manual', { init: [REMOVE_SPY] });
+    await connect(p);
+    await p.run('window.__go()'); // no buffering goal: it appends every segment and ends the stream
+    await waitFor(() => p.run("window.__ms.readyState === 'ended'"), 5000);
+    const held = await sbRanges(p);
+    await p.run("window.__ms.addEventListener('sourceopen', () => { window.__reopened = true; })");
+    await send(p, { t: 'tap', on: true });
+    await send(p, { t: 'drive', mode: 'seekhop', flush: true });
+    await waitFor(async () => { const d = (await lastProgress(p))?.drive; return d && d.unflushed === 'ended'; }, 3000);
+    await waitFor(async () => (await driveState(p)) === 'done', 5000);
+    assert.ok(!(await driveStates(p)).includes('flushed'));
+    assert.deepEqual(await removes(p), []);
+    assert.deepEqual([await p.run('window.__ms.readyState'), await p.run('!!window.__reopened')], ['ended', false]);
+    assert.deepEqual(await sbRanges(p), held);
+    await send(p, { t: 'drive', mode: 'stop' });
+    assert.deepEqual([(await media(p)).t, (await media(p)).muted], [0, false]);
+    await checkPosted(p);
+    await p.close();
   });
 });
 

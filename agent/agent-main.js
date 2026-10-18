@@ -644,10 +644,14 @@
     const msg = { t: 'tap-progress', bytes: tap.bytes, buffered: rangesOf(el), duration: durOf(el), mimes: [...tap.mimes].slice(0, 16) };
     const own = sbsOf(el);
     if (own) msg.sbs = own;
-    if (drv.mode) msg.drive = { mode: drv.mode, state: drv.state, at: Math.max(0, drv.mode === 'seekhop' ? drv.cursor : el.currentTime) };
+    if (drv.mode) {
+      msg.drive = { mode: drv.mode, state: drv.told ? 'flushed' : drv.state, at: Math.max(0, drv.mode === 'seekhop' ? drv.cursor : el.currentTime) };
+      if (drv.unflushed) msg.drive.unflushed = drv.unflushed;
+    }
     const s = JSON.stringify(msg);
     if (s === tp.last) return;
     tp.last = s; tp.at = performance.now();
+    if (drv.told) { drv.told = false; tapDirty(); } // flushed is said once, then how the drive goes
     emit(s);
   }
 
@@ -682,12 +686,14 @@
   // goal, waiting at each until it has buffered the step; accelerate plays it fast through the
   // assist rate machinery (and its back-off), pitch unlocked. Either mutes the player; stop puts
   // back its rate, pitch, mute, volume, position and playing state. Progress goes up in
-  // tap-progress.drive: running, done (all of it buffered), stalled or refused.
+  // tap-progress.drive: running, done (all of it buffered), stalled or refused (and flushed, once).
   // Recording a whole track from the tab's sound runs accelerate with audible (the player keeps
   // its sound), from (it starts at that place) and hold (it waits there, paused, for the next
   // accelerate), so the recording starts with the track.
+  // flush: a player that was playing before the tap holds media the tap never saw, and would never
+  // fetch it again (see "flush"): its buffer is emptied first, then it is driven from 0.
   const HOP_WAIT = 3000, END_TOL = 0.3, START_TOL = 0.2;
-  const drv = { mode: null, el: null, base: null, state: '', cursor: 0, hop: 0, since: 0, timer: 0 };
+  const drv = { mode: null, el: null, base: null, state: '', cursor: 0, hop: 0, since: 0, timer: 0, gen: 0, flushing: false, told: false, unflushed: '' };
   // MP3 and ADTS carry no timestamps: their appends can only be placed in order, so no seek-hop.
   const NO_STAMPS = /^audio\/(mpeg|mp3|aac|x-aac)\b/i;
 
@@ -707,19 +713,26 @@
       drv.base = { t: el.currentTime, paused: el.paused, rate: el.playbackRate, dflt: el.defaultPlaybackRate, pp: el.preservesPitch, muted: el.muted, volume: el.volume };
       drv.timer = setInterval(driveCheck, 250);
     } else if (st.enforcing) release(); // from accelerate to seekhop
-    drv.mode = m.mode; drv.since = performance.now();
+    drv.mode = m.mode; drv.since = performance.now(); drv.gen++;
+    Object.assign(drv, { flushing: false, told: false, unflushed: '' });
     if (m.mode === 'seekhop' && [...tap.mimes].some((x) => NO_STAMPS.test(x))) { drv.state = 'refused'; tapDirty(); return; }
     drv.state = 'running';
     try { el.muted = m.audible === true ? drv.base.muted : true; } catch (_) {}
     if (m.mode === 'seekhop') {
       const t = el.currentTime, step = typeof m.step === 'number' && m.step >= 0.5 && m.step <= 600 ? m.step : 0;
-      drv.hop = step || Math.max(1, bufEnd(el, t) - t); // the player's buffering goal, as it shows now
-      drv.cursor = 0;
-      hop();
-    } else {
-      if (typeof m.from === 'number' && Number.isFinite(m.from) && m.from >= 0) { try { nativePause.call(el); el.currentTime = m.from; } catch (_) {} }
-      accelerate(typeof m.rate === 'number' && m.rate > 1 && m.rate <= 16 ? m.rate : 8, m.hold === true);
+      drv.hop = step || Math.max(1, bufEnd(el, t) - t); // the player's buffering goal, as it shows now (before a flush)
     }
+    const go = () => {
+      if (m.mode === 'seekhop') {
+        drv.cursor = 0;
+        hop();
+      } else {
+        if (typeof m.from === 'number' && Number.isFinite(m.from) && m.from >= 0) { try { nativePause.call(el); el.currentTime = m.from; } catch (_) {} }
+        accelerate(typeof m.rate === 'number' && m.rate > 1 && m.rate <= 16 ? m.rate : 8, m.hold === true);
+      }
+      tapDirty();
+    };
+    if (m.flush === true) flush(el, go); else go();
     tapDirty();
   }
   function hop() {
@@ -733,7 +746,7 @@
   }
   // A stall is said, not final: a player that buffers again is hopped on from where it got to.
   function driveCheck() {
-    if (!drv.mode || (drv.state !== 'running' && drv.state !== 'stalled')) return;
+    if (!drv.mode || drv.flushing || (drv.state !== 'running' && drv.state !== 'stalled')) return;
     const el = drv.el, dur = lengthOf(el), late = performance.now() - drv.since > HOP_WAIT;
     const stall = () => { if (drv.state !== 'stalled') { drv.state = 'stalled'; tapDirty(); } };
     if (drv.mode === 'accelerate') {
@@ -760,7 +773,8 @@
     if (!drv.mode) return;
     const { el, base } = drv;
     clearInterval(drv.timer);
-    Object.assign(drv, { mode: null, el: null, base: null, state: '', timer: 0 });
+    Object.assign(drv, { mode: null, el: null, base: null, state: '', timer: 0, flushing: false, told: false, unflushed: '' });
+    drv.gen++; // a flush still waiting on the player stops there
     if (st.enforcing) release();
     try {
       el.defaultPlaybackRate = base.dflt; el.playbackRate = base.rate; el.preservesPitch = base.pp;
@@ -769,6 +783,65 @@
       if (el.currentTime !== base.t) el.currentTime = base.t;
     } catch (_) {}
     tapDirty();
+  }
+
+  // ---------------------------------------------------------------- flush
+  // drive {flush: true}: before driving, every SourceBuffer the tap takes sound from in the driven
+  // player's MediaSource is emptied (never one of pictures), so the player fetches again what it held
+  // from before the tap. Real players decide what to fetch from what their buffers hold, the way they
+  // fetch again a range dropped under memory pressure. Only while the drive holds the player (muted,
+  // rate in hand): stop gives back its place and playing state, and it buffers again by itself.
+  // A MediaSource that has ended is left alone: a remove would reopen it and fire sourceopen, which a
+  // player may take for a fresh start, and nothing would end the stream again. Said in tap-progress:
+  // drive.state 'flushed' once, or drive.unflushed (why not) while the drive goes on without it.
+  const sbRemove = window.SourceBuffer ? SourceBuffer.prototype.remove : null, FLUSH_WAIT = 3000;
+  /** The driven player's MediaSource and its sound SourceBuffers, or {why} it cannot be flushed. */
+  function flushable(el) {
+    let src = '';
+    try { src = el.currentSrc || el.src || ''; } catch (_) {}
+    const r = /^blob:/i.test(src) ? msUrls.get(src) : null, ms = r && r.deref();
+    if (!ms || !sbRemove) return { why: 'none' };
+    try {
+      if (ms.readyState === 'ended') return { why: 'ended' };
+      if (ms.readyState !== 'open') return { why: 'none' };
+      const list = [], all = ms.sourceBuffers;
+      let pics = 0;
+      for (let i = 0; i < all.length; i++) { const rec = sbs.get(all[i]); if (rec && rec.skip) pics++; else if (rec) list.push(all[i]); }
+      return list.length ? { ms, list } : { why: pics ? 'video' : 'none' };
+    } catch (_) { return { why: 'none' }; }
+  }
+  /** Until sb is free and stays so into the next task (a player appends again right after its own updateend). */
+  async function free(sb) {
+    const t0 = performance.now();
+    while (sb.updating) {
+      if (performance.now() - t0 > FLUSH_WAIT) throw new Error('busy');
+      await new Promise((r) => { listen.call(sb, 'updateend', r, { once: true }); setTimeout(r, FLUSH_WAIT); });
+      await new Promise((r) => setTimeout(r, 0));
+    }
+  }
+  async function flush(el, go) {
+    const gen = drv.gen, f = flushable(el);
+    if (f.why) { drv.unflushed = f.why; go(); return; }
+    drv.flushing = true;
+    try {
+      for (const sb of f.list) {
+        await free(sb);
+        if (gen !== drv.gen) return;
+        let end = f.ms.duration;
+        if (!Number.isFinite(end)) { const b = sb.buffered; end = b.length ? b.end(b.length - 1) : 0; }
+        if (!(end > 0) || !sb.buffered.length) continue;
+        sbRemove.call(sb, 0, end);
+        await free(sb);
+        if (gen !== drv.gen) return;
+      }
+      drv.told = true;
+      try { el.currentTime = 0; } catch (_) {}
+    } catch (_) {
+      if (gen !== drv.gen) return;
+      drv.unflushed = 'none'; // the player took its buffer back meanwhile, or the remove failed
+    }
+    drv.flushing = false;
+    go();
   }
 
   // ---------------------------------------------------------------- page-context fetch

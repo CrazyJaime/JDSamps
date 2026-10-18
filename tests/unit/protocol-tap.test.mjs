@@ -35,6 +35,21 @@ test('tap-progress may say how a drive of the player is going', () => {
   }
 });
 
+test('a drive asked to flush says flushed once it has, or why it would not (and drives on unflushed)', () => {
+  const m = { t: 'tap-progress', bytes: 1, buffered: [], duration: 180, mimes: [] };
+  for (const mode of ['seekhop', 'accelerate']) {
+    const drive = { mode, state: 'flushed', at: 0 };
+    assert.deepEqual(validateAgentMessage({ ...m, drive }), { ...m, drive });
+  }
+  for (const unflushed of ['video', 'ended', 'none']) {
+    const drive = { mode: 'seekhop', state: 'running', at: 3, unflushed };
+    assert.deepEqual(validateAgentMessage({ ...m, drive }), { ...m, drive });
+  }
+  for (const unflushed of ['evil', 7, '', null]) {
+    assert.deepEqual(validateAgentMessage({ ...m, drive: { mode: 'seekhop', state: 'running', at: 3, unflushed } }).drive, { mode: 'seekhop', state: 'running', at: 3 }, String(unflushed));
+  }
+});
+
 test('tap-urls: media requests with method, Range and size; only http(s) links', () => {
   const r = { url: 'https://cdn.example.com/a/seg-00004.m4s?sig=abc', method: 'GET', range: 'bytes=0-999', size: 1000, media: true };
   assert.deepEqual(validateAgentMessage({ t: 'tap-urls', reqs: [r] }), { t: 'tap-urls', reqs: [r] });
