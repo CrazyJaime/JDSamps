@@ -26,6 +26,13 @@ before(async () => {
   const wav = (name, opts) => { const b = makeTrackWav(opts); fs.writeFileSync(path.join(tmp, name), b); return parseWav(b).seconds; };
   files.kick = wav('kick.wav', { bpm: 124, seconds: 20 });
   files.long = wav('long.wav', { bpm: 120, seconds: 70, kind: 'mid' });
+  files.five = wav('five.wav', { bpm: 120, seconds: 300, kind: 'mid' });
+  { // a 124 BPM kick whose first beat comes after 0.37 s of silence
+    const b = makeTrackWav({ bpm: 124, seconds: 30 }), pad = Buffer.alloc(Math.round(0.37 * 48000) * 2), late = Buffer.concat([b.subarray(0, 44), pad, b.subarray(44)]);
+    late.writeUInt32LE(late.length - 8, 4); late.writeUInt32LE(late.length - 44, 40);
+    fs.writeFileSync(path.join(tmp, 'late.wav'), late);
+    files.lateLead = 0.37;
+  }
   execFileSync('/usr/bin/ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', path.join(tmp, 'kick.wav'), '-codec:a', 'libmp3lame', '-b:a', '160k', path.join(tmp, 'kick.mp3')]);
   const send = (res, type, file) => { res.writeHead(200, { 'content-type': type, 'cache-control': 'no-store' }); res.end(fs.readFileSync(path.join(tmp, file))); };
   server = http.createServer((req, res) => {
@@ -34,6 +41,8 @@ before(async () => {
       case '/kick.mp3': return send(res, 'audio/mpeg', 'kick.mp3');
       case '/linked-kick.wav': return send(res, 'audio/wav', 'kick.wav');
       case '/long.wav': return send(res, 'audio/wav', 'long.wav');
+      case '/five.wav': return send(res, 'audio/wav', 'five.wav');
+      case '/late.wav': return send(res, 'audio/wav', 'late.wav');
       case '/page.html': res.writeHead(200, { 'content-type': 'text/html' }); return res.end('<!doctype html><title>Not audio</title><p>Hello.</p>');
       case '/slow.wav': // headers and a little audio, then nothing until the client gives up
         req.on('close', () => { slowClosed = true; });
@@ -79,7 +88,8 @@ test('a local file loads onto a resident deck: the whole track, named after the 
   assert.equal(d.playing, false);
   assert.ok(d.cue < 0.05, `cue ${d.cue}`);
   await deckWhere((x) => x.id === d.id && Math.abs(x.playhead - x.cue) < 1e-6 && x.engineRate === 0); // parked on the cue
-  assert.equal(d.bpm.state, 'SEARCH');
+  assert.equal(d.bpm.state, 'LOCKED', 'gridded from the whole track at once');
+  assert.ok(Math.abs(d.bpm.native - 124) < 0.05, `native ${d.bpm.native}`);
   assert.ok((await events(deck)).some((e) => /Loaded “kick” on deck \d/.test(e.text)));
 });
 
@@ -235,6 +245,42 @@ test('a loading deck that holds a tab\'s capture falls back to live, saying why 
   assert.equal((await act(deck, r.deckId, 'eject')).ok, true);
   await waitFor(async () => !(await decks()).some((x) => x.id === r.deckId));
   await tab.close();
+});
+
+test('a loaded track is beat-gridded the moment it is resident: its tempo, grid, first-beat cue and whole waveform', async () => {
+  const r = await act(deck, null, 'loadUrl', { url: `${origin}/late.wav` });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const d = await deckWhere((x) => x.title === 'late' && x.kind === 'resident');
+  assert.ok(Math.abs(d.bpm.native - 124) < 0.05, `native ${d.bpm.native}`);
+  assert.ok(d.grid && Math.abs(60 / d.grid.T - 124) < 0.05, `grid ${JSON.stringify(d.grid)}`);
+  assert.ok(Math.abs(d.cue - files.lateLead) < 0.02, `cue ${d.cue}: not on the first beat at ${files.lateLead}`);
+  const e = await engine(`const d = e.decks.get(${d.id}); return { canBeat: d.canBeat(), seeded: !!d.tempo.seeded, waveEnd: d.waveEnd() };`);
+  assert.equal(e.canBeat, true, 'the deck can beat-match at once');
+  assert.equal(e.seeded, true, 'its tempo comes from the whole track');
+  assert.ok(e.waveEnd > d.duration - 0.1, `waveform to ${e.waveEnd} of ${d.duration} s`);
+});
+
+test('a gridded resident deck takes a typed tempo for its track and keeps it while it plays', async () => {
+  const id = (await decks()).find((x) => x.title === 'late').id;
+  assert.deepEqual(await act(deck, id, 'setNativeBpm', { bpm: 125 }), { ok: true, error: undefined });
+  assert.equal((await act(deck, id, 'play')).ok, true);
+  await sleep(1500);
+  const d = (await decks()).find((x) => x.id === id);
+  assert.ok(Math.abs(d.bpm.native - 125) < 0.01, `native ${d.bpm.native}`);
+  assert.equal(d.bpm.manual, 'typed');
+  assert.equal((await engine(`return e.decks.get(${id}).canBeat();`)), true);
+  assert.equal((await act(deck, id, 'eject')).ok, true);
+  await waitFor(async () => !(await decks()).some((x) => x.id === id));
+});
+
+test('cancelling while the beat is being found stops the load and leaves no deck', async () => {
+  const pending = act(deck, null, 'loadUrl', { url: `${origin}/five.wav` });
+  const d = await deckWhere((x) => x.title === 'five' && x.kind === 'loading' && /beat/.test(x.load.strategy || ''), 20000);
+  assert.equal((await act(deck, d.id, 'loadCancel')).ok, true);
+  const r = await pending;
+  assert.equal(r.ok, false);
+  assert.match(r.error, /cancel/i);
+  await waitFor(async () => !(await decks()).some((x) => x.id === d.id));
 });
 
 test('the deck page shows loading and resident decks without errors', () => { assert.deepEqual(pageErrors, []); });

@@ -200,6 +200,14 @@ export class Deck {
     if (this.cueAuto && !this.hasPlayed) this.setCue(this.firstAudible ?? 0);
   }
 
+  /** The automatic cue moves, once, to the first beat of grid g at the track's first sound. */
+  snapAutoCue(g) {
+    if (!g || !this.cueAuto || this.cueSnapped || this.hasPlayed || this.firstAudible == null) return;
+    this.cueSnapped = true;
+    const k = Math.ceil((this.firstAudible - 0.05 - g.t0) / g.T);
+    this.setCue(g.t0 + k * g.T);
+  }
+
   noteFirstAudible(L, R, at) {
     if (this.firstAudible != null) return;
     for (let i = 0; i < L.length; i++) if (Math.abs(L[i]) > AUDIBLE || Math.abs(R[i]) > AUDIBLE) { this.firstAudible = at + i / this.sr; return; }
@@ -238,12 +246,7 @@ export class Deck {
       }
     } else if (m.t === 'odf' && this.tempo) {
       this.tempo.pushBatch(m);
-      const g = this.followTempo().grid;
-      if (g && this.cueAuto && !this.cueSnapped && !this.hasPlayed && this.firstAudible != null) {
-        this.cueSnapped = true;
-        const k = Math.ceil((this.firstAudible - 0.05 - g.t0) / g.T);
-        this.setCue(g.t0 + k * g.T);
-      }
+      this.snapAutoCue(this.followTempo().grid);
       const tStart = m.t0 / this.sr, hop = m.spf / this.sr;
       this.appendWave(tStart, hop, m.bands);
       this.engine.broadcastWave(this, tStart, hop, m.bands);
