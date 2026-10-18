@@ -172,6 +172,8 @@ export function validateAgentMessage(m) {
     }
     return s;
   }
+  // The site kept pausing a decked tab, so the agent stopped resisting (said once per tab).
+  if (m.t === 'external-pause') return { t: 'external-pause' };
   if (m.t === 'external-rate') {
     if (typeof m.rate !== 'number' || !Number.isFinite(m.rate) || m.rate <= 0 || m.rate > 16) return null;
     return { t: 'external-rate', rate: m.rate };

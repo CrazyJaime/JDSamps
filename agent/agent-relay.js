@@ -20,7 +20,7 @@
   function onHello(e) { if (e.detail == null) offer(); }
   window.addEventListener(HELLO, onHello);
   offer();
-  let port = null, wanted = false, last = null, rated = false, answering = false, timer = 0;
+  let port = null, wanted = false, last = null, rated = false, isolated = false, answering = false, timer = 0;
   // Upward traffic, per message type: the last JSON forwarded, the latest one waiting, and when
   // that type last went up.
   const sent = {}, pending = {}, at = {};
@@ -30,6 +30,8 @@
     window.removeEventListener(HELLO, onHello);
     window.removeEventListener(`s${chan}`, onStatus);
     clearTimeout(timer);
+    // A replaced relay must not leave the page's pauses guarded with nobody left to lift it.
+    if (isolated) { isolated = false; try { toMain({ t: 'isolate', on: false }); } catch (_) {} }
     if (port) { try { port.disconnect(); } catch (_) {} port = null; }
   }
 
@@ -47,15 +49,17 @@
     if (port) return;
     try { port = rt.connect({ name: 'jds-agent' }); } catch (_) { port = null; return; }
     port.onMessage.addListener((m) => {
-      if (!m || typeof m !== 'object' || (m.t !== 'rate' && m.t !== 'release' && m.t !== 'query')) return;
-      if (m.t !== 'query') rated = m.t === 'rate';
+      if (!m || typeof m !== 'object' || (m.t !== 'rate' && m.t !== 'release' && m.t !== 'query' && m.t !== 'isolate')) return;
+      if (m.t === 'isolate') isolated = m.on === true;
+      else if (m.t !== 'query') rated = m.t === 'rate';
       command(m);
     });
     port.onDisconnect.addListener(() => {
       void rt.lastError; port = null; wanted = false;
       for (const k of Object.keys(sent)) delete sent[k];
-      // The engine is gone (crash, update, eject): give the page its player back now.
+      // The engine is gone (crash, update, eject): give the page its player back now, rate and pauses.
       if (rated) { rated = false; toMain({ t: 'release' }); }
+      if (isolated) { isolated = false; toMain({ t: 'isolate', on: false }); }
     });
     if (last) post('status', last);
   }
@@ -90,7 +94,7 @@
       if (Number.isInteger(m.count) && m.count >= 0 && m.count < 1000) { for (const f of stops) f(m.count); stops.clear(); }
       return;
     }
-    if (!m || typeof m !== 'object' || (m.t !== 'status' && m.t !== 'external-rate')) return;
+    if (!m || typeof m !== 'object' || (m.t !== 'status' && m.t !== 'external-rate' && m.t !== 'external-pause')) return;
     if (m.t === 'status') last = e.detail;
     if (wanted && m.hasMedia) connect();
     if (answering) { delete pending[m.t]; post(m.t, e.detail); } else pending[m.t] = e.detail;

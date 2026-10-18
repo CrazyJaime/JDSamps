@@ -1,7 +1,9 @@
 // agent/agent-main.js — JD Samps player-assist agent (page MAIN world, every frame, document_start).
 // Registers media elements the page plays (including detached `new Audio()` objects) and, only
 // when a deck asks, sets their playbackRate (with preservesPitch=false) so the engine can refill a
-// deck's buffer, or pauses them all when the deck is ejected. Silent until its first command.
+// deck's buffer, or pauses them all when the deck is ejected. While a deck is capturing the tab
+// it also drops pauses the page's own script asks for, so a site that allows one playing track
+// at a time cannot stop a deck's source. Silent until its first command.
 // Talks to agent-relay.js through window CustomEvents carrying JSON strings (objects do not cross
 // JS worlds reliably), on a channel name the relay picks at random and hands over at
 // document_start, before any page script runs.
@@ -16,6 +18,10 @@
   // cmdAt: when the last rate command came (the agent lets go LET_GO ms after it); letGo: when
   // (wall-clock ms) it last let go by itself, until the next command.
   const st = { active: false, enforcing: false, target: 1, seq: 0, dog: 0, cmdAt: 0, letGo: 0 };
+  // The pause guard, on from the `isolate` command (a deck is capturing this tab) until the deck
+  // lets the tab go: a pause the page's own script asks for is dropped. told: the one report that
+  // the site keeps pausing anyway.
+  const iso = { on: false, told: false };
   // Statuses up: the last one sent and when, and whether a newer one is waiting.
   const out = { last: '', at: -1e9, dirty: false, timer: 0, queued: false };
 
@@ -135,7 +141,7 @@
 
   function register(el) {
     if (!(el instanceof HTMLMediaElement) || info.has(el)) return;
-    info.set(el, { base: null, ext: [], off: false });
+    info.set(el, { base: null, ext: [], off: false, pst: [], pauseOff: false });
     refs.push(new WeakRef(el));
     // Pages that are never decked never call live(): drop collected elements here as well.
     if (refs.length >= pruneAt) { refs = refs.filter((r) => r.deref() !== undefined); pruneAt = Math.max(256, 2 * refs.length); }
@@ -172,9 +178,67 @@
 
   const proto = HTMLMediaElement.prototype, nativePause = proto.pause;
   for (const name of ['play', 'pause', 'load']) {
-    const orig = proto[name];
-    proto[name] = disguise({ [name](...args) { try { register(this); } catch (_) {} return orig.apply(this, args); } }[name]);
+    const orig = proto[name], guarded = name === 'pause';
+    proto[name] = disguise({ [name](...args) {
+      try { register(this); } catch (_) {}
+      if (guarded && blockPause(this)) return undefined;
+      return orig.apply(this, args);
+    } }[name]);
   }
+
+  // ---------------------------------------------------------------- pause guard
+  // Sites that allow one playing track at a time stop their other tabs, and whatever they use to
+  // decide, they stop them by calling pause(). While a deck is capturing this tab that pause is
+  // dropped: a pause from page script keeps no transient user activation, a pause the user makes
+  // on the page does, and the agent's own pauses never come through this wrapper at all (they use
+  // nativePause). As with a page that insists on its playback rate, the agent stops resisting
+  // after PAUSE_TRIES attempts in PAUSE_WINDOW ms and says so once, so a site that keeps trying
+  // and the agent never ping-pong. Wired at document_start, the only moment the prototypes can
+  // still be taken before page script, and inert until the deck says `isolate`.
+  const PAUSE_TRIES = 3, PAUSE_WINDOW = 2000;
+  const userDid = () => { try { return !!(navigator.userActivation && navigator.userActivation.isActive); } catch (_) { return false; } };
+  function blockPause(el) {
+    if (!iso.on || userDid()) return false;
+    let x;
+    try { if (el.paused) return false; x = info.get(el); } catch (_) { return false; }
+    if (!x || x.pauseOff) return false;
+    const t = performance.now();
+    x.pst = x.pst.filter((v) => t - v < PAUSE_WINDOW);
+    x.pst.push(t);
+    if (x.pst.length < PAUSE_TRIES) return true;
+    x.pauseOff = true;
+    if (!iso.told) { iso.told = true; emit(JSON.stringify({ t: 'external-pause' })); }
+    return false;
+  }
+
+  // Tearing the source out stops a player as surely as pausing it, and costs one more wrapper.
+  // Only emptying is blocked: a new source is a track change the page is entitled to make, and
+  // load() is how a player re-buffers or moves to the next track, so both are left alone.
+  // Taking the element out of the document is left alone as well: Chrome pauses it with its own
+  // internal steps, which no JS wrapper is on the path of, and putting it back and playing it
+  // again would be exactly the fight loop this guard exists to avoid.
+  for (const prop of ['src', 'srcObject']) {
+    const d = Object.getOwnPropertyDescriptor(proto, prop);
+    if (!d || !d.set || !d.configurable) continue;
+    const set = Object.getOwnPropertyDescriptor({ set [prop](v) {
+      if (iso.on && (v == null || v === '')) {
+        try { register(this); } catch (_) {}
+        if (blockPause(this)) return;
+      }
+      d.set.call(this, v);
+    } }, prop).set;
+    Object.defineProperty(proto, prop, { ...d, set: disguise(set) });
+  }
+
+  /** A deck started capturing this tab (or stopped): put the guard up, or take it down. */
+  function setIsolate(on) {
+    if (iso.on === on) return;
+    iso.on = on;
+    if (!on) return;
+    iso.told = false;
+    for (const el of live()) { const x = info.get(el); if (x) { x.pst = []; x.pauseOff = false; } }
+  }
+
   // Players poll currentTime/paused for their progress bars: that finds elements that were already
   // playing before a late injection (tabs open before install, which get the agent when they are
   // loaded on a deck, i.e. just before the first command). Patched only from the first command on.
@@ -241,12 +305,17 @@
       st.letGo = 0;
       release();
       send();
+    } else if (m.t === 'isolate') {
+      // A deck started capturing this tab (on) or stopped (off). Carries no seq: it is not part
+      // of the rate conversation and must not disturb it.
+      if (typeof m.on === 'boolean') setIsolate(m.on);
     } else if (m.t === 'stop') {
       // The deck is ejecting this tab: once its capture goes, the page plays out of the speakers.
       // Give the page its own rate back, pause every player, and say how many of them were heard
       // (0: nothing to pause here, so the tab gets muted instead).
       if (seq != null) st.seq = seq;
       st.letGo = 0;
+      setIsolate(false); // the tab is leaving the deck: it is its site's again
       release();
       scan();
       let count = 0;
