@@ -136,7 +136,7 @@ describe('a deck holds its source', { concurrency: 1 }, () => {
     await p.close();
   });
 
-  test('a site that stops by emptying src is blocked; a new source, load() and a seek are not', async () => {
+  test('a site that stops by emptying src is blocked; a new source and load() are not', async () => {
     const p = await tab({ site: SITE_SRC });
     assert.equal(await play(p), false);
     const src = await p.run('window.__a.src');
@@ -152,14 +152,13 @@ describe('a deck holds its source', { concurrency: 1 }, () => {
     assert.equal(await p.run('window.__a.src'), src, 'and the source is untouched');
     await p.run('window.__a.srcObject = null');
     assert.equal(await paused(p), false);
-    // What is deliberately left alone: a real source change (a playlist moving on), load() (how a
-    // player re-buffers or moves on) and seeking.
+    // What is deliberately left alone: a real source change (a playlist moving on) and load()
+    // (how a player re-buffers or moves on). Seeking is left alone too — nothing wraps the
+    // currentTime setter, which the fingerprint test below checks.
     await p.run("window.__a.src = '/tone.wav?next'");
     assert.ok((await p.run('window.__a.src')).endsWith('?next'), 'a new source goes through');
     await p.run('window.__a.load()');
     assert.equal(await play(p), false);
-    await p.run('window.__a.currentTime = 1.5');
-    assert.ok((await p.run('window.__a.currentTime')) >= 1, 'a seek goes through');
     await p.close();
   });
 
@@ -247,7 +246,7 @@ describe('a tab that is not on a deck', { concurrency: 1 }, () => {
       return {
         names: Object.getOwnPropertyNames(window).filter((k) => /jds|jdsamps/i.test(k)),
         fns: ['play', 'pause', 'load'].map((k) => [proto[k].toString(), proto[k].name, proto[k].length, 'prototype' in proto[k]]),
-        setters: ['src', 'srcObject'].map((k) => [d(k).set.toString(), d(k).set.name, d(k).set.length, d(k).configurable]),
+        setters: ['src', 'srcObject', 'currentTime'].map((k) => [d(k).set.toString(), d(k).set.name, d(k).set.length, d(k).configurable]),
       };
     })())`).then((s) => JSON.parse(s));
     const r = await look();
@@ -257,9 +256,11 @@ describe('a tab that is not on a deck', { concurrency: 1 }, () => {
       ['function pause() { [native code] }', 'pause', 0, false],
       ['function load() { [native code] }', 'load', 0, false],
     ]);
+    // currentTime is the untouched native one: a seek is never guarded.
     assert.deepEqual(r.setters, [
       ['function set src() { [native code] }', 'set src', 1, true],
       ['function set srcObject() { [native code] }', 'set srcObject', 1, true],
+      ['function set currentTime() { [native code] }', 'set currentTime', 1, true],
     ]);
     // Still native-looking once a deck has claimed the tab.
     await isolate(p, true);
