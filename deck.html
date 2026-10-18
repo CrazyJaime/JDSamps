@@ -22,6 +22,7 @@
     <symbol id="i-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></symbol>
     <symbol id="i-sound" viewBox="0 0 24 24"><path d="M4 9.5h3.5L12 5v14l-4.5-4.5H4z" fill="currentColor"/><path d="M15.5 8.5a5 5 0 0 1 0 7M18 6a8.5 8.5 0 0 1 0 12" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></symbol>
     <symbol id="i-dot" viewBox="0 0 24 24"><circle cx="12" cy="12" r="6" fill="currentColor"/></symbol>
+    <symbol id="i-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 11v5.5M12 7.6v.4" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></symbol>
   </svg>
 
   <header class="topbar">
@@ -145,8 +146,15 @@
     <section class="deck" aria-label="Deck">
       <header class="deck-head">
         <span class="slot" data-slot></span>
-        <img class="fav" data-fav alt="" width="16" height="16" />
-        <span class="title" data-title></span>
+        <div class="head-text">
+          <div class="head-line"><img class="fav" data-fav alt="" width="16" height="16" /><span class="title" data-title></span></div>
+          <div class="head-line"><span class="badge kind" data-kind><span data-kind-word></span><span data-kind-pct></span></span><span class="load-line" data-load-line hidden></span></div>
+        </div>
+        <button class="btn ghost icon sm" data-act="loadCancel" aria-label="Cancel loading" title="Cancel loading" hidden><svg class="ic"><use href="#i-x"/></svg></button>
+        <div class="report" data-report hidden>
+          <button class="btn ghost icon sm" data-report-btn aria-label="Load report" title="Load report" aria-haspopup="menu" aria-expanded="false"><svg class="ic"><use href="#i-info"/></svg></button>
+          <div class="menu" role="menu" data-report-menu hidden><button class="btn sm" role="menuitem" data-copy-report>Copy load report</button></div>
+        </div>
         <button class="btn ghost icon sm" data-act="eject" aria-label="Eject deck"><svg class="ic"><use href="#i-eject"/></svg></button>
       </header>
       <div class="deck-assign">
@@ -174,6 +182,8 @@
           <span class="reserve-bar"><span data-reserve-fill></span></span>
           <span class="mono" data-reserve-text>0.0s</span>
         </div>
+        <span class="time mono" data-time title="Elapsed / remaining" hidden></span>
+        <button class="btn sm" data-copy-report hidden>Copy load report</button>
       </div>
       <div class="transport">
         <button class="btn cue big" data-hold="cue">CUE</button>
@@ -184,6 +194,7 @@
       <div class="tools">
         <button class="btn sm" data-act="syncPlay" title="Start exactly on the next master beat">SYNC PLAY</button>
         <button class="btn sm" data-act="live" title="Jump to the live edge (lowest latency)">LIVE</button>
+        <button class="btn sm chip" data-act="bar1" hidden>BAR 1?</button>
         <button class="btn sm" data-act="half" title="Halve the detected tempo">½×</button>
         <button class="btn sm" data-act="double" title="Double the detected tempo">2×</button>
         <button class="btn sm" data-act="tap" title="Tap tempo (Shift-click: mark beat 1)">TAP</button>
