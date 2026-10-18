@@ -62,6 +62,12 @@ const LIVE = {
   big: 'the track is too large to hold, so it plays live from the tab.',
   failed: (why) => `the whole track could not be read from this page (${why}), so it plays live from the tab.`,
 };
+/** Why a player asked to flush was not (tap-progress drive.unflushed), for the load report. */
+const UNFLUSHED = {
+  ended: 'it had loaded the whole track and ended its stream, which a flush would reopen',
+  video: 'it holds pictures only',
+  none: 'its media source could not be flushed',
+};
 const DECISIVE = ['drm', 'worker', 'preview', 'live'];
 const NO_LENGTH = "the page's player has not said how long the track is";
 const TAB_CAP = 600 * 2 ** 20;       // bytes from one tab: each frame's tap holds at most this, and so does the whole tab
@@ -598,10 +604,16 @@ export class Loader extends Job {
     const T = this.target();
     if (T == null) return { outcome: 'skipped', why: NO_LENGTH };
     const stampless = !!(f.prog && f.prog.mimes.length && f.prog.mimes.every((m) => NO_STAMPS.test(m)));
-    let mode = null, placed = null, out = null, pass = null;
-    const go = (m, from) => {
+    // A gap at the start of what the tap holds is what the player buffered before the tap (named by the range it holds
+    // there): a player never fetches what it holds again, so the first drive has it flush its buffer first.
+    await this.complete();
+    const startOf = () => { const g = this.gapsNow()[0]; return g && g[0] < 0.05 ? g : null; }, g0 = stampless ? null : startOf();
+    const held = g0 && ((f.prog && f.prog.buffered) || []).find(([a, b]) => a <= g0[0] + 0.5 && b > g0[0]);
+    const unfetched = g0 && `the player would not fetch the start again after a flush: ${span(held ? [g0[0], Math.min(g0[1], held[1])] : g0)} came before the deck could read it`;
+    let mode = null, placed = null, out = null, pass = null, flushed = false, unflushed = false;
+    const go = (m, from, flush) => {
       mode = m;
-      this.send(f, m === 'seekhop' ? { t: 'drive', mode: m } : { t: 'drive', mode: m, rate: DRIVE_RATE, ...(from != null ? { from } : {}) });
+      this.send(f, m === 'seekhop' ? { t: 'drive', mode: m, ...(flush ? { flush: true } : {}) } : { t: 'drive', mode: m, rate: DRIVE_RATE, ...(from != null ? { from } : {}) });
       const how = m === 'seekhop' ? 'seek-hop' : `accelerate ${DRIVE_RATE}×${from != null ? ` from ${from.toFixed(1)} s` : ''}`;
       e.how = e.how ? `${e.how}, then ${how}` : how;
       this.say(this.progress, m === 'seekhop' ? SAY.hop : SAY.fast(DRIVE_RATE));
@@ -609,13 +621,18 @@ export class Loader extends Job {
     const band = this.band(), end = now() + this.t.drive + T * this.t.drivePerSec;
     let bytes = f.bytes, fresh = now(), checked = 0;
     try {
-      go(stampless ? 'accelerate' : 'seekhop');
+      go(stampless ? 'accelerate' : 'seekhop', null, !!g0);
+      // Said once, and looked for in every message from the page, so it is never missed.
+      if (g0) this.until(() => { const d = f.prog && f.prog.drive; return !!d && d.state === 'flushed'; }, end - now()).then((yes) => {
+        if (yes) { flushed = true; e.how = e.how.replace('seek-hop', 'seek-hop after a flush'); }
+      }, () => {});
       for (;;) {
         const seen = f.prog;
         await this.until(() => f.prog !== seen || f.left, this.t.check);
         this.check();
         if (f.bytes !== bytes) { bytes = f.bytes; fresh = now(); }
         const d = f.prog && f.prog.drive, st = d && d.mode === mode && !(pass && f.prog === pass.prog) ? d.state : 'running';
+        if (d && d.unflushed && !unflushed) { unflushed = true; this.rep.notes.push(`the player was not flushed: ${UNFLUSHED[d.unflushed]}`); }
         if (st === 'done' || now() - checked >= this.t.check) {
           checked = now();
           placed = await this.complete();
@@ -629,7 +646,7 @@ export class Loader extends Job {
           if (placed) break;
           const gaps = this.gapsNow();
           if (!gaps.length) { out = { outcome: 'failed', why: NO_LENGTH }; break; } // the player no longer gives a length
-          const why = `the player buffered the whole track, but ${gaps.map(span).join(', ')} came before the deck could read it`;
+          const why = `the player buffered the whole track, but ${gaps.map(span).join(', ')} came before the deck could read it${flushed && gaps[0][0] < 0.05 ? ', and it would not fetch the start again after a flush' : ''}`;
           // A player keeps only so much behind its playhead: what it held from before the tap may be gone from it by
           // now, and run once more from the first gap it fetches that again (never for appends placed in order only).
           if (!pass && !stampless) { pass = { why, prog: f.prog }; go('accelerate', gaps[0][0]); fresh = now(); continue; }
@@ -638,6 +655,8 @@ export class Loader extends Job {
         }
         if (mode === 'seekhop' && (st === 'refused' || now() - fresh > this.t.stall)) { go('accelerate'); fresh = now(); continue; }
         if (mode === 'accelerate' && st === 'refused') { out = { outcome: 'failed', why: pass ? pass.why : 'the page will not let its player run faster' }; break; }
+        // Flushed, and nothing comes even played: a player that never fetches a piece twice. The start is not to be had.
+        if (mode === 'accelerate' && flushed && startOf() && now() - fresh > this.t.stall) { out = { outcome: 'failed', why: unfetched }; break; }
         if (now() > end) { out = { outcome: 'failed', why: `the player had not given the whole track after ${secs(now() - end + this.t.drive + T * this.t.drivePerSec)} (missing ${this.gapsNow().map(span).join(', ')})` }; break; }
       }
     } finally {

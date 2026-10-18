@@ -525,3 +525,44 @@ test('the opus pieces this harness serves are what the model sites serve', () =>
   assert.equal(r.segs.length, 31);
   assert.ok(near(DUR, 120.0065, 1e-9));
 });
+
+// ---------------------------------------------------------------- a player already playing when it is loaded (flush)
+const drives = (tab) => tab.sent().filter((m) => m.t === 'drive' && m.mode !== 'stop');
+
+test('the start a player held from before the tap, which no link can fetch again, has the first drive flush the player', async () => {
+  const { tab } = await load({ kind: 'mse', rendition: hi(), preTap: 6, playing: 1 });
+  assert.deepEqual(drives(tab).map((m) => [m.mode, m.flush]), [['seekhop', true], ['accelerate', undefined]]);
+});
+
+test('no flush when the tap holds the start (the player started after it), nor for appends placed in order only', async () => {
+  const { tab } = await load({ kind: 'mse', rendition: hi(), preTap: 0, playing: 2 });
+  assert.ok(drives(tab).length && drives(tab).every((m) => m.flush === undefined), JSON.stringify(drives(tab)));
+  const r = await load({ kind: 'mse', rendition: hi(), preTap: 6, playing: 1, mimes: ['audio/mpeg'], appends: [{ bytes: mp3(120.0065), mime: 'audio/mpeg' }] });
+  assert.ok(drives(r.tab).length && drives(r.tab).every((m) => m.flush === undefined), JSON.stringify(drives(r.tab)));
+});
+
+test('flushed, a player that fetches again what left its buffer gives the whole track in one seek-hop: resident', async () => {
+  const { result, tab, engine, deck } = await load({ kind: 'mse', rendition: hi(), preTap: 6, playing: 1, flush: 'refetch' });
+  assert.equal(result.kind, 'resident', JSON.stringify(called(engine, 'failLoadingToLive')));
+  assert.ok(near(called(engine, 'startResidentDeck')[0].frames / SR, 120, 0.02));
+  assert.deepEqual(drives(tab).map((m) => m.mode), ['seekhop']);
+  assert.match(deck.load.report, /drive \(seek-hop after a flush\): ok in \d+\.\d s/);
+});
+
+test('flushed, a player that never fetches a piece twice ends live, the report naming the start it would not fetch again', async () => {
+  const { result, engine, deck, tab } = await load({ kind: 'mse', rendition: hi(), preTap: 6, playing: 1, flush: 'sticky' });
+  assert.equal(result.kind, 'live');
+  assert.deepEqual(called(engine, 'startResidentDeck'), []);
+  const why = /the player would not fetch the start again after a flush: 0\.0–24\.0 s came before the deck could read it/;
+  assert.match(called(engine, 'failLoadingToLive')[0].reason, why);
+  assert.match(deck.load.report, new RegExp(`drive \\(seek-hop after a flush, then accelerate 8×\\): failed in \\d+\\.\\d s — ${why.source}`));
+  assert.match(deck.load.report, new RegExp(`First failure: drive: ${why.source}`));
+  assert.ok(tab.kinds().lastIndexOf('drive stop') > tab.kinds().lastIndexOf('drive accelerate'), 'the drive is stopped');
+});
+
+test('a flush the player refuses (it has ended its stream) is noted in the report, and the drive goes on as it did before', async () => {
+  const { result, deck } = await load({ kind: 'mse', rendition: hi(), preTap: 6, playing: 1, flush: 'ended' });
+  assert.equal(result.kind, 'live');
+  assert.match(deck.load.report, /note: the player was not flushed: it had loaded the whole track and ended its stream/);
+  assert.match(deck.load.report, /drive \(seek-hop, then accelerate 8× from 0\.0 s\): failed in \d+\.\d s — the player buffered the whole track, but 0\.0–24\.0 s came before the deck could read it\n/);
+});
