@@ -30,6 +30,7 @@ async function boot() {
     ctx, params: { 'buffer.capSec': 240, 'rec.format': 'wav', 'bpm.range': 'AUTO', 'assist.on': false },
     decks: new Map(), clock: new MasterClock(), silentSink, master: { bus, removeDeck() {}, setAssign() {}, meterIn() {} },
     createStretch: () => SignalsmithStretch(ctx, { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2] }),
+    heardTime: () => ctx.currentTime,
     deliver: (blob, name) => env.delivered.push({ name, size: blob.size }),
     event: (level, text) => { if (level === 'error') env.errors.push(text); },
     eject() {}, broadcast() {}, broadcastWave() {},
