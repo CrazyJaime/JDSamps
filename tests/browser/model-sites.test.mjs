@@ -242,6 +242,25 @@ test('?sticky=1 keeps a player that fetches each segment once: what is removed f
   }));
 });
 
+test('?onward=1 goes on from the segment it fetched last, as shaka does: emptied under it, a seek holding nothing fetches on from there; a seek outside what it holds, holding something, starts again there', async () => {
+  await Promise.all(['mse', 'opaque', 'abr'].map(async (name) => {
+    const o = await open(name, { query: 'onward=1' });
+    await clickToPlay(o.page);
+    const before = await removeAll(o.page), mediaNs = async (from) => (await pageState(o.page)).appends.slice(from).filter((a) => a.kind === 'media').map((a) => a.n);
+    const lastN = (await pageState(o.page)).appends.slice(0, before).filter((a) => a.kind === 'media').at(-1).n;
+    await waitFor(async () => { const b = await sbBuffered(o.page); return b.length === 1 && b[0][1] - b[0][0] >= 20; }, 10000)
+      .catch(async () => assert.fail(`${name}: buffered ${JSON.stringify(await sbBuffered(o.page))}`));
+    assert.equal((await mediaNs(before))[0], lastN + 1, `${name}: on from its last segment`);
+    assert.ok((await sbBuffered(o.page))[0][0] > 0.5, `${name}: the start is not fetched again: ${JSON.stringify(await sbBuffered(o.page))}`);
+    const seek = (await pageState(o.page)).appends.length;
+    await o.page.evaluate(() => { document.querySelector('audio').currentTime = 0; });
+    await waitFor(async () => { const b = await sbBuffered(o.page); return b.length === 1 && b[0][0] <= 0.01 && b[0][1] >= 20; }, 10000)
+      .catch(async () => assert.fail(`${name}: buffered ${JSON.stringify(await sbBuffered(o.page))}`));
+    assert.deepEqual((await mediaNs(seek)).slice(0, 5), [0, 1, 2, 3, 4], `${name}: started again from 0`);
+    await done(o);
+  }));
+});
+
 test('/m/ratefight: resets playbackRate within 50 ms, and on seeking', async () => {
   const o = await open('ratefight');
   await assertModel(o.page, 'ratefight');

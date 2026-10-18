@@ -332,6 +332,18 @@ for (const name of ['opaque', 'mse', 'abr']) {
   });
 }
 
+test('a YouTube-like page whose player goes on from its last segment as shaka does (?onward=1), already playing for 5 s when it is loaded, ends resident', async () => {
+  // shaka looks at its buffer only when it seeks, and empties it on a seek outside what it holds only if it still holds
+  // something: emptied under it and sent to 0, it goes on from its last segment and jumps its playhead over the gap.
+  const site = await openSite('opaque', 'autoplay=1&onward=1');
+  await waitFor(() => site.tab.evaluate(() => { const m = window.__media(); return !m.paused && m.t > 5; }), 20000);
+  const d = await loadTab(site.tabId);
+  assert.equal(d.kind, 'resident', JSON.stringify(d.load));
+  assert.ok(Math.abs(d.duration - OPUS_END) < 0.015, `duration ${d.duration}`);
+  await assertBytesTrue(d.id);
+  await assertReleased(d, site);
+});
+
 test('a YouTube-like page whose player never fetches a piece twice (?sticky=1), already playing when loaded, plays live: the report says it would not fetch the start again', async () => {
   const site = await openSite('opaque', 'autoplay=1&sticky=1');
   await waitFor(() => site.tab.evaluate(() => { const m = window.__media(); return !m.paused && m.t > 5; }), 20000);

@@ -619,7 +619,7 @@ export class Loader extends Job {
       this.say(this.progress, m === 'seekhop' ? SAY.hop : SAY.fast(DRIVE_RATE));
     };
     const band = this.band(), end = now() + this.t.drive + T * this.t.drivePerSec;
-    let bytes = f.bytes, fresh = now(), checked = 0;
+    let bytes = f.bytes, fresh = now(), checked = 0, stalled = 0;
     try {
       go(stampless ? 'accelerate' : 'seekhop', null, !!g0);
       // Said once, and looked for in every message from the page, so it is never missed.
@@ -632,6 +632,7 @@ export class Loader extends Job {
         this.check();
         if (f.bytes !== bytes) { bytes = f.bytes; fresh = now(); }
         const d = f.prog && f.prog.drive, st = d && d.mode === mode && !(pass && f.prog === pass.prog) ? d.state : 'running';
+        stalled = st === 'stalled' ? stalled || now() : 0;
         if (d && d.unflushed && !unflushed) { unflushed = true; this.rep.notes.push(`the player was not flushed: ${UNFLUSHED[d.unflushed]}`); }
         if (st === 'done' || now() - checked >= this.t.check) {
           checked = now();
@@ -653,7 +654,9 @@ export class Loader extends Job {
           out = { outcome: 'failed', why: pass ? pass.why : why };
           break;
         }
-        if (mode === 'seekhop' && (st === 'refused' || now() - fresh > this.t.stall)) { go('accelerate'); fresh = now(); continue; }
+        // A seek-hop stalls when it brings nothing new, or when the player says so while it appends elsewhere (shaka going on
+        // from its last segment after a flush): either way, accelerate.
+        if (mode === 'seekhop' && (st === 'refused' || now() - fresh > this.t.stall || (stalled && now() - stalled > this.t.stall))) { go('accelerate'); fresh = now(); continue; }
         if (mode === 'accelerate' && st === 'refused') { out = { outcome: 'failed', why: pass ? pass.why : 'the page will not let its player run faster' }; break; }
         // Flushed, and nothing comes even played: a player that never fetches a piece twice. The start is not to be had.
         if (mode === 'accelerate' && flushed && startOf() && now() - fresh > this.t.stall) { out = { outcome: 'failed', why: unfetched }; break; }

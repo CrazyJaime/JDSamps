@@ -566,3 +566,9 @@ test('a flush the player refuses (it has ended its stream) is noted in the repor
   assert.match(deck.load.report, /note: the player was not flushed: it had loaded the whole track and ended its stream/);
   assert.match(deck.load.report, /drive \(seek-hop, then accelerate 8× from 0\.0 s\): failed in \d+\.\d s — the player buffered the whole track, but 0\.0–24\.0 s came before the deck could read it\n/);
 });
+
+test('a seek-hop the player says has stalled goes to accelerate after a stall, even while bytes keep coming from elsewhere (shaka going on from its last segment)', async () => {
+  const { result, tab } = await load({ kind: 'mse', rendition: hi(), preTap: 6, playing: 1, seekhop: 'trickle', evicts: true });
+  assert.equal(result.kind, 'resident', JSON.stringify(tab.sent().filter((m) => m.t === 'drive')));
+  assert.deepEqual(drives(tab).map((m) => [m.mode, m.from]), [['seekhop', undefined], ['accelerate', undefined], ['accelerate', 0]]);
+});

@@ -55,7 +55,8 @@ export const code = (s) => Math.fround([...String(s)].reduce((n, c) => (n * 31 +
  *   rendition, preTap (segments appended before the tap was on: lost but for the init), playing (segments appended right after tap on),
  *   list (the HLS playlist was requested), segUrls (segment requests seen), pageFetch (false: every page fetch fails),
  *   src (a progressive element source URL), tralbum ({url, duration}), files ({url: bytes}, served to the page and the engine),
- *   errors (reasons reported at tap on), seekhop ('ok' | 'stall' | 'refuse'), accelerate ('ok' | 'refuse'), mimes (override),
+ *   errors (reasons reported at tap on), seekhop ('ok' | 'stall' | 'refuse' | 'trickle': stalled where it hops, while the player
+ *   appends on elsewhere, so bytes keep coming but never what is missing), accelerate ('ok' | 'refuse'), mimes (override),
  *   appends (MSE parts as {bytes} the player appends on a drive, in order, for a stream with no timestamps),
  *   status (the frame agent's status, over a heard playing player's), framePages ([{...}]: frame i's page, over this one),
  *   other ({rendition, sb, n}: another player's SourceBuffer in the frame, appending its init and first n segments at tap on),
@@ -95,6 +96,13 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
       const how = pg[mode] || 'ok';
       if (how === 'refuse' || (mode === 'seekhop' && (pg.mimes || []).some((m) => /mpeg|aac/.test(m)))) { progress({ drive: { mode, state: 'refused', at: 0 } }); return; }
       if (how === 'stall') { progress({ drive: { mode, state: 'stalled', at: 24 } }); return; }
+      if (how === 'trickle') {
+        progress({ drive: { mode, state: 'stalled', at: 0 } });
+        const k = pg.preTap || 0;
+        fr.trickle = setInterval(() => emit({ t: 'tap-ready', parts: [{ blobUrl: mint(r.segs[k].bytes), mime: r.mime, kind: 'media', sb: 0, seq: fr.seq++ }], duration: fr.duration }), 20);
+        fr.trickle.unref();
+        return;
+      }
       const unflushed = m.flush === true && ['ended', 'video', 'none'].includes(pg.flush) ? { unflushed: pg.flush } : {};
       if (m.flush === true && (pg.flush === 'refetch' || pg.flush === 'sticky')) {
         fr.flushed = pg.flush;
@@ -115,6 +123,7 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
       log.push({ frame: i, m, at: performance.now() });
       for (const h of tab.hooks) h(m, i);
       if (fr.left) return;
+      if (m.t === 'drive') clearInterval(fr.trickle);
       if (m.t === 'tap' && m.on === true) {
         if (pg.kind === 'mse' && pg.preTap > 0) emit({ t: 'tap-ready', parts: [{ blobUrl: mint(r.init.bytes), mime: r.mime, kind: 'init', sb: 0, seq: fr.seq++ }], duration: Number.isFinite(fr.duration) ? fr.duration : null });
         const reqs = [];
