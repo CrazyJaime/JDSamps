@@ -46,7 +46,7 @@ kbd { font: 0.8rem var(--mono); padding: 0.05rem 0.35rem; border: 1px solid var(
 }
 .btn:hover { background: #222736; }
 .btn:active { transform: translateY(1px); }
-.btn:focus-visible, .pad:focus-visible, .kill:focus-visible, .seg button:focus-visible, [role="slider"]:focus-visible {
+.btn:focus-visible, .pad:focus-visible, .kill:focus-visible, .seg button:focus-visible, [role="slider"]:focus-visible, .tempo-entry:focus-visible {
   outline: 2px solid #fff; outline-offset: 2px;
 }
 .btn.sm { min-width: 32px; min-height: max(32px, 1.9rem); padding: 0 0.55rem; font-size: 0.75rem; }
@@ -122,6 +122,7 @@ kbd { font: 0.8rem var(--mono); padding: 0.05rem 0.35rem; border: 1px solid var(
 .logo { width: 2rem; height: 2rem; border-radius: 0.4rem; }
 .brand-text h1 { font-size: 1.05rem; letter-spacing: 0.02em; }
 .tag { font-size: 0.75rem; color: var(--muted); }
+.build { margin-left: 0.45rem; font-size: 0.75rem; color: var(--muted); white-space: nowrap; }
 .spacer { flex: 1; }
 .clock { display: flex; align-items: baseline; gap: 0.55rem; padding: 0.3rem 0.7rem; border: 1px solid var(--line); border-radius: var(--r); background: var(--panel-2); }
 .clock-label { font: 700 0.75rem var(--sans); letter-spacing: 0.08em; color: var(--muted); }
@@ -187,6 +188,10 @@ body[data-decks="5"] .wave-bpm, body[data-decks="6"] .wave-bpm { font-size: 0.75
 .tempo-meta { display: flex; flex-direction: column; gap: 0.15rem; align-items: flex-start; }
 .pitch { font-size: 0.85rem; color: var(--txt); white-space: nowrap; }
 .native { font-size: 0.75rem; color: var(--muted); white-space: nowrap; }
+/* The BPM and ORIG readouts take a typed tempo: a click (or Enter) puts an input of the same size in their place. */
+.tempo-entry { border-radius: 0.2rem; cursor: text; }
+.tempo-entry:hover { background: var(--raised); }
+.tempo-edit { margin: 0; padding: 0; border: 0; border-radius: 0.2rem; min-width: 0; background: var(--bg); color: var(--txt); outline: 2px solid var(--deck); outline-offset: 1px; user-select: text; }
 .leds { display: grid; grid-template-columns: repeat(2, 0.65rem); gap: 0.25rem; }
 .leds i { width: 0.65rem; height: 0.65rem; border-radius: 0.15rem; background: var(--raised); }
 .leds i.on { background: var(--deck); box-shadow: 0 0 0.5rem var(--deck); }
@@ -215,7 +220,9 @@ body[data-decks="5"] .wave-bpm, body[data-decks="6"] .wave-bpm { font-size: 0.75
   .tools { grid-template-columns: repeat(9, minmax(0, 1fr)); }
   .tools > :last-child { grid-column: auto; }
 }
-.tempo-row { display: grid; grid-template-columns: auto 1fr auto auto; align-items: center; gap: 0.35rem; }
+/* Tight around the tempo fader: every pixel of its length is tempo resolution. */
+.tempo-row { display: grid; grid-template-columns: auto 1fr auto auto; align-items: center; gap: 0.25rem; }
+.tempo-row .range { padding: 0 0.3rem; }
 
 .mixer { display: grid; grid-template-columns: minmax(0, 1fr) 3.6rem; gap: 0.4rem; }
 .knobgrid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.3rem 0.2rem; align-items: start; }
@@ -294,6 +301,9 @@ body[data-decks="5"] .wave-bpm, body[data-decks="6"] .wave-bpm { font-size: 0.75
 .hslider .thumb { position: absolute; top: 50%; width: 1.1rem; height: 1.7rem; margin: -0.85rem 0 0 -0.55rem; border-radius: 0.25rem; background: linear-gradient(180deg, #e5e8ef, #a9afbd); box-shadow: 0 1px 4px rgb(0 0 0 / 0.6); }
 .hslider .thumb::after { content: ""; position: absolute; left: 50%; top: 0.2rem; bottom: 0.2rem; width: 2px; margin-left: -1px; background: #111; }
 .hslider .readout { position: absolute; right: 0; bottom: -0.3rem; font: 0.75rem/1 var(--mono); color: var(--muted); }
+/* While SYNC drives the tempo fader its handle is SYNC blue (moving it turns SYNC off). */
+.hslider.pitch.synced .thumb { background: linear-gradient(180deg, #dbeafe, var(--sync)); }
+.hslider.pitch.synced .rail { background: color-mix(in srgb, var(--sync) 35%, var(--raised)); }
 .hslider.xf { height: 2.8rem; width: min(46rem, 60vw); }
 .hslider.xf .thumb { width: 2.2rem; height: 2.4rem; margin: -1.2rem 0 0 -1.1rem; }
 .vfader { width: 2.4rem; height: 100%; }

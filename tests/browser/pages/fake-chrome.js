@@ -8,6 +8,7 @@
     storage: {},
     connected: false,
     state: null,
+    manifest: { manifest_version: 3, name: 'JD Samps', version: '0.0.0' },
     push(msg) { for (const fn of listeners.msg) fn(msg); },
     disconnect() { fake.connected = false; for (const fn of listeners.disc) fn(); },
     reply(id, ok = true, error) { fake.push({ t: 'reply', id, ok, error }); },
@@ -36,6 +37,7 @@
         return Promise.resolve(typeof r === 'function' ? r(msg) : r ?? { ok: true });
       },
       getURL: (p) => `/${p}`,
+      getManifest: () => fake.manifest,
     },
     storage: {
       local: {

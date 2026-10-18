@@ -1,6 +1,6 @@
 // ui/deck-strip.js — one deck: its column in the board and its row in the waveform stack.
 // All page-derived text goes through textContent; favicons are only set after isSafeIconUrl().
-import { DECK_COLORS, PITCH_RANGES, isSafeIconUrl } from '../shared/protocol.js';
+import { DECK_COLORS, PITCH_RANGES, isSafeIconUrl, parseTypedBpm } from '../shared/protocol.js';
 import { $, $$, clone, setText, toggleAttr, setAttr, setHidden, setClass, setStyle, pageHidden, cssSize, forgetSize, fmtBpm, fmtPct, fmtClock } from './util.js';
 import { Knob, Fader, bindPad, bindSeg } from './controls.js';
 import { WaveStore, drawWave, beatIndex } from './waveform.js';
@@ -74,12 +74,21 @@ export class DeckStrip {
     };
     // On-air fader: no wheel (a stray scroll must not cut a deck) and no double-click jump to full.
     this.fader = new Fader(this.q('[data-ctl="fader"]'), { label: `Deck ${d.slot} channel fader`, def: 1, value: p.fader, ticks: [0, 0.25, 0.5, 0.75, 1], wheel: false, reset: false, onChange: (v) => this.set('fader', v), format: (v) => `${Math.round(v * 100)}%` });
+    // Fine moves (Shift-drag, Shift-wheel, Shift-arrows) step a 128 BPM deck by at most 0.03 BPM at ±10%.
     this.pitch = new Fader(this.q('[data-ctl="pitch"]'), {
       orientation: 'horizontal', label: `Deck ${d.slot} tempo`, min: -1, max: 1, def: 0, value: p.range ? p.pitch / p.range : 0, center: true, readout: true,
-      step: 0.005, fine: 0.0005,
-      format: (v) => fmtPct(v * this.d.params.range),
+      step: 0.005, fine: 0.0005, fineDrag: 0.002,
+      format: (v) => this.fmtTempo(v * this.d.params.range),
       onChange: (v) => this.set('pitch', v * this.d.params.range),
     });
+    // The BPM and ORIG readouts take a typed tempo (click, tap, or Enter): the one to play at, and the track's own.
+    const entry = (el, value, action, label) => {
+      const open = () => this.editTempo(el, value(), action, label);
+      el.addEventListener('click', open);
+      el.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.repeat) { e.preventDefault(); open(); } });
+    };
+    entry(this.refs.bpm, () => this.shownBpm, 'setBpm', `Deck ${d.slot}: tempo to play at`);
+    entry(this.refs.native, () => this.d.bpm.native, 'setNativeBpm', `Deck ${d.slot}: original tempo of the track`);
     for (const band of ['hi', 'mid', 'low']) {
       const el = this.q(`[data-kill="${band}"]`);
       const pad = bindPad(el, { latch: true, onDown: () => this.set(`kill.${band}`, true, true), onUp: () => this.set(`kill.${band}`, false), onLatch: () => this.set(`kill.${band}`, true) });
@@ -147,6 +156,50 @@ export class DeckStrip {
     });
     // Eject needs a 500 ms hold: a stray click must never kill a playing deck.
     bindHold(this.q('[data-act="eject"]'), { ms: 500, onHold: () => this.act('eject'), onShort: () => this.toast('Hold the eject button to unload this deck.', 'info') });
+  }
+
+  /** Tempo fader readout: the percentage, and the BPM it plays at once the deck has one. */
+  fmtTempo(pitch) {
+    const n = this.d.bpm.native;
+    return n ? `${fmtPct(pitch)} · ${fmtBpm(n * (1 + pitch))}` : fmtPct(pitch);
+  }
+
+  /**
+   * Type a tempo in place of a readout: an input of the same size takes its place (the layout does
+   * not move). Enter sends `action`, junk is refused with a toast, Escape or blur cancels.
+   */
+  editTempo(el, value, action, label) {
+    if (el.hidden) return;
+    const r = el.getBoundingClientRect(), cs = getComputedStyle(el);
+    const input = document.createElement('input');
+    Object.assign(input, { type: 'text', inputMode: 'decimal', className: 'tempo-edit', autocomplete: 'off', spellcheck: false, value: value ? value.toFixed(1) : '' });
+    input.setAttribute('aria-label', label);
+    for (const k of ['fontFamily', 'fontSize', 'fontWeight', 'letterSpacing', 'textAlign']) input.style[k] = cs[k];
+    input.style.width = `${r.width}px`;
+    input.style.height = `${r.height}px`;
+    el.hidden = true;
+    el.after(input);
+    input.focus();
+    input.select();
+    let open = true;
+    const close = (refocus) => {
+      if (!open) return;
+      open = false;
+      input.remove();
+      el.hidden = false;
+      if (refocus) el.focus();
+    };
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); close(true); return; }
+      if (e.key !== 'Enter') return;
+      e.preventDefault();
+      const t = parseTypedBpm(input.value);
+      if (!t.ok) { this.toast(t.error, 'warn'); input.select(); return; }
+      close(true);
+      this.conn.flush(); // a tempo fader move still queued must not land after the typed tempo
+      this.act(action, { bpm: t.bpm });
+    });
+    input.addEventListener('blur', () => close(false));
   }
 
   /** Rolls held by keys and pads, newest last: releasing one falls back to the newest still held. */
@@ -219,10 +272,10 @@ export class DeckStrip {
     else if (this.shownBpm == null || Math.abs(out - this.shownBpm) >= 0.07) this.shownBpm = out;
     setText(r.bpm, fmtBpm(this.shownBpm));
     setText(r.wbpm, fmtBpm(this.shownBpm));
-    setText(r.tstate, d.bpm.tapped ? 'TAP' : d.bpm.state);
+    setText(r.tstate, d.bpm.tapped ? (d.bpm.manual === 'typed' ? 'SET' : 'TAP') : d.bpm.state);
     setClass(r.tstate, `badge ${d.bpm.tapped ? 'ok' : STATE_CLASS[d.bpm.state] || ''}`);
     setText(r.pitch, fmtPct(p.pitch));
-    setText(r.native, d.bpm.native ? `orig ${fmtBpm(d.bpm.native)}${d.bpm.mult !== 1 ? ` ×${d.bpm.mult}` : ''}` : '');
+    setText(r.native, `orig ${fmtBpm(d.bpm.native)}${d.bpm.native && d.bpm.mult !== 1 ? ` ×${d.bpm.mult}` : ''}`);
 
     const resFrac = Math.min(1, d.reserve / 30);
     setStyle(r.reserveFill, 'width', `${(resFrac * 100).toFixed(1)}%`);
@@ -256,6 +309,12 @@ export class DeckStrip {
     for (const k of Object.keys(this.knobs)) this.knobs[k].set(p[k]);
     this.fader.set(p.fader);
     this.pitch.set(p.range ? p.pitch / p.range : 0);
+    // The readout's BPM follows a new tempo reading too, not only the fader.
+    if (this.pitch.readout.textContent !== this.fmtTempo(this.pitch.value * p.range)) this.pitch.render();
+    // While SYNC drives the fader it says so: moving it turns SYNC off.
+    const locked = d.sync.on && !d.sync.isMaster;
+    this.pitch.el.classList.toggle('synced', locked);
+    setAttr(this.pitch.el, 'title', locked ? 'Locked to SYNC: moving it turns SYNC off' : '');
     for (const band of ['hi', 'mid', 'low']) this[`kill_${band}`].setOn(p[`kill.${band}`]);
     this.fxOn.setOn(p['fx.on']);
     for (const k of Object.keys(this.segs)) this.segs[k].set(p[k]);

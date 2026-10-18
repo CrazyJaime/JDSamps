@@ -29,7 +29,10 @@ window.addEventListener('blur', letGo);
 document.addEventListener('visibilitychange', () => { if (document.hidden) letGo(); });
 
 class Continuous {
-  /** o.wheel = false: no scroll-wheel control; o.reset = false: no double-click reset. */
+  /**
+   * o.wheel = false: no scroll-wheel control; o.reset = false: no double-click reset.
+   * o.fineDrag: the most one pixel of Shift-drag moves a Fader, so fine moves stay fine on a short one.
+   */
   constructor(el, o) {
     this.el = el;
     this.o = { min: 0, max: 1, step: 0.01, fine: 0.002, format: (v) => v.toFixed(2), wheel: true, reset: true, ...o };
@@ -214,7 +217,8 @@ export class Fader extends Continuous {
         const pos = vertical ? ev.clientY : ev.clientX;
         const px = vertical ? last - pos : pos - last;
         last = pos;
-        this.commit(this.value + (px / span) * (this.o.max - this.o.min) * (ev.shiftKey ? 0.15 : 1));
+        const per = ((this.o.max - this.o.min) / span) * (ev.shiftKey ? 0.15 : 1);
+        this.commit(this.value + px * (ev.shiftKey && this.o.fineDrag ? Math.min(per, this.o.fineDrag) : per));
       });
     });
     this.render();

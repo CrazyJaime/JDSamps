@@ -7,8 +7,10 @@ import { launchPlain } from './playwright.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..');
 const FAKE = fs.readFileSync(path.join(ROOT, 'tests/browser/pages/fake-chrome.js'), 'utf8');
+const MANIFEST = JSON.parse(fs.readFileSync(path.join(ROOT, 'manifest.json'), 'utf8'));
 
-export async function openUi({ state = null, hubReplies = {}, viewport = { width: 1440, height: 900 }, storage = {} } = {}) {
+/** manifest: what chrome.runtime.getManifest() returns (default: the real manifest.json). */
+export async function openUi({ state = null, hubReplies = {}, viewport = { width: 1440, height: 900 }, storage = {}, manifest = MANIFEST } = {}) {
   const server = await startStaticServer(ROOT);
   const browser = await launchPlain();
   const page = await browser.newPage({ viewport });
@@ -16,7 +18,7 @@ export async function openUi({ state = null, hubReplies = {}, viewport = { width
   page.on('pageerror', (e) => errors.push(String(e)));
   page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
   await page.addInitScript(FAKE);
-  await page.addInitScript(([s, h, st]) => { window.__fake.state = s; Object.assign(window.__fake.hubReplies, h); Object.assign(window.__fake.storage, st); }, [state, hubReplies, storage]);
+  await page.addInitScript(([s, h, st, mf]) => { window.__fake.state = s; Object.assign(window.__fake.hubReplies, h); Object.assign(window.__fake.storage, st); window.__fake.manifest = mf; }, [state, hubReplies, storage, manifest]);
   await page.goto(`${server.origin}/deck.html`);
   return {
     page,
