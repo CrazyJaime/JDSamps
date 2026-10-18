@@ -250,14 +250,60 @@ test('an MSE page whose segments can be fetched again ends resident: the start i
   await assertReleased(d, site);
 });
 
-test('an ABR page ends resident with no doubled or missing audio at its quality switch', async () => {
-  const site = await openSite('abr');
-  await playing(site.tab);
-  const d = await loadTab(site.tabId);
+test('an ABR page captured across its quality switch (lo, then hi from 12 s) ends resident from both renditions, with no doubled or missing audio at the switch', async (t) => {
+  const site = await openSite('abr', '');
+  const d = await loadTab(site.tabId, {
+    // Its player starts once the deck is reading the page, so the tap captures the switch itself. What the deck is
+    // decoded from is kept: each piece's SHA-256, to tell which rendition it is.
+    during: async (r) => {
+      await waitFor(() => engine(`const l = e.loads.get(${r.deckId}); return !!l && l.loader.tapping;`), 15000);
+      await engine(`const l = e.loads.get(${r.deckId}).loader, dp = l.d.decodePlaced;
+        const hex = async (b) => [...new Uint8Array(await crypto.subtle.digest('SHA-256', b))].map((x) => x.toString(16).padStart(2, '0')).join('');
+        l.d.decodePlaced = async (ctx, placed, o) => {
+          window.__runs = await Promise.all(placed.runs.map(async (run) => Promise.all(run.segs.map(async (s) => ({ t0: s.t0, t1: s.t1, sha: await hex(s.bytes) })))));
+          return dp(ctx, placed, o);
+        };
+        return true;`);
+      await site.tab.click('#play');
+    },
+  });
   assert.equal(d.kind, 'resident', JSON.stringify(d.load));
   assert.ok(Math.abs(d.duration - OPUS_END) < 0.015, `duration ${d.duration}`);
-  const c = await compare(d.id, opusUrls('opus-hi'));
-  assert.ok(c.corr > 0.999, JSON.stringify(c));
+  // Both renditions are in what the deck was decoded from, each piece byte-true, lo up to the switch and hi after it.
+  const repOf = new Map(['opus-lo', 'opus-hi'].flatMap((rep) => index.reps[rep].segs.map((s) => [s.sha256, { rep, t0: s.t0 }])));
+  const segs = (await engine('return window.__runs;')).flat();
+  for (const s of segs) assert.ok(repOf.has(s.sha) && Math.abs(repOf.get(s.sha).t0 - s.t0) < 1e-6, `the piece at ${s.t0} s is no rendition's piece for that time`);
+  const at = (t) => repOf.get(segs.find((s) => s.t0 <= t && t < s.t1).sha).rep;
+  assert.deepEqual([at(10), at(14)], ['opus-lo', 'opus-hi'], 'the switch at 12 s is in the deck');
+  assert.ok(new Set(segs.map((s) => repOf.get(s.sha).rep)).size === 2);
+  // Continuous at the switch: either side lines up with its rendition decoded whole at lag 0 (a doubled or missing
+  // piece would shift it by whole seconds), and the span across the switch matches the two stitched there.
+  const c = await engine(`
+    const pcm = e.__pcm.get(${d.id}), a = pcm.L, sr = pcm.sampleRate;
+    const dec = async (rep) => {
+      const bufs = await Promise.all(${JSON.stringify(Object.fromEntries(['opus-lo', 'opus-hi'].map((rep) => [rep, opusUrls(rep)])))}[rep].map((u) => fetch(u).then((r) => r.arrayBuffer())));
+      const cat = new Uint8Array(bufs.reduce((n, b) => n + b.byteLength, 0)); let k = 0;
+      for (const b of bufs) { cat.set(new Uint8Array(b), k); k += b.byteLength; }
+      return (await e.ctx.decodeAudioData(cat.buffer)).getChannelData(0);
+    };
+    const lo = await dec('opus-lo'), hi = await dec('opus-hi'), cut = Math.round(12 * sr);
+    const both = new Float32Array(hi.length); both.set(lo.subarray(0, cut)); both.set(hi.subarray(cut), cut);
+    const corr = (ref, i0, n, lag) => { let ab = 0, aa = 0, bb = 0; for (let i = 0; i < n; i++) { const x = a[i0 + i], y = ref[i0 + i + lag]; ab += x * y; aa += x * x; bb += y * y; } return ab / Math.sqrt(aa * bb); };
+    const best = (ref, from, to) => {
+      const i0 = Math.round(from * sr), n = Math.round((to - from) * sr), W = Math.round(0.04 * sr);
+      let lag = 0, top = -2;
+      for (let l = -W; l <= W; l += 2) { const x = corr(ref, i0, n, l); if (x > top) { top = x; lag = l; } }
+      for (let l = lag - 2; l <= lag + 2; l++) { const x = corr(ref, i0, n, l); if (x > top) { top = x; lag = l; } }
+      return { lagMs: (lag / sr) * 1000, corr: top, atZero: corr(ref, i0, n, 0) };
+    };
+    e.__pcm.delete(${d.id});
+    return { before: best(lo, 10.5, 11.95), after: best(hi, 12.05, 13.5), across: best(both, 11.5, 12.5) };
+  `);
+  t.diagnostic(`runs: ${segs.map((s) => `${s.t0}:${repOf.get(s.sha).rep}`).join(' ')}; at the switch: ${JSON.stringify(c)}`);
+  for (const [k, x] of Object.entries(c)) {
+    assert.equal(x.lagMs, 0, `${k} the switch: lined up ${x.lagMs.toFixed(3)} ms off (${JSON.stringify(c)})`);
+    assert.ok(x.atZero > 0.99, `${k} the switch: ${JSON.stringify(c)}`);
+  }
   await assertReleased(d, site);
 });
 
@@ -583,10 +629,14 @@ test('ejected mid-drive: within 1 s the page has its player back, the capture is
   await site.tab.close();
 });
 
-test('ejected while the beat is being found: the analysis Worker is terminated and no deck is left', async () => {
-  await engine(`if (!window.__W) { const W = window.__W = globalThis.Worker; window.__workers = { made: 0, ended: 0 };
-    globalThis.Worker = class extends W { constructor(...a) { super(...a); window.__workers.made++; } terminate() { window.__workers.ended++; return super.terminate(); } }; }
-    window.__workers = { made: 0, ended: 0 };
+test('ejected while the beat is being found: the analysis Worker is terminated before it finishes, and no deck is left', async () => {
+  // Every Worker counted: made, terminated, and each result it sent back (one that finished its analysis sends one).
+  await engine(`if (!window.__W) { const W = window.__W = globalThis.Worker;
+    globalThis.Worker = class extends W {
+      constructor(...a) { super(...a); window.__workers.made++; this.addEventListener('message', () => { window.__workers.results++; }); }
+      terminate() { window.__workers.ended++; return super.terminate(); }
+    }; }
+    window.__workers = { made: 0, ended: 0, results: 0 };
     const f = e.analyse.bind(e); e.__analyse = f;
     e.analyse = (pcm, signal) => { const p = f(pcm, signal); const id = [...e.loads.keys()][0]; e.eject(id); return p; };
     return true;`);
@@ -598,6 +648,9 @@ test('ejected while the beat is being found: the analysis Worker is terminated a
     await waitFor(async () => !(await decks()).some((x) => x.id === r.deckId), 30000);
     await waitFor(() => engine('return window.__workers.made > 0 && window.__workers.made === window.__workers.ended;'), 3000)
       .catch(async () => assert.fail(JSON.stringify(await engine('return window.__workers;'))));
+    // analyseTrack terminates its Worker once it has answered too: only one stopped by the eject never answers.
+    await sleep(1000);
+    assert.equal(await engine('return window.__workers.results;'), 0, 'the Worker finished its analysis: the eject did not stop it');
     assert.deepEqual(await engine('return [...e.__pcm.keys()];'), [], 'nothing was promoted');
     await site.tab.close();
   } finally { await engine('e.analyse = e.__analyse; delete e.__analyse; return true;'); }
