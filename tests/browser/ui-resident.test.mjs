@@ -117,34 +117,57 @@ test('a loading deck is inert but for eject and cancel: the rest is dimmed and a
   // Its A/THRU/B and REC give their place to what the load is doing.
   for (const sel of ['[data-seg="xf"] button[data-v="A"]', '[data-act="rec"]']) assert.equal(await d3.locator(sel).isVisible(), false, sel);
 
-  await ui.clearSent();
+  // Each press is checked right after it, before the next one could undo what it did (a later click closes a tempo
+  // entry the last one opened): nothing sent for the deck, no tempo entry, no toast, and the deck looks the same.
+  const look = () => d3.evaluate((el) => [el.textContent, ...[...el.querySelectorAll('[aria-pressed], [aria-valuenow], [data-bpm], [data-native]')]
+    .map((x) => `${x.getAttribute('aria-pressed')}|${x.getAttribute('aria-valuenow')}|${x.hidden}`)].join('\n'));
+  const before = await look();
+  const press = async (what, fn) => {
+    await ui.clearSent();
+    await fn();
+    await wait(40); // a slider's value goes out on the next frame
+    assert.deepEqual((await ui.sent()).filter((m) => (m.t === 'act' || m.t === 'set') && m.deck === 3), [], `${what}: sent to the engine`);
+    assert.equal(await page.locator('input.tempo-edit').count(), 0, `${what}: a tempo entry opened`);
+    assert.deepEqual(await toasts(), [], `${what}: toast`);
+    assert.ok((await look()) === before, `${what}: the deck changed`);
+  };
   for (const sel of ['[data-act="playToggle"]', '[data-act="sync"]', '[data-act="master"]', '[data-act="syncPlay"]', '[data-act="live"]', '[data-act="half"]',
-    '[data-act="tap"]', '[data-act="gridFwd"]', '[data-act="keyLock"]', '[data-act="syncMode"]', '[data-act="jumpFwd"]', '[data-act="range"]',
+    '[data-act="tap"]', '[data-act="gridFwd"]', '[data-act="keyLock"]', '[data-act="syncMode"]', '[data-act="jumpFwd"]', '[data-act="jumpSize"]', '[data-act="range"]',
     '[data-seg="fx.type"] button[data-v="GATE"]', '[data-kill="low"]', '[data-pad="fx.on"]', '[data-roll="0.5"]',
     '[data-hold="cue"]', '[data-hold="nudge+"]', '[data-bpm]', '[data-native]', '[data-act="clipReset"]']) {
-    await d3.locator(sel).click({ force: true }); // past Playwright's own aria-disabled check: the page must ignore it
+    await press(sel, () => d3.locator(sel).click({ force: true })); // past Playwright's own aria-disabled check: the page must ignore it
   }
   for (const ctl of ['[data-ctl="eq.hi"] svg', '[data-ctl="pitch"]', '[data-ctl="fader"]']) {
     const b = await d3.locator(ctl).boundingBox();
-    await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2);
-    await page.mouse.down();
-    await page.mouse.move(b.x + b.width / 2 + 30, b.y + b.height / 2 - 30, { steps: 4 });
-    await page.mouse.up();
-    await page.mouse.wheel(0, -120);
+    await press(`drag ${ctl}`, async () => {
+      await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2);
+      await page.mouse.down();
+      await page.mouse.move(b.x + b.width / 2 + 30, b.y + b.height / 2 - 30, { steps: 4 });
+      await page.mouse.up();
+    });
+    await press(`wheel ${ctl}`, () => page.mouse.wheel(0, -120));
   }
-  await page.keyboard.press('Digit3');
-  for (const k of ['Space', 'KeyS', 'Shift+KeyS', 'KeyQ', 'KeyF', 'KeyT', 'Shift+KeyT', 'KeyK', 'ArrowUp', 'Comma', 'Period', 'KeyV', 'KeyC', 'ArrowRight', 'KeyR']) await page.keyboard.press(k);
-  const ov = await row(3).locator('[data-overview]').boundingBox();
-  await page.mouse.click(ov.x + ov.width / 2, ov.y + ov.height / 2);
-  const wv = await row(3).locator('[data-wave]').boundingBox();
-  await page.mouse.move(wv.x + wv.width / 2, wv.y + wv.height / 2);
-  await page.mouse.down();
-  await page.mouse.move(wv.x + wv.width / 2 - 100, wv.y + wv.height / 2, { steps: 4 });
-  await page.mouse.up();
-  await wait(100);
-  assert.deepEqual((await ui.sent()).filter((m) => (m.t === 'act' || m.t === 'set') && m.deck === 3), []);
-  assert.equal(await page.locator('input.tempo-edit').count(), 0, 'no tempo entry opened');
-  assert.deepEqual(await toasts(), []);
+  const blur = () => page.evaluate(() => document.activeElement && document.activeElement.blur());
+  await blur();
+  for (const k of ['Digit3', 'Space', 'KeyS', 'Shift+KeyS', 'KeyQ', 'KeyF', 'KeyT', 'Shift+KeyT', 'KeyK', 'ArrowUp', 'Comma', 'Period', 'KeyV', 'KeyC', 'ArrowRight', 'KeyR']) {
+    await press(k, () => page.keyboard.press(k));
+  }
+  // A focused control's own keys.
+  for (const [sel, k] of [['[data-bpm]', 'Enter'], ['[data-ctl="eq.hi"]', 'ArrowUp'], ['[data-kill="low"]', 'Enter']]) {
+    await press(`${k} on ${sel}`, async () => { await d3.locator(sel).focus(); await page.keyboard.press(k); });
+  }
+  await blur();
+  await press('click the overview', async () => {
+    const ov = await row(3).locator('[data-overview]').boundingBox();
+    await page.mouse.click(ov.x + ov.width / 2, ov.y + ov.height / 2);
+  });
+  await press('drag the waveform', async () => {
+    const wv = await row(3).locator('[data-wave]').boundingBox();
+    await page.mouse.move(wv.x + wv.width / 2, wv.y + wv.height / 2);
+    await page.mouse.down();
+    await page.mouse.move(wv.x + wv.width / 2 - 100, wv.y + wv.height / 2, { steps: 4 });
+    await page.mouse.up();
+  });
 });
 
 test('the cancel ✕ sends loadCancel at once; a held eject still ejects a loading deck', async () => {
