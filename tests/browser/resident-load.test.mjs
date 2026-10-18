@@ -181,10 +181,11 @@ test('a link that is not audio, or not there, is refused with a reason and leave
   await waitFor(async () => (await decks()).length === n);
 });
 
-test('a deck shows that it is loading, refuses to play meanwhile, and loadCancel stops the fetch and ejects it', async () => {
-  const pending = act(deck, null, 'loadUrl', { url: `${origin}/slow.wav` });
+test('a deck shows that it is loading, with its load\'s token, refuses to play meanwhile, and loadCancel stops the fetch and ejects it', async () => {
+  const pending = act(deck, null, 'loadUrl', { url: `${origin}/slow.wav`, token: 'tok-slow-1' });
   const d = await deckWhere((x) => x.kind === 'loading');
   assert.equal(d.title, 'slow');
+  assert.equal(d.load.token, 'tok-slow-1', 'the deck page knows the deck by its load\'s token');
   assert.equal(d.load.state, 'loading');
   assert.match(d.load.strategy, /fetching/);
   assert.match((await act(deck, d.id, 'play')).error, /still loading/);

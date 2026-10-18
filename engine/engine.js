@@ -390,7 +390,7 @@ class Engine {
    * A deck that shows as loading while its track is on the way: its chain is built, nothing plays. It
    * holds a tab's capture (streamId), if given, for a fall-back to live.
    */
-  async startLoadingDeck({ tabId = null, streamId = null, meta = {} } = {}) {
+  async startLoadingDeck({ tabId = null, streamId = null, meta = {}, token = null } = {}) {
     const no = await this.readyForDeck(tabId);
     if (no) return { ok: false, error: no };
     let stream = null;
@@ -398,6 +398,7 @@ class Engine {
       try { stream = await this.tabStream(streamId); } catch (err) { return { ok: false, error: `Chrome would not share that tab's audio: ${err.message}` }; }
     }
     const deck = this.newDeck({ tabId, stream, meta, kind: 'loading' });
+    if (token) deck.setLoad({ token }); // in its first snapshot: the deck page knows its load's deck by it
     try {
       await deck.build();
     } catch (err) {
@@ -488,25 +489,25 @@ class Engine {
   }
 
   /** A local file, as the deck page's blob: URL for it. */
-  loadFile({ name, blobUrl }) {
+  loadFile({ name, blobUrl, token }) {
     const title = trackTitle(name) || 'track';
-    return this.loadDirect(blobUrl, { title }, { strategy: 'reading the file', failed: `Could not read “${title}”` });
+    return this.loadDirect(blobUrl, { title }, { strategy: 'reading the file', failed: `Could not read “${title}”`, token });
   }
 
   /** A link to an audio file, fetched here. */
-  loadUrl({ url }) {
+  loadUrl({ url, token }) {
     const u = new URL(url);
     let name = u.pathname;
     try { name = decodeURIComponent(name); } catch (_) {}
-    return this.loadDirect(url, { title: trackTitle(name) || u.hostname, url }, { strategy: 'fetching the link', failed: 'Could not fetch that link' });
+    return this.loadDirect(url, { title: trackTitle(name) || u.hostname, url }, { strategy: 'fetching the link', failed: 'Could not fetch that link', token });
   }
 
   /**
    * Fetch and decode a whole track onto a new deck, which shows as loading meanwhile. Settles when the
    * deck is resident ({ok:true}), or with the reason it is not (the deck is gone again).
    */
-  async loadDirect(src, meta, { strategy, failed }) {
-    const r = await this.serial(() => this.startLoadingDeck({ meta }));
+  async loadDirect(src, meta, { strategy, failed, token }) {
+    const r = await this.serial(() => this.startLoadingDeck({ meta, token }));
     if (!r.ok) return r;
     const deck = this.decks.get(r.deckId), ac = new AbortController(), load = { abort: () => ac.abort() };
     this.loads.set(deck.id, load);

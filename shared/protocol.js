@@ -124,6 +124,8 @@ export function validateValue(spec, value) {
 
 const isDeckRef = (d) => d === null || Number.isInteger(d);
 const isHttpUrl = (u) => { try { return /^https?:$/.test(new URL(u).protocol); } catch (_) { return false; } };
+const isToken = (t) => t == null || (typeof t === 'string' && t.length > 0 && t.length <= 64);
+const BAD_TOKEN = 'token must be a string of 1 to 64 characters';
 
 function validateActArg(a, arg) {
   const fail = (error) => ({ ok: false, error });
@@ -167,14 +169,17 @@ function validateActArg(a, arg) {
     case 'setBpm': case 'setNativeBpm':
       if (typeof arg.bpm !== 'number' || !(arg.bpm >= TYPED_BPM[0] && arg.bpm <= TYPED_BPM[1])) return fail(`${a}.bpm must be a number from ${TYPED_BPM[0]} to ${TYPED_BPM[1]}`);
       return { ok: true, arg: { bpm: arg.bpm } };
-    // A local file reaches the engine as a blob: URL the deck page made for it.
+    // A local file reaches the engine as a blob: URL the deck page made for it. token (either load, optional): the
+    // deck page's mark for this load, shown in its deck's snapshot (load.token), so the page knows which deck is its.
     case 'loadFile':
       if (typeof arg.name !== 'string' || !arg.name || arg.name.length > 300) return fail('loadFile.name must be a file name');
       if (typeof arg.blobUrl !== 'string' || !arg.blobUrl.startsWith('blob:') || arg.blobUrl.length > 2048) return fail('loadFile.blobUrl must be a blob: URL');
-      return { ok: true, arg: { name: arg.name, blobUrl: arg.blobUrl } };
+      if (!isToken(arg.token)) return fail(BAD_TOKEN);
+      return { ok: true, arg: { name: arg.name, blobUrl: arg.blobUrl, ...(arg.token != null ? { token: arg.token } : {}) } };
     case 'loadUrl':
       if (typeof arg.url !== 'string' || arg.url.length > 8192 || !isHttpUrl(arg.url)) return fail('That is not a web link (http or https).');
-      return { ok: true, arg: { url: arg.url } };
+      if (!isToken(arg.token)) return fail(BAD_TOKEN);
+      return { ok: true, arg: { url: arg.url, ...(arg.token != null ? { token: arg.token } : {}) } };
     default:
       return { ok: true, arg: {} };
   }

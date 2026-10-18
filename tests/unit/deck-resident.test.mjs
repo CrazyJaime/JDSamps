@@ -172,6 +172,19 @@ test('TAP gives a resident deck with no analysis its tempo', async () => {
   assert.ok(s.grid, 'no grid after TAP');
 });
 
+test("a file or link load's token stays in the deck's load through every later update and the promotion; a deck without one shows none", () => {
+  const clock = { t: 1 };
+  const engine = makeEngine(clock);
+  const d = new Deck(engine, { id: 4, slot: 4, tabId: null, stream: null, meta: { title: 'x' }, params: { ...PARAMS }, kind: 'loading' });
+  d.setLoad({ token: 'tok-1' });
+  d.setLoad({ progress: 0.5, strategy: 'decoding' });
+  d.setLoad({ state: 'ready', progress: 1, strategy: null, error: null });
+  assert.deepEqual(d.load, { state: 'ready', progress: 1, strategy: null, error: null, report: null, token: 'tok-1' });
+  const plain = new Deck(engine, { id: 5, slot: 5, tabId: null, stream: null, meta: {}, params: { ...PARAMS }, kind: 'loading' });
+  plain.setLoad({ progress: 0.2 });
+  assert.equal('token' in plain.load, false);
+});
+
 test('a loading deck is inert but for eject, takes its track in pieces, then becomes resident', async () => {
   const clock = { t: 1 };
   const engine = makeEngine(clock);

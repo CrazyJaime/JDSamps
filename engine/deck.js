@@ -236,13 +236,14 @@ export class Deck {
     this.cue = 0;
   }
 
-  /** What the snapshot says about a load. Fields not given are kept; progress is 0..1. */
-  setLoad({ state, progress, strategy, error, report } = {}) {
+  /** What the snapshot says about a load. Fields not given are kept; progress is 0..1; token: a file or link load's mark. */
+  setLoad({ state, progress, strategy, error, report, token } = {}) {
     const l = this.load, keep = (v, old) => (v === undefined ? old : v);
     this.load = {
       state: keep(state, l.state), progress: clamp(Number(keep(progress, l.progress)) || 0, 0, 1),
       strategy: keep(strategy, l.strategy), error: keep(error, l.error), report: keep(report, l.report),
     };
+    if (keep(token, l.token) != null) this.load.token = keep(token, l.token);
   }
 
   // ------------------------------------------------------------------ input

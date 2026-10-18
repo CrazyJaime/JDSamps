@@ -20,9 +20,10 @@ export class TrackLoader {
   constructor({ conn, toast }) {
     this.conn = conn;
     this.toast = toast;
-    this.loads = []; // loads waiting for their answer, oldest first: {after, deckId, cancelled, settle}
+    this.loads = []; // loads waiting for their answer, oldest first: {token, after, deckId, cancelled, settle}
     this.decks = []; // the latest snapshot's decks
     this.maxId = 0;  // the newest deck id seen
+    this.tabbed = new Set(); // decks seen with a tab: none of them is a file's or a link's
     this.engineId = undefined;
   }
 
@@ -38,12 +39,15 @@ export class TrackLoader {
 
   loadLink(url) { return this.load('loadUrl', { url }); }
 
-  /** A cancel the DJ asked for (✕, eject, STOP ALL) is not an error: the load onto that deck ends without a word. */
+  /**
+   * A cancel the DJ asked for (✕, eject, STOP ALL) is not an error: the load onto that deck ends without a word. The
+   * load's token goes with it, and its deck shows it (load.token), so the load knows its deck exactly.
+   */
   async load(a, arg) {
-    const l = { after: this.maxId, deckId: null, cancelled: false, settle: null };
+    const l = { token: crypto.randomUUID(), after: this.maxId, deckId: null, cancelled: false, settle: null };
     this.loads.push(l);
     try {
-      const r = await this.conn.act(null, a, arg, { late: () => this.late(l) });
+      const r = await this.conn.act(null, a, { ...arg, token: l.token }, { late: () => this.late(l) });
       if (!r.ok && r.error && !l.cancelled) this.toast(r.error, 'warn');
       return r;
     } finally {
@@ -52,19 +56,23 @@ export class TrackLoader {
   }
 
   /**
-   * Each snapshot: a load's deck is the oldest deck without a tab that is newer than any deck seen when it was
-   * asked for, and than the deck of every earlier load (the engine makes them in that order, with rising ids).
+   * Each snapshot: a load's deck is the one showing its token. A load without a token takes, as before, the oldest
+   * deck without a tab (and never one seen with a tab, or one showing a token) that is newer than any deck seen when
+   * it was asked for, and than every earlier such load's deck.
    */
   update(s) {
-    if (s.engineId !== this.engineId) { this.engineId = s.engineId; this.maxId = 0; } // a new engine numbers its decks from 1
+    if (s.engineId !== this.engineId) { this.engineId = s.engineId; this.maxId = 0; this.tabbed.clear(); } // a new engine numbers its decks from 1
+    for (const d of s.decks) if (d.tabId != null) this.tabbed.add(d.id);
     let floor = 0;
     for (const l of this.loads) {
-      l.after = Math.max(l.after, floor);
+      const byOrder = !l.token;
+      if (byOrder) l.after = Math.max(l.after, floor);
       if (l.deckId == null) {
-        const d = s.decks.filter((x) => x.id > l.after && x.tabId == null).sort((x, y) => x.id - y.id)[0];
+        const d = l.token ? s.decks.find((x) => x.load && x.load.token === l.token)
+          : s.decks.filter((x) => x.id > l.after && x.tabId == null && !this.tabbed.has(x.id) && !(x.load && x.load.token)).sort((x, y) => x.id - y.id)[0];
         if (d) l.deckId = d.id;
       }
-      if (l.deckId != null) floor = Math.max(floor, l.deckId);
+      if (byOrder && l.deckId != null) floor = Math.max(floor, l.deckId);
     }
     for (const d of s.decks) this.maxId = Math.max(this.maxId, d.id);
     this.decks = s.decks;
