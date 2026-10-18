@@ -345,10 +345,16 @@ test('60 s deck recordings: with assist off the reserve drained at rate − 1, t
   assert.ok(Math.abs(slope + x) < 0.1 * x, `reserve slope ${slope} s/s, expected ${-x}`);
 });
 
-test('the mix recording has both decks at 128 BPM with aligned beats', async () => {
+test('the mix recording has both decks at 128 BPM with aligned beats', async (t) => {
+  // What each deck was doing as the recording started and stopped: said with the beats, for a failure to explain.
+  const was = (s) => s.decks.map((d) => `deck ${d.slot}: rate ${d.engineRate.toFixed(4)}, pitch ${d.params.pitch.toFixed(4)}, native ${d.bpm.native?.toFixed(3)}, out ${d.bpm.out?.toFixed(3)}, phase ${d.sync.phaseMs?.toFixed(1)} ms, starved ${d.starved}, reserve ${d.reserve.toFixed(2)} s`).join('; ');
+  const s0 = await state(deck);
   const { wav } = await record('mix', 8);
+  const s1 = await state(deck);
   assert.ok(wav.seconds > 7 && wav.sr > 0);
   const lo = bandOnsets(wav.mono, wav.sr, 'low'), hi = bandOnsets(wav.mono, wav.sr, 'high');
+  const iv = (on) => on.slice(1).map((x, i) => Math.round((x - on[i]) * 1000)).join(' ');
+  t.diagnostic(`beat to beat (ms): low ${iv(lo)}; high ${iv(hi)}. At the start ${was(s0)}. At the end ${was(s1)}.`);
   assert.ok(Math.abs(medianBpm(lo) - 128) < 1, `low ${medianBpm(lo)}`);
   assert.ok(Math.abs(medianBpm(hi) - 128) < 1, `high ${medianBpm(hi)}`);
   const offs = lo.map((t) => Math.min(...hi.map((u) => Math.abs(u - t)))).sort((x, y) => x - y);
