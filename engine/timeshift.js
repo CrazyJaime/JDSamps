@@ -7,6 +7,12 @@
 export const GUARD = 0.5;        // s of reserve below which the deck may not play faster than 1×
 export const LIVE_RESERVE = 0.6; // s of reserve kept by the LIVE jump
 const KEEP = 2;                  // s of past schedule kept for heard-time and TAP lookups
+// asap(): a change is heard exactly at its output time when the node has it one STFT hop before
+// then (a quarter of its latency at the default preset: 30 ms), plus an audio callback and jitter.
+// Measured in Chromium (10.7 ms callbacks, six stretchers running): jumps scheduled 50 ms ahead
+// were heard exactly like those scheduled 150 ms ahead (soon()); at 35 ms some came up to 15 ms
+// late. A late one still lands on the position the model gives (clicks within 2.6 ms), only later.
+const HOP_SLACK = 0.02;
 
 const FIELDS = ['active', 'rate', 'semitones', 'input', 'loopStart', 'loopEnd'];
 const TRANSPORT = ['active', 'input', 'loopStart', 'loopEnd']; // start/pause, jump, loop: intent a rate update must not undo
@@ -40,6 +46,8 @@ export class Timeshift {
   }
 
   soon(now) { return now + this.lat + 0.03; }
+  /** Earliest output time a change lands exactly (see HOP_SLACK): what a hand on the playhead waits for. */
+  asap(now) { return now + this.lat / 4 + HOP_SLACK; }
 
   /** Segment in effect at output time t (the first one before any). Scans from the end: 'now' and later are O(1). */
   segAt(t) {
@@ -67,6 +75,9 @@ export class Timeshift {
 
   /** Output time of the last planned change (pending or queued), or -Infinity. */
   pendingUntil() { return this.segs[this.segs.length - 1].output; }
+
+  /** The planned transport change (start, pause, jump, loop) still ahead of `now`, which change() folds a jump into. */
+  planned(now) { return this.segs.find((s) => s.output > now && s.transport); }
 
   build(T, fields) {
     const base = this.segAt(T);

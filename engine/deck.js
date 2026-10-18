@@ -31,6 +31,17 @@ const DRY_NOTICE_EVERY = 30; // s: at most one 'audio ran dry' notice per deck i
 // unconfirmed rate counts as refused, how long assist stays off after the page refused it, and the
 // keep-alive period (the agent lets go of the page after 3 s without a command).
 const ASSIST_EPS = 1e-4, ASSIST_CONFIRM = 2, ASSIST_REFUSE = 5, ASSIST_OFF = 30, ASSIST_KEEPALIVE = 1;
+// Search (nudge held on a paused deck): slow enough at first to place a cue, then doubling every
+// SEARCH_DOUBLE s up to SEARCH_MAX (input s per s). Fine (Shift) is five times slower.
+const SEARCH_V0 = 0.5, SEARCH_DOUBLE = 0.75, SEARCH_MAX = 16;
+const frac = (x) => x - Math.floor(x);
+
+/** Input seconds a search held for h s has covered. */
+function searchDistance(h, fine) {
+  const k = fine ? 0.2 : 1, v0 = SEARCH_V0 * k, vmax = SEARCH_MAX * k, r = Math.LN2 / SEARCH_DOUBLE;
+  const top = Math.log(vmax / v0) / r; // held this long, it is at full speed
+  return (v0 / r) * (Math.exp(r * Math.min(h, top)) - 1) + vmax * Math.max(0, h - top);
+}
 
 export class Deck {
   constructor(engine, { id, slot, tabId, stream, meta, params }) {
@@ -66,6 +77,8 @@ export class Deck {
     this.roll = null;
     this.rollFrom = null;
     this.loop = null;
+    this.search = null;  // a held search on a paused deck: {dir, fine, from, at}
+    this.navKeep = null; // the latest navigation target {p, T}: kept buffered until it has landed
     this.starved = false;
     this.emergencyUntil = 0;
     this.edgeAt = null; // context time (s) the input worklet made the newest chunk we have heard of
@@ -292,6 +305,7 @@ export class Deck {
     const input = this.ts.clampInput(p);
     this.ts.change(this.now(), T, { active: true, input, rate: this.effRate(input), semitones: this.semis(input) });
     this.wantPlay = true;
+    this.search = null; // a search is a paused deck's: playing, the held nudge is a nudge again
     this.hasPlayed = true;
     this.playingSince = T;
     this.settleUntil = T + 0.5;
@@ -374,11 +388,17 @@ export class Deck {
         else { this.engine.clock.follow(this.id); this.syncOn = false; this.phaseMs = null; }
         return OK;
       case 'nudge':
+        // Paused, the nudge buttons search instead: the playhead moves while held (searchTick).
+        this.search = !this.wantPlay && arg.dir ? { dir: arg.dir, fine: arg.fine, from: this.ts.posAt(this.landAt(now)), at: now } : null;
+        if (this.search) this.cueAuto = false;
         this.nudge = arg.dir;
-        this.nudgeFactor = arg.dir ? 1 + arg.dir * (arg.fine ? 0.01 : 0.04) : 1;
-        this.applyRate();
+        // amt: a jog bend (waveform drag), sized by the drag; else the fixed fine/coarse steps.
+        this.nudgeFactor = arg.dir && !this.search ? 1 + arg.dir * (arg.amt ?? (arg.fine ? 0.01 : 0.04)) : 1;
+        if (this.wantPlay) this.sched(this.landAt(now), {});
         this.settleUntil = now + (arg.dir ? 1e9 : 1);
         return OK;
+      case 'seek': return this.seek(arg.pos, arg.quantize, now);
+      case 'beatJump': return this.beatJump(arg.beats, now);
       case 'tap': {
         if (!this.tempo) return fail('Waiting for audio.');
         const t = this.engine.ctxTimeAtWall(arg.wallMs ?? this.engine.wallNow());
@@ -455,8 +475,7 @@ export class Deck {
 
   rollEnd(now, T) {
     if (!this.rollFrom) return OK;
-    const slip = this.rollFrom.p + this.rollFrom.rate * (T - this.rollFrom.T);
-    this.sched(T, { input: this.ts.clampInput(slip), loopStart: 0, loopEnd: 0 });
+    this.sched(T, { input: this.ts.clampInput(this.slipAt(T)), loopStart: 0, loopEnd: 0 });
     this.roll = null; this.loop = null; this.rollFrom = null;
     this.settleUntil = T + 0.3;
     return OK;
@@ -468,6 +487,119 @@ export class Deck {
     if (this.rollFrom) await this.act('rollEnd');
     if (this.nudge) await this.act('nudge', { dir: 0 });
     if (this.previewing) await this.act('cueUp');
+  }
+
+  // ------------------------------------------------------------------ navigation
+  // Seek, beat jump and search move the deck's own playhead within what it has buffered
+  // (historyStart to liveEdge), so the DJ never has to move the source tab's player. A deck whose
+  // whole track is buffered reaches all of it the same way.
+
+  /**
+   * Output time a navigation change asked for now lands at. A paused deck is silent: at once. A
+   * playing one as soon as the stretcher lands it exactly (Timeshift.asap), or with the change
+   * already on its way if that lands sooner, so a drag's stream of seeks (or a jog's of bends) is
+   * heard every ~50 ms instead of each one pushing the last out until the hand stops. A planned
+   * start or pause keeps its time: change() folds the jump into it.
+   */
+  landAt(now) {
+    const ts = this.ts;
+    let T = now;
+    if (this.wantPlay) { T = ts.asap(now); const pend = ts.pendingUntil(); if (pend > now) T = Math.min(T, pend); }
+    const planned = ts.planned(now);
+    return planned ? Math.max(T, planned.output) : T;
+  }
+
+  /** Input position the deck would be at at output time t: under a roll, where the track carries on (the slip). */
+  slipAt(t) {
+    const r = this.rollFrom;
+    return r ? r.p + r.rate * (t - r.T) : this.ts.posAt(t);
+  }
+
+  /** Where navigation may put the playhead: the buffer less clampInput's margins, and for a playing deck LIVE's reserve. */
+  navRange() {
+    const ts = this.ts, lo = ts.historyStart + 0.01;
+    return { lo, hi: Math.max(lo, ts.liveEdge - ts.lat - (this.wantPlay ? LIVE_RESERVE : 0.3)) };
+  }
+
+  /** Why the playhead cannot go to `target` from `at`: how much is buffered on that side. */
+  notBuffered(target, at, { lo, hi }) {
+    const s = target < at ? Math.max(0, at - lo) : Math.max(0, hi - at);
+    return `Only ${s < 10 ? s.toFixed(1) : Math.round(s)} s buffered ${target < at ? 'behind' : 'ahead of'} the playhead.`;
+  }
+
+  /** Playing in BEAT sync: a follower phase-locked to the master, or the master BEAT followers lock to. */
+  beatLocked() {
+    if (!this.wantPlay || this.previewing) return false;
+    if (this.isMaster()) return [...this.engine.decks.values()].some((d) => d !== this && d.syncOn && d.params.syncMode === 'BEAT');
+    return this.syncOn && this.params.syncMode === 'BEAT';
+  }
+
+  /**
+   * Where a jump to `pos` landing at T goes to keep the beat phase. A follower SYNCed in BEAT lines
+   * up with the master clock there, as a start does (alignForStart). Any other playing deck moves
+   * whole beats from `at`, where it would have been at T: its own phase is kept (and a master's is
+   * the clock its followers keep). A paused deck lands on the nearest beat. No confident grid at
+   * pos: no phase to keep.
+   */
+  phaseLand(pos, T, at) {
+    const g = this.grids.at(pos);
+    if (!g || !this.canBeat(pos)) return pos;
+    if (this.beatLocked() && !this.isMaster()) return this.alignForStart(pos, T);
+    const gc = this.wantPlay ? this.grids.at(at) : null;
+    const ph = gc ? frac((at - gc.t0) / gc.T) : 0;
+    return g.t0 + (Math.round((pos - g.t0) / g.T - ph) + ph) * g.T;
+  }
+
+  /**
+   * Move the playhead to input position `pos`. Inside the buffer it is clamped to navRange();
+   * outside it, refused. Phase is kept (phaseLand) when the deck plays in BEAT sync or `quantize`
+   * asks for it; whole beats at a time, so a landing past the margins steps back a beat.
+   */
+  seek(pos, quantize, now) {
+    const ts = this.ts, range = this.navRange();
+    if (pos < ts.historyStart || pos > ts.liveEdge) return fail(this.notBuffered(pos, this.slipAt(now), range));
+    const T = this.landAt(now);
+    let target = clamp(pos, range.lo, range.hi);
+    if (quantize || this.beatLocked()) {
+      let p = this.phaseLand(target, T, this.slipAt(T));
+      const g = this.grids.at(p);
+      if (g) { while (p > range.hi) p -= g.T; while (p < range.lo) p += g.T; }
+      if (p >= range.lo && p <= range.hi) target = p; // a buffer shorter than a beat: as asked
+    }
+    return this.jumpTo(target, T);
+  }
+
+  /** Move ±beats along the grid at the playhead, keeping phase. Past the buffer: refused, never clamped off the beat. */
+  beatJump(beats, now) {
+    const T = this.landAt(now), at = this.slipAt(T), g = this.grids.at(at);
+    if (!g) return fail(NO_GRID);
+    const range = this.navRange();
+    let target = at + beats * g.T;
+    // Another grid there (the next track, an assist step), or SYNCed: land on the beat that keeps phase.
+    if (this.grids.seg(target) !== this.grids.seg(at) || this.beatLocked()) target = this.phaseLand(target, T, at);
+    if (target < range.lo || target > range.hi) return fail(this.notBuffered(target, this.slipAt(now), range));
+    return this.jumpTo(target, T);
+  }
+
+  /**
+   * Land a navigation jump at T. Under a roll it moves the slip, where the track carries on and the
+   * release lands: the roll is the DJ's held pad, the jump is on the track beneath it, and moving
+   * the slip honours both (ending the roll would cut a pad still held down).
+   */
+  jumpTo(target, T) {
+    this.cueAuto = false; // the DJ has placed the playhead: the automatic cue no longer pulls it back
+    this.navKeep = { p: target, T };
+    if (this.rollFrom) { this.rollFrom = { ...this.rollFrom, p: target, T }; return OK; }
+    this.sched(T, { input: target });
+    if (this.wantPlay) this.settleUntil = Math.max(this.settleUntil, T + 0.3);
+    return OK;
+  }
+
+  /** A held search on a paused deck: the playhead goes where the hold has taken it so far. */
+  searchTick(now) {
+    const s = this.search, { lo, hi } = this.navRange();
+    const p = clamp(s.from + s.dir * searchDistance(now - s.at, s.fine), lo, hi);
+    if (Math.abs(p - this.ts.posAt(this.landAt(now))) > 1e-9) this.sched(now, { input: p });
   }
 
   // ------------------------------------------------------------------ manual grid tools
@@ -603,6 +735,7 @@ export class Deck {
     } else if (!this.wantPlay && this.starved) {
       this.starved = false; // re-evaluated on the next PLAY
     }
+    if (this.search && !this.wantPlay) this.searchTick(now);
 
     if (now >= this.nextAssist) { this.nextAssist = now + 0.25; this.assistTick(now, res); }
     if (now >= this.nextFxClock) {
@@ -714,7 +847,9 @@ export class Deck {
         this.engine.event('warn', `Deck ${this.slot}: buffer almost full. It will skip ahead when full; press LIVE to catch up now.`, this.id);
       }
     }
-    const keepFrom = Math.min(this.cue - 1, p - this.ts.historySec, this.loop ? this.loop.start - 1 : Infinity);
+    // A roll's slip (moved by a seek, it can be far from the loop) and a jump still on its way stay buffered.
+    const nav = Math.min(this.rollFrom ? this.rollFrom.p - 1 : Infinity, this.navKeep && this.navKeep.T > now - 1 ? this.navKeep.p - 1 : Infinity);
+    const keepFrom = Math.min(this.cue - 1, p - this.ts.historySec, this.loop ? this.loop.start - 1 : Infinity, nav);
     // Never drop the audio under (or just behind) a playing deck's playhead.
     const r = await this.ts.trim(now, keepFrom, this.wantPlay ? p - CAP_MARGIN : Infinity);
     if (!r.dropped || this.disposed) return;
