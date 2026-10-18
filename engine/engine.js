@@ -47,6 +47,7 @@ class Engine {
     this.decks = new Map();
     this.loads = new Map(); // deck id → its load in progress ({abort()}): loadCancel and eject stop it
     this.tabStops = new WeakMap(); // deck → its STOP_TAB (sent once)
+    this.leaving = new WeakSet(); // decks an eject has been asked for: it takes them in their turn on serial()
     this.nextId = 1;
     this.clock = new MasterClock();
     this.ui = new Set();
@@ -411,7 +412,7 @@ class Engine {
     let deck = null;
     if (deckId != null) {
       deck = this.decks.get(deckId);
-      if (!deck) return { ok: false, error: 'That deck is gone.' };
+      if (!deck || this.leaving.has(deck)) return { ok: false, error: 'That deck is gone.' };
       if (deck.kind !== 'loading' || deck.ts.liveEdge > 0) return { ok: false, error: `Deck ${deck.slot} is not waiting for a track.` };
     } else {
       const no = await this.readyForDeck(tabId);
@@ -436,7 +437,7 @@ class Engine {
       this.event('warn', `Deck ${deck.slot}: no beat grid from the whole track (${err.message}). TAP the beat.`, deck.id);
     }
     if (deckId == null) this.addDeck(deck);
-    else if (this.decks.get(deck.id) !== deck) return { ok: false, error: 'That deck is gone.' };
+    else if (this.decks.get(deck.id) !== deck || this.leaving.has(deck)) return { ok: false, error: 'That deck is gone.' }; // ejected meanwhile: not loaded
     this.event('info', `Loaded “${deck.meta.title || 'track'}” on deck ${deck.slot}. It is cued: press PLAY when you're ready.`, deck.id);
     return { ok: true, deckId: deck.id, slot: deck.slot };
   }
@@ -464,7 +465,8 @@ class Engine {
   /** A loading deck holding a tab's capture plays it live after all; the reason is said once. */
   async failLoadingToLive(deckId, reason) {
     const d = this.decks.get(deckId);
-    if (!d || d.kind !== 'loading') return { ok: false, error: d ? `Deck ${d.slot} is not loading.` : 'That deck is gone.' };
+    if (!d || this.leaving.has(d)) return { ok: false, error: 'That deck is gone.' };
+    if (d.kind !== 'loading') return { ok: false, error: `Deck ${d.slot} is not loading.` };
     if (!d.stream) return { ok: false, error: `Deck ${d.slot} has no tab audio to play live.` };
     this.abortLoad(deckId);
     try {
@@ -501,7 +503,7 @@ class Engine {
     if (!r.ok) return r;
     const deck = this.decks.get(r.deckId), ac = new AbortController(), load = { abort: () => ac.abort() };
     this.loads.set(deck.id, load);
-    const gone = () => ac.signal.aborted || this.decks.get(deck.id) !== deck;
+    const gone = () => ac.signal.aborted || this.decks.get(deck.id) !== deck || this.leaving.has(deck);
     const refuse = async (error) => {
       const cancelled = gone();
       if (this.loads.get(deck.id) === load) this.loads.delete(deck.id);
@@ -582,7 +584,7 @@ class Engine {
     this.abortLoad(id);
     // Stopping the tab starts now, ahead of the queue, so STOP ALL stops every tab in parallel.
     const d0 = this.decks.get(id);
-    if (d0) this.stopTab(d0);
+    if (d0) { this.leaving.add(d0); this.stopTab(d0); }
     return this.serial(async () => {
       const d = this.decks.get(id);
       if (!d) return;
