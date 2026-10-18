@@ -27,18 +27,33 @@ export function deckXfGain(assign, g) {
   return assign === 'A' ? g.a : assign === 'B' ? g.b : 1;
 }
 
-export function chooseMultiplier(masterBpm, nativeBpm) {
+/**
+ * Hysteresis for the half/double choice, in log2 units: a multiplier already in use is kept
+ * until another is better by this much (~2.8 % of tempo past the boundary on either side), so a
+ * pitch nudge or tracker jitter across the √2 ratio cannot jump a deck an octave.
+ */
+export const MULT_MARGIN = 0.08;
+
+/**
+ * Half/double multiplier so a deck of `nativeBpm` plays nearest `masterBpm`.
+ * `current` is the multiplier already in use: it is kept unless another beats it by `margin`
+ * (pass Infinity to hold it whatever happens).
+ */
+export function chooseMultiplier(masterBpm, nativeBpm, current = null, margin = MULT_MARGIN) {
+  const mults = [1, 0.5, 2];
+  const err = (m) => Math.abs(Math.log2((masterBpm * m) / nativeBpm));
   let best = 1, bestErr = Infinity;
-  for (const m of [1, 0.5, 2]) {
-    const e = Math.abs(Math.log2((masterBpm * m) / nativeBpm));
+  for (const m of mults) {
+    const e = err(m);
     if (e < bestErr - 1e-12) { bestErr = e; best = m; }
   }
-  return best;
+  if (best === current || !mults.includes(current)) return best;
+  return bestErr < err(current) - margin ? best : current;
 }
 
 /** Tempo ratio (1+pitch) that makes a deck of `nativeBpm` play at `masterBpm`·mult. */
-export function syncRatio(masterBpm, nativeBpm, range) {
-  const mult = chooseMultiplier(masterBpm, nativeBpm);
+export function syncRatio(masterBpm, nativeBpm, range, current = null, margin = MULT_MARGIN) {
+  const mult = chooseMultiplier(masterBpm, nativeBpm, current, margin);
   const want = (masterBpm * mult) / nativeBpm;
   const ratio = clamp(want, 1 - range, 1 + range);
   return { ratio, mult, want, outOfRange: Math.abs(ratio - want) > 1e-9 };

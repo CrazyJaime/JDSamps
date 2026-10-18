@@ -13,7 +13,7 @@ import { createIsolator, createTrim } from './eq.js';
 import { createFxRack } from './fx.js';
 import { Recorder } from './recorder.js';
 import { glide } from './params.js';
-import { syncRatio, lastBeatOut, phaseError, planCorrection, engineSemitones, assistStep, pickAutoMaster } from './sync.js';
+import { syncRatio, lastBeatOut, phaseError, planCorrection, engineSemitones, assistStep, pickAutoMaster, MULT_MARGIN } from './sync.js';
 
 const OK = { ok: true };
 const fail = (error) => ({ ok: false, error });
@@ -55,6 +55,8 @@ export class Deck {
     this.playingSince = Infinity;
     this.syncOn = false;
     this.outOfRange = false;
+    this.syncMult = null;    // half/double multiplier in use, latched while the deck plays
+    this.syncMaster = null;  // the deck it was chosen against
     this.phaseMs = null;
     this.beatLostNoted = false; // a BEAT-synced deck lost its grid: said once per SYNC press
     this.settleUntil = 0;
@@ -262,7 +264,10 @@ export class Deck {
 
   /** Shift a start position so the deck's beats land on the master clock's beats at time T. */
   alignForStart(p, T) {
-    if (!this.syncOn || this.params.syncMode !== 'BEAT' || !this.canBeat() || this.isMaster()) return p;
+    if (this.params.syncMode !== 'BEAT' || !this.canBeat()) return p;
+    // The master sets the phase while the clock follows it; on a free clock it kept running
+    // without the master, so the master drops back in on it like any other deck.
+    if (!(this.isMaster() ? this.engine.clock.state().mode === 'free' : this.syncOn)) return p;
     const mb = this.engine.clock.beat(T), g = this.grids.at(p);
     if (!mb || !g) return p;
     const rate = this.effRate(p);
@@ -304,12 +309,21 @@ export class Deck {
         return OK;
       case 'syncPlay': {
         if (this.wantPlay && !this.previewing) return OK;
+        const clock = this.engine.clock;
+        // SYNC▶ is SYNC then PLAY: with no master at all, pick one the way the SYNC button does,
+        // and say why when it cannot, rather than degrading to a silent unsynced PLAY.
+        if (clock.assigned == null && clock.state().mode === 'none') {
+          const r = this.actSync(true, now);
+          if (!r.ok) return r;
+        }
         let start = T;
-        const mb = !this.isMaster() ? this.engine.clock.beat(T) : null;
+        // A free clock keeps the phase the master left behind, so the master itself drops back in on it.
+        const mb = !this.isMaster() || clock.state().mode === 'free' ? clock.beat(T) : null;
         if (mb) { start = mb.lastBeat + mb.period; while (start < T) start += mb.period; }
         const wasSync = this.syncOn;
-        if (mb && this.canBeat()) this.syncOn = true;
-        if (!wasSync && this.syncOn) this.syncTick(now); // tempo first: the start and its alignment use the synced rate
+        // A confident grid is what phase lock needs, so BEAT mode alone demands it — as actSync has it.
+        if (mb && !this.isMaster() && (this.params.syncMode !== 'BEAT' || this.canBeat())) this.syncOn = true;
+        if (!wasSync && this.syncOn) { this.syncMult = null; this.syncTick(now); } // tempo first: the start and its alignment use the synced rate
         // From the cue only when the playhead sits there (fresh, CUE-returned, previewing); else resume in place.
         const p = this.ts.posAt(start);
         const from = this.previewing || Math.abs(p - this.cue) < 0.02 ? this.snapToGrid(this.cue) : mb ? this.snapToGrid(p) : p;
@@ -374,12 +388,14 @@ export class Deck {
 
   actSync(on, now) {
     const want = on == null ? !this.syncOn : on;
-    if (!want) { this.syncOn = false; this.phaseMs = null; return OK; }
+    if (!want) { this.syncOn = false; this.phaseMs = null; this.syncMult = null; return OK; }
     if (this.isMaster()) return fail('This deck is the master. Make another deck master to sync this one.');
     if (!this.tempoInfo().native) return fail('No BPM yet. Wait for the deck to lock, or TAP the tempo.');
     const clock = this.engine.clock;
     let pick = null;
-    if (clock.state().mode === 'none') {
+    // Auto-pick only when there is neither a deck assigned nor a clock already running: a master
+    // the DJ assigned by hand is not stolen just because it has not published a tempo yet.
+    if (clock.assigned == null && clock.state().mode === 'none') {
       const others = [...this.engine.decks.values()].filter((d) => d !== this).map((d) => ({
         id: d.id, playing: d.wantPlay && !!d.tempoInfo().native, canBeat: d.canBeat(), conf: d.tempo ? d.tempo.get().conf : 0, since: d.playingSince,
       }));
@@ -396,6 +412,7 @@ export class Deck {
     this.syncOn = true;
     this.beatLostNoted = false;
     this.settleUntil = 0;
+    this.syncMult = null; // a SYNC press re-chooses the half/double octave
     this.syncTick(now);
     return OK;
   }
@@ -688,7 +705,13 @@ export class Deck {
     const c = this.engine.clock.state();
     const native = this.tempoInfo().native;
     if (!c.bpm || !native) return;
-    const r = syncRatio(c.bpm, native, this.params.range);
+    // The half/double octave is latched for as long as the deck plays: a pitch move on the master
+    // must never double a deck mid-mix. It is re-chosen on a SYNC press, while the deck is silent,
+    // and when the DJ hands mastership to another deck. Silent moves still get hysteresis.
+    const master = this.engine.clock.assigned;
+    if (master != null && master !== this.syncMaster) { this.syncMaster = master; this.syncMult = null; }
+    const r = syncRatio(c.bpm, native, this.params.range, this.syncMult, this.wantPlay ? Infinity : MULT_MARGIN);
+    this.syncMult = r.mult;
     this.outOfRange = r.outOfRange;
     if (Math.abs(r.ratio - (1 + this.params.pitch)) > 2e-5) {
       this.params.pitch = r.ratio - 1;
@@ -730,11 +753,13 @@ export class Deck {
     const p = this.ts.posAt(now), g = this.grids.at(p), rate = this.ts.rateAt(now), out = this.tempoInfo(p).out;
     if (!out) return null;
     const playing = this.wantPlay && !this.previewing && this.ts.playingAt(now);
-    // A starved deck plays slower than its set tempo: publish the tempo of the beat it plays,
-    // so slaves match the same beat their phase lock follows.
-    if (g && rate > 0) return { playing, bpm: this.starved ? (60 * rate) / g.T : out, lastBeat: lastBeatOut(g, p, rate, now), period: g.T / rate };
+    // One clock: the tempo of the beat actually being played — nudge, bend and starve clamp
+    // included — so bpm and period describe the same beat and slaves follow what they hear.
+    if (g && rate > 0) return { playing, bpm: (60 * rate) / g.T, lastBeat: lastBeatOut(g, p, rate, now), period: g.T / rate };
+    // No grid under the playhead means no phase to publish: let the clock keep the last real one
+    // and free-run, the way it does for a master that paused, instead of re-anchoring to this tick.
     const bpm = this.starved && rate > 0 ? (out * rate) / this.desiredRate(p) : out;
-    return { playing, bpm, lastBeat: now, period: 60 / bpm };
+    return { playing: false, bpm, lastBeat: now, period: 60 / bpm };
   }
 
   // ------------------------------------------------------------------ agent (player assist)
