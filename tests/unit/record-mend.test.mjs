@@ -76,6 +76,14 @@ test('one kick out of place is a kick out of place, not a skip: nothing is cut',
   assert.equal(r.steps.length, 0, JSON.stringify(r.steps));
 });
 
+test('the first beat and the last are left alone: the capture settles as the player starts, and the track ends', () => {
+  const clean = kicks();
+  for (const at of [Math.round(0.3 * SR), Math.round((32 * T + 0.3) * SR)]) { // between beats 0 and 1, and the last two
+    const r = mendSteps(both(clean, (x) => ins(x, at, 2400)), T);
+    assert.equal(r.steps.length, 0, `${at / SR} s: ${JSON.stringify(r.steps)}`);
+  }
+});
+
 test('a track with no steady beat is left alone', () => {
   const n = 10 * SR, L = new Float32Array(n);
   for (let i = 0; i < n; i++) L[i] = 0.3 * Math.sin(2 * Math.PI * 220 * (i / SR)) * (0.5 + 0.5 * Math.sin(i / SR));

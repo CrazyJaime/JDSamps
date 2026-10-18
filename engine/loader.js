@@ -840,9 +840,10 @@ export function mendSteps(pcm, T) {
   if (on.length < 8) return { pcm, steps: [] };
   const gaps = on.slice(1).map((x, i) => x - on[i]), beats = gaps.map((g) => Math.max(1, Math.round(g / (T * sr))));
   const per = gaps.map((g, i) => g / beats[i]).sort((a, b) => a - b), P = per[per.length >> 1]; // the period, by the median
-  const d = gaps.map((g, i) => g - beats[i] * P), steady = (i) => i < 0 || i >= d.length || Math.abs(d[i]) <= SKIP_STEADY * sr;
+  const d = gaps.map((g, i) => g - beats[i] * P), steady = (i) => Math.abs(d[i]) <= SKIP_STEADY * sr;
   const steps = [];
-  for (let i = 0; i < d.length; i++) {
+  // Not the first interval or the last: the capture settles as the player starts, and the track ends.
+  for (let i = 1; i < d.length - 1; i++) {
     if (Math.abs(d[i]) < SKIP_MIN * sr || Math.abs(d[i]) > 0.45 * P || !steady(i - 1) || !steady(i + 1)) continue;
     steps.push({ a: on[i] + hop, b: on[i + 1] - hop, D: Math.round(d[i]) });
   }
@@ -881,7 +882,7 @@ export function mendSteps(pcm, T) {
     if (len > 0) src = at + len; else { dst -= len; src = at; } // a cut skips audio; a loss gets silence
   }
   oL.set(L.subarray(src), dst); oR.set(R.subarray(src), dst);
-  return { pcm: { L: oL, R: oR, sampleRate: sr }, steps: edits.map(([, , { b, D }]) => ({ at: b / sr, ms: (D / sr) * 1000 })) };
+  return { pcm: { L: oL, R: oR, sampleRate: sr }, steps: edits.map(([, len, { b }]) => ({ at: b / sr, ms: (len / sr) * 1000 })) };
 }
 
 export class Recording extends Job {
