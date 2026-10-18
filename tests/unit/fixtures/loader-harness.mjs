@@ -179,7 +179,7 @@ export function makeEngine({ tabs = [], limitMin = 15, hubOk = true } = {}) {
       }
       return Promise.resolve({ ok: true });
     },
-    stopTab(d) { e.hubLog.push({ type: 'STOP_TAB', tabId: d.tabId }); e.order.push('STOP_TAB'); return turn(); },
+    stopTab(d, o = {}) { e.hubLog.push({ type: 'STOP_TAB', tabId: d.tabId, ...o }); e.order.push('STOP_TAB'); return turn(); },
     tabDecks() { return [...e.decks.values()].filter((d) => d.tabId != null).map((d) => ({ tabId: d.tabId, slot: d.slot })); },
     async analyse(pcm, signal) {
       e.calls.push({ fn: 'analyse', frames: pcm.L.length });

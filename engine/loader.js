@@ -688,13 +688,14 @@ export class Loader extends Job {
   }
 
   /**
-   * The tab stops mattering: its player paused and given back its rate (STOP_TAB), the held capture stopped,
-   * the agents' tap off and the agents let go, the tab forgotten (closing it no longer ejects the deck).
+   * The tab stops mattering: its player paused and given back its rate (STOP_TAB, as a release: never left
+   * muted), the held capture stopped, the agents' tap off and the agents let go, the tab forgotten (closing it no
+   * longer ejects the deck).
    */
   async release() {
     const d = this.deck, e = this.engine;
     if (e.decks.get(d.id) !== d) return;
-    await e.stopTab(d);
+    await e.stopTab(d, { release: true });
     if (e.decks.get(d.id) !== d) return; // ejected meanwhile: the eject lets go of all of it
     if (d.stream) { for (const t of d.stream.getTracks()) t.stop(); d.stream = null; }
     for (const a of d.agents.values()) { try { a.port.postMessage({ t: 'tap', on: false, forget: true }); a.port.disconnect(); } catch (_) {} }

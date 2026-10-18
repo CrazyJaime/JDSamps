@@ -136,6 +136,10 @@ async function assertReleased(d, site) {
   await waitFor(() => site.tab.evaluate(() => window.__media().paused), 3000).catch(() => {});
   const m = await site.tab.evaluate(() => window.__media());
   assert.deepEqual([m.paused, m.rate, m.pp], [true, 1, true], 'the page has its player back, paused at its own rate');
+  // No mute of ours is left on the tab, whatever its player was doing when it was released.
+  const muted = await h.sw.evaluate((id) => chrome.tabs.get(id).then((t) => t.mutedInfo), site.tabId);
+  assert.equal(muted.muted, false, `the tab was left muted: ${JSON.stringify(muted)}`);
+  if (d.seen != null) assert.deepEqual((await events(deck)).slice(d.seen).filter((e) => /so it was muted/.test(e.text)), []);
   assert.equal(await h.sw.evaluate(() => chrome.action.getBadgeText({})), '', 'the badge dropped the tab');
   assert.equal((await act(deck, d.id, 'play')).ok, true);
   await sleep(800);
@@ -240,6 +244,22 @@ test('a page that fights playbackRate ends resident from the link it requested, 
   assert.deepEqual(await site.tab.evaluate(() => window.__page.resets), [], 'the page never had its rate changed');
   assert.match(d.load.report, /refetch \(fetching the track\): ok/);
   assert.doesNotMatch(d.load.report, /^ +drive/m);
+  await assertReleased(d, site);
+});
+
+test('a page the DJ pauses while it loads still ends resident, and its tab is released paused, never muted', async () => {
+  const site = await openSite('progressive');
+  await playing(site.tab);
+  const d = await loadTab(site.tabId, {
+    during: async (r) => {
+      await waitFor(() => engine(`const l = e.loads.get(${r.deckId}); return !!l && l.loader.tapping;`), 15000);
+      await site.tab.click('body', { position: { x: 2, y: 2 } }); // a pause the user makes gets past the deck's pause guard
+      await site.tab.evaluate(() => document.querySelector('audio').pause());
+    },
+  });
+  assert.equal(d.kind, 'resident', JSON.stringify(d.load));
+  const c = await compare(d.id, [`${server.origin}/m/media/track.mp3`]);
+  assert.ok(Math.abs(d.duration - c.refSeconds) < 0.015 && c.maxd < 1e-6, JSON.stringify(c));
   await assertReleased(d, site);
 });
 

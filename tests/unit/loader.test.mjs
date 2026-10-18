@@ -201,6 +201,7 @@ test('a resident load releases the tab: STOP_TAB, the capture stopped, the agent
   const stop = engine.order.indexOf('STOP_TAB'), changed = engine.order.lastIndexOf('DECKS_CHANGED');
   assert.ok(stop >= 0 && changed > stop, engine.order.join());
   assert.equal(engine.hubLog[stop].tabId, 7, 'STOP_TAB for the source tab');
+  assert.equal(engine.hubLog[stop].release, true, 'a release: the tab is paused, never left muted');
   assert.deepEqual(engine.hubLog[changed].decks, [], 'the hub forgets the tab');
   assert.equal(deck.tracks[0].stopped, true, 'the held capture is stopped');
   assert.equal(deck.stream, null);

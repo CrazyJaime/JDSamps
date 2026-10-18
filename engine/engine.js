@@ -564,12 +564,13 @@ class Engine {
   }
 
   /** Before a deck's capture goes, stop its tab playing (the hub pauses the page's players, or
-   *  mutes the tab), so the ejected track does not come out of the speakers. Bounded. */
-  stopTab(d) {
+   *  mutes the tab), so the ejected track does not come out of the speakers. Bounded. release: the
+   *  deck went resident and lets go of its tab, which is paused but never left muted. */
+  stopTab(d, { release = false } = {}) {
     if (d.tabId == null) return Promise.resolve(); // a deck with no tab has none to stop
     let p = this.tabStops.get(d);
     if (!p) {
-      p = withTimeout(this.hub({ type: HUB.STOP_TAB, tabId: d.tabId }), STOP_TAB_MS, 'STOP_TAB timed out').then((r) => {
+      p = withTimeout(this.hub({ type: HUB.STOP_TAB, tabId: d.tabId, ...(release ? { release } : {}) }), STOP_TAB_MS, 'STOP_TAB timed out').then((r) => {
         if (r && r.ok && r.muted) this.event('info', `Deck ${d.slot}: the tab has no pausable player, so it was muted.`);
       }, () => {});
       this.tabStops.set(d, p);
