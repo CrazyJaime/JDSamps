@@ -161,6 +161,63 @@ export function validateUiMessage(m) {
  */
 export const START_WHY = Object.freeze(['none', 'timeout', 'ambiguous', 'refused', 'playing', 'started']);
 
+/**
+ * Why a frame's page tap cannot give the engine the track: protected media, MSE inside a worker
+ * (out of the tap's reach), a preview only, a stream with no end, nothing to capture (or too
+ * much), or a page-context fetch that failed.
+ */
+export const TAP_ERRORS = Object.freeze(['drm', 'worker', 'preview', 'live', 'none', 'fetch']);
+const TAP_KINDS = ['init', 'media', 'file'];
+const isCount = (n, max = Number.MAX_SAFE_INTEGER) => Number.isSafeInteger(n) && n >= 0 && n <= max;
+const tapDuration = (d) => (typeof d === 'number' && Number.isFinite(d) && d > 0 ? d : null);
+const isMime = (s) => typeof s === 'string' && s.length <= 256;
+// A page-minted blob: URL (the tap's bytes never travel on the port, only these).
+const BLOB_URL = /^blob:(https?:\/\/[^\s/?#]+|null)\/[0-9a-f-]{36}$/i;
+const HTTP_URL = /^https?:\/\/[^\s]+$/i;
+
+/** The tap messages: bounded lists of plain numbers and strings, or null. */
+function validateTapMessage(m) {
+  if (m.t === 'tap-progress') {
+    const { bytes, buffered, mimes } = m;
+    if (typeof bytes !== 'number' || !Number.isFinite(bytes) || bytes < 0) return null;
+    if (!Array.isArray(buffered) || buffered.length > 64) return null;
+    if (!buffered.every((r) => Array.isArray(r) && r.length === 2 && r.every(Number.isFinite) && r[0] >= 0 && r[0] <= r[1])) return null;
+    if (!Array.isArray(mimes) || mimes.length > 16 || !mimes.every(isMime)) return null;
+    return { t: m.t, bytes, buffered: buffered.map(([a, b]) => [a, b]), duration: tapDuration(m.duration), mimes: [...mimes] };
+  }
+  if (m.t === 'tap-urls') {
+    if (!Array.isArray(m.reqs) || !m.reqs.length || m.reqs.length > 64) return null;
+    const reqs = [];
+    for (const r of m.reqs) {
+      if (!r || typeof r.url !== 'string' || r.url.length > 8192 || !HTTP_URL.test(r.url)) return null;
+      if (typeof r.method !== 'string' || !/^[A-Z]{1,16}$/.test(r.method) || typeof r.media !== 'boolean') return null;
+      if (r.range !== null && (typeof r.range !== 'string' || r.range.length > 128)) return null;
+      if (r.size !== null && !isCount(r.size)) return null;
+      const q = { url: r.url, method: r.method, range: r.range, size: r.size, media: r.media };
+      // Not seen by the tap's own hooks (the page's resource history, a media element's source):
+      // the method and Range header are not known.
+      if (r.past === true) q.past = true;
+      reqs.push(q);
+    }
+    return { t: m.t, reqs };
+  }
+  if (m.t === 'tap-ready') {
+    if (!Array.isArray(m.parts) || !m.parts.length || m.parts.length > 256) return null;
+    const parts = [];
+    for (const p of m.parts) {
+      if (!p || typeof p.blobUrl !== 'string' || !BLOB_URL.test(p.blobUrl) || !isMime(p.mime) || !TAP_KINDS.includes(p.kind)) return null;
+      if (!Number.isInteger(p.sb) || p.sb < -1 || p.sb >= 1000 || !isCount(p.seq)) return null;
+      parts.push({ blobUrl: p.blobUrl, mime: p.mime, kind: p.kind, sb: p.sb, seq: p.seq });
+    }
+    return { t: m.t, parts, duration: tapDuration(m.duration) };
+  }
+  if (m.t === 'tap-error') {
+    if (!TAP_ERRORS.includes(m.reason)) return null;
+    return { t: m.t, reason: m.reason, detail: typeof m.detail === 'string' ? m.detail.slice(0, 300) : '' };
+  }
+  return null;
+}
+
 /** Agent (content script) messages are untrusted page-adjacent data. */
 export function validateAgentMessage(m) {
   if (!m || typeof m !== 'object') return null;
@@ -198,6 +255,7 @@ export function validateAgentMessage(m) {
     if (!START_WHY.includes(m.why)) return null;
     return { t: 'started', count: m.count, why: m.why };
   }
+  if (typeof m.t === 'string' && m.t.startsWith('tap-')) return validateTapMessage(m);
   return null;
 }
 

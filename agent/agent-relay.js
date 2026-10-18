@@ -1,7 +1,8 @@
 // agent/agent-relay.js — JD Samps relay (ISOLATED world, every frame). Connects this frame to the
 // offscreen engine (port 'jds-agent') only after the extension asks ({jds:'connect'}) and only if
 // the frame has media. Relays engine commands down to agent-main.js and status up, on a random
-// per-page channel it offers agent-main.js at document_start (see agent-main.js). On eject, the
+// per-page channel it offers agent-main.js at document_start (see agent-main.js). The page tap's
+// statuses go up the same way; its bytes never do, only blob: URLs. On eject, the
 // service worker calls __jdsStop() here (scripting.executeScript, this isolated world only) to
 // have agent-main.js pause the frame's players before the capture goes.
 (() => {
@@ -20,11 +21,16 @@
   function onHello(e) { if (e.detail == null) offer(); }
   window.addEventListener(HELLO, onHello);
   offer();
-  let port = null, wanted = false, last = null, rated = false, isolated = false, answering = false, timer = 0;
+  let port = null, wanted = false, last = null, rated = false, isolated = false, tapping = false, answering = false, timer = 0;
   // Upward traffic, per message type: the last JSON forwarded, the latest one waiting, and when
   // that type last went up.
   const sent = {}, pending = {}, at = {};
   const toMain = (m) => window.dispatchEvent(new CustomEvent(`c${chan}`, { detail: JSON.stringify(m) }));
+  // Engine commands for agent-main.js. The page tap's (tap, drive, fetch, readTralbum) leave
+  // blob: URLs and possibly a driven player behind: undone when the engine goes away.
+  const COMMANDS = ['rate', 'release', 'query', 'isolate', 'tap', 'drive', 'fetch', 'readTralbum'], TAP_COMMANDS = COMMANDS.slice(4);
+  // The tap's parts, requests and errors each say something new: never coalesced or dropped.
+  const TAP_EVERY = ['tap-ready', 'tap-urls', 'tap-error'], TAP_MAX = 1 << 18;
 
   function retire() {
     window.removeEventListener(HELLO, onHello);
@@ -32,6 +38,7 @@
     clearTimeout(timer);
     // A replaced relay must not leave the page's pauses guarded with nobody left to lift it.
     if (isolated) { isolated = false; try { toMain({ t: 'isolate', on: false }); } catch (_) {} }
+    if (tapping) { tapping = false; try { toMain({ t: 'tap', on: false, forget: true }); } catch (_) {} }
     if (port) { try { port.disconnect(); } catch (_) {} port = null; }
   }
 
@@ -49,17 +56,20 @@
     if (port) return;
     try { port = rt.connect({ name: 'jds-agent' }); } catch (_) { port = null; return; }
     port.onMessage.addListener((m) => {
-      if (!m || typeof m !== 'object' || (m.t !== 'rate' && m.t !== 'release' && m.t !== 'query' && m.t !== 'isolate')) return;
+      if (!m || typeof m !== 'object' || !COMMANDS.includes(m.t)) return;
       if (m.t === 'isolate') isolated = m.on === true;
+      else if (TAP_COMMANDS.includes(m.t)) tapping = true;
       else if (m.t !== 'query') rated = m.t === 'rate';
       command(m);
     });
     port.onDisconnect.addListener(() => {
       void rt.lastError; port = null; wanted = false;
       for (const k of Object.keys(sent)) delete sent[k];
-      // The engine is gone (crash, update, eject): give the page its player back now, rate and pauses.
+      // The engine is gone (crash, update, eject): give the page its player back now, rate and
+      // pauses, and let the tap's blob URLs go (nobody is left to read them).
       if (rated) { rated = false; toMain({ t: 'release' }); }
       if (isolated) { isolated = false; toMain({ t: 'isolate', on: false }); }
+      if (tapping) { tapping = false; toMain({ t: 'tap', on: false, forget: true }); }
     });
     if (last) post('status', last);
   }
@@ -87,9 +97,15 @@
   }
 
   function onStatus(e) {
-    if (typeof e.detail !== 'string' || e.detail.length > 1000) return;
+    if (typeof e.detail !== 'string' || e.detail.length > TAP_MAX) return;
     let m;
     try { m = JSON.parse(e.detail); } catch (_) { return; }
+    const tapMsg = !!m && typeof m.t === 'string' && m.t.startsWith('tap-');
+    if (!tapMsg && e.detail.length > 1000) return;
+    if (tapMsg && TAP_EVERY.includes(m.t)) {
+      if (port) { try { port.postMessage(m); } catch (_) {} }
+      return;
+    }
     if (m && m.t === 'stopped') {
       if (Number.isInteger(m.count) && m.count >= 0 && m.count < 1000) { for (const f of stops) f(m.count); stops.clear(); }
       return;
@@ -98,7 +114,7 @@
       if (Number.isInteger(m.count) && m.count >= 0 && m.count < 1000 && WHY.includes(m.why)) { for (const f of starts) f(m); starts.clear(); }
       return;
     }
-    if (!m || typeof m !== 'object' || (m.t !== 'status' && m.t !== 'external-rate' && m.t !== 'external-pause')) return;
+    if (!m || typeof m !== 'object' || (m.t !== 'status' && m.t !== 'external-rate' && m.t !== 'external-pause' && m.t !== 'tap-progress')) return;
     if (m.t === 'status') last = e.detail;
     if (wanted && m.hasMedia) connect();
     if (answering) { delete pending[m.t]; post(m.t, e.detail); } else pending[m.t] = e.detail;
