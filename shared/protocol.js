@@ -75,7 +75,13 @@ export const DECK_ACTIONS = Object.freeze([
   'tap1', 'live', 'rollStart', 'rollEnd', 'recStart', 'recStop', 'eject', 'clipReset', 'playToggle',
   'setBpm', 'setNativeBpm',
   'loadCancel', 'recordWhole',
+  'seek', 'beatJump',
 ]);
+/** Beat-jump sizes the deck page offers (any whole number of beats up to MAX_JUMP_BEATS is accepted). */
+export const JUMP_BEATS = Object.freeze([1, 4, 8, 16, 32]);
+export const MAX_JUMP_BEATS = 128;
+/** Largest jog bend (a nudge with an amount): ±10 % of the tempo. */
+export const MAX_BEND = 0.1;
 export const MASTER_ACTIONS = Object.freeze(['mixRecStart', 'mixRecStop', 'clipReset', 'stopAll', 'loadFile', 'loadUrl']);
 
 /** Tempos the DJ may type (setBpm: the tempo to play at; setNativeBpm: the track's own tempo). */
@@ -123,7 +129,17 @@ function validateActArg(a, arg) {
   switch (a) {
     case 'nudge':
       if (![-1, 0, 1].includes(arg.dir)) return fail('nudge.dir must be -1, 0 or 1');
-      return { ok: true, arg: { dir: arg.dir, fine: !!arg.fine } };
+      // amt: a jog bend's size (fraction of the tempo), in place of the fixed fine/coarse steps.
+      if (arg.amt == null) return { ok: true, arg: { dir: arg.dir, fine: !!arg.fine } };
+      if (typeof arg.amt !== 'number' || !(arg.amt > 0 && arg.amt <= MAX_BEND)) return fail(`nudge.amt must be a number in (0, ${MAX_BEND}]`);
+      return { ok: true, arg: { dir: arg.dir, fine: !!arg.fine, amt: arg.amt } };
+    case 'seek':
+      if (typeof arg.pos !== 'number' || !Number.isFinite(arg.pos)) return fail('seek.pos must be a finite number (input seconds)');
+      if (arg.quantize != null && typeof arg.quantize !== 'boolean') return fail('seek.quantize must be boolean');
+      return { ok: true, arg: { pos: arg.pos, quantize: !!arg.quantize } };
+    case 'beatJump':
+      if (!Number.isInteger(arg.beats) || arg.beats === 0 || Math.abs(arg.beats) > MAX_JUMP_BEATS) return fail(`beatJump.beats must be a whole number of beats, 1 to ${MAX_JUMP_BEATS} either way`);
+      return { ok: true, arg: { beats: arg.beats } };
     case 'mult':
       if (![0.5, 2].includes(arg.factor)) return fail('mult.factor must be 0.5 or 2');
       return { ok: true, arg: { factor: arg.factor } };

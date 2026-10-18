@@ -53,6 +53,8 @@ export function bindKeys({ getStrip, selectSlot, conn, master, toggleHelp, close
       case 'KeyF': if (once) latchDown(c, strip, 'fx.on'); break;
       case 'KeyV': case 'KeyB': case 'KeyN': case 'KeyM': if (once) { held.set(c, { roll: true, strip }); strip.rollDown(c, ROLL[c]); } break;
       case 'ArrowLeft': case 'ArrowRight': if (once) { held.set(c, { nudge: true, strip }); strip.nudgeDown(c, c === 'ArrowLeft' ? -1 : 1, e.shiftKey); } break;
+      // Beat jump back / forward; with Shift, a smaller / bigger jump.
+      case 'Comma': case 'Period': if (once) { const dir = c === 'Comma' ? -1 : 1; if (e.shiftKey) strip.jumpSize(dir); else strip.beatJump(dir); } break;
       case 'ArrowUp': strip.nudgePitch(0.001); break;
       case 'ArrowDown': strip.nudgePitch(-0.001); break;
       case 'KeyR': if (once) { held.set(c, { hold: strip.recHold }); strip.recHold.start(); } break;

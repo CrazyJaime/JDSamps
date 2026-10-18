@@ -137,7 +137,8 @@ kbd { font: 0.8rem var(--mono); padding: 0.05rem 0.35rem; border: 1px solid var(
 
 /* ---------- waveform stack ---------- */
 .waves { display: grid; gap: 1px; background: var(--line); border-bottom: 1px solid var(--line); }
-.wave-row { display: grid; grid-template-columns: 4.6rem minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); height: var(--wave-h, 3.4rem); overflow: hidden; background: var(--bg); }
+/* Each row: slot and BPM, the whole-buffer overview (click or drag: move the playhead), the zoomed waveform. */
+.wave-row { --ov-w: clamp(9rem, 17vw, 20rem); position: relative; display: grid; grid-template-columns: 4.6rem var(--ov-w) minmax(0, 1fr); grid-template-rows: minmax(0, 1fr); height: var(--wave-h, 3.4rem); overflow: hidden; background: var(--bg); }
 /* The stack shrinks per row as decks are added (body[data-decks] is set by ui/app.js). */
 body[data-decks="4"] { --wave-h: 2.4rem; }
 body[data-decks="5"] { --wave-h: 1.6rem; }
@@ -151,6 +152,20 @@ body[data-decks="5"] .wave-bpm, body[data-decks="6"] .wave-bpm { font-size: 0.75
 /* Canvases always sit in boxes of definite size: an auto-sized canvas grows every time it is
    redrawn at its client size (feedback loop). */
 .wave { width: 100%; height: 100%; min-width: 0; min-height: 0; display: block; }
+.overview { position: relative; min-width: 0; min-height: 0; border-right: 1px solid var(--line); }
+.ov { width: 100%; height: 100%; display: block; cursor: pointer; touch-action: none; }
+/* Reserve warnings sit over the overview's live end, where the reserve is drawn; clicks go through. */
+.ov-flags { position: absolute; top: 0; right: 0.25rem; bottom: 0; display: flex; align-items: center; gap: 0.25rem; pointer-events: none; }
+.ov-flags .badge { min-height: 0; line-height: 1.15; background: rgb(7 8 11 / 0.85); }
+/* The waveform drag does what the hint says: paused, it moves the playhead; playing, it bends the tempo (jog). */
+.wave { touch-action: none; }
+.wave[data-jog="seek"] { cursor: ew-resize; }
+.wave[data-jog="bend"] { cursor: col-resize; }
+.jog-hint {
+  position: absolute; top: 50%; left: calc(4.6rem + var(--ov-w) + 0.4rem); transform: translateY(-50%); padding: 0 0.3rem; border-radius: 0.25rem;
+  font: 700 0.75rem/1.15 var(--sans); letter-spacing: 0.05em; color: var(--txt); background: rgb(7 8 11 / 0.8); pointer-events: none; visibility: hidden;
+}
+.wave:hover ~ .jog-hint, .wave-row.dragging .jog-hint { visibility: visible; }
 
 /* ---------- board ---------- */
 .board { display: grid; grid-template-columns: 1fr auto; min-height: 0; }
@@ -203,8 +218,13 @@ body[data-decks="5"] .wave-bpm, body[data-decks="6"] .wave-bpm { font-size: 0.75
 .reserve-bar { position: relative; width: 4.5rem; height: 0.45rem; border-radius: 0.3rem; background: var(--raised); overflow: hidden; }
 .reserve-bar span { position: absolute; inset: 0 auto 0 0; width: 0; background: var(--deck); }
 .reserve.low .reserve-bar span { background: var(--warn); }
-/* RESERVE EMPTY stands in for the (empty) reserve meter, so the status stays one line. */
-.deck-status:has([data-starved]:not([hidden])) .reserve { display: none; }
+.reserve.low [data-reserve-text] { color: var(--warn); }
+/* Beat jump: back, size, forward. The overview shows the reserve too, so a narrow deck drops the bar. */
+.jump { display: flex; gap: 0.2rem; }
+.jump-size { min-width: max(32px, 2.2rem); padding: 0 0.3rem; }
+.deck-status .reserve { min-width: 0; }
+.deck-status .reserve-bar { width: auto; flex: 0 1 4.5rem; min-width: 1.5rem; }
+@container deck (max-width: 260px) { .reserve-bar { display: none; } }
 .phase { position: relative; width: 4.5rem; height: 0.9rem; border-radius: 0.3rem; background: var(--raised); }
 .phase::before { content: ""; position: absolute; left: 50%; top: 0; bottom: 0; width: 1px; background: var(--dim); }
 .phase span { position: absolute; top: 0.15rem; width: 0.6rem; height: 0.6rem; margin-left: -0.3rem; border-radius: 50%; background: var(--sync); left: 50%; }
@@ -270,6 +290,11 @@ body[data-decks="5"] .wave-bpm, body[data-decks="6"] .wave-bpm { font-size: 0.75
 @media (max-height: 820px) {
   .compact .seg.beats { grid-template-columns: repeat(8, minmax(0, 1fr)); }
   .compact .seg.beats button { min-width: 0; }
+  /* Room for the beat-jump row: tighter deck spacing and, with five or six decks, slightly thinner waveform rows. */
+  .deck { gap: 0.3rem; }
+  .compact .deck { gap: 0.2rem; }
+  body[data-decks="5"] { --wave-h: 1.4rem; }
+  body[data-decks="6"] { --wave-h: 1.2rem; }
 }
 @container deck (max-width: 330px) {
   .deck-tempo { gap: 0.4rem; }

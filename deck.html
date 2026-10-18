@@ -14,6 +14,8 @@
     <symbol id="i-eject" viewBox="0 0 24 24"><path d="M12 5l7.5 9h-15zM4.5 16.5h15V19h-15z" fill="currentColor"/></symbol>
     <symbol id="i-left" viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     <symbol id="i-right" viewBox="0 0 24 24"><path d="M9 5l7 7-7 7" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-jump-back" viewBox="0 0 24 24"><path d="M12 5l-7 7 7 7M19 5l-7 7 7 7" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/></symbol>
+    <symbol id="i-jump-fwd" viewBox="0 0 24 24"><path d="M12 5l7 7-7 7M5 5l7 7-7 7" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round"/></symbol>
     <symbol id="i-gear" viewBox="0 0 24 24"><path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7zm8.4 4.6l1.9 1.5-2 3.4-2.3-.8a7.6 7.6 0 0 1-1.7 1l-.4 2.4h-3.8l-.4-2.4a7.6 7.6 0 0 1-1.7-1l-2.3.8-2-3.4 1.9-1.5a7.7 7.7 0 0 1 0-2.2L1.7 9.4l2-3.4 2.3.8a7.6 7.6 0 0 1 1.7-1l.4-2.4h3.8l.4 2.4a7.6 7.6 0 0 1 1.7 1l2.3-.8 2 3.4-1.9 1.5a7.7 7.7 0 0 1 0 2.2z" fill="currentColor"/></symbol>
     <symbol id="i-help" viewBox="0 0 24 24"><path d="M9.2 9a2.9 2.9 0 1 1 4.3 2.5c-.9.5-1.5 1.1-1.5 2.1v.6M12 17.6v.4" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></symbol>
     <symbol id="i-list" viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/></symbol>
@@ -101,7 +103,9 @@
           <tr><td><kbd>Shift</kbd>+<kbd>Space</kbd></td><td>Play on next master beat</td><td><kbd>C</kbd></td><td>Cue (hold to preview)</td></tr>
           <tr><td><kbd>S</kbd></td><td>Sync</td><td><kbd>Shift</kbd>+<kbd>S</kbd></td><td>Master</td></tr>
           <tr><td><kbd>K</kbd></td><td>Key lock</td><td><kbd>T</kbd></td><td>Tap tempo</td></tr>
-          <tr><td><kbd>Q</kbd> <kbd>A</kbd> <kbd>Z</kbd></td><td>Kill high / mid / low</td><td><kbd>←</kbd> <kbd>→</kbd></td><td>Nudge (hold)</td></tr>
+          <tr><td><kbd>Q</kbd> <kbd>A</kbd> <kbd>Z</kbd></td><td>Kill high / mid / low</td><td><kbd>←</kbd> <kbd>→</kbd></td><td>Nudge (hold); search when paused</td></tr>
+          <tr><td><kbd>,</kbd> <kbd>.</kbd></td><td>Beat jump back / forward</td><td><kbd>Shift</kbd>+<kbd>,</kbd> <kbd>.</kbd></td><td>Beat jump size smaller / bigger</td></tr>
+          <tr><td>Click the overview</td><td>Move the playhead there</td><td>Drag the waveform</td><td>Paused: move the playhead. Playing: bend the tempo</td></tr>
           <tr><td><kbd>↑</kbd> <kbd>↓</kbd></td><td>Tempo ±0.1%</td><td><kbd>F</kbd></td><td>FX on (hold = momentary)</td></tr>
           <tr><td><kbd>V</kbd> <kbd>B</kbd> <kbd>N</kbd> <kbd>M</kbd></td><td>Roll 1/8, 1/4, 1/2, 1 (hold)</td><td><kbd>[</kbd> <kbd>]</kbd> <kbd>\</kbd></td><td>Crossfader left / right / centre</td></tr>
           <tr><td><kbd>R</kbd></td><td>Record deck (hold to stop)</td><td><kbd>Shift</kbd>+<kbd>R</kbd></td><td>Record mix (hold to stop)</td></tr>
@@ -117,7 +121,12 @@
   <template id="tpl-wave-row">
     <div class="wave-row">
       <div class="wave-gutter"><span class="slot" data-slot></span><span class="mono wave-bpm" data-wbpm>—</span></div>
+      <div class="overview" title="The whole buffer: click or drag to move the playhead there">
+        <canvas class="ov" data-overview role="img"></canvas>
+        <span class="ov-flags"><span class="badge" data-assist hidden>ASSIST</span><span class="badge warn" data-starved hidden>RESERVE EMPTY</span></span>
+      </div>
       <canvas class="wave" data-wave></canvas>
+      <span class="jog-hint" data-jog-hint aria-hidden="true"></span>
     </div>
   </template>
 
@@ -155,13 +164,16 @@
         <div class="phase" data-phase hidden title="Phase offset to the master clock"><span data-phase-dot></span></div>
       </div>
       <div class="deck-status">
+        <div class="jump" role="group" aria-label="Beat jump">
+          <button class="btn sm icon" data-act="jumpBack" title="Beat jump back (,)"><svg class="ic"><use href="#i-jump-back"/></svg></button>
+          <button class="btn sm jump-size mono" data-act="jumpSize" title="Beat jump size: click for bigger, Shift-click for smaller (Shift+, and Shift+.)">4</button>
+          <button class="btn sm icon" data-act="jumpFwd" title="Beat jump forward (.)"><svg class="ic"><use href="#i-jump-fwd"/></svg></button>
+        </div>
         <div class="reserve" title="Buffered audio ahead of the playhead (lets the deck play faster than the source)">
           <span class="label">RESERVE</span>
           <span class="reserve-bar"><span data-reserve-fill></span></span>
           <span class="mono" data-reserve-text>0.0s</span>
         </div>
-        <span class="badge" data-assist hidden>ASSIST</span>
-        <span class="badge warn" data-starved hidden>RESERVE EMPTY</span>
       </div>
       <div class="transport">
         <button class="btn cue big" data-hold="cue">CUE</button>
