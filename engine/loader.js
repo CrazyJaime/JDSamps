@@ -345,7 +345,7 @@ export class Loader extends Job {
       if (got) return got;
     }
     // Links the player asked for while it was driven: one more pass at them.
-    if (order.includes('refetch') && this.mseFrame() && this.wanted(null).urls.length) {
+    if (order.includes('refetch') && this.mseFrame() && this.wanted(this.plan).urls.length) {
       const got = await this.step('refetch', (e) => this.refetch(e));
       if (got) return got;
     }
@@ -656,7 +656,7 @@ export class Loader extends Job {
       e.event('warn', `Deck ${d.slot}: no beat grid from the whole track (${err.message}). TAP the beat.`, d.id);
     }
     this.check();
-    this.rep.steps.push({ name: 'beat', outcome: analysis ? 'ok' : 'none', why: analysis ? `${analysis.bpm.toFixed(2)} BPM` : '', ms: now() - t0 });
+    this.rep.steps.push({ name: 'beat', outcome: analysis ? 'ok' : 'none', why: analysis && analysis.bpm > 0 ? `${analysis.bpm.toFixed(2)} BPM` : 'no steady beat', ms: now() - t0 });
     const res = await e.serial(() => e.startResidentDeck({ deckId: d.id, pcm, analysis }));
     if (!res.ok) { this.check(); throw new Stop('live', LIVE.failed(res.error)); }
     this.done = true; // the tap's messages are not this load's any more

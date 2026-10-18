@@ -259,6 +259,15 @@ test('a load that ends live leaves a report naming the rung that failed first, a
   assert.match(r, /First failure: drive: the player buffered the whole track/);
 });
 
+test('a track with no steady beat still loads, and its report says so', async () => {
+  const link = 'https://site.example/ambient.mp3';
+  const { result, deck } = await load({ kind: 'progressive', src: link, files: { [link]: file('ambient', 120.0065) } }, {
+    before: ({ engine }) => { engine.analyse = async () => ({ bpm: 0, conf: 0, octConf: 0, segments: [], bar1: null, residuals: { median: 0, max: 0 }, wave: null }); },
+  });
+  assert.equal(result.kind, 'resident');
+  assert.match(deck.load.report, /beat: ok in \d+\.\d s — no steady beat/);
+});
+
 test('a refusal leaves a report too, its reason as the first failure', async () => {
   const { deck } = await load({ kind: 'mse', rendition: hi(), errors: ['drm'] });
   assert.match(deck.load.report, /Result: live: this page's audio is protected/);
