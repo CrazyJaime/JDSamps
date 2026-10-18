@@ -31,7 +31,7 @@ const src = path.join(TMP, 'src.wav');
 ff('-f', 'lavfi', '-i', `aevalsrc=exprs='0.3*sin(${phase})+${click}|0.3*cos(${phase})+${click}':s=48000:d=${SEC}`,
   '-c:a', 'pcm_s16le', ...BIT, src);
 
-fs.rmSync(OUT, { recursive: true, force: true });
+for (const f of ['lo', 'hi', 'whole-lo.mp4', 'track.webm', 'track.mp3']) fs.rmSync(path.join(OUT, f), { recursive: true, force: true }); // only our own outputs
 fs.mkdirSync(OUT, { recursive: true });
 for (const [rep, rate] of [['lo', '48k'], ['hi', '128k']]) {
   // an MP4 intermediate keeps sample-exact timestamps (Matroska would round them to 1 ms)
@@ -48,6 +48,6 @@ ff('-i', src, '-t', '10', '-c:a', 'libmp3lame', '-b:a', '32k', ...BIT, '-id3v2_v
 fs.rmSync(TMP, { recursive: true, force: true });
 
 let total = 0;
-const walk = (d) => { for (const f of fs.readdirSync(d)) { const p = path.join(d, f); if (fs.statSync(p).isDirectory()) walk(p); else total += fs.statSync(p).size; } };
-walk(OUT);
+const walk = (p) => { if (fs.statSync(p).isDirectory()) for (const f of fs.readdirSync(p)) walk(path.join(p, f)); else total += fs.statSync(p).size; };
+for (const f of ['lo', 'hi', 'whole-lo.mp4', 'track.webm', 'track.mp3']) walk(path.join(OUT, f));
 console.log(`wrote ${OUT} (${(total / 1024).toFixed(0)} KiB)`);
