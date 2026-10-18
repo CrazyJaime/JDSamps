@@ -227,7 +227,7 @@ test('any deck with a load report offers Copy load report from its ⓘ menu', as
   await info.click();
   assert.equal(await menu.isVisible(), true);
   assert.equal(await info.getAttribute('aria-expanded'), 'true');
-  await menu.getByRole('menuitem', { name: 'Copy load report' }).click();
+  await menu.getByRole('button', { name: 'Copy load report' }).click();
   await wait(50);
   assert.deepEqual(await copied(), [REPORT]);
   assert.equal(await menu.isHidden(), true, 'closes once used');
@@ -246,12 +246,37 @@ test('a live deck whose whole-track load failed offers to record the whole track
   await ui.clearSent();
   const menu = deckEl(1).locator('[data-report-menu]');
   await deckEl(1).locator('[data-report-btn]').click();
-  const rec = menu.getByRole('menuitem', { name: 'Record whole track (2×, reduced highs)' });
+  const rec = menu.getByRole('button', { name: 'Record whole track (2×, reduced highs)' });
   assert.equal(await rec.isVisible(), true);
   await rec.click();
   await wait(50);
   assert.deepEqual((await sent('act', (m) => m.deck === 1)).map((m) => m.a), ['recordWhole']);
   assert.equal(await menu.isHidden(), true);
+});
+
+test('the ⓘ menu is a plain list of buttons, like the rest of the page: used from the keyboard, focus goes back to the ⓘ; Tab out closes it', async () => {
+  await stubClipboard();
+  await show(kinds((s) => { s.decks[0].load.report = REPORT; }));
+  const info = deckEl(1).locator('[data-report-btn]'), menu = deckEl(1).locator('[data-report-menu]');
+  assert.equal(await page.locator('[role="menu"], [role="menuitem"], [aria-haspopup="menu"], [aria-haspopup="true"]').count(), 0, 'no menu roles anywhere');
+  const focused = (loc) => loc.evaluate((el) => document.activeElement === el);
+  for (const [name, tabs] of [['Copy load report', 0], ['Record whole track (2×, reduced highs)', 1]]) {
+    await info.focus();
+    await page.keyboard.press('Enter');
+    assert.equal(await menu.isVisible(), true, name);
+    for (let i = 0; i < tabs; i++) await page.keyboard.press('Tab');
+    assert.equal(await focused(menu.getByRole('button', { name })), true, `${name} focused`);
+    await page.keyboard.press('Enter');
+    await wait(50);
+    assert.equal(await menu.isHidden(), true, `${name}: closed once used`);
+    assert.equal(await focused(info), true, `${name}: focus back on the ⓘ`);
+  }
+  await info.focus();
+  await page.keyboard.press('Enter');
+  await page.keyboard.press('Tab');
+  await page.keyboard.press('Tab');
+  assert.equal(await menu.isHidden(), true, 'Tab past its last button closes it');
+  assert.equal(await info.getAttribute('aria-expanded'), 'false');
 });
 
 test('the ⓘ menu opens inside the window on the leftmost and the rightmost of six decks at 1280×720', async () => {
