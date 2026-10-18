@@ -17,6 +17,7 @@ import { syncRatio, lastBeatOut, phaseError, planCorrection, engineSemitones, as
 
 const OK = { ok: true };
 const fail = (error) => ({ ok: false, error });
+const NO_GRID = 'No beat grid yet. Wait for the deck to lock, or TAP the beat.';
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const withTimeout = (p, ms, msg) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
 const CAP_MARGIN = 4; // s of audio always kept behind a playing deck's playhead (covers small backward jumps)
@@ -358,9 +359,15 @@ export class Deck {
         this.tapAt(this.ts.posAt(t));
         return OK;
       }
-      case 'mult': if (this.tempo) this.multiplyAt(this.heardPos(), arg.factor); return OK;
-      case 'gridShift': if (this.tempo) this.shiftAt(this.heardPos(), arg); return OK;
-      case 'tap1': if (this.tempo) this.bar1At(this.heardPos()); return OK;
+      case 'mult':
+        if (!this.tempo) return fail('Waiting for audio.');
+        return this.multiplyAt(this.heardPos(), arg.factor) ? OK : fail('½× / 2× would take the beat grid outside the BPM range it can hold.');
+      case 'gridShift':
+        if (!this.tempo) return fail('Waiting for audio.');
+        return this.shiftAt(this.heardPos(), arg) ? OK : fail(NO_GRID);
+      case 'tap1':
+        if (!this.tempo) return fail('Waiting for audio.');
+        return this.bar1At(this.heardPos()) ? OK : fail(NO_GRID);
       case 'rollStart': return this.rollStart(arg.beats, now, T);
       case 'rollEnd': return this.rollEnd(now, T);
       case 'recStart':
@@ -440,26 +447,34 @@ export class Deck {
 
   followsTrackAt(p) { const n = this.grids.trackAt(p); return n == null || n === this.tempo.track.n; }
 
+  /** @returns false (so act() can say why) when there is no grid at p to move. */
   shiftAt(p, { beats = 0, ms = 0 }) {
+    if (!this.grids.at(p)) return false;
     if (this.followsTrackAt(p)) this.tempo.shiftGrid({ beats, ms });
     this.grids.editTrack(this.grids.trackAt(p), (g) => ({ ...g, t0: g.t0 + beats * g.T + ms / 1000 }));
     this.followTempo();
+    return true;
   }
 
+  /** @returns false when the tracker, or the manual BPM bounds, refuse the new grid. */
   multiplyAt(p, factor) {
     const g = this.grids.at(p);
-    if (this.followsTrackAt(p)) { if (!this.tempo.multiply(factor)) return; }
-    else if (!g || (60 * factor) / g.T < MANUAL_BPM[0] || (60 * factor) / g.T > MANUAL_BPM[1]) return;
+    if (this.followsTrackAt(p)) { if (!this.tempo.multiply(factor)) return false; }
+    else if (!g || (60 * factor) / g.T < MANUAL_BPM[0] || (60 * factor) / g.T > MANUAL_BPM[1]) return false;
     this.grids.editTrack(this.grids.trackAt(p), (x) => ({ ...x, T: x.T / factor }));
     this.followTempo();
+    return true;
   }
 
+  /** @returns false when there is no grid at p to mark the downbeat on. */
   bar1At(p) {
     const g = this.grids.at(p);
-    const b = g ? g.t0 + Math.round((p - g.t0) / g.T) * g.T : p;
+    if (!g) return false;
+    const b = g.t0 + Math.round((p - g.t0) / g.T) * g.T;
     if (this.followsTrackAt(p)) this.tempo.setBar1(Math.round(b * this.sr), false);
     this.grids.editTrack(this.grids.trackAt(p), (x) => ({ ...x, bar1: b }));
     this.followTempo();
+    return true;
   }
 
   /** TAP at heard input position p: the tapped grid holds there, and is carried across its track at each source rate. */
@@ -495,7 +510,13 @@ export class Deck {
       v = clamp(v, -this.params.range, this.params.range);
       if (this.syncOn) { this.syncOn = false; this.phaseMs = null; this.engine.event('info', `Deck ${this.slot}: sync off (tempo moved by hand).`); }
     }
-    if (k === 'range') this.params.pitch = clamp(this.params.pitch, -v, v);
+    // A narrower range must never move a deck that is on air: refuse it and say so, instead of
+    // clamping the pitch in place (one stray RANGE click would be a silent mid-track tempo jump).
+    if (k === 'range' && Math.abs(this.params.pitch) > v + 1e-9) {
+      const pct = `${this.params.pitch < 0 ? '−' : '+'}${Math.abs(this.params.pitch * 100).toFixed(2)}%`;
+      this.engine.event('warn', `Deck ${this.slot}: tempo is ${pct}, outside ±${Math.round(v * 100)}%. Move the tempo fader inside it first.`, this.id);
+      return;
+    }
     this.params[k] = v;
     this.applyParam(k, v);
   }
