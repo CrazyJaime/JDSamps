@@ -159,6 +159,10 @@ function validateActArg(a, arg) {
     case 'tap':
       if (arg.wallMs != null && (typeof arg.wallMs !== 'number' || !Number.isFinite(arg.wallMs))) return fail('tap.wallMs must be a number');
       return { ok: true, arg: arg.wallMs == null ? {} : { wallMs: arg.wallMs } };
+    case 'tap1': // t: mark bar 1 at this input position (an analysis's suggestion) instead of the playhead
+      if (arg.t == null) return { ok: true, arg: {} };
+      if (typeof arg.t !== 'number' || !Number.isFinite(arg.t) || arg.t < 0) return fail('tap1.t must be a position in seconds');
+      return { ok: true, arg: { t: arg.t } };
     case 'setBpm': case 'setNativeBpm':
       if (typeof arg.bpm !== 'number' || !(arg.bpm >= TYPED_BPM[0] && arg.bpm <= TYPED_BPM[1])) return fail(`${a}.bpm must be a number from ${TYPED_BPM[0]} to ${TYPED_BPM[1]}`);
       return { ok: true, arg: { bpm: arg.bpm } };

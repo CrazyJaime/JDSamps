@@ -59,6 +59,10 @@ test('action arguments are validated and normalised', () => {
   assert.deepEqual(validateUiMessage({ t: 'act', deck: 1, a: 'sync' }).arg, { on: null });
   assert.deepEqual(validateUiMessage({ t: 'act', deck: 1, a: 'tap', arg: { wallMs: 123.5 } }).arg, { wallMs: 123.5 });
   assert.equal(validateUiMessage({ t: 'act', deck: 1, a: 'tap', arg: { wallMs: 'x' } }).ok, false);
+  // tap1 marks bar 1 at the playhead, or at a given input position t (the analysis's suggestion).
+  assert.deepEqual(validateUiMessage({ t: 'act', deck: 1, a: 'tap1' }).arg, {});
+  assert.deepEqual(validateUiMessage({ t: 'act', deck: 1, a: 'tap1', arg: { t: 12.5 } }).arg, { t: 12.5 });
+  for (const t of ['12', -1, NaN, Infinity]) assert.equal(validateUiMessage({ t: 'act', deck: 1, a: 'tap1', arg: { t } }).ok, false, String(t));
   for (const a of DECK_ACTIONS) assert.equal(typeof a, 'string');
   for (const a of MASTER_ACTIONS) assert.equal(typeof a, 'string');
 });

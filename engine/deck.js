@@ -512,7 +512,7 @@ export class Deck {
         return this.shiftAt(this.heardPos(), arg) ? OK : fail(NO_GRID);
       case 'tap1':
         if (!this.tempo) return fail('Waiting for audio.');
-        return this.bar1At(this.heardPos()) ? OK : fail(NO_GRID);
+        return this.bar1At(arg.t ?? this.heardPos()) ? OK : fail(NO_GRID);
       case 'setBpm': return this.setBpm(arg.bpm);
       case 'setNativeBpm':
         if (!this.tempo) return fail('Waiting for audio.');
@@ -1244,6 +1244,7 @@ export class Deck {
     return {
       id: this.id, slot: this.slot, tabId: this.tabId, title: this.meta.title, favIconUrl: this.meta.favIconUrl, url: this.meta.url,
       kind: this.kind, duration: this.duration, load: { ...this.load },
+      analysis: this.analysis ? { bar1: this.analysis.bar1 || null, conf: this.analysis.conf } : null, // whole-track analysis: bar 1 suggestion
       playing: this.wantPlay, previewing: this.previewing, cue: this.cue, playhead: p,
       engineRate: playingNow ? ts.rateAt(now) : 0, liveEdge: ts ? ts.liveEdge : 0, reserve: ts ? ts.reserveAt(now) : 0,
       starved: this.starved, historyStart: ts ? ts.historyStart : 0,
