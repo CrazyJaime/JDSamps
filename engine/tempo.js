@@ -103,7 +103,7 @@ export function pickOctave(base, lo, hi, alt, sub, o = DEFAULTS, held = 0) {
   let top = folded;
   while (top * 2 <= hiS) top *= 2;
   for (let b = top; b >= loS; b /= 2) lv.push(b);
-  if (lv.length < 2) return { bpm: folded, conf: 1 };
+  if (lv.length < 2) return { bpm: lv.length ? lv[0] : folded, conf: 1 }; // one level: nothing to choose
   const bar = (b) => (held && rel(b, held) < 0.04 ? o.octAlt * (1 - o.octHyst) : o.octAlt);
   const clear = (x) => clamp01(0.35 + 2.5 * x);
   let conf = 1;
