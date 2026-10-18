@@ -52,7 +52,7 @@ export function bindKeys({ getStrip, selectSlot, conn, master, toggleHelp, close
       case 'KeyQ': case 'KeyA': case 'KeyZ': if (once) latchDown(c, strip, KILL[c]); break;
       case 'KeyF': if (once) latchDown(c, strip, 'fx.on'); break;
       case 'KeyV': case 'KeyB': case 'KeyN': case 'KeyM': if (once) { held.set(c, { roll: true, strip }); strip.rollDown(c, ROLL[c]); } break;
-      case 'ArrowLeft': case 'ArrowRight': if (once) { held.set(c, { nudge: true, strip }); strip.act('nudge', { dir: c === 'ArrowLeft' ? -1 : 1, fine: e.shiftKey }); } break;
+      case 'ArrowLeft': case 'ArrowRight': if (once) { held.set(c, { nudge: true, strip }); strip.nudgeDown(c, c === 'ArrowLeft' ? -1 : 1, e.shiftKey); } break;
       case 'ArrowUp': strip.nudgePitch(0.001); break;
       case 'ArrowDown': strip.nudgePitch(-0.001); break;
       case 'KeyR': if (once) { held.set(c, { hold: strip.recHold }); strip.recHold.start(); } break;
@@ -68,7 +68,7 @@ export function bindKeys({ getStrip, selectSlot, conn, master, toggleHelp, close
     if (!h) return;
     if (h.cue) { held.delete(c); h.strip.act('cueUp'); }
     else if (h.roll) { held.delete(c); h.strip.rollUp(c); }
-    else if (h.nudge) { held.delete(c); h.strip.act('nudge', { dir: 0 }); }
+    else if (h.nudge) { held.delete(c); h.strip.nudgeUp(c); }
     else if (h.hold) { held.delete(c); h.hold.cancel(true); }
     else latchUp(c);
     e.preventDefault();
@@ -79,7 +79,7 @@ export function bindKeys({ getStrip, selectSlot, conn, master, toggleHelp, close
     for (const [c, h] of held) {
       if (h.cue) h.strip.act('cueUp');
       else if (h.roll) h.strip.rollUp(c);
-      else if (h.nudge) h.strip.act('nudge', { dir: 0 });
+      else if (h.nudge) h.strip.nudgeUp(c);
       else if (h.hold) h.hold.cancel();
       else latchUp(c);
     }

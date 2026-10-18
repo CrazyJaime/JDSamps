@@ -13,10 +13,11 @@ import { createIsolator, createTrim } from './eq.js';
 import { createFxRack } from './fx.js';
 import { Recorder } from './recorder.js';
 import { glide } from './params.js';
-import { syncRatio, lastBeatOut, phaseError, planCorrection, engineSemitones, assistStep, pickAutoMaster } from './sync.js';
+import { syncRatio, lastBeatOut, phaseError, planCorrection, engineSemitones, assistStep, pickAutoMaster, MULT_MARGIN } from './sync.js';
 
 const OK = { ok: true };
 const fail = (error) => ({ ok: false, error });
+const NO_GRID = 'No beat grid yet. Wait for the deck to lock, or TAP the beat.';
 const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 const withTimeout = (p, ms, msg) => Promise.race([p, new Promise((_, rej) => setTimeout(() => rej(new Error(msg)), ms))]);
 const CAP_MARGIN = 4; // s of audio always kept behind a playing deck's playhead (covers small backward jumps)
@@ -55,6 +56,8 @@ export class Deck {
     this.playingSince = Infinity;
     this.syncOn = false;
     this.outOfRange = false;
+    this.syncMult = null;    // half/double multiplier in use, latched while the deck plays
+    this.syncMaster = null;  // the deck it was chosen against
     this.phaseMs = null;
     this.beatLostNoted = false; // a BEAT-synced deck lost its grid: said once per SYNC press
     this.settleUntil = 0;
@@ -77,6 +80,7 @@ export class Deck {
       inLag: Infinity,
     };
     this.agents = new Map();
+    this.pauseFought = false; // a frame's site kept pausing its player: warned once
     this.meter = { peak: 0, rms: 0, clipUntil: 0, clipFrame: Math.round(engine.ctx.currentTime * this.sr) }; // clips before this deck are not its own
     this.error = null;
     this.nextTrim = 0;
@@ -272,7 +276,10 @@ export class Deck {
 
   /** Shift a start position so the deck's beats land on the master clock's beats at time T. */
   alignForStart(p, T) {
-    if (!this.syncOn || this.params.syncMode !== 'BEAT' || !this.canBeat() || this.isMaster()) return p;
+    if (this.params.syncMode !== 'BEAT' || !this.canBeat()) return p;
+    // The master sets the phase while the clock follows it; on a free clock it kept running
+    // without the master, so the master drops back in on it like any other deck.
+    if (!(this.isMaster() ? this.engine.clock.state().mode === 'free' : this.syncOn)) return p;
     const mb = this.engine.clock.beat(T), g = this.grids.at(p);
     if (!mb || !g) return p;
     const rate = this.effRate(p);
@@ -314,12 +321,21 @@ export class Deck {
         return OK;
       case 'syncPlay': {
         if (this.wantPlay && !this.previewing) return OK;
+        const clock = this.engine.clock;
+        // SYNC▶ is SYNC then PLAY: with no master at all, pick one the way the SYNC button does,
+        // and say why when it cannot, rather than degrading to a silent unsynced PLAY.
+        if (clock.assigned == null && clock.state().mode === 'none') {
+          const r = this.actSync(true, now);
+          if (!r.ok) return r;
+        }
         let start = T;
-        const mb = !this.isMaster() ? this.engine.clock.beat(T) : null;
+        // A free clock keeps the phase the master left behind, so the master itself drops back in on it.
+        const mb = !this.isMaster() || clock.state().mode === 'free' ? clock.beat(T) : null;
         if (mb) { start = mb.lastBeat + mb.period; while (start < T) start += mb.period; }
         const wasSync = this.syncOn;
-        if (mb && this.canBeat()) this.syncOn = true;
-        if (!wasSync && this.syncOn) this.syncTick(now); // tempo first: the start and its alignment use the synced rate
+        // A confident grid is what phase lock needs, so BEAT mode alone demands it — as actSync has it.
+        if (mb && !this.isMaster() && (this.params.syncMode !== 'BEAT' || this.canBeat())) this.syncOn = true;
+        if (!wasSync && this.syncOn) { this.syncMult = null; this.syncTick(now); } // tempo first: the start and its alignment use the synced rate
         // From the cue only when the playhead sits there (fresh, CUE-returned, previewing); else resume in place.
         const p = this.ts.posAt(start);
         const from = this.previewing || Math.abs(p - this.cue) < 0.02 ? this.snapToGrid(this.cue) : mb ? this.snapToGrid(p) : p;
@@ -371,9 +387,15 @@ export class Deck {
         this.tapAt(this.ts.posAt(t));
         return OK;
       }
-      case 'mult': if (this.tempo) this.multiplyAt(this.heardPos(), arg.factor); return OK;
-      case 'gridShift': if (this.tempo) this.shiftAt(this.heardPos(), arg); return OK;
-      case 'tap1': if (this.tempo) this.bar1At(this.heardPos()); return OK;
+      case 'mult':
+        if (!this.tempo) return fail('Waiting for audio.');
+        return this.multiplyAt(this.heardPos(), arg.factor) ? OK : fail('½× / 2× would take the beat grid outside the BPM range it can hold.');
+      case 'gridShift':
+        if (!this.tempo) return fail('Waiting for audio.');
+        return this.shiftAt(this.heardPos(), arg) ? OK : fail(NO_GRID);
+      case 'tap1':
+        if (!this.tempo) return fail('Waiting for audio.');
+        return this.bar1At(this.heardPos()) ? OK : fail(NO_GRID);
       case 'rollStart': return this.rollStart(arg.beats, now, T);
       case 'rollEnd': return this.rollEnd(now, T);
       case 'recStart':
@@ -387,12 +409,14 @@ export class Deck {
 
   actSync(on, now) {
     const want = on == null ? !this.syncOn : on;
-    if (!want) { this.syncOn = false; this.phaseMs = null; return OK; }
+    if (!want) { this.syncOn = false; this.phaseMs = null; this.syncMult = null; return OK; }
     if (this.isMaster()) return fail('This deck is the master. Make another deck master to sync this one.');
     if (!this.tempoInfo().native) return fail('No BPM yet. Wait for the deck to lock, or TAP the tempo.');
     const clock = this.engine.clock;
     let pick = null;
-    if (clock.state().mode === 'none') {
+    // Auto-pick only when there is neither a deck assigned nor a clock already running: a master
+    // the DJ assigned by hand is not stolen just because it has not published a tempo yet.
+    if (clock.assigned == null && clock.state().mode === 'none') {
       const others = [...this.engine.decks.values()].filter((d) => d !== this).map((d) => ({
         id: d.id, playing: d.wantPlay && !!d.tempoInfo().native, canBeat: d.canBeat(), conf: d.tempo ? d.tempo.get().conf : 0, since: d.playingSince,
       }));
@@ -409,6 +433,7 @@ export class Deck {
     this.syncOn = true;
     this.beatLostNoted = false;
     this.settleUntil = 0;
+    this.syncMult = null; // a SYNC press re-chooses the half/double octave
     this.syncTick(now);
     return OK;
   }
@@ -453,26 +478,34 @@ export class Deck {
 
   followsTrackAt(p) { const n = this.grids.trackAt(p); return n == null || n === this.tempo.track.n; }
 
+  /** @returns false (so act() can say why) when there is no grid at p to move. */
   shiftAt(p, { beats = 0, ms = 0 }) {
+    if (!this.grids.at(p)) return false;
     if (this.followsTrackAt(p)) this.tempo.shiftGrid({ beats, ms });
     this.grids.editTrack(this.grids.trackAt(p), (g) => ({ ...g, t0: g.t0 + beats * g.T + ms / 1000 }));
     this.followTempo();
+    return true;
   }
 
+  /** @returns false when the tracker, or the manual BPM bounds, refuse the new grid. */
   multiplyAt(p, factor) {
     const g = this.grids.at(p);
-    if (this.followsTrackAt(p)) { if (!this.tempo.multiply(factor)) return; }
-    else if (!g || (60 * factor) / g.T < MANUAL_BPM[0] || (60 * factor) / g.T > MANUAL_BPM[1]) return;
+    if (this.followsTrackAt(p)) { if (!this.tempo.multiply(factor)) return false; }
+    else if (!g || (60 * factor) / g.T < MANUAL_BPM[0] || (60 * factor) / g.T > MANUAL_BPM[1]) return false;
     this.grids.editTrack(this.grids.trackAt(p), (x) => ({ ...x, T: x.T / factor }));
     this.followTempo();
+    return true;
   }
 
+  /** @returns false when there is no grid at p to mark the downbeat on. */
   bar1At(p) {
     const g = this.grids.at(p);
-    const b = g ? g.t0 + Math.round((p - g.t0) / g.T) * g.T : p;
+    if (!g) return false;
+    const b = g.t0 + Math.round((p - g.t0) / g.T) * g.T;
     if (this.followsTrackAt(p)) this.tempo.setBar1(Math.round(b * this.sr), false);
     this.grids.editTrack(this.grids.trackAt(p), (x) => ({ ...x, bar1: b }));
     this.followTempo();
+    return true;
   }
 
   /** TAP at heard input position p: the tapped grid holds there, and is carried across its track at each source rate. */
@@ -508,7 +541,13 @@ export class Deck {
       v = clamp(v, -this.params.range, this.params.range);
       if (this.syncOn) { this.syncOn = false; this.phaseMs = null; this.engine.event('info', `Deck ${this.slot}: sync off (tempo moved by hand).`); }
     }
-    if (k === 'range') this.params.pitch = clamp(this.params.pitch, -v, v);
+    // A narrower range must never move a deck that is on air: refuse it and say so, instead of
+    // clamping the pitch in place (one stray RANGE click would be a silent mid-track tempo jump).
+    if (k === 'range' && Math.abs(this.params.pitch) > v + 1e-9) {
+      const pct = `${this.params.pitch < 0 ? '−' : '+'}${Math.abs(this.params.pitch * 100).toFixed(2)}%`;
+      this.engine.event('warn', `Deck ${this.slot}: tempo is ${pct}, outside ±${Math.round(v * 100)}%. Move the tempo fader inside it first.`, this.id);
+      return;
+    }
     this.params[k] = v;
     this.applyParam(k, v);
   }
@@ -701,7 +740,13 @@ export class Deck {
     const c = this.engine.clock.state();
     const native = this.tempoInfo().native;
     if (!c.bpm || !native) return;
-    const r = syncRatio(c.bpm, native, this.params.range);
+    // The half/double octave is latched for as long as the deck plays: a pitch move on the master
+    // must never double a deck mid-mix. It is re-chosen on a SYNC press, while the deck is silent,
+    // and when the DJ hands mastership to another deck. Silent moves still get hysteresis.
+    const master = this.engine.clock.assigned;
+    if (master != null && master !== this.syncMaster) { this.syncMaster = master; this.syncMult = null; }
+    const r = syncRatio(c.bpm, native, this.params.range, this.syncMult, this.wantPlay ? Infinity : MULT_MARGIN);
+    this.syncMult = r.mult;
     this.outOfRange = r.outOfRange;
     if (Math.abs(r.ratio - (1 + this.params.pitch)) > 2e-5) {
       this.params.pitch = r.ratio - 1;
@@ -743,11 +788,13 @@ export class Deck {
     const p = this.ts.posAt(now), g = this.grids.at(p), rate = this.ts.rateAt(now), out = this.tempoInfo(p).out;
     if (!out) return null;
     const playing = this.wantPlay && !this.previewing && this.ts.playingAt(now);
-    // A starved deck plays slower than its set tempo: publish the tempo of the beat it plays,
-    // so slaves match the same beat their phase lock follows.
-    if (g && rate > 0) return { playing, bpm: this.starved ? (60 * rate) / g.T : out, lastBeat: lastBeatOut(g, p, rate, now), period: g.T / rate };
+    // One clock: the tempo of the beat actually being played — nudge, bend and starve clamp
+    // included — so bpm and period describe the same beat and slaves follow what they hear.
+    if (g && rate > 0) return { playing, bpm: (60 * rate) / g.T, lastBeat: lastBeatOut(g, p, rate, now), period: g.T / rate };
+    // No grid under the playhead means no phase to publish: let the clock keep the last real one
+    // and free-run, the way it does for a master that paused, instead of re-anchoring to this tick.
     const bpm = this.starved && rate > 0 ? (out * rate) / this.desiredRate(p) : out;
-    return { playing, bpm, lastBeat: now, period: 60 / bpm };
+    return { playing: false, bpm, lastBeat: now, period: 60 / bpm };
   }
 
   // ------------------------------------------------------------------ agent (player assist)
@@ -836,9 +883,22 @@ export class Deck {
       if (!m || this.disposed || this.agents.get(frameId) !== a) return;
       if (m.t === 'status') { a.status = m; this.onAgentStatus(a); }
       else if (m.t === 'external-rate' && a === this.assist.agent) this.refuseAssist();
+      else if (m.t === 'external-pause') this.notePauseFight();
     });
     port.onDisconnect.addListener(() => { void chrome.runtime.lastError; if (this.agents.get(frameId) === a) this.agents.delete(frameId); });
-    try { port.postMessage({ t: 'query' }); } catch (_) {}
+    // This deck is capturing the frame's tab: until it lets go, a pause the frame's own site asks
+    // for is dropped, so a site that allows one playing track at a time cannot stop the source.
+    try { port.postMessage({ t: 'query' }); port.postMessage({ t: 'isolate', on: true }); } catch (_) {}
+  }
+
+  /**
+   * A frame's site keeps pausing its player although the tab is on a deck, so its agent stopped
+   * resisting rather than fight it. Said once per deck: nothing more can be done from here.
+   */
+  notePauseFight() {
+    if (this.pauseFought) return;
+    this.pauseFought = true;
+    this.engine.event('warn', `Deck ${this.slot}: the site keeps pausing this tab — it may only allow one track at a time.`, this.id);
   }
 
   /** Assist rate commands go to the heard element's frame only. */
@@ -883,6 +943,7 @@ export class Deck {
     if (this.disposed) return;
     this.disposed = true;
     this.sendAgent({ t: 'release' });
+    this.sendAgent({ t: 'isolate', on: false });
     for (const a of this.agents.values()) { try { a.port.disconnect(); } catch (_) {} }
     this.agents.clear();
     if (this.recorder && this.recorder.state !== 'idle') {
