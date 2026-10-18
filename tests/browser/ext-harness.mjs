@@ -112,6 +112,9 @@ export async function startTrackServer({ seconds = 60 } = {}) {
 // media in tests/fixtures/sites (made by tests/fixtures/make-site-fixtures.mjs; index.json there
 // describes every file). Each page sets window.__model = {name, kind, duration, notes}, logs what
 // its player does in window.__page, offers window.__media(), and plays on a click or ?autoplay=1.
+// The MSE players choose what to fetch from their SourceBuffer's buffered ranges, as real players do
+// (window.__mse holds their MediaSource and SourceBuffer); ?sticky=1 makes one that never fetches a
+// segment twice.
 //   /m/progressive  <audio src> MP3 with byte ranges
 //   /m/mse          MSE, plain GET segments from an HLS playlist, 20 s ahead
 //   /m/opaque       MSE, segments only by POST with a single-use token chain, framed
@@ -152,7 +155,10 @@ async function getBytes(url) {
   if (!r.ok) throw new Error(`${url}: ${r.status}`);
   return r.arrayBuffer();
 }
-function appendTo(sb, data) {
+/** Append once the SourceBuffer is free (something else, a page-world flush, may be using it), at `offset` if given. */
+async function appendTo(sb, data, offset = null) {
+  while (sb.updating) await new Promise((r) => sb.addEventListener('updateend', r, { once: true }));
+  if (offset != null) sb.timestampOffset = offset;
   return new Promise((resolve, reject) => {
     const ok = () => { sb.removeEventListener('error', bad); resolve(); };
     const bad = () => { sb.removeEventListener('updateend', ok); reject(new Error('appendBuffer failed')); };
@@ -164,9 +170,14 @@ function appendTo(sb, data) {
 /**
  * The tiny player: keeps `ahead` s buffered past now(), one segment at a time. Segment n spans
  * times[n % N], one period later per lap when `loop`. A change of rep appends that rep's init first.
+ * The next segment is chosen as hls.js chooses it, from the SourceBuffer's buffered ranges: the one
+ * at the end of the range holding the playhead (holes under HOLE ignored, TOL for a range that ends a
+ * few ms short of its last segment), or the playhead's own when no range holds it. So whatever leaves
+ * the buffer (a remove, an eviction) is fetched again. `sticky`: a player that fetches each segment
+ * once and never again, whatever its buffer holds.
  */
-function pump({ ms, sb, now, times, fetchInit, fetchSeg, repOf = () => '', ahead = 20, loop = false, log, fail }) {
-  const N = times.length, period = times[N - 1][1], have = new Set();
+function pump({ ms, sb, now, times, fetchInit, fetchSeg, repOf = () => '', ahead = 20, loop = false, sticky = false, log, fail }) {
+  const N = times.length, period = times[N - 1][1], have = new Set(), HOLE = 0.1, TOL = 0.25;
   let busy = false, cur = null;
   const startOf = (n) => times[n % N][0] + Math.floor(n / N) * period;
   const index = (t) => {
@@ -174,25 +185,37 @@ function pump({ ms, sb, now, times, fetchInit, fetchSeg, repOf = () => '', ahead
     const lap = Math.floor(t / period), i = times.findIndex(([, t1]) => t - lap * period < t1);
     return lap * N + (i < 0 ? N - 1 : i);
   };
+  const ranges = () => {
+    const b = sb.buffered, out = [];
+    for (let i = 0; i < b.length; i++) {
+      const last = out[out.length - 1];
+      if (last && b.start(i) - last[1] < HOLE) last[1] = Math.max(last[1], b.end(i)); else out.push([b.start(i), b.end(i)]);
+    }
+    return out;
+  };
+  const next = (t) => {
+    if (sticky) { let n = index(t); while (have.has(n)) n++; return n; }
+    const r = ranges().find(([s, e]) => s <= t + HOLE && e > t);
+    return r ? index(r[1] + TOL) : index(t);
+  };
+  const full = () => (sticky ? have.size === N : ranges().some(([s, e]) => s <= HOLE && e >= period - TOL));
   const entry = (kind, data, extra) => ({ kind, ...extra, bytes: data.byteLength, view: ArrayBuffer.isView(data), offset: data.byteOffset || 0 });
   return async function tick() {
     if (busy) return;
     busy = true;
     try {
-      for (;;) {
-        const t = now();
-        let n = index(t);
-        while (have.has(n)) n++;
-        if ((!loop && n >= N) || startOf(n) - t >= ahead) break;
+      for (let last = -1; ;) {
+        const t = now(), n = next(t);
+        if ((!loop && n >= N) || startOf(n) - t >= ahead || n === last) break; // n === last: it did not stay in the buffer
+        last = n;
         have.add(n);
         const rep = repOf(n);
         if (rep !== cur) { const init = await fetchInit(rep); await appendTo(sb, init); log(entry('init', init, { rep })); cur = rep; }
         const data = await fetchSeg(n, rep);
-        if (loop) sb.timestampOffset = Math.floor(n / N) * period;
-        await appendTo(sb, data);
+        await appendTo(sb, data, loop ? Math.floor(n / N) * period : null);
         log(entry('media', data, { n, rep }));
       }
-      if (!loop && have.size === N && ms.readyState === 'open') ms.endOfStream();
+      if (!loop && full() && ms.readyState === 'open') ms.endOfStream();
     } catch (e) { fail(e); } finally { busy = false; }
   };
 }
@@ -202,9 +225,10 @@ async function mseOn(a, mime, duration, { prepare, ...opts }) {
   a.src = URL.createObjectURL(ms);
   await new Promise((r) => ms.addEventListener('sourceopen', r, { once: true }));
   const sb = ms.addSourceBuffer(mime);
+  window.__mse = { ms, sb };
   ms.duration = duration;
   if (prepare) prepare(ms, sb);
-  const tick = pump({ ms, sb, now: () => a.currentTime, log: (x) => P.appends.push(x), fail: (e) => P.errors.push(String(e)), ...opts });
+  const tick = pump({ ms, sb, now: () => a.currentTime, sticky: qs.get('sticky') === '1', log: (x) => P.appends.push(x), fail: (e) => P.errors.push(String(e)), ...opts });
   for (const ev of ['timeupdate', 'seeking']) a.addEventListener(ev, tick);
   setInterval(tick, 250);
   tick();
@@ -381,16 +405,17 @@ function modelSites() {
   const attr = (s) => s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
   const opus = (rep) => ({ list: `/m/media/${rep}.m3u8`, mime: OPUS_MP4 });
   const audio = (src) => `<audio id="a"${src ? ` src="${src}"` : ''}></audio>`;
+  const BUFFERED = 'It decides what to fetch from its SourceBuffer\'s buffered ranges, as hls.js does, so a range removed from its buffer is fetched again; ?sticky=1 makes it a player that fetches each segment once and never again.';
   const pages = {
     progressive: (S) => ({ kind: 'progressive', duration: S, main: elementPage, body: audio('/m/media/track.mp3'),
       notes: 'A plain <audio src> MP3 served with byte ranges, like a direct file link: the URL can simply be fetched again.' }),
     mse: (S) => ({ kind: 'mse', duration: S, main: msePage, lib: true, cfg: opus('opus-hi'), body: audio(),
-      notes: 'An MSE player that reads an HLS playlist and GETs each 4 s fMP4 segment, keeping 20 s buffered ahead, like Mixcloud or SoundCloud: every segment URL can be fetched again.' }),
+      notes: `An MSE player that reads an HLS playlist and GETs each 4 s fMP4 segment, keeping 20 s buffered ahead, like Mixcloud or SoundCloud: every segment URL can be fetched again. ${BUFFERED}` }),
     opaque: (S) => ({ kind: 'mse-opaque', duration: S, main: opaquePage, lib: true, body: audio(),
       cfg: { token: mint(), times: index().reps['opus-hi'].segs.map((s) => [s.t0, s.t1]), mime: OPUS_MP4 },
-      notes: 'An MSE player whose segments come only from POST /m/seg, framed, each request spending a single-use token the last response handed over, like YouTube SABR: nothing can be fetched again, so driving the player is the only way to the audio.' }),
+      notes: `An MSE player whose segments come only from POST /m/seg, framed, each request spending a single-use token the last response handed over, like YouTube SABR: nothing can be fetched again, so driving the player is the only way to the audio. ${BUFFERED}` }),
     abr: (S) => ({ kind: 'mse-abr', duration: S, main: abrPage, lib: true, cfg: { master: '/m/media/opus.m3u8', mime: OPUS_MP4, switchAt: 12 }, body: audio(),
-      notes: 'An MSE player that starts on the 12 kbps rendition and switches to 24 kbps at 12 s by appending the other init segment, like a DASH or HLS quality switch.' }),
+      notes: `An MSE player that starts on the 12 kbps rendition and switches to 24 kbps at 12 s by appending the other init segment, like a DASH or HLS quality switch. ${BUFFERED}` }),
     ratefight: (S) => ({ kind: 'progressive', duration: S, main: ratefightPage, body: audio('/m/media/track.webm'),
       notes: 'An <audio src> WebM whose page puts playbackRate back to 1 on every ratechange and on every seek.' }),
     worker: (S) => ({ kind: 'mse-worker', duration: S, main: workerPage, cfg: { script: '/m/worker.js' }, body: audio(),

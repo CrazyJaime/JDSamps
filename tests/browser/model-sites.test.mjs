@@ -196,6 +196,52 @@ test('/m/abr: lo segments to 12 s, then the hi init segment and hi segments; pla
   await done(o);
 });
 
+/**
+ * With the player paused and idle (its 20 s ahead buffered), remove everything its SourceBuffer holds and go back
+ * to 0, as a page-world flush does. -> how many appends the page had logged before the remove.
+ */
+async function removeAll(page) {
+  await page.evaluate(() => document.querySelector('audio').pause());
+  await waitFor(() => page.evaluate(() => {
+    const { sb } = window.__mse, a = document.querySelector('audio'), b = sb.buffered;
+    return !sb.updating && b.length > 0 && b.end(b.length - 1) >= a.currentTime + 16;
+  }));
+  await new Promise((r) => setTimeout(r, 300)); // no fetch left in flight
+  return page.evaluate(() => new Promise((res) => {
+    const { ms, sb } = window.__mse, n = window.__page.appends.length;
+    sb.addEventListener('updateend', () => { document.querySelector('audio').currentTime = 0; res(n); }, { once: true });
+    sb.remove(0, ms.duration);
+  }));
+}
+const sbBuffered = (page) => page.evaluate(() => { const b = window.__mse.sb.buffered, out = []; for (let i = 0; i < b.length; i++) out.push([b.start(i), b.end(i)]); return out; });
+
+test('/m/mse, /m/opaque, /m/abr decide what to fetch from the SourceBuffer, as hls.js does: a range removed from it is fetched again', async () => {
+  await Promise.all(['mse', 'opaque', 'abr'].map(async (name) => {
+    const o = await open(name);
+    await clickToPlay(o.page);
+    const before = await removeAll(o.page);
+    assert.deepEqual(await sbBuffered(o.page), [], `${name}: emptied`);
+    await waitFor(async () => { const b = await sbBuffered(o.page); return b.length === 1 && b[0][0] <= 0.01 && b[0][1] >= 20; }, 10000)
+      .catch(async () => assert.fail(`${name}: buffered ${JSON.stringify(await sbBuffered(o.page))}`));
+    const again = (await pageState(o.page)).appends.slice(before);
+    assert.deepEqual(again.filter((a) => a.kind === 'media').slice(0, 5).map((a) => a.n), [0, 1, 2, 3, 4], `${name}: ${JSON.stringify(again)}`);
+    if (name === 'abr') assert.deepEqual(again.slice(0, 2).map((a) => `${a.rep}:${a.kind}`), ['lo:init', 'lo:media'], 'back to the start of the low rendition');
+    await done(o);
+  }));
+});
+
+test('?sticky=1 keeps a player that fetches each segment once: what is removed from its buffer is never fetched again', async () => {
+  await Promise.all(['mse', 'opaque', 'abr'].map(async (name) => {
+    const o = await open(name, { query: 'sticky=1' });
+    await clickToPlay(o.page);
+    const before = await removeAll(o.page);
+    await new Promise((r) => setTimeout(r, 2000));
+    assert.deepEqual(await sbBuffered(o.page), [], `${name}: nothing fetched again`);
+    assert.deepEqual((await pageState(o.page)).appends.slice(before), [], name);
+    await done(o);
+  }));
+});
+
 test('/m/ratefight: resets playbackRate within 50 ms, and on seeking', async () => {
   const o = await open('ratefight');
   await assertModel(o.page, 'ratefight');
