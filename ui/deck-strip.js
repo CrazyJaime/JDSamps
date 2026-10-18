@@ -69,7 +69,7 @@ export class DeckStrip {
       rec: this.q('[data-act="rec"]'), recLabel: this.q('[data-act="rec"] span'), recTime: this.q('[data-rec-time]'),
       wslot: $('[data-slot]', this.waveRow), wbpm: $('[data-wbpm]', this.waveRow), wave: $('[data-wave]', this.waveRow),
       kind: this.q('[data-kind]'), kindWord: this.q('[data-kind-word]'), kindPct: this.q('[data-kind-pct]'), loadLine: this.q('[data-load-line]'), cancel: this.q('[data-act="loadCancel"]'),
-      report: this.q('[data-report]'), reportBtn: this.q('[data-report-btn]'), reportMenu: this.q('[data-report-menu]'),
+      report: this.q('[data-report]'), reportBtn: this.q('[data-report-btn]'), reportMenu: this.q('[data-report-menu]'), recWhole: this.q('[data-record-whole]'),
       copyNow: this.q('.deck-status [data-copy-report]'), jump: this.q('.jump'), time: this.q('[data-time]'),
       live: this.q('[data-act="live"]'), bar1: this.q('[data-act="bar1"]'),
     };
@@ -161,6 +161,8 @@ export class DeckStrip {
     // The whole-track analysis's bar 1, offered while the grid has none: TAP 1 there.
     on('[data-act="bar1"]', () => { const b = this.d.analysis && this.d.analysis.bar1; if (b) this.act('tap1', { t: b.t }); });
     for (const el of $$('[data-copy-report]', this.el)) el.addEventListener('click', () => { this.closeReportMenu(); this.copyReport(); });
+    // A live deck whose bytes could not be had: record the track from the tab at 2× instead (spec §4.4), only when asked.
+    this.refs.recWhole.addEventListener('click', () => { this.closeReportMenu(); this.act('recordWhole'); });
     this.bindReportMenu();
     on('[data-act="half"]', () => this.act('mult', { factor: 0.5 }));
     on('[data-act="double"]', () => this.act('mult', { factor: 2 }));
@@ -581,6 +583,7 @@ export class DeckStrip {
     setAttr(r.loadLine, 'title', line);
     setHidden(r.cancel, kind !== 'loading');
     setHidden(r.report, !load.report || failed); // a failed deck shows the copy button itself
+    setHidden(r.recWhole, kind !== 'live');
     if (r.report.hidden) this.closeReportMenu();
     setHidden(r.copyNow, !failed);
     setHidden(r.jump, failed);

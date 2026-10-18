@@ -146,9 +146,10 @@ its tab live says **LIVE**.
   **✕** work meanwhile. A load that fails says why. **Copy load report** (on the failed deck, or
   in the **ⓘ** menu of a deck that has a report) copies a short plain-text report: send it in so
   the site can be fixed.
-- When a page's audio cannot be read at all, Settings → **Record whole track at 2× when bytes are
-  unavailable** (off by default) records the tab at double speed instead, losing the highest
-  frequencies.
+- When a page's audio cannot be read at all, the deck plays live. **Record whole track (2×,
+  reduced highs)** in its **ⓘ** menu records the tab at double speed instead, losing the highest
+  frequencies; Settings → **Record whole track at 2× when bytes are unavailable** (off by
+  default) does that without asking.
 
 ### Memory
 

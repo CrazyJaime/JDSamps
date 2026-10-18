@@ -211,6 +211,20 @@ test('any deck with a load report offers Copy load report from its ⓘ menu', as
   await info.click();
   await deckEl(1).locator('[data-title]').click();
   assert.equal(await menu.isHidden(), true, 'a click elsewhere closes it');
+  assert.equal(await menu.locator('[data-record-whole]').isHidden(), true, 'a whole-track deck has nothing to record');
+});
+
+test('a live deck whose whole-track load failed offers to record the whole track at 2× from its ⓘ menu', async () => {
+  await show(kinds((s) => { s.decks[0].load.report = REPORT; }));
+  await ui.clearSent();
+  const menu = deckEl(1).locator('[data-report-menu]');
+  await deckEl(1).locator('[data-report-btn]').click();
+  const rec = menu.getByRole('menuitem', { name: 'Record whole track (2×, reduced highs)' });
+  assert.equal(await rec.isVisible(), true);
+  await rec.click();
+  await wait(50);
+  assert.deepEqual((await sent('act', (m) => m.deck === 1)).map((m) => m.a), ['recordWhole']);
+  assert.equal(await menu.isHidden(), true);
 });
 
 // ---------------------------------------------------------------- bar 1, navigation
