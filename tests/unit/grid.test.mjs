@@ -222,6 +222,16 @@ test('TAP on a cued, paused deck is refused out loud and cannot poison the taps 
   assert.ok(near(d.tempo.get().inBpm, 124, 1), `tapped BPM ${d.tempo.get().inBpm.toFixed(2)} should be ~124`);
 });
 
+test('a deck cued at the start of its buffer can beat-match', async () => {
+  // The tracker needs a few seconds of onsets before it locks, but the grid it then finds covers
+  // the audio before it — as the grid map's own first segment does, from -Infinity.
+  const { d, clock } = realDeck();
+  await feed(d, clock, synth({ ...PATTERNS.house, bars: 16, tail: 0 }).x);
+  assert.equal(d.ts.playingAt(clock.t), false, 'the deck is still cued');
+  assert.ok(d.ts.posAt(clock.t) < 1, `cued at ${d.ts.posAt(clock.t)} s`);
+  assert.equal(d.canBeat(), true, 'the cue point is in audio the deck has a grid for');
+});
+
 test('canBeat asks about the grid under the playhead, not the tracker at the live edge', async () => {
   // 50 s of solid 124 BPM house, then the tab moves on to an ambient pad. The deck plays 30 s
   // behind the live edge, so the DJ is still hearing the house track.

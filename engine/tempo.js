@@ -555,6 +555,10 @@ export class DeckTempo {
   vouchFor() {
     const t = this.tracker.lastT, v = this.vouch;
     const ok = !!this.tapped || (this.tracker.state === 'locked' && this.tracker.conf >= 0.5);
+    // Nothing is recorded before the first grid: the tracker needs seconds of onsets to find one,
+    // and the grid it then finds covers the audio before it, as the grid map's own first
+    // segment does. Only losing a grid it once had says anything about the audio.
+    if (!v.length && !ok) return;
     if (!v.length || v[v.length - 1].ok !== ok) v.push({ t, ok });
     while (v.length > 1 && v[1].t <= t - this.tracker.o.vouchSec * this.sr) v.shift();
   }
