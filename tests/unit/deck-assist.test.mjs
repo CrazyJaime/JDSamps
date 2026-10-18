@@ -404,3 +404,24 @@ test('malformed or hostile agent messages change nothing in the engine (Review F
   const st = env.d.state(env.clock.t);
   assert.ok(st.assist.active && st.assist.sourceRate > 1 && Number.isFinite(st.engineRate) && Number.isFinite(st.reserve), JSON.stringify(st.assist));
 });
+
+test('a deck guards the pauses of every frame it captures, and reports a site that keeps pausing once', async () => {
+  const env = await setup();
+  const a = agent(env, 0), b = agent(env, 1, { audible: false });
+  // Every frame's agent is told the tab is on a deck, right after the first query.
+  for (const port of [a, b]) {
+    assert.deepEqual(port.sent.slice(0, 2), [{ at: 1, t: 'query' }, { at: 1, t: 'isolate', on: true }], JSON.stringify(port.sent.slice(0, 2)));
+  }
+  // The guard gave up on a site that keeps pausing: the user is told, once, whichever frame says so.
+  a.deliver({ t: 'external-pause' });
+  a.deliver({ t: 'external-pause' });
+  b.deliver({ t: 'external-pause' });
+  assert.deepEqual(env.engine.events, [{ level: 'warn', text: 'Deck 1: the site keeps pausing this tab — it may only allow one track at a time.' }]);
+  assert.equal(env.d.assist.sourceRate, 1, 'and assist is left alone');
+  // Ejecting gives the tab back to its site.
+  env.engine.events.length = 0;
+  for (const port of [a, b]) port.deliver(port.status());
+  env.d.recorder = { state: 'idle', teardown() {} };
+  await env.d.dispose();
+  assert.deepEqual(a.sent.filter((m) => m.t === 'isolate').map((m) => m.on), [true, false]);
+});
