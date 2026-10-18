@@ -196,7 +196,7 @@ export class Deck {
       const [lo, hi] = BPM_RANGES[this.engine.params['bpm.range']] || BPM_RANGES.AUTO;
       this.tempo = new DeckTempo({ sampleRate: this.sr, fps: new OdfCore(this.sr, () => {}).fps, lo, hi });
     }
-    this.setLoad({ state: 'ready', progress: 1, error: null });
+    this.setLoad({ state: 'ready', progress: 1, strategy: null, error: null });
     if (this.cueAuto && !this.hasPlayed) this.setCue(this.firstAudible ?? 0);
   }
 
@@ -495,6 +495,7 @@ export class Deck {
       case 'recStart':
         try { this.recorder.start(this.engine.params['rec.format']); return OK; } catch (err) { return fail(`Could not start recording: ${err.message}`); }
       case 'recStop': this.recorder.stop(); return OK;
+      case 'recordWhole': return fail('Recording a whole track from the page is not available yet.');
       case 'clipReset': this.meter.clipUntil = 0; return OK;
       default: return fail(`Unknown action ${a}`);
     }

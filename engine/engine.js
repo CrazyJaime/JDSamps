@@ -10,6 +10,7 @@ import { createMaster } from './master.js';
 import { Recorder } from './recorder.js';
 import { MasterClock } from './sync.js';
 import { Deck } from './deck.js';
+import { fetchArrayBuffer, decodeTo, resample, limitPcm } from './decode.js';
 
 const STRETCH_URL = new URL('../vendor/signalsmith-stretch/SignalsmithStretch.js', import.meta.url).href;
 SignalsmithStretch.moduleUrl = STRETCH_URL;
@@ -23,6 +24,8 @@ const TICK_FRAMES = 1536;     // the master worklet's meter (tick) period
 const STOP_TAB_MS = 2500;
 const INSTANCE = crypto.randomUUID(); // snapshot.engineId: the UI restores its settings into each new engine
 const NOTE_TTL = 60000; // a hub notice raised with no deck page open waits this long for one
+/** A track's name from its file name or link: no folders, no extension. */
+const trackTitle = (name) => String(name).split(/[\\/]/).pop().replace(/\.[A-Za-z0-9]{1,5}$/, '').trim();
 
 // Trust: the relay content script runs in every frame of every site, so any renderer can speak
 // as it. Only extension contexts (the service worker, the deck page) may command the engine.
@@ -40,6 +43,7 @@ class Engine {
     this.ctx = new AudioContext({ latencyHint: 'interactive' });
     this.params = defaults(MASTER_PARAMS);
     this.decks = new Map();
+    this.loads = new Map(); // deck id → its load in progress ({abort()}): loadCancel and eject stop it
     this.tabStops = new WeakMap(); // deck → its STOP_TAB (sent once)
     this.nextId = 1;
     this.clock = new MasterClock();
@@ -102,7 +106,8 @@ class Engine {
     return run;
   }
 
-  deckByTab(tabId) { for (const d of this.decks.values()) if (d.tabId === tabId) return d; return null; }
+  /** The deck bound to a tab. A deck with no tab (a file, a link) is no tab's. */
+  deckByTab(tabId) { if (tabId == null) return null; for (const d of this.decks.values()) if (d.tabId === tabId) return d; return null; }
 
   // ------------------------------------------------------------------ messaging
   listen() {
@@ -154,7 +159,7 @@ class Engine {
       return;
     }
     let r;
-    if (m.deck === null) r = await this.masterAct(m.a);
+    if (m.deck === null) r = await this.masterAct(m.a, v.arg);
     else { const d = this.decks.get(m.deck); r = d ? await d.act(m.a, v.arg) : { ok: false, error: 'That deck is gone.' }; }
     reply(r.ok, r.error);
   }
@@ -191,7 +196,7 @@ class Engine {
     }
   }
 
-  async masterAct(a) {
+  async masterAct(a, arg) {
     switch (a) {
       case 'mixRecStart':
         try { this.mixRec.start(this.params['rec.format']); return { ok: true }; } catch (err) { return { ok: false, error: `Could not start the mix recording: ${err.message}` }; }
@@ -204,6 +209,8 @@ class Engine {
         this.mixRec.stop();
         for (const id of [...this.decks.keys()]) this.eject(id);
         return { ok: true };
+      case 'loadFile': return this.loadFile(arg);
+      case 'loadUrl': return this.loadUrl(arg);
       default: return { ok: false, error: `Unknown action ${a}` };
     }
   }
@@ -253,35 +260,219 @@ class Engine {
 
   // ------------------------------------------------------------------ decks
   async startDeck(tabId, streamId, meta) {
-    const existing = this.deckByTab(tabId);
-    if (existing) return { ok: false, error: `That tab is already on deck ${existing.slot}.` };
-    if (this.decks.size >= MAX_DECKS) return { ok: false, error: `All ${MAX_DECKS} decks are in use. Eject one first.` };
-    this.idleSince = null;
-    if (this.ctx.state !== 'running') await this.ctx.resume().catch(() => {});
+    const no = await this.readyForDeck(tabId);
+    if (no) return { ok: false, error: no };
     let stream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: streamId } }, video: false });
+      stream = await this.tabStream(streamId);
     } catch (err) {
       return { ok: false, error: `Chrome would not share that tab's audio: ${err.message}` };
     }
+    const deck = this.newDeck({ tabId, stream, meta });
+    try {
+      await deck.init();
+    } catch (err) {
+      return this.notStarted(deck, err);
+    }
+    this.addDeck(deck);
+    this.hub({ type: HUB.AGENT_CONNECT, tabId });
+    this.event('info', `Loaded “${meta.title || 'tab'}” on deck ${deck.slot}. It is cued: press PLAY when you're ready.`, deck.id);
+    return { ok: true, deckId: deck.id, slot: deck.slot };
+  }
+
+  /** Why no new deck can start now (the tab is on a deck already, or every slot is taken), or null; wakes the context. */
+  async readyForDeck(tabId) {
+    const existing = this.deckByTab(tabId);
+    if (existing) return `That tab is already on deck ${existing.slot}.`;
+    if (this.decks.size >= MAX_DECKS) return `All ${MAX_DECKS} decks are in use. Eject one first.`;
+    this.idleSince = null;
+    if (this.ctx.state !== 'running') await this.ctx.resume().catch(() => {});
+    return null;
+  }
+
+  tabStream(streamId) {
+    return navigator.mediaDevices.getUserMedia({ audio: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: streamId } }, video: false });
+  }
+
+  /** A deck in the first free slot, with the default deck settings. */
+  newDeck({ tabId = null, stream = null, meta = {}, kind }) {
     const used = new Set([...this.decks.values()].map((d) => d.slot));
     let slot = 1; while (used.has(slot)) slot++;
     const params = defaults(DECK_PARAMS);
     params.range = this.params['pitch.defaultRange'];
-    const deck = new Deck(this, { id: this.nextId++, slot, tabId, stream, meta, params });
-    try {
-      await deck.init();
-    } catch (err) {
-      for (const t of stream.getTracks()) t.stop();
-      await deck.dispose().catch(() => {});
-      return { ok: false, error: `The deck could not start: ${err.message}` };
-    }
+    return new Deck(this, { id: this.nextId++, slot, tabId, stream, meta, params, kind });
+  }
+
+  addDeck(deck) {
     this.decks.set(deck.id, deck);
     this.master.addDeck(deck.id, deck.xfGain, deck.params.xf);
     this.hub({ type: HUB.DECKS_CHANGED, decks: [...this.decks.values()].map((d) => ({ tabId: d.tabId, slot: d.slot })) });
-    this.hub({ type: HUB.AGENT_CONNECT, tabId });
-    this.event('info', `Loaded “${meta.title || 'tab'}” on deck ${slot}. It is cued: press PLAY when you're ready.`, deck.id);
-    return { ok: true, deckId: deck.id, slot };
+  }
+
+  async notStarted(deck, err) {
+    if (deck.stream) for (const t of deck.stream.getTracks()) t.stop();
+    await deck.dispose().catch(() => {});
+    return { ok: false, error: `The deck could not start: ${err.message}` };
+  }
+
+  // ------------------------------------------------------------------ whole tracks (resident decks)
+  // startLoadingDeck and startResidentDeck (for a new deck) run under serial(), as startDeck does.
+
+  /**
+   * A deck that shows as loading while its track is on the way: its chain is built, nothing plays. It
+   * holds a tab's capture (streamId), if given, for a fall-back to live.
+   */
+  async startLoadingDeck({ tabId = null, streamId = null, meta = {} } = {}) {
+    const no = await this.readyForDeck(tabId);
+    if (no) return { ok: false, error: no };
+    let stream = null;
+    if (streamId) {
+      try { stream = await this.tabStream(streamId); } catch (err) { return { ok: false, error: `Chrome would not share that tab's audio: ${err.message}` }; }
+    }
+    const deck = this.newDeck({ tabId, stream, meta, kind: 'loading' });
+    try {
+      await deck.build();
+    } catch (err) {
+      return this.notStarted(deck, err);
+    }
+    this.addDeck(deck);
+    if (tabId != null) this.hub({ type: HUB.AGENT_CONNECT, tabId });
+    return { ok: true, deckId: deck.id, slot: deck.slot };
+  }
+
+  /**
+   * A deck holding a whole decoded track, pcm {L, R, sampleRate}: a new deck, or the loading deck
+   * deckId promoted (a failed promotion leaves it loading, for its loader to decide). Its beat grid
+   * comes from gridResident() before it is reported ready.
+   */
+  async startResidentDeck({ deckId = null, tabId = null, pcm, meta = {}, analysis = null } = {}) {
+    if (!pcm || !(pcm.L && pcm.L.length) || !pcm.R || pcm.R.length !== pcm.L.length) return { ok: false, error: 'There is no audio to load.' };
+    let deck = null;
+    if (deckId != null) {
+      deck = this.decks.get(deckId);
+      if (!deck) return { ok: false, error: 'That deck is gone.' };
+      if (deck.kind !== 'loading' || deck.ts.liveEdge > 0) return { ok: false, error: `Deck ${deck.slot} is not waiting for a track.` };
+    } else {
+      const no = await this.readyForDeck(tabId);
+      if (no) return { ok: false, error: no };
+    }
+    // The stretcher runs at the context's rate.
+    if (pcm.sampleRate !== this.ctx.sampleRate) pcm = await resample(pcm, this.ctx.sampleRate);
+    if (deck) {
+      if (this.decks.get(deck.id) !== deck) return { ok: false, error: 'That deck is gone.' };
+      Object.assign(deck.meta, meta);
+    } else deck = this.newDeck({ tabId, meta });
+    try {
+      await deck.initResident(pcm);
+    } catch (err) {
+      if (deckId == null) return this.notStarted(deck, err);
+      deck.setLoad({ state: 'error', error: err.message });
+      return { ok: false, error: `Deck ${deck.slot} could not take the track: ${err.message}` };
+    }
+    try {
+      await this.gridResident(deck, pcm, analysis);
+    } catch (err) {
+      this.event('warn', `Deck ${deck.slot}: no beat grid from the whole track (${err.message}). TAP the beat.`, deck.id);
+    }
+    if (deckId == null) this.addDeck(deck);
+    else if (this.decks.get(deck.id) !== deck) return { ok: false, error: 'That deck is gone.' };
+    this.event('info', `Loaded “${deck.meta.title || 'track'}” on deck ${deck.slot}. It is cued: press PLAY when you're ready.`, deck.id);
+    return { ok: true, deckId: deck.id, slot: deck.slot };
+  }
+
+  /** Whole-track analysis fits a resident deck's beat grid here (given as `analysis`, or run on `pcm`). */
+  async gridResident(deck, pcm, analysis) {}
+
+  /** A loading deck holding a tab's capture plays it live after all; the reason is said once. */
+  async failLoadingToLive(deckId, reason) {
+    const d = this.decks.get(deckId);
+    if (!d || d.kind !== 'loading') return { ok: false, error: d ? `Deck ${d.slot} is not loading.` : 'That deck is gone.' };
+    if (!d.stream) return { ok: false, error: `Deck ${d.slot} has no tab audio to play live.` };
+    this.abortLoad(deckId);
+    try {
+      await d.initLive();
+    } catch (err) {
+      this.eject(deckId);
+      return { ok: false, error: `The deck could not start: ${err.message}` };
+    }
+    d.setLoad({ state: 'ready', progress: 1, strategy: null, error: null });
+    if (reason) this.event('warn', `Deck ${d.slot}: ${reason}`, d.id);
+    return { ok: true, deckId: d.id, slot: d.slot };
+  }
+
+  /** A local file, as the deck page's blob: URL for it. */
+  loadFile({ name, blobUrl }) {
+    const title = trackTitle(name) || 'track';
+    return this.loadDirect(blobUrl, { title }, { strategy: 'reading the file', failed: `Could not read “${title}”` });
+  }
+
+  /** A link to an audio file, fetched here. */
+  loadUrl({ url }) {
+    const u = new URL(url);
+    let name = u.pathname;
+    try { name = decodeURIComponent(name); } catch (_) {}
+    return this.loadDirect(url, { title: trackTitle(name) || u.hostname, url }, { strategy: 'fetching the link', failed: 'Could not fetch that link' });
+  }
+
+  /**
+   * Fetch and decode a whole track onto a new deck, which shows as loading meanwhile. Settles when the
+   * deck is resident ({ok:true}), or with the reason it is not (the deck is gone again).
+   */
+  async loadDirect(src, meta, { strategy, failed }) {
+    const r = await this.serial(() => this.startLoadingDeck({ meta }));
+    if (!r.ok) return r;
+    const deck = this.decks.get(r.deckId), ac = new AbortController(), load = { abort: () => ac.abort() };
+    this.loads.set(deck.id, load);
+    const gone = () => ac.signal.aborted || this.decks.get(deck.id) !== deck;
+    const refuse = async (error) => {
+      const cancelled = gone();
+      if (this.loads.get(deck.id) === load) this.loads.delete(deck.id);
+      if (!cancelled) await this.eject(deck.id);
+      return { ok: false, error: cancelled ? 'Loading was cancelled.' : error };
+    };
+    deck.setLoad({ strategy });
+    let buf, pcm;
+    try {
+      buf = await fetchArrayBuffer(src, { signal: ac.signal });
+    } catch (err) {
+      return refuse(`${failed}: ${err.message}`);
+    }
+    if (gone()) return refuse();
+    deck.setLoad({ progress: 0.5, strategy: 'decoding' });
+    try {
+      pcm = await decodeTo(this.ctx, buf);
+    } catch (_) {
+      return refuse(`“${meta.title}” is not audio this browser can play.`);
+    }
+    if (gone()) return refuse();
+    this.loads.delete(deck.id);
+    const lim = limitPcm(pcm, this.params['resident.limitMin']);
+    pcm = null;
+    const res = await this.serial(() => this.startResidentDeck({ deckId: deck.id, pcm: lim.pcm }));
+    if (!res.ok) return refuse(res.error);
+    if (lim.notice) this.event('warn', `Deck ${deck.slot}: ${lim.notice}`, deck.id);
+    return res;
+  }
+
+  /** Stop a deck's load in progress, and eject the deck. */
+  async loadCancel(id) {
+    const d = this.decks.get(id);
+    if (!d || d.kind !== 'loading') return { ok: false, error: d ? `Deck ${d.slot} is not loading.` : 'That deck is gone.' };
+    this.abortLoad(id);
+    await this.eject(id);
+    return { ok: true };
+  }
+
+  abortLoad(id) {
+    const l = this.loads.get(id);
+    if (l) { this.loads.delete(id); l.abort(); }
+  }
+
+  /** Bytes of decoded audio held by decks that are not live (stereo float32). */
+  residentBytes() {
+    let n = 0;
+    for (const d of this.decks.values()) if (d.kind !== 'live' && d.ts) n += Math.round(d.ts.liveEdge * this.ctx.sampleRate) * 8;
+    return n;
   }
 
   /** Before a deck's capture goes, stop its tab playing (the hub pauses the page's players, or
@@ -298,6 +489,7 @@ class Engine {
   }
 
   eject(id, reason) {
+    this.abortLoad(id);
     // Stopping the tab starts now, ahead of the queue, so STOP ALL stops every tab in parallel.
     const d0 = this.decks.get(id);
     if (d0) this.stopTab(d0);
@@ -424,7 +616,7 @@ class Engine {
       outputLatency: this.ctx.outputLatency || 0, clock: cs,
       master: {
         params: { ...this.params }, peakL: this.mm.peakL, peakR: this.mm.peakR, rmsL: this.mm.rmsL, rmsR: this.mm.rmsR,
-        clipL: now < this.clipUntil.L, clipR: now < this.clipUntil.R, gr: this.mm.gr,
+        clipL: now < this.clipUntil.L, clipR: now < this.clipUntil.R, gr: this.mm.gr, residentBytes: this.residentBytes(),
         rec: this.mixRec ? { state: this.mixRec.state, format: this.mixRec.format, seconds: this.mixRec.seconds } : { state: 'idle', format: 'wav', seconds: 0 },
       },
       decks,
