@@ -92,13 +92,14 @@ function onState(s) {
   snap = s;
   if (s.engineId !== engineId) { engineId = s.engineId; restored = false; } // a re-created engine starts from defaults
   if (!restored) restoreSettings(s);
+  loader.update(s);
   const ids = new Set(s.decks.map((d) => d.id));
   for (const [id, st] of strips) if (!ids.has(id)) { st.destroy(); strips.delete(id); }
   const decksEl = $('#decks'), wavesEl = $('#waves');
   s.decks.forEach((d, i) => {
     let st = strips.get(d.id);
     if (!st) {
-      st = new DeckStrip(d, { conn, toast, onSelect: select });
+      st = new DeckStrip(d, { conn, toast, onSelect: select, onLeave: (id) => loader.cancelled(id) });
       strips.set(d.id, st);
     }
     if (decksEl.children[i + 1] !== st.el) decksEl.insertBefore(st.el, decksEl.children[i + 1] || null);
@@ -154,6 +155,7 @@ help.addEventListener('click', (e) => { if (e.target === help) toggle(help, fals
 $('#stopAllBtn').addEventListener('click', async () => {
   if (!snap || !snap.decks.length) return;
   if (!confirm('Stop all decks and finish all recordings?')) return;
+  loader.cancelledAll();
   const r = await conn.act(null, 'stopAll');
   if (!r.ok && r.error) toast(r.error, 'warn');
 });

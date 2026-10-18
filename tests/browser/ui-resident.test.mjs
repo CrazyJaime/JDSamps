@@ -179,13 +179,15 @@ test('the cancel ✕ sends loadCancel at once; a held eject still ejects a loadi
   await x.click();
   await wait(50);
   assert.deepEqual((await sent('act', (m) => m.deck === 3)).map((m) => [m.a, m.arg]), [['loadCancel', {}]]);
+  // That deck is gone now; the next loading deck takes a held eject.
+  await show(kinds((s) => { s.decks[2].id = 9; }));
   await ui.clearSent();
   const b = await deckEl(3).locator('[data-act="eject"]').boundingBox();
   await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2);
   await page.mouse.down();
   await wait(600);
   await page.mouse.up();
-  assert.deepEqual((await sent('act', (m) => m.deck === 3)).map((m) => m.a), ['eject']);
+  assert.deepEqual((await sent('act', (m) => m.deck === 9)).map((m) => m.a), ['eject']);
 });
 
 // ---------------------------------------------------------------- failed loads, load reports
@@ -539,6 +541,76 @@ test('the Sources drawer loads a link to an audio file; anything but a web link 
   assert.deepEqual((await loadActs('loadUrl')).map((m) => [m.deck, m.arg]), [[null, { url: 'https://example.com/a.mp3' }]]);
   assert.equal(await field.inputValue(), '', 'cleared once sent');
   await page.locator('#sources [data-close]').click();
+});
+
+/** A link loaded from the Sources drawer: its loadUrl act. */
+async function loadLink(url) {
+  await page.locator('#sourcesBtn').click();
+  await page.locator('#loadLink').fill(url);
+  await page.locator('#loadLink').press('Enter');
+  await page.locator('#sources [data-close]').click();
+  await wait(30);
+  return (await loadActs('loadUrl')).find((m) => m.arg.url === url);
+}
+/** kinds() with more decks after the first three, each loading the way loadFile/loadUrl's deck does (no tab). Engine
+ *  deck ids only ever rise, so theirs are above any an earlier test showed. */
+const withLoading = (...more) => kinds((s) => { s.decks.push(...more.map((o) => loadingDeck({ title: 'long', url: '', ...o }))); });
+const lastAct = async (a, deckId) => (await sent('act', (m) => m.a === a && m.deck === deckId)).at(-1);
+
+test('a cancel the DJ asked for is not an error: no warning after ✕, a held eject or STOP ALL, and a second ✕ is ignored', async () => {
+  await show(kinds());
+  await spyRevoke();
+  await manual(true);
+  await ui.clearSent();
+  await clearToasts();
+  try {
+    // ✕, twice in quick succession: one loadCancel, and the link's "Loading was cancelled." says nothing.
+    const link = await loadLink('https://example.com/long.mp3');
+    await show(withLoading({ id: 91, slot: 4, url: 'https://example.com/long.mp3' }));
+    await deckEl(4).locator('[data-act="loadCancel"]').dblclick();
+    await wait(50);
+    const cancels = await sent('act', (m) => m.a === 'loadCancel');
+    assert.deepEqual(cancels.map((m) => m.deck), [91], 'one loadCancel');
+    await reply(cancels[0].id, true);
+    await show(kinds());
+    await reply(link.id, false, 'Loading was cancelled.');
+    await wait(50);
+    assert.deepEqual(await toasts(), []);
+    // A held eject on a dropped file's loading deck.
+    await drop('.board', [{ name: 'b.mp3', type: 'audio/mpeg' }]);
+    await wait(30);
+    const file = (await loadActs('loadFile')).at(-1);
+    await show(withLoading({ id: 92, slot: 4 }));
+    const b = await deckEl(4).locator('[data-act="eject"]').boundingBox();
+    await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2);
+    await page.mouse.down();
+    await wait(600);
+    await page.mouse.up();
+    await reply((await lastAct('eject', 92)).id, true);
+    await show(kinds());
+    await reply(file.id, false, 'Loading was cancelled.');
+    await wait(50);
+    assert.deepEqual(await toasts(), []);
+    assert.deepEqual(await revoked(), [file.arg.blobUrl]);
+    // STOP ALL, confirmed.
+    const all = await loadLink('https://example.com/all.mp3');
+    await show(withLoading({ id: 93, slot: 4, url: 'https://example.com/all.mp3' }));
+    page.once('dialog', (d) => d.accept());
+    await page.locator('#stopAllBtn').click();
+    await wait(50);
+    await reply((await lastAct('stopAll', null)).id, true);
+    await show(kinds());
+    await reply(all.id, false, 'Loading was cancelled.');
+    await wait(50);
+    assert.deepEqual(await toasts(), []);
+    // A load nobody cancelled still says why it failed.
+    const bad = await loadLink('https://example.com/missing.mp3');
+    await show(withLoading({ id: 94, slot: 4, url: 'https://example.com/missing.mp3' }));
+    await show(kinds());
+    await reply(bad.id, false, ERROR);
+    await wait(50);
+    assert.deepEqual(await toasts(), [ERROR]);
+  } finally { await manual(false); }
 });
 
 /** A paste (Ctrl/Cmd+V) of text on the element matching sel, or on the page itself. */

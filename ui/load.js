@@ -18,24 +18,58 @@ export class TrackLoader {
   constructor({ conn, toast }) {
     this.conn = conn;
     this.toast = toast;
+    this.loads = []; // loads waiting for their answer, oldest first: {after, deckId, cancelled}
+    this.maxId = 0;  // the newest deck id seen
+    this.engineId = undefined;
   }
 
   /** The engine fetches the file through a blob: URL made here, revoked once its load has settled either way. */
   async loadFile(file) {
     const blobUrl = URL.createObjectURL(file);
     try {
-      return this.said(await this.conn.act(null, 'loadFile', { name: file.name, blobUrl }));
+      return await this.load('loadFile', { name: file.name, blobUrl });
     } finally {
       URL.revokeObjectURL(blobUrl);
     }
   }
 
-  async loadLink(url) { return this.said(await this.conn.act(null, 'loadUrl', { url })); }
+  loadLink(url) { return this.load('loadUrl', { url }); }
 
-  said(r) {
-    if (!r.ok && r.error) this.toast(r.error, 'warn');
-    return r;
+  /** A cancel the DJ asked for (✕, eject, STOP ALL) is not an error: the load onto that deck ends without a word. */
+  async load(a, arg) {
+    const l = { after: this.maxId, deckId: null, cancelled: false };
+    this.loads.push(l);
+    try {
+      const r = await this.conn.act(null, a, arg);
+      if (!r.ok && r.error && !l.cancelled) this.toast(r.error, 'warn');
+      return r;
+    } finally {
+      this.loads.splice(this.loads.indexOf(l), 1);
+    }
   }
+
+  /**
+   * Each snapshot: a load's deck is the oldest deck without a tab that is newer than any deck seen when it was
+   * asked for, and than the deck of every earlier load (the engine makes them in that order, with rising ids).
+   */
+  update(s) {
+    if (s.engineId !== this.engineId) { this.engineId = s.engineId; this.maxId = 0; } // a new engine numbers its decks from 1
+    let floor = 0;
+    for (const l of this.loads) {
+      l.after = Math.max(l.after, floor);
+      if (l.deckId == null) {
+        const d = s.decks.filter((x) => x.id > l.after && x.tabId == null).sort((x, y) => x.id - y.id)[0];
+        if (d) l.deckId = d.id;
+      }
+      if (l.deckId != null) floor = Math.max(floor, l.deckId);
+    }
+    for (const d of s.decks) this.maxId = Math.max(this.maxId, d.id);
+  }
+
+  /** The DJ asked for deck `id` to go (✕ or eject). */
+  cancelled(id) { for (const l of this.loads) if (l.deckId === id) l.cancelled = true; }
+  /** STOP ALL: every deck goes. */
+  cancelledAll() { for (const l of this.loads) l.cancelled = true; }
 
   /** Each audio file onto a deck of its own; the rest are named and left alone. */
   drop(files) {
