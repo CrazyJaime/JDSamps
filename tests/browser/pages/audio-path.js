@@ -26,7 +26,7 @@ async function boot() {
   const env = { ctx, silentSink, events: [] };
   env.engine = {
     ctx, params: { 'buffer.capSec': 240, 'rec.format': 'wav', 'bpm.range': 'AUTO', 'assist.on': false },
-    decks: new Map(), clock: new MasterClock(), silentSink, master,
+    decks: new Map(), clock: new MasterClock(), silentSink, master, broadcastWave() {},
     createStretch: () => SignalsmithStretch(ctx, { numberOfInputs: 1, numberOfOutputs: 1, outputChannelCount: [2] }),
     deliver() {}, eject() {}, broadcast() {}, updateClock() {},
     event: (level, text) => env.events.push({ level, text, at: ctx.currentTime }),

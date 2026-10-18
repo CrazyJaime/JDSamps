@@ -29,13 +29,16 @@
   let chan = null;
   const emit = (s) => { if (chan) window.dispatchEvent(new CustomEvent(`s${chan}`, { detail: s })); };
 
+  /** Audible: a player the user hears, or would hear if it ran. `audible` below counts these. */
+  const heard = (el) => !el.muted && el.volume > 0;
+
   function status() {
     const els = live();
     let playing = false, audible = 0, main = null;
     for (const el of els) {
       if (el.paused) continue;
       playing = true;
-      if (!el.muted && el.volume > 0) { if (!audible++) main = el; } else if (!audible) main = el;
+      if (heard(el)) { if (!audible++) main = el; } else if (!audible) main = el;
     }
     return {
       t: 'status', hasMedia: els.length > 0, playing, rate: main ? main.playbackRate : 1, preservesPitch: main ? main.preservesPitch !== false : true,
@@ -166,6 +169,31 @@
     report();
   }
 
+  // The tab has just been loaded onto a deck, so its audio goes to the capture and not to the
+  // speakers: starting its player is silent to the user, and it fills the deck's buffer (the deck
+  // itself stays cued). Nothing but the playing state is touched — no rate, no preservesPitch, no
+  // enforcing: a start is not an assist command, and it must not engage player assist.
+  function startPlayback() {
+    const answer = (count, why) => { emit(JSON.stringify({ t: 'started', count, why })); };
+    const els = live();
+    if (els.some((el) => !el.paused && heard(el))) { answer(0, 'playing'); return; } // nothing was needed
+    const cands = els.filter((el) => el.paused && heard(el));
+    if (!cands.length) { answer(0, 'none'); return; }
+    // Several to choose from: the longest is the track, the short ones are jingles and adverts.
+    // A tie (or lengths the page has not loaded yet) is too close to call, so nothing is started.
+    const len = (el) => (Number.isFinite(el.duration) && el.duration > 0 ? el.duration : 0);
+    const [first, second] = [...cands].sort((a, b) => len(b) - len(a));
+    if (second && len(first) <= len(second)) { answer(0, 'ambiguous'); return; }
+    // POSITION POLICY, the one place it lives: the playhead is left where the page had it, so a
+    // track parked half-way in resumes from there (`first.currentTime = 0;` here would rewind).
+    // play() is rejected when the page's autoplay policy refuses it (this call carries no user
+    // activation of its own) or the media will not load. Said once, never retried.
+    let p;
+    try { p = nativePlay.call(first); } catch (_) { answer(0, 'refused'); return; }
+    if (!p || typeof p.then !== 'function') { answer(first.paused ? 0 : 1, first.paused ? 'refused' : 'started'); return; }
+    p.then(() => { answer(1, 'started'); }, () => { answer(0, 'refused'); });
+  }
+
   // Wrappers answer toString() like the built-ins they replace.
   const native = new WeakMap(), fnToString = Function.prototype.toString;
   const asNative = { toString() { return native.has(this) ? native.get(this) : fnToString.call(this); } }.toString;
@@ -176,7 +204,7 @@
   };
   disguise(asNative);
 
-  const proto = HTMLMediaElement.prototype, nativePause = proto.pause;
+  const proto = HTMLMediaElement.prototype, nativePause = proto.pause, nativePlay = proto.play;
   for (const name of ['play', 'pause', 'load']) {
     const orig = proto[name], guarded = name === 'pause';
     proto[name] = disguise({ [name](...args) {
@@ -321,11 +349,15 @@
       let count = 0;
       for (const el of live()) {
         if (el.paused) continue;
-        const heard = !el.muted && el.volume > 0;
+        const was = heard(el);
         try { nativePause.call(el); } catch (_) { continue; }
-        if (heard && el.paused) count++;
+        if (was && el.paused) count++;
       }
       emit(JSON.stringify({ t: 'stopped', count }));
+    } else if (m.t === 'start') {
+      // A deck has just taken this tab: start the player the DJ forgot to start (see startPlayback).
+      scan();
+      startPlayback();
     }
   }
 })();

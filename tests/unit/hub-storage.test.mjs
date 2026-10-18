@@ -16,7 +16,11 @@ const chrome = {
   runtime: {
     id: 'abcdefghijklmnopabcdefghijklmnop', lastError: null, getURL: (p = '') => EXT + p,
     getContexts: async () => { await turn(); return [{}]; },
-    sendMessage: async (m) => { await turn(); sent.push(m); ops.push(m.type); return m.type === 'PING' ? { ok: true, decks: [] } : { ok: true }; },
+    sendMessage: async (m) => {
+      await turn(); sent.push(m); ops.push(m.type);
+      if (m.type === 'PING') return { ok: true, decks: [] };
+      return m.type === 'START' ? { ok: true, deckId: 1, slot: 1 } : { ok: true };
+    },
     onMessage: event(), onInstalled: event(),
   },
   storage: { session: {
@@ -268,6 +272,7 @@ test('a mute the user made is left alone', async () => {
   assert.deepEqual(tabs[1].mutedInfo, { muted: true, reason: 'user' });
   assert.ok(!ops.includes('muted:false'), ops.join());
   assert.deepEqual(muteRecords(), []);
+  await settle(); // each load starts the tab's player behind it: let that finish inside this test
 });
 
 test('a LOAD_TAB that races a STOP_TAB of the same tab waits for it, so the capture is not muted', async () => {
@@ -277,6 +282,80 @@ test('a LOAD_TAB that races a STOP_TAB of the same tab waits for it, so the capt
   await Promise.all([stop, load]);
   assert.equal(tabs[0].mutedInfo.muted, false);
   assert.ok(ops.lastIndexOf('muted:false') < ops.indexOf('START'), ops.join());
+  await new Promise((r) => setTimeout(r, 500)); // longer than the load's start budget
+  await settle();
+});
+
+// ---------------------------------------------------------------- load: start the tab playing
+// A tab loaded onto a deck plays into the capture, not the speakers, so a player the DJ forgot to
+// start would leave the deck on silence. LOAD_TAB asks every frame's agent to start one.
+/** executeScript results for a start: one {t:'started', ...} per frame relay (null: no relay). */
+const startFrames = (...whys) => whys.map((w, i) => ({ frameId: i, result: w == null ? null : { t: 'started', count: w === 'started' ? 1 : 0, why: w } }));
+const isStart = (o) => !!o.func && /__jdsStart/.test(String(o.func));
+const starting = (...whys) => (o) => (isStart(o) ? startFrames(...whys) : []);
+const startScripts = () => scripts.filter(isStart);
+
+test('LOAD_TAB asks every frame of the tab to start its player, and says nothing when one does', async () => {
+  runScript = starting(null, 'none', 'started');
+  const r = await hub({ type: 'LOAD_TAB', tabId: 11 });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  await settle();
+  assert.equal(startScripts().length, 1);
+  assert.deepEqual([startScripts()[0].target.tabId, startScripts()[0].target.allFrames], [11, true]);
+  assert.ok(ops.indexOf('START') >= 0 && ops.indexOf('START') < ops.length, ops.join());
+  assert.deepEqual(toEngineOf('NOTIFY'), [], 'a player that started needs no notice');
+});
+
+test('a page with no player to start says so, and the deck is loaded all the same', async () => {
+  runScript = starting('none');
+  assert.equal((await hub({ type: 'LOAD_TAB', tabId: 11 })).ok, true);
+  await settle();
+  assert.deepEqual(toEngineOf('START').map((m) => m.tabId), [11], 'the deck was loaded');
+  const notes = toEngineOf('NOTIFY');
+  assert.equal(notes.length, 1, JSON.stringify(notes));
+  assert.equal(notes[0].level, 'info');
+  assert.equal(notes[0].text, 'Deck 1: this page has no media player to start — start the audio on the tab yourself.');
+});
+
+test('a page that refuses to play is reported as something the DJ must do on the tab', async () => {
+  runScript = starting('refused');
+  assert.equal((await hub({ type: 'LOAD_TAB', tabId: 11 })).ok, true);
+  await settle();
+  const notes = toEngineOf('NOTIFY');
+  assert.equal(notes.length, 1, JSON.stringify(notes));
+  assert.equal(notes[0].level, 'warn');
+  assert.equal(notes[0].text, 'Deck 1: the page refused to start playback — press play on the tab.');
+});
+
+test('a tab that is already playing is left alone, with nothing to report', async () => {
+  runScript = starting('playing');
+  assert.equal((await hub({ type: 'LOAD_TAB', tabId: 11 })).ok, true);
+  await settle();
+  assert.deepEqual(toEngineOf('NOTIFY'), []);
+});
+
+test('a start that never answers neither delays nor fails the load, and is bounded', async () => {
+  runScript = (o) => (isStart(o) ? new Promise(() => {}) : o.func ? frames(1) : []);
+  const t0 = Date.now();
+  assert.equal((await hub({ type: 'LOAD_TAB', tabId: 11 })).ok, true, 'the deck loads whatever the page does');
+  assert.ok(Date.now() - t0 < 300, `LOAD_TAB answered after ${Date.now() - t0} ms`);
+  // An eject right after waits for the start to be given up on, so the pause cannot be undone by it.
+  const t1 = Date.now();
+  assert.deepEqual(await stopTab(11), { ok: true, paused: 1, muted: false });
+  const dt = Date.now() - t1;
+  assert.ok(dt >= 200 && dt < 1500, `STOP_TAB waited ${dt} ms for the start in flight`);
+  await settle();
+  assert.deepEqual(toEngineOf('NOTIFY'), [], 'a start nobody answered says nothing');
+});
+
+test('a start is put into a tab that has no agent, and a tab that is gone is skipped', async () => {
+  let injected = false;
+  runScript = (o) => { if (o.files) { injected = true; return []; } return isStart(o) ? startFrames(injected ? 'started' : null) : []; };
+  assert.equal((await hub({ type: 'LOAD_TAB', tabId: 11 })).ok, true);
+  await settle();
+  assert.deepEqual(scripts.filter((o) => o.files).map((o) => [o.files[0], o.world || 'ISOLATED', o.target.allFrames]),
+    [['agent/agent-main.js', 'MAIN', true], ['agent/agent-relay.js', 'ISOLATED', true]]);
+  assert.deepEqual(toEngineOf('NOTIFY'), []);
 });
 
 // ---------------------------------------------------------------- tab discarding

@@ -650,3 +650,33 @@ test('loading a tab we muted unmutes it first, so the deck hears it', async () =
   assert.equal((await act(deck, d.id, 'eject')).ok, true);
   await waitFor(async () => (await state(deck)).decks.length === 0, 8000);
 });
+
+test('a tab whose player was never started is started by the load: the deck buffers and locks a BPM', async () => {
+  const url = `${server.url('a')}?autoplay=0`; // the track A page, with the player left stopped
+  const tab = await h.context.newPage();
+  await tab.goto(url);
+  await sleep(500);
+  const before = await tab.evaluate(() => window.__media());
+  assert.equal(before.paused, true, 'nobody pressed play on the tab');
+  const tabId = await tabIdFor(h, url);
+  const seen = (await events(deck)).length;
+  assert.equal((await hubCall(deck, { type: 'LOAD_TAB', tabId })).ok, true);
+  // Nothing below touches the tab: the load started its player, inaudibly, into the capture.
+  const d = await waitFor(async () => (await state(deck)).decks.find((x) => x.tabId === tabId), 8000);
+  await waitFor(() => tab.evaluate(() => !window.__media().paused), 5000);
+  await waitFor(async () => { const x = (await state(deck)).decks.find((y) => y.id === d.id); return x && x.reserve > 1; }, 15000);
+  await waitFor(async () => {
+    const x = (await state(deck)).decks.find((y) => y.id === d.id);
+    return x && x.bpm.state === 'LOCKED' && Math.abs(x.bpm.native - 124) < 0.4;
+  }, 30000);
+  const x = (await state(deck)).decks.find((y) => y.id === d.id);
+  assert.equal(x.playing, false, 'still cued: the start fills the buffer, it does not play the deck');
+  const m = await tab.evaluate(() => window.__media());
+  assert.deepEqual([m.paused, m.rate, m.pp], [false, 1, true], 'playing at its own rate');
+  assert.ok(m.t >= before.t, `the playhead was moved back: ${before.t} -> ${m.t}`);
+  assert.deepEqual((await events(deck)).slice(seen).filter((e) => /start/.test(e.text)), [], 'nothing was left for the DJ to do');
+  assert.equal((await act(deck, d.id, 'eject')).ok, true);
+  await waitFor(async () => !(await state(deck)).decks.some((y) => y.id === d.id), 8000);
+  await waitFor(() => tab.evaluate(() => window.__media().paused), 3000);
+  await tab.close();
+});

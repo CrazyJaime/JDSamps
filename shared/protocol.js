@@ -152,6 +152,15 @@ export function validateUiMessage(m) {
   return { ok: false, error: 'unknown message type' };
 }
 
+/**
+ * What a frame's agent did with the page's player when its tab was loaded onto a deck: no player
+ * to start, nothing it could say in time ('timeout', from the relay), too many players to choose
+ * between, one that refused to play, one already playing, one it started. Ordered weakest claim
+ * first, so a tab's frames combine by taking the last of them: what one frame found beats
+ * another's 'none', and not knowing beats claiming there is nothing.
+ */
+export const START_WHY = Object.freeze(['none', 'timeout', 'ambiguous', 'refused', 'playing', 'started']);
+
 /** Agent (content script) messages are untrusted page-adjacent data. */
 export function validateAgentMessage(m) {
   if (!m || typeof m !== 'object') return null;
@@ -182,6 +191,12 @@ export function validateAgentMessage(m) {
     // Answer to an eject's stop: how many heard players the frame's agent paused.
     if (!Number.isInteger(m.count) || m.count < 0 || m.count >= 1000) return null;
     return { t: 'stopped', count: m.count };
+  }
+  if (m.t === 'started') {
+    // Answer to a load's start: how many players the frame's agent started, and why not more.
+    if (!Number.isInteger(m.count) || m.count < 0 || m.count >= 1000) return null;
+    if (!START_WHY.includes(m.why)) return null;
+    return { t: 'started', count: m.count, why: m.why };
   }
   return null;
 }

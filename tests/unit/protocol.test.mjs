@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  DECK_PARAMS, MASTER_PARAMS, DECK_ACTIONS, MASTER_ACTIONS, HUB, defaults, validateValue,
+  DECK_PARAMS, MASTER_PARAMS, DECK_ACTIONS, MASTER_ACTIONS, HUB, START_WHY, defaults, validateValue,
   validateUiMessage, validateAgentMessage, isSafeIconUrl, sanitizeTitle, recordingFilename, timestamp,
 } from '../../shared/protocol.js';
 
@@ -100,6 +100,17 @@ test("validateAgentMessage takes an eject's {t:'stopped', count} only with a san
   assert.deepEqual(validateAgentMessage({ t: 'stopped', count: 3, extra: 'x' }), { t: 'stopped', count: 3 });
   for (const count of [undefined, -1, 1.5, 1e9, '2', null, NaN]) assert.equal(validateAgentMessage({ t: 'stopped', count }), null, String(count));
   assert.equal(HUB.STOP_TAB, 'STOP_TAB');
+});
+
+test("validateAgentMessage takes a load's {t:'started', count, why} only with a known reason", () => {
+  assert.deepEqual(validateAgentMessage({ t: 'started', count: 1, why: 'started' }), { t: 'started', count: 1, why: 'started' });
+  assert.deepEqual(validateAgentMessage({ t: 'started', count: 0, why: 'none', extra: 'x' }), { t: 'started', count: 0, why: 'none' });
+  for (const why of START_WHY) assert.equal(validateAgentMessage({ t: 'started', count: 0, why }).why, why);
+  for (const why of [undefined, '', 'evil', 'STARTED', null, 1]) assert.equal(validateAgentMessage({ t: 'started', count: 0, why }), null, String(why));
+  for (const count of [undefined, -1, 1.5, 1e9, '2', null, NaN]) assert.equal(validateAgentMessage({ t: 'started', count, why: 'started' }), null, String(count));
+  // Ordered weakest claim first, so the hub can combine a tab's frames by rank.
+  assert.ok(START_WHY.indexOf('timeout') > START_WHY.indexOf('none'), 'not knowing beats claiming there is nothing');
+  assert.equal(START_WHY[START_WHY.length - 1], 'started');
 });
 
 test('isSafeIconUrl only allows http(s) and data:image', () => {

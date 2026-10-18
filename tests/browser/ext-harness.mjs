@@ -79,13 +79,14 @@ export function makeTrackWav({ bpm, seconds = 60, kind = 'low', sr = 48000 }) {
 
 const TRACKS = { a: { bpm: 124, kind: 'low' }, b: { bpm: 128, kind: 'high' }, c: { bpm: 120, kind: 'mid' } };
 
-/** /a, /b: <audio loop autoplay> pages (124 BPM low kick, 128 BPM high click).
+/** /a, /b: <audio loop autoplay> pages (124 BPM low kick, 128 BPM high click). `?autoplay=0` on
+ *  either serves the same page with the player stopped, for a DJ who forgot to press play.
  *  /c: Web-Audio page (AudioBufferSourceNode) at 120 BPM, plus a muted decorative <audio> that
  *  player assist must not mistake for the source. Tracks are `seconds` long: an <audio> loop
  *  restart leaves a ~0.1 s gap in the captured audio. */
 export async function startTrackServer({ seconds = 60 } = {}) {
   const wavs = Object.fromEntries(Object.entries(TRACKS).map(([k, t]) => [k, makeTrackWav({ ...t, seconds })]));
-  const media = (k) => `<!doctype html><title>Track ${k.toUpperCase()} ${TRACKS[k].bpm} BPM</title><audio id="a" src="/${k}.wav" loop autoplay></audio>
+  const media = (k, autoplay) => `<!doctype html><title>Track ${k.toUpperCase()} ${TRACKS[k].bpm} BPM</title><audio id="a" src="/${k}.wav" loop${autoplay ? ' autoplay' : ''}></audio>
 <script>window.__media = () => { const a = document.getElementById('a'); return { t: a.currentTime, rate: a.playbackRate, pp: a.preservesPitch, paused: a.paused }; };</script>`;
   const webaudio = `<!doctype html><title>Track C ${TRACKS.c.bpm} BPM (Web Audio)</title><audio id="decor" src="/c.wav" muted loop autoplay></audio><script>
   (async () => { const ctx = new AudioContext(); const buf = await ctx.decodeAudioData(await (await fetch('/c.wav')).arrayBuffer());
@@ -95,7 +96,7 @@ export async function startTrackServer({ seconds = 60 } = {}) {
     const u = new URL(req.url, 'http://x');
     const m = u.pathname.match(/^\/([abc])\.wav$/);
     if (m) { res.writeHead(200, { 'content-type': 'audio/wav' }); res.end(wavs[m[1]]); return; }
-    if (u.pathname === '/a' || u.pathname === '/b') { res.writeHead(200, { 'content-type': 'text/html' }); res.end(media(u.pathname.slice(1))); return; }
+    if (u.pathname === '/a' || u.pathname === '/b') { res.writeHead(200, { 'content-type': 'text/html' }); res.end(media(u.pathname.slice(1), u.searchParams.get('autoplay') !== '0')); return; }
     if (u.pathname === '/c') { res.writeHead(200, { 'content-type': 'text/html' }); res.end(webaudio); return; }
     res.writeHead(404); res.end();
   });
