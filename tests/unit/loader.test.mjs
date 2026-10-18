@@ -164,6 +164,36 @@ for (const [reason, re] of [['drm', /protected/], ['worker', /worker/], ['previe
   });
 }
 
+/** load() options: the page reports `reason` as the loader does `when` (a command it sends, or 'beat': the analysis). */
+const lateError = (reason, when) => ({
+  before: ({ tab, engine }) => {
+    let fired = false;
+    const fire = () => { if (!fired) { fired = true; setImmediate(() => tab.frames[0].emit({ t: 'tap-error', reason, detail: `late ${reason}` })); } };
+    if (when !== 'beat') { tab.hooks.push((m) => { if (when(m)) fire(); }); return; }
+    const f = engine.analyse.bind(engine);
+    engine.analyse = async (pcm, s) => { fire(); await settle(10); return f(pcm, s); };
+  },
+});
+for (const [reason, re] of [['drm', /protected/], ['worker', /worker/], ['preview', /30-second preview/], ['live', /live stream/]]) {
+  for (const [stage, page, when, before] of [
+    ['while the pieces are fetched', { kind: 'mse', rendition: hi(), preTap: 6, playing: 2, list: true, segUrls: true }, (m) => m.t === 'fetch', ['tap on', 'readTralbum', 'fetch']],
+    ['while the player is driven', { kind: 'mse', rendition: hi(), preTap: 0, playing: 1 }, (m) => m.t === 'drive' && m.mode === 'seekhop', ['tap on', 'readTralbum', 'drive seekhop']],
+    ['while the beat is found', { kind: 'progressive', src: 'https://site.example/t.mp3', files: { 'https://site.example/t.mp3': file('t', 120.0065) } }, 'beat', ['tap on', 'readTralbum', 'fetch']],
+  ]) {
+    test(`${reason} said after the first look, ${stage}: live at once with its one message, nothing more asked of the page, nothing promoted`, async () => {
+      const { result, engine, tab } = await load(page, lateError(reason, when));
+      assert.equal(result.kind, 'live', JSON.stringify(result));
+      assert.deepEqual(called(engine, 'startResidentDeck'), []);
+      const f = called(engine, 'failLoadingToLive');
+      assert.equal(f.length, 1);
+      assert.match(f[0].reason, re);
+      assert.equal(engine.events.filter((e) => /^Deck 1: /.test(e.text)).length, 1, 'said once');
+      assert.deepEqual(asked(tab), before, 'nothing fetched again, driven or run faster after it');
+      if (stage.includes('driven')) assert.ok(tab.kinds().includes('drive stop'));
+    });
+  }
+}
+
 test('a stream with no end goes live without trying the slower rungs', async () => {
   const { result, engine, tab } = await load({ kind: 'mse', rendition: hi(), preTap: 6, list: true, segUrls: true, duration: Infinity, liveAfter: 60 });
   assert.equal(result.kind, 'live');

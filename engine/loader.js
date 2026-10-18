@@ -138,11 +138,14 @@ class Job {
     signal.addEventListener('abort', () => this.poke(), { once: true });
   }
 
-  /** Resolves true once cond() holds (checked whenever the page says something), false after ms; rejects when cancelled. */
+  /**
+   * Resolves true once cond() holds, or something every wait gives way to (urgent(): the caller's check() says what),
+   * checked whenever the page says something; false after ms; rejects when cancelled.
+   */
   until(cond, ms) {
     return new Promise((resolve, reject) => {
       if (this.signal.aborted) { reject(new Stop('cancel', 'Loading was cancelled.')); return; }
-      if (cond()) { resolve(true); return; }
+      if (cond() || this.urgent()) { resolve(true); return; }
       const w = { cond, resolve, reject, timer: 0 };
       w.timer = setTimeout(() => { this.waiters.delete(w); resolve(false); }, Math.max(0, ms));
       this.waiters.add(w);
@@ -153,10 +156,11 @@ class Job {
     for (const w of [...this.waiters]) {
       let go = false;
       if (this.signal.aborted) { clearTimeout(w.timer); this.waiters.delete(w); w.reject(new Stop('cancel', 'Loading was cancelled.')); continue; }
-      try { go = w.cond(); } catch (_) {}
+      try { go = w.cond() || this.urgent(); } catch (_) {}
       if (go) { clearTimeout(w.timer); this.waiters.delete(w); w.resolve(true); }
     }
   }
+  urgent() { return false; }
   /** No more waiting: every timer cleared. */
   end() {
     this.done = true;
@@ -194,6 +198,7 @@ export class Loader extends Job {
     this.tapping = false;
     this.gone = null;          // the page went away mid-load
     this.pinned = null;        // the frame whose player is the track, once the page has been looked at
+    this.looked = false;       // past the first look: a decisive tap error ends the load wherever it is
     this.big = false;
     this.bytes = 0;            // read from the tab, all frames
     this.host = hostOf(deck.meta && deck.meta.url);
@@ -308,9 +313,16 @@ export class Loader extends Job {
   }
 
   // ---------------------------------------------------------------- waiting
-  /** After every await: stop if the load was cancelled, the deck is gone, or the page went away. */
+  /** Waits give way to a decisive tap error once the page has been looked at. */
+  urgent() { return this.looked && !!this.decisive(); }
+  /**
+   * After every await: stop if the load was cancelled or the deck is gone; go live, with its one message, on a decisive
+   * tap error (protected, in a worker, a preview, a stream) whenever the page reports it; stop if the page went away.
+   */
   check() {
     if (this.signal.aborted || this.engine.decks.get(this.deck.id) !== this.deck) throw new Stop('cancel', 'Loading was cancelled.');
+    const why = this.looked && this.decisive();
+    if (why) throw new Stop('live', LIVE[why]);
     if (this.gone) throw new Stop('live', LIVE.gone);
     if (this.big) throw new Stop('live', LIVE.big);
   }
@@ -363,6 +375,7 @@ export class Loader extends Job {
     const why = this.decisive(), D = this.duration();
     this.rep.steps.push({ name: 'look', outcome: why || 'ok', why: D != null ? `the player says ${D.toFixed(3)} s` : "the player's length is not known", ms: now() - t0 });
     if (why) throw new Stop('live', LIVE[why]);
+    this.looked = true;
   }
 
   /** The rungs, from the site's first. -> {pcm, notice} for a whole track; throws Stop('live') when none gives one. */
