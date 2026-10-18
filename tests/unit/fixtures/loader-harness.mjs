@@ -176,12 +176,16 @@ export function makeDeck(tab, { id = 1, slot = 1, title = 'Model track' } = {}) 
   return deck;
 }
 
-/** A fake engine: the I1 entry points, the hub (AGENT_CONNECT connects the tab), events. */
+/**
+ * A fake engine: the I1 entry points, the hub (AGENT_CONNECT connects the tab), events. Its eject has the real one's
+ * shape: the load is stopped and the tab's STOP_TAB started at once, and the deck goes in its turn on serial().
+ */
 export function makeEngine({ tabs = [], limitMin = 15, hubOk = true } = {}) {
   let q = Promise.resolve();
+  const stops = new WeakMap(); // deck -> its STOP_TAB, sent once (the real engine's tabStops)
   const e = {
     ctx: { sampleRate: SR }, params: { 'resident.limitMin': limitMin, 'bpm.range': 'AUTO' }, decks: new Map(), loads: new Map(),
-    hubLog: [], events: [], notes: [], calls: [], order: [],
+    hubLog: [], events: [], notes: [], calls: [], order: [], leaving: new WeakSet(),
     serial(fn) { const run = q.then(fn, fn); q = run.catch(() => {}); return run; },
     hub(m) {
       e.hubLog.push(structuredClone(m)); e.order.push(m.type);
@@ -192,7 +196,14 @@ export function makeEngine({ tabs = [], limitMin = 15, hubOk = true } = {}) {
       }
       return Promise.resolve({ ok: true });
     },
-    stopTab(d, o = {}) { e.hubLog.push({ type: 'STOP_TAB', tabId: d.tabId, ...o }); e.order.push('STOP_TAB'); return turn(); },
+    stopTab(d, o = {}) {
+      if (d.tabId == null) return Promise.resolve();
+      if (!stops.has(d)) {
+        e.hubLog.push({ type: 'STOP_TAB', tabId: d.tabId, ...o }); e.order.push('STOP_TAB');
+        stops.set(d, turn().then(() => { e.order.push('STOP_TAB done'); }));
+      }
+      return stops.get(d);
+    },
     tabDecks() { return [...e.decks.values()].filter((d) => d.tabId != null).map((d) => ({ tabId: d.tabId, slot: d.slot })); },
     async analyse(pcm, signal) {
       e.calls.push({ fn: 'analyse', frames: pcm.L.length });
@@ -202,24 +213,38 @@ export function makeEngine({ tabs = [], limitMin = 15, hubOk = true } = {}) {
     },
     async startResidentDeck({ deckId, pcm, analysis, ...rest }) {
       e.calls.push({ fn: 'startResidentDeck', deckId, frames: pcm.L.length, code: pcm.L[0], analysis: !!analysis, rest });
-      await turn();
       const d = e.decks.get(deckId);
-      if (!d) return { ok: false, error: 'That deck is gone.' };
+      if (!d || e.leaving.has(d)) return { ok: false, error: 'That deck is gone.' };
+      await turn();
       d.kind = 'resident'; d.duration = pcm.L.length / pcm.sampleRate;
       d.setLoad({ state: 'ready', progress: 1, strategy: null, error: null });
+      if (e.decks.get(deckId) !== d || e.leaving.has(d)) return { ok: false, error: 'That deck is gone.' }; // ejected meanwhile
+      e.events.push({ level: 'info', text: `Loaded “${d.meta.title}” on deck ${d.slot}.` });
       return { ok: true, deckId, slot: d.slot };
     },
     async failLoadingToLive(deckId, reason) {
       e.calls.push({ fn: 'failLoadingToLive', deckId, reason });
       const d = e.decks.get(deckId);
-      if (!d) return { ok: false, error: 'That deck is gone.' };
+      if (!d || e.leaving.has(d)) return { ok: false, error: 'That deck is gone.' };
       const l = e.loads.get(deckId); if (l) { e.loads.delete(deckId); l.abort(); }
       d.kind = 'live';
       d.setLoad({ state: 'ready', progress: 1, strategy: null, error: null });
       if (reason) e.events.push({ level: 'warn', text: `Deck ${d.slot}: ${reason}` });
       return { ok: true, deckId, slot: d.slot };
     },
-    eject(id) { e.calls.push({ fn: 'eject', deckId: id }); const l = e.loads.get(id); if (l) { e.loads.delete(id); l.abort(); } e.decks.delete(id); return Promise.resolve(); },
+    eject(id) {
+      e.calls.push({ fn: 'eject', deckId: id });
+      const l = e.loads.get(id); if (l) { e.loads.delete(id); l.abort(); }
+      const d0 = e.decks.get(id);
+      if (d0) { e.leaving.add(d0); e.stopTab(d0); }
+      return e.serial(async () => {
+        const d = e.decks.get(id);
+        if (!d) return;
+        e.decks.delete(id);
+        e.hubLog.push({ type: 'DECKS_CHANGED', decks: e.tabDecks(), eject: true }); e.order.push('DECKS_CHANGED');
+        await e.stopTab(d);
+      });
+    },
     event(level, text) { e.events.push({ level, text }); },
     notify(level, text) { e.notes.push({ level, text }); },
   };

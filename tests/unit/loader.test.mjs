@@ -213,14 +213,22 @@ test('progress only goes up, and says in plain words what the loader is doing', 
   assert.equal(deck.load.progress, 1);
 });
 
-test('a resident load releases the tab: STOP_TAB, the capture stopped, the agents tapped off and let go, then the tab forgotten', async () => {
+test('a resident load releases the tab in order: STOP_TAB answered, then the capture stopped, the agents tapped off and let go, then the tab forgotten', async () => {
   const link = 'https://site.example/media/track.mp3';
-  const { tab, engine, deck } = await load({ kind: 'progressive', src: link, files: { [link]: file('a', 120) } });
-  const stop = engine.order.indexOf('STOP_TAB'), changed = engine.order.lastIndexOf('DECKS_CHANGED');
-  assert.ok(stop >= 0 && changed > stop, engine.order.join());
-  assert.equal(engine.hubLog[stop].tabId, 7, 'STOP_TAB for the source tab');
-  assert.equal(engine.hubLog[stop].release, true, 'a release: the tab is paused, never left muted');
-  assert.deepEqual(engine.hubLog[changed].decks, [], 'the hub forgets the tab');
+  const { tab, engine, deck } = await load({ kind: 'progressive', src: link, files: { [link]: file('a', 120) } }, {
+    before: ({ engine: e, deck: d, tab: t }) => {
+      const tr = d.tracks[0], stop = tr.stop;
+      tr.stop = function () { e.order.push('capture stopped'); return stop.call(this); };
+      const disc = t.frames[0].port.disconnect;
+      t.frames[0].port.disconnect = () => { e.order.push('agent let go'); disc(); };
+    },
+  });
+  // The tab is silenced (its STOP_TAB answered) before its capture goes, so the track never comes out of the speakers.
+  assert.deepEqual(engine.order.filter((x) => x !== 'AGENT_CONNECT'), ['STOP_TAB', 'STOP_TAB done', 'capture stopped', 'agent let go', 'DECKS_CHANGED']);
+  const stop = engine.hubLog.find((m) => m.type === 'STOP_TAB'), changed = engine.hubLog.findLast((m) => m.type === 'DECKS_CHANGED');
+  assert.equal(stop.tabId, 7, 'STOP_TAB for the source tab');
+  assert.equal(stop.release, true, 'a release: the tab is paused, never left muted');
+  assert.deepEqual(changed.decks, [], 'the hub forgets the tab');
   assert.equal(deck.tracks[0].stopped, true, 'the held capture is stopped');
   assert.equal(deck.stream, null);
   assert.equal(deck.tabId, null);
@@ -379,11 +387,16 @@ test('two loads racing on two tabs: each deck gets its own track, and no tab hea
 async function ejectAt(k, page) {
   const tab = makeTab(page), engine = makeEngine({ tabs: [tab] });
   let n = 0, at = null;
-  const { deck, loader } = loaderFor(tab, engine, { fetchBytes: (u, o) => { tick(`read ${u.slice(0, 12)}`); return fetcher([tab])(u, o); } });
+  const { deck, loader, ac } = loaderFor(tab, engine, { fetchBytes: (u, o) => { tick(`read ${u.slice(0, 12)}`); return fetcher([tab])(u, o); } });
   const order = [];
   function tick(what) {
     order.push(what);
-    if (n++ === k && at == null) { at = { what, sent: tab.log.length }; engine.eject(deck.id); }
+    if (n++ === k && at == null) {
+      at = { what, sent: tab.log.length };
+      // Another deck starting holds serial() for a moment, so the eject's turn (and its deck's going) comes later.
+      engine.serial(() => new Promise((r) => setTimeout(r, 25)));
+      engine.eject(deck.id);
+    }
   }
   tab.hooks.push((m) => tick(`send ${m.t}${m.mode ? ` ${m.mode}` : ''}`));
   for (const fn of ['hub', 'stopTab', 'analyse', 'startResidentDeck', 'failLoadingToLive']) {
@@ -391,8 +404,9 @@ async function ejectAt(k, page) {
     engine[fn] = (...a) => { tick(fn); return f(...a); };
   }
   const result = await loader.run();
+  await engine.serial(() => {}); // the eject has had its turn
   await settle(30);
-  return { result, at, tab, engine, deck, order };
+  return { result, at, tab, engine, deck, order, signal: ac.signal };
 }
 
 for (const [name, page] of [
@@ -403,9 +417,12 @@ for (const [name, page] of [
   test(`ejected at every step of a load ${name}: cancelled, nothing promoted or sent live, the page given back, then silence`, async () => {
     let k = 0;
     for (;; k++) {
-      const { result, at, tab, engine, deck, order } = await ejectAt(k, page);
+      const { result, at, tab, engine, deck, order, signal } = await ejectAt(k, page);
       if (!at) { assert.ok(k > 5, `only ${k} steps`); break; }
       const where = `ejected at step ${k} (${at.what}) of ${order.join(', ')}`;
+      // The eject stops the load at once (its deck goes later, in its turn), as the real one does.
+      assert.equal(signal.aborted, true, `${where}: the load's abort signal fired`);
+      assert.equal(engine.decks.has(deck.id), false, `${where}: the deck is gone`);
       if (order.slice(0, k).includes('startResidentDeck')) {
         // Ejected while the tab was being released: the load had finished, and the eject takes the resident deck.
         assert.equal(result.kind, 'resident', where);
@@ -414,11 +431,14 @@ for (const [name, page] of [
       }
       assert.deepEqual(result, { ok: false, error: 'Loading was cancelled.' }, where);
       const after = engine.calls.slice(engine.calls.findIndex((c) => c.fn === 'eject') + 1);
-      // A promotion already on its way finds the deck gone; none is started after the eject.
+      // A promotion already on its way finds the deck on its way out; none is started after the eject.
       assert.notEqual(deck.kind, 'resident', where);
+      assert.deepEqual(engine.events.filter((e) => /^Loaded /.test(e.text)), [], `${where}: said to be loaded`);
       assert.ok(after.filter((c) => c.fn === 'startResidentDeck').length <= (at.what === 'startResidentDeck' ? 1 : 0), where);
       assert.ok(after.filter((c) => c.fn === 'failLoadingToLive').length <= (at.what === 'failLoadingToLive' ? 1 : 0), where);
-      assert.equal(engine.hubLog.filter((m) => m.type === 'DECKS_CHANGED' || m.type === 'STOP_TAB').length, 0, `${where}: no release of an ejected deck`);
+      // No release of an ejected deck: the eject's own STOP_TAB and DECKS_CHANGED only, and the deck keeps its tab.
+      assert.deepEqual(engine.hubLog.filter((m) => (m.type === 'STOP_TAB' && m.release) || (m.type === 'DECKS_CHANGED' && !m.eject)), [], `${where}: released`);
+      assert.equal(deck.tabId, tab.tabId, `${where}: released`);
       const late = tab.log.slice(at.sent).map((x) => x.m).filter((m) => !(m.t === 'drive' && m.mode === 'stop') && !(m.t === 'tap' && m.on === false));
       // The command that was being sent when the eject came is the only other one.
       assert.ok(late.length <= (at.what.startsWith('send') ? 1 : 0), `${where}: sent after the eject: ${JSON.stringify(late)}`);
