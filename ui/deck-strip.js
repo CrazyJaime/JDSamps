@@ -20,6 +20,7 @@ export class DeckStrip {
     this.d = d;
     this.shownBpm = null;
     this.rollHeld = [];
+    this.nudgeHeld = [];
     this.store = new WaveStore();
     this.el = clone('tpl-deck');
     this.waveRow = clone('tpl-wave-row');
@@ -104,7 +105,7 @@ export class DeckStrip {
       const shift = (e) => { fine = e.shiftKey; };
       el.addEventListener('pointerdown', shift);
       el.addEventListener('keydown', shift);
-      bindPad(el, { latch: false, onDown: () => this.act('nudge', { dir, fine }), onUp: () => this.act('nudge', { dir: 0 }) });
+      bindPad(el, { latch: false, onDown: () => this.nudgeDown(el, dir, fine), onUp: () => this.nudgeUp(el) });
     }
     const on = (sel, fn) => this.q(sel).addEventListener('click', fn);
     on('[data-act="playToggle"]', () => this.act('playToggle'));
@@ -124,9 +125,17 @@ export class DeckStrip {
     on('[data-act="keyLock"]', () => this.set('keyLock', !this.d.params.keyLock));
     on('[data-act="syncMode"]', () => this.set('syncMode', this.d.params.syncMode === 'BEAT' ? 'TEMPO' : 'BEAT'));
     on('[data-act="clipReset"]', () => this.act('clipReset')); // deck meter: clear its clip light (spec §3.7)
+    // One click must never slam a deck that is on air: the cycle steps past any range too narrow
+    // to hold the tempo the deck is at (the engine refuses such a change anyway), and when none
+    // can hold it the DJ is told instead of the button quietly doing nothing.
     on('[data-act="range"]', () => {
-      const i = PITCH_RANGES.indexOf(this.d.params.range);
-      this.set('range', PITCH_RANGES[(i + 1) % PITCH_RANGES.length]);
+      const p = this.d.params, n = PITCH_RANGES.length, i = PITCH_RANGES.indexOf(p.range);
+      for (let k = 1; k <= n; k++) {
+        const r = PITCH_RANGES[(i + k) % n];
+        if (r === p.range) break;
+        if (Math.abs(p.pitch) <= r + 1e-9) { this.set('range', r); return; }
+      }
+      this.toast(`Tempo is ${fmtPct(p.pitch)}: no other pitch range can hold it. Move the tempo fader first.`, 'warn');
     });
     // REC starts on one press; stopping needs a 600 ms hold so a slip never splits a recording.
     this.recHold = bindHold(this.refs.rec, {
@@ -153,6 +162,22 @@ export class DeckStrip {
     this.rollHeld.splice(i, 1);
     if (!this.rollHeld.length) this.act('rollEnd');
     else if (wasNewest) this.act('rollStart', { beats: this.rollHeld[this.rollHeld.length - 1].beats });
+  }
+
+  /** Nudges held by keys and pads, newest last: releasing one falls back to the newest still held. */
+  nudgeDown(src, dir, fine) {
+    this.nudgeHeld = this.nudgeHeld.filter((h) => h.src !== src);
+    this.nudgeHeld.push({ src, dir, fine });
+    this.act('nudge', { dir, fine });
+  }
+  nudgeUp(src) {
+    const i = this.nudgeHeld.findIndex((h) => h.src === src);
+    if (i < 0) return;
+    const wasNewest = i === this.nudgeHeld.length - 1;
+    this.nudgeHeld.splice(i, 1);
+    const top = this.nudgeHeld[this.nudgeHeld.length - 1];
+    if (!top) this.act('nudge', { dir: 0 });
+    else if (wasNewest) this.act('nudge', { dir: top.dir, fine: top.fine });
   }
 
   /** Keyboard entry points (Task 13 keys.js). */

@@ -390,6 +390,35 @@ test('while the page is hidden snapshots touch no deck or master DOM; showing th
   await page.waitForTimeout(30);
 });
 
+// One click of RANGE must never slam a deck that is on air: the cycle skips a range too narrow
+// for the tempo the deck is at, and when none fits it says so instead of clamping the pitch.
+test('RANGE skips a range that cannot hold the deck’s tempo, and says so when none can', async () => {
+  const rangeBtn = deckEl(1).locator('[data-act="range"]');
+  const ranges = async () => (await sets((m) => m.deck === 1 && m.key === 'range')).map((m) => m.value);
+  const at = async (range, pitch) => {
+    const s = threeDecks();
+    Object.assign(s.decks[0].params, { range, pitch });
+    await ui.push({ t: 'state', s });
+    await page.waitForTimeout(40);
+    await ui.clearSent();
+    await page.evaluate(() => document.getElementById('toasts').replaceChildren());
+    await rangeBtn.click();
+    await page.waitForTimeout(40);
+  };
+  // +3%: every range holds it, so the cycle just steps on (WIDE wraps round to ±6).
+  await at(0.5, 0.03);
+  assert.deepEqual(await ranges(), [0.06]);
+  // +8% at WIDE: ±6 would clamp the tempo, so the step skips it and lands on ±10.
+  await at(0.5, 0.08);
+  assert.deepEqual(await ranges(), [0.1]);
+  // +30% at WIDE: nothing narrower can hold it, so no range is sent and the DJ is told why.
+  await at(0.5, 0.3);
+  assert.deepEqual(await ranges(), [], 'no silent 18.5% tempo drop');
+  assert.ok((await page.locator('.toast').allTextContents()).some((t) => /tempo/i.test(t)), 'the DJ is told why');
+  await ui.push({ t: 'state', s: threeDecks() });
+  await page.waitForTimeout(30);
+});
+
 test('no console errors', () => { assert.deepEqual(ui.errors, []); });
 
 test('empty state is shown with no decks', async () => {

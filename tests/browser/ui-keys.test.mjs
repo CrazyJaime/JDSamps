@@ -140,6 +140,46 @@ test('releasing one roll falls back to the newest roll still held (keys and pads
   assert.deepEqual(await rolls(), [['rollStart', 0.5], ['rollStart', 0.125], ['rollStart', 0.5], ['rollEnd', null]]);
 });
 
+test('releasing one nudge arrow falls back to the other still held (keys and pads)', async () => {
+  await blur();
+  await page.keyboard.press('Digit1');
+  const nudges = async () => (await acts((m) => m.deck === 1 && m.a === 'nudge')).map((m) => [m.arg.dir, m.arg.fine ?? null]);
+  // Hold →, tap ←: letting go of ← must go back to nudging forward, not stop the nudge dead.
+  await ui.clearSent();
+  await page.keyboard.down('ArrowRight'); await wait(30);
+  await page.keyboard.down('ArrowLeft'); await wait(30);
+  await page.keyboard.up('ArrowLeft'); await wait(40);
+  assert.deepEqual(await nudges(), [[1, false], [-1, false], [1, false]]);
+  await page.keyboard.up('ArrowRight'); await wait(40);
+  assert.deepEqual(await nudges(), [[1, false], [-1, false], [1, false], [0, null]]);
+  // Releasing the older arrow first changes nothing until the newest one goes too.
+  await ui.clearSent();
+  await page.keyboard.down('ArrowRight'); await wait(30);
+  await page.keyboard.down('ArrowLeft'); await wait(30);
+  await page.keyboard.up('ArrowRight'); await wait(40);
+  assert.deepEqual(await nudges(), [[1, false], [-1, false]]);
+  await page.keyboard.up('ArrowLeft'); await wait(40);
+  assert.deepEqual(await nudges(), [[1, false], [-1, false], [0, null]]);
+  // On-screen nudge − held with the mouse, ArrowRight pressed and released, then the pad released.
+  await ui.clearSent();
+  const pad = deckEl(1).locator('[data-hold="nudge-"]');
+  const b = await pad.boundingBox();
+  await page.mouse.move(b.x + 5, b.y + 5);
+  await page.mouse.down(); await wait(30);
+  await page.keyboard.down('ArrowRight'); await wait(30);
+  await page.keyboard.up('ArrowRight'); await wait(30);
+  await page.mouse.up(); await wait(40);
+  assert.deepEqual(await nudges(), [[-1, false], [1, false], [-1, false], [0, null]]);
+  // Losing the window mid-hold ends the nudge exactly once.
+  await ui.clearSent();
+  await page.keyboard.down('ArrowRight'); await wait(30);
+  await page.keyboard.down('ArrowLeft'); await wait(30);
+  await page.evaluate(() => window.dispatchEvent(new Event('blur')));
+  await wait(40);
+  await page.keyboard.up('ArrowLeft'); await page.keyboard.up('ArrowRight'); await wait(40);
+  assert.deepEqual(await nudges(), [[1, false], [-1, false], [0, null]]);
+});
+
 test('TAP is stamped at the press, not the release (pointer and keyboard)', async () => {
   await page.evaluate(() => { window.addEventListener('pointerdown', (e) => { window.__downAt = performance.timeOrigin + e.timeStamp; }, true); });
   const tap = deckEl(1).locator('[data-act="tap"]');
