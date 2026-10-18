@@ -153,7 +153,7 @@ export function mp4Items(buf, { resync = [] } = {}) {
       if (r == null) break;
       p = r; ftyp = null; continue;
     }
-    if (bx.type === 'ftyp') ftyp = bx;
+    if (bx.type === 'ftyp') { ftyp = bx; info = null; }                         // a new init: nothing after it is placed until its moov
     else if (bx.type === 'moov') {
       const start = ftyp && ftyp.end === bx.start ? ftyp.start : bx.start;
       info = readInit(b.subarray(start, bx.end));
@@ -243,7 +243,7 @@ export function webmItems(buf, { resync = [] } = {}) {
     const x = readEl(b, p, b.length);
     if (!x || !TOP.has(x.id)) { const r = skip(p); if (r == null) break; p = r; continue; }
     if (x.id === ID.SEGMENT) { p = x.data; continue; }                        // step inside: its children are the stream
-    if (x.id === ID.EBML) { head = x.start; scale = 1e6; fileDur = null; }
+    if (x.id === ID.EBML) { head = x.start; scale = 1e6; fileDur = null; info = null; }
     if (x.id === ID.CLUSTER) {
       let end = x.end, tc = 0, first = null, last = null, frame = 0, prevAbs = null;
       if (end == null) {                                                        // unknown size: runs to the next level-1 element
@@ -325,7 +325,7 @@ function xing(b, p, h) {
 
 function walk(buf, header, lameTag) {
   const b = bytesOf(buf);
-  let p = 0, frames = 0, samples = 0, junk = 0, sampleRate = 0, spf = 0, end = 0, synced = false, delay = 0, padding = 0;
+  let p = 0, frames = 0, samples = 0, junk = 0, sampleRate = 0, spf = 0, end = 0, synced = false, delay = 0, padding = 0, midJunk = false, lost = false;
   while (p + 4 <= b.length) {
     if (b[p] === 0x49 && b[p + 1] === 0x44 && b[p + 2] === 0x33 && p + 10 <= b.length) {            // ID3v2 tag
       p += 10 + ((b[p + 6] & 127) << 21 | (b[p + 7] & 127) << 14 | (b[p + 8] & 127) << 7 | (b[p + 9] & 127)) + (b[p + 5] & 0x10 ? 10 : 0);
@@ -339,14 +339,15 @@ function walk(buf, header, lameTag) {
       const x = lameTag && frames === 0 && !end ? lameTag(b, p, h) : null;
       if (x) { delay = x.delay; padding = x.padding; }
       else { frames++; samples += h.spf; if (h.spf > spf) spf = h.spf; }
+      if (lost) midJunk = true;
       sampleRate = h.sr; p = end = next; synced = true; continue;
     }
-    junk++; p++; synced = false;
+    junk++; p++; synced = false; lost = frames > 0;
   }
-  return { sampleRate, frames, samples: Math.max(0, samples - delay - padding), junk, end, spf, delay, padding };
+  return { sampleRate, frames, samples: Math.max(0, samples - delay - padding), junk, midJunk, end, spf, delay, padding };
 }
 
-/** MP3 (Layer III) frame walk: {sampleRate, frames, samples, junk, end, spf, delay, padding}. */
+/** MP3 (Layer III) frame walk: {sampleRate, frames, samples, junk, midJunk, end, spf, delay, padding}. midJunk: sync was lost between frames. */
 export const mp3Frames = (buf) => walk(buf, mp3Header, xing);
-/** ADTS (AAC) header walk: {sampleRate, frames, samples, junk, end, spf}. */
+/** ADTS (AAC) header walk: {sampleRate, frames, samples, junk, midJunk, end, spf}. */
 export const adtsFrames = (buf) => walk(buf, adtsHeader, null);

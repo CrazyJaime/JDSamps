@@ -84,6 +84,15 @@ test('mp4Items drops a fragment whose samples do not fit its mdat, and media wit
   assert.deepEqual(mp4Items(good).map((i) => i.kind), [], 'no timescale without an init');
 });
 
+test('a new init that never completes does not lend the old one to the media after it', () => {
+  const ftyp = initSeg().subarray(0, 28);                                   // ftyp alone: its moov was never appended
+  const mp4 = mp4Items(cat(initSeg(), fragSeg({ t: 0, durs: [960] }), ftyp, fragSeg({ t: 960, durs: [960] })));
+  assert.deepEqual(mp4.map((i) => i.kind), ['init', 'media']);
+  const ebml = webmInit().subarray(0, 26);                                  // the EBML header element alone
+  const webm = webmItems(cat(webmInit(), webmCluster({ tc: 0, rel: [0] }), ebml, webmCluster({ tc: 20, rel: [0] })));
+  assert.deepEqual(webm.map((i) => i.kind), ['init', 'media']);
+});
+
 test('mp4Items resyncs at the next part boundary after junk', () => {
   const init = initSeg(), a = fragSeg({ t: 0, durs: [960] }), b = fragSeg({ t: 960, durs: [960] });
   const junk = new Uint8Array(13).fill(0xAB);
@@ -121,7 +130,9 @@ test('mp3Frames walks frames, skips an ID3v2 tag and resyncs over junk', () => {
   assert.equal(r.frames, 5);
   assert.equal(r.samples, 5 * 1152);
   assert.equal(r.junk, 7);
+  assert.equal(r.midJunk, true, 'sync lost between frames: bytes may be missing there');
   assert.equal(r.end, buf.length);
+  assert.equal(mp3Frames(cat(new Uint8Array(5), f(), f(), new Uint8Array(128))).midJunk, false, 'junk at the edges (tags) is not a hole');
 });
 
 test('mp3Frames leaves a frame cut short at the end out of the count', () => {
