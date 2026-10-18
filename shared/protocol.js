@@ -168,6 +168,7 @@ export const START_WHY = Object.freeze(['none', 'timeout', 'ambiguous', 'refused
  */
 export const TAP_ERRORS = Object.freeze(['drm', 'worker', 'preview', 'live', 'none', 'fetch']);
 const TAP_KINDS = ['init', 'media', 'file'];
+const TAP_DRIVES = ['seekhop', 'accelerate'], TAP_DRIVE_STATES = ['running', 'done', 'stalled', 'refused'];
 const isCount = (n, max = Number.MAX_SAFE_INTEGER) => Number.isSafeInteger(n) && n >= 0 && n <= max;
 const tapDuration = (d) => (typeof d === 'number' && Number.isFinite(d) && d > 0 ? d : null);
 const isMime = (s) => typeof s === 'string' && s.length <= 256;
@@ -183,7 +184,14 @@ function validateTapMessage(m) {
     if (!Array.isArray(buffered) || buffered.length > 64) return null;
     if (!buffered.every((r) => Array.isArray(r) && r.length === 2 && r.every(Number.isFinite) && r[0] >= 0 && r[0] <= r[1])) return null;
     if (!Array.isArray(mimes) || mimes.length > 16 || !mimes.every(isMime)) return null;
-    return { t: m.t, bytes, buffered: buffered.map(([a, b]) => [a, b]), duration: tapDuration(m.duration), mimes: [...mimes] };
+    const out = { t: m.t, bytes, buffered: buffered.map(([a, b]) => [a, b]), duration: tapDuration(m.duration), mimes: [...mimes] };
+    // How a drive of the player is going: still at it, done (all of it buffered), stalled (it
+    // stopped buffering) or refused (the page fights the rate, or the media cannot be seek-hopped).
+    const d = m.drive;
+    if (d && typeof d === 'object' && TAP_DRIVES.includes(d.mode) && TAP_DRIVE_STATES.includes(d.state) && Number.isFinite(d.at) && d.at >= 0) {
+      out.drive = { mode: d.mode, state: d.state, at: d.at };
+    }
+    return out;
   }
   if (m.t === 'tap-urls') {
     if (!Array.isArray(m.reqs) || !m.reqs.length || m.reqs.length > 64) return null;
@@ -213,7 +221,9 @@ function validateTapMessage(m) {
   }
   if (m.t === 'tap-error') {
     if (!TAP_ERRORS.includes(m.reason)) return null;
-    return { t: m.t, reason: m.reason, detail: typeof m.detail === 'string' ? m.detail.slice(0, 300) : '' };
+    const out = { t: m.t, reason: m.reason, detail: typeof m.detail === 'string' ? m.detail.slice(0, 300) : '' };
+    if (isCount(m.seq)) out.seq = m.seq; // a failed fetch: the link's place in the request
+    return out;
   }
   return null;
 }

@@ -21,6 +21,20 @@ test('tap-progress: bytes, buffered ranges, duration and mimes, bounded', () => 
   ]) assert.equal(validateAgentMessage(bad), null, JSON.stringify(bad).slice(0, 120));
 });
 
+test('tap-progress may say how a drive of the player is going', () => {
+  const m = { t: 'tap-progress', bytes: 1, buffered: [], duration: 180, mimes: [] };
+  for (const mode of ['seekhop', 'accelerate']) {
+    for (const state of ['running', 'done', 'stalled', 'refused']) {
+      const drive = { mode, state, at: 42.5 };
+      assert.deepEqual(validateAgentMessage({ ...m, drive }), { ...m, drive });
+    }
+  }
+  // A drive report that is not one is left out; the progress itself still counts.
+  for (const drive of [{ mode: 'warp', state: 'running', at: 1 }, { mode: 'seekhop', state: 'evil', at: 1 }, { mode: 'seekhop', state: 'done', at: -1 }, 'x', null]) {
+    assert.deepEqual(validateAgentMessage({ ...m, drive }), m, JSON.stringify(drive));
+  }
+});
+
 test('tap-urls: media requests with method, Range and size; only http(s) links', () => {
   const r = { url: 'https://cdn.example.com/a/seg-00004.m4s?sig=abc', method: 'GET', range: 'bytes=0-999', size: 1000, media: true };
   assert.deepEqual(validateAgentMessage({ t: 'tap-urls', reqs: [r] }), { t: 'tap-urls', reqs: [r] });
@@ -55,6 +69,9 @@ test('tap-error: a known reason and a short plain detail', () => {
   for (const reason of TAP_ERRORS) assert.deepEqual(validateAgentMessage({ t: 'tap-error', reason, detail: 'x' }), { t: 'tap-error', reason, detail: 'x' });
   assert.equal(validateAgentMessage({ t: 'tap-error', reason: 'none', detail: 'y'.repeat(2000) }).detail.length, 300);
   assert.deepEqual(validateAgentMessage({ t: 'tap-error', reason: 'drm' }), { t: 'tap-error', reason: 'drm', detail: '' });
+  // A page-context fetch that failed names the link by its place in the request.
+  assert.deepEqual(validateAgentMessage({ t: 'tap-error', reason: 'fetch', detail: '#3: HTTP 404', seq: 3 }), { t: 'tap-error', reason: 'fetch', detail: '#3: HTTP 404', seq: 3 });
+  assert.deepEqual(validateAgentMessage({ t: 'tap-error', reason: 'fetch', detail: 'x', seq: -1 }), { t: 'tap-error', reason: 'fetch', detail: 'x' });
   for (const bad of [{ t: 'tap-error' }, { t: 'tap-error', reason: 'evil', detail: '' }, { t: 'tap-error', reason: 'DRM', detail: '' }]) {
     assert.equal(validateAgentMessage(bad), null, JSON.stringify(bad));
   }

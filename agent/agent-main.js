@@ -79,9 +79,11 @@
   // go of at once (the relay's port drops). Checked on every event and command, so a throttled
   // timer can only make the release late, and the timer itself re-checks the clock, so a stale
   // one never lets go of a rate still in use.
+  // A drive of the player (see "drive") has its own end, a stop or the port going away: the
+  // watchdog leaves it alone.
   const LET_GO = 10000;
   function watchdog() {
-    if (!st.enforcing) return;
+    if (!st.enforcing || drv.mode) return;
     const left = st.cmdAt + LET_GO - performance.now();
     if (left <= 0) { st.letGo = performance.timeOrigin + performance.now(); release(); }
     else if (!st.dog) st.dog = setTimeout(() => { st.dog = 0; watchdog(); }, left);
@@ -118,6 +120,7 @@
         const rate = el.playbackRate;
         restore(el, x, rate);
         emit(JSON.stringify({ t: 'external-rate', rate }));
+        if (drv.mode === 'accelerate' && el === drv.el) { drv.state = 'refused'; tapDirty(); }
       }
     }
     report();
@@ -297,7 +300,7 @@
   const INIT_MAX = 256 * 1024; // the largest init segment kept while dormant
   const tap = { on: false, bytes: 0, seq: 0, nsb: 0, gen: 0, reqs: 0, infAt: 0, told: new Set(), mimes: new Set(), srcs: new Set() };
   const sbs = new WeakMap(); // SourceBuffer -> { i, mime, skip, init }
-  let inits = []; // WeakRefs to the SourceBuffers holding a kept init, for the tap to find them
+  let known = [], knownAt = 32; // WeakRefs to the SourceBuffers in sbs, for the tap to find them
   const wiredEls = new Set(), watched = new Set(); // what carries a tap listener this session
   const handed = new Set(); // blob: URLs handed to the engine: its to read until it says forget
   const xhrs = new WeakMap();
@@ -336,7 +339,12 @@
   // browser refuses is not captured, so a player retrying it is not captured twice.
   function recOf(sb, mime = '') {
     let rec = sbs.get(sb);
-    if (!rec) { rec = { i: tap.nsb++, mime, skip: videoMime(mime), init: null }; sbs.set(sb, rec); }
+    if (!rec) {
+      rec = { i: tap.nsb++, mime, skip: videoMime(mime), init: null };
+      sbs.set(sb, rec);
+      if (known.length >= knownAt) { known = known.filter((r) => r.deref() !== undefined); knownAt = Math.max(32, 2 * known.length); }
+      known.push(new WeakRef(sb));
+    }
     return rec;
   }
   /** A view of an appended buffer (not a copy), by brand: it may come from another realm. */
@@ -352,10 +360,6 @@
       if (rec.mime.includes('mp4') && videoInit(u8)) { rec.skip = true; return; }
     }
     rec.init = u8;
-    if (!inits.some((r) => r.deref() === sb)) {
-      if (inits.length >= 32) inits = inits.filter((r) => { const s = r.deref(); return !!s && !!(sbs.get(s) || {}).init; });
-      inits.push(new WeakRef(sb));
-    }
   }
   function dormant(sb, data) {
     const src = viewOf(data);
@@ -384,13 +388,14 @@
     handLater();
     tapDirty();
   }
-  /** Tap on: the kept init of every SourceBuffer still in use goes first, before any media. */
-  function sendKeptInits() {
-    for (const r of inits) {
+  /** Tap on: the SourceBuffers still in use are reported, and their kept inits go first. */
+  function tapSourceBuffers() {
+    for (const r of known) {
       const sb = r.deref(), rec = sb && sbs.get(sb);
-      if (!rec || !rec.init || rec.skip) continue;
+      if (!rec || rec.skip) continue;
       try { void sb.buffered; } catch (_) { continue; } // removed from its MediaSource: the player has moved on
-      queuePart(sb, rec, rec.init, 'init');
+      if (rec.mime) tap.mimes.add(rec.mime);
+      if (rec.init) queuePart(sb, rec, rec.init, 'init');
     }
   }
   function tooLarge() {
@@ -516,6 +521,7 @@
   function onTapMedia(e) {
     if (!tap.on) return;
     if (e.type === 'encrypted') tapFail('drm', 'the media is encrypted');
+    driveCheck();
     tapDirty();
   }
   function wireTap(el) {
@@ -528,10 +534,11 @@
     watched.add(sb);
     listen.call(sb, 'updateend', onSbUpdate);
   }
-  function onSbUpdate() { tapDirty(); }
+  function onSbUpdate() { driveCheck(); tapDirty(); }
 
-  /** The player the tap reports on: playing and heard first, then loaded, then the longest. */
+  /** The player the tap reports on: the driven one; else playing and heard, loaded, longest. */
   function mainEl() {
+    if (drv.el) return drv.el;
     let best = null, score = -1;
     for (const el of live()) {
       const d = Number.isFinite(el.duration) ? Math.min(el.duration, 1e6) : 0;
@@ -593,7 +600,9 @@
     if (!tap.on) return;
     checkPage();
     const el = mainEl();
-    const s = JSON.stringify({ t: 'tap-progress', bytes: tap.bytes, buffered: rangesOf(el), duration: durOf(el), mimes: [...tap.mimes].slice(0, 16) });
+    const msg = { t: 'tap-progress', bytes: tap.bytes, buffered: rangesOf(el), duration: durOf(el), mimes: [...tap.mimes].slice(0, 16) };
+    if (drv.mode) msg.drive = { mode: drv.mode, state: drv.state, at: Math.max(0, drv.mode === 'seekhop' ? drv.cursor : el.currentTime) };
+    const s = JSON.stringify(msg);
     if (s === tp.last) return;
     tp.last = s; tp.at = performance.now();
     emit(s);
@@ -619,13 +628,166 @@
     tp.last = '';
     activate(); scan(); watchPolling();
     for (const el of live()) wireTap(el);
-    sendKeptInits();
+    tapSourceBuffers();
     history();
     checkPage();
     tapDirty();
   }
+  // ---------------------------------------------------------------- drive
+  // To get the whole track the deck has the player fetch all of it, while the tap captures what
+  // it appends: seekhop seeks through the track in steps the size of the player's own buffering
+  // goal, waiting at each until it has buffered the step; accelerate plays it fast through the
+  // assist rate machinery (and its back-off), pitch unlocked. Either mutes the player; stop puts
+  // back its rate, pitch, mute, volume, position and playing state. Progress goes up in
+  // tap-progress.drive: running, done (all of it buffered), stalled or refused.
+  const HOP_WAIT = 3000, END_TOL = 0.3, START_TOL = 0.2;
+  const drv = { mode: null, el: null, base: null, state: '', cursor: 0, hop: 0, since: 0, timer: 0 };
+  // MP3 and ADTS carry no timestamps: their appends can only be placed in order, so no seek-hop.
+  const NO_STAMPS = /^audio\/(mpeg|mp3|aac|x-aac)\b/i;
+
+  /** The end of the buffered range that holds (or starts just after) t; t itself if none. */
+  function bufEnd(el, t) {
+    try { const b = el.buffered; for (let i = 0; i < b.length; i++) if (b.start(i) <= t + START_TOL && b.end(i) > t) return b.end(i); } catch (_) {}
+    return t;
+  }
+  const lengthOf = (el) => { const d = el.duration; return d > 0 && d !== Infinity ? d : 0; };
+  function drive(m) {
+    if (m.mode === 'stop') { driveStop(); return; }
+    if (!tap.on || (m.mode !== 'seekhop' && m.mode !== 'accelerate')) return;
+    const el = drv.el || mainEl();
+    if (!el) { emit(JSON.stringify({ t: 'tap-error', reason: 'none', detail: 'no player to drive' })); return; }
+    if (!drv.mode) {
+      drv.el = el;
+      drv.base = { t: el.currentTime, paused: el.paused, rate: el.playbackRate, dflt: el.defaultPlaybackRate, pp: el.preservesPitch, muted: el.muted, volume: el.volume };
+      drv.timer = setInterval(driveCheck, 250);
+    } else if (st.enforcing) release(); // from accelerate to seekhop
+    drv.mode = m.mode; drv.since = performance.now();
+    if (m.mode === 'seekhop' && [...tap.mimes].some((x) => NO_STAMPS.test(x))) { drv.state = 'refused'; tapDirty(); return; }
+    drv.state = 'running';
+    try { el.muted = true; } catch (_) {}
+    if (m.mode === 'seekhop') {
+      const t = el.currentTime, step = typeof m.step === 'number' && m.step >= 0.5 && m.step <= 600 ? m.step : 0;
+      drv.hop = step || Math.max(1, bufEnd(el, t) - t); // the player's buffering goal, as it shows now
+      drv.cursor = 0;
+      hop();
+    } else accelerate(typeof m.rate === 'number' && m.rate > 1 && m.rate <= 16 ? m.rate : 8);
+    tapDirty();
+  }
+  function hop() {
+    const el = drv.el, dur = lengthOf(el);
+    if (!dur) return; // no length yet: driveCheck waits for one
+    const e = bufEnd(el, drv.cursor);
+    if (e >= dur - END_TOL) { drv.state = 'done'; tapDirty(); return; }
+    drv.cursor = e; drv.since = performance.now();
+    try { el.currentTime = e; } catch (_) {}
+    tapDirty();
+  }
+  // A stall is said, not final: a player that buffers again is hopped on from where it got to.
+  function driveCheck() {
+    if (!drv.mode || (drv.state !== 'running' && drv.state !== 'stalled')) return;
+    const el = drv.el, dur = lengthOf(el), late = performance.now() - drv.since > HOP_WAIT;
+    const stall = () => { if (drv.state !== 'stalled') { drv.state = 'stalled'; tapDirty(); } };
+    if (drv.mode === 'accelerate') {
+      if (el.ended || (dur && bufEnd(el, el.currentTime) >= dur - END_TOL)) { drv.state = 'done'; tapDirty(); }
+      return;
+    }
+    if (!dur) { if (late) stall(); return; }
+    const e = bufEnd(el, drv.cursor), moved = e > drv.cursor + 0.05;
+    if (drv.state === 'stalled') { if (moved) { drv.state = 'running'; hop(); } return; }
+    if (e >= Math.min(dur - END_TOL, drv.cursor + drv.hop)) hop();
+    else if (late) { if (moved) hop(); else stall(); } // slower than its goal: move on
+  }
+  function accelerate(rate) {
+    st.target = rate; st.enforcing = true; st.letGo = 0;
+    scan();
+    for (const el of live()) { const x = info.get(el); if (x) { x.off = false; x.ext = []; } apply(el); }
+    const el = drv.el, refused = () => { if (drv.mode === 'accelerate') { drv.state = 'refused'; tapDirty(); } };
+    if (!el.paused) return;
+    let p;
+    try { p = nativePlay.call(el); } catch (_) { refused(); return; }
+    if (p && typeof p.then === 'function') p.then(null, refused);
+  }
+  function driveStop() {
+    if (!drv.mode) return;
+    const { el, base } = drv;
+    clearInterval(drv.timer);
+    Object.assign(drv, { mode: null, el: null, base: null, state: '', timer: 0 });
+    if (st.enforcing) release();
+    try {
+      el.defaultPlaybackRate = base.dflt; el.playbackRate = base.rate; el.preservesPitch = base.pp;
+      el.muted = base.muted; el.volume = base.volume;
+      if (base.paused && !el.paused) nativePause.call(el);
+      if (el.currentTime !== base.t) el.currentTime = base.t;
+    } catch (_) {}
+    tapDirty();
+  }
+
+  // ---------------------------------------------------------------- page-context fetch
+  // {t:'fetch', urls}: the engine has the page fetch links again (signed links are bound to the
+  // page's session), with the fetch the agent took at document_start, never one the page put in
+  // its place: eight at a time, each given 15 s. Each result is a tap-ready part, kind 'media',
+  // numbered by its place in the list; a failure is a tap-error 'fetch' with that number.
+  // {t:'readTralbum'}: a Bandcamp page's own stream link (its data-tralbum JSON), fetched the
+  // same way and handed over as one 'file' part.
+  const FETCH_WAIT = 15000, FILE_WAIT = 60000, Abort_ = AbortController;
+  const jobs = new Set();
+  async function grab(url, wait, gen) {
+    const ac = new Abort_(), timer = setTimeout(() => ac.abort(), wait);
+    jobs.add(ac);
+    try {
+      const res = await nFetch.call(window, url, { signal: ac.signal });
+      if (!res.ok) return { error: `HTTP ${res.status}` };
+      const blob = await res.blob();
+      return gen === tap.gen ? { blob, mime: (res.headers.get('content-type') || '').slice(0, 256) } : {};
+    } catch (_) {
+      return gen !== tap.gen ? {} : { error: ac.signal.aborted ? `timed out after ${wait / 1000} s` : 'network error' };
+    } finally { clearTimeout(timer); jobs.delete(ac); }
+  }
+  /** Count a fetched Blob against the limit; false when it does not fit (the tap gives up). */
+  function holds(blob) {
+    if (tap.bytes + blob.size > CAP) { tooLarge(); return false; }
+    tap.bytes += blob.size;
+    return true;
+  }
+  function fetchUrls(m) {
+    if (!Array.isArray(m.urls) || !m.urls.length || m.urls.length > 512) return;
+    const urls = m.urls.map((u) => (typeof u === 'string' ? absUrl(u) : null));
+    const n = Number.isInteger(m.concurrency) && m.concurrency >= 1 && m.concurrency <= 16 ? m.concurrency : 8, gen = tap.gen;
+    const fail = (seq, why) => emit(JSON.stringify({ t: 'tap-error', reason: 'fetch', detail: `#${seq}: ${why}`, seq }));
+    let next = 0;
+    const worker = async () => {
+      while (next < urls.length && gen === tap.gen) {
+        const seq = next++;
+        if (!urls[seq]) { fail(seq, 'not a web link'); continue; }
+        const r = await grab(urls[seq], FETCH_WAIT, gen);
+        if (r.error) fail(seq, r.error);
+        else if (r.blob && holds(r.blob)) { pend.push({ blob: r.blob, mime: r.mime, kind: 'media', sb: -1, seq }); handLater(); tapDirty(); }
+      }
+    };
+    for (let k = 0; k < Math.min(n, urls.length); k++) worker();
+  }
+  async function readTralbum() {
+    let url = null, duration = null;
+    try {
+      const el = document.querySelector('[data-tralbum]');
+      const t = el ? (JSON.parse(el.getAttribute('data-tralbum')).trackinfo || [])[0] : null;
+      const f = t && t.file && t.file['mp3-128'];
+      if (typeof f === 'string') url = absUrl(f);
+      if (t && Number.isFinite(t.duration) && t.duration > 0) duration = t.duration;
+    } catch (_) {}
+    if (!url) { emit(JSON.stringify({ t: 'tap-error', reason: 'none', detail: 'no stream link on the page' })); return; }
+    const r = await grab(url, FILE_WAIT, tap.gen);
+    if (r.error) { emit(JSON.stringify({ t: 'tap-error', reason: 'fetch', detail: `the stream link: ${r.error}` })); return; }
+    if (!r.blob || !holds(r.blob)) return;
+    const blobUrl = mkUrl(r.blob);
+    handed.add(blobUrl);
+    emit(JSON.stringify({ t: 'tap-ready', parts: [{ blobUrl, mime: r.mime || 'audio/mpeg', kind: 'file', sb: -1, seq: 0 }], duration }));
+  }
+
   /** Off: drop every copy not handed over. forget: revoke the handed-over URLs too. */
   function tapOff(forget) {
+    driveStop();
+    for (const ac of jobs) ac.abort();
     if (tap.on) {
       tap.on = false;
       for (const el of wiredEls) for (const ev of TAP_EVENTS) unlisten.call(el, ev, onTapMedia);
@@ -681,6 +843,7 @@
       send();
     } else if (m.t === 'rate') {
       if (typeof m.rate !== 'number' || !Number.isFinite(m.rate) || m.rate < 0.5 || m.rate > 2) return;
+      if (drv.mode) { send(); return; } // the player is being driven: no assist on top of it
       activate();
       // After letting go by itself the agent takes the page again only on a new command: a
       // keep-alive of the old one (an engine back from a stall) is answered with the status that
@@ -736,6 +899,12 @@
       // blob URL handed over, which it has read or no longer wants).
       if (m.on === true) tapOn();
       else if (m.on === false) tapOff(m.forget === true);
+    } else if (m.t === 'drive') {
+      drive(m);
+    } else if (m.t === 'fetch') {
+      fetchUrls(m);
+    } else if (m.t === 'readTralbum') {
+      readTralbum();
     }
   }
 })();

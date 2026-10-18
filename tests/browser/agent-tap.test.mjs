@@ -114,7 +114,8 @@ const PLAYER = `<!doctype html><title>player</title><body><audio id="a"></audio>
     const s = sb;
     if (!s) return;
     for (;;) {
-      const t = a.currentTime, from = Math.floor(t / SEG) + 1, to = AHEAD ? Math.min(N, Math.ceil((t + AHEAD) / SEG)) : N;
+      const t = a.currentTime, from = Math.floor(t / SEG) + 1;
+      const to = Math.min(AHEAD ? Math.min(N, Math.ceil((t + AHEAD) / SEG)) : N, Math.ceil((window.__limit || 1e9) / SEG));
       let k = from;
       while (k <= to && have.has(k)) k++;
       if (k > to || sb !== s) break;
@@ -127,11 +128,12 @@ const PLAYER = `<!doctype html><title>player</title><body><audio id="a"></audio>
     if (sb === s && have.size === N && ms.readyState === 'open' && !sb.updating) ms.endOfStream();
   }
   const pump = () => (chain = chain.then(pass, pass));
+  window.__pump = pump; // __limit (s): a player that will not buffer past it
   window.__go = async () => {
     sb = null; ms = new MediaSource(); have = new Set(); window.__fx.appended = [];
     a.src = URL.createObjectURL(ms);
     await new Promise((r) => { ms.onsourceopen = r; });
-    sb = ms.addSourceBuffer(${JSON.stringify(MIME)});
+    sb = ms.addSourceBuffer(q.get('mime') || ${JSON.stringify(MIME)});
     window.__sb = sb; window.__ms = ms;
     if (q.has('raw')) { if (DUR) ms.duration = DUR; return; }
     await push(await get('/fx/' + SET + '/init.mp4'));
@@ -170,6 +172,26 @@ const WORKER = `<!doctype html><title>worker</title><body><audio id="a"></audio>
 </script>`;
 
 const BLANK = '<!doctype html><title>blank</title><body><audio id="a"></audio>';
+
+// A Bandcamp-like album page: the player's data is JSON in a data-tralbum attribute.
+// ?mode=ok | none (no attribute) | nourl (the track has no stream link).
+function TRALBUM(mode) {
+  const info = { trackinfo: [{ title: 'Track', duration: 30.04, file: mode === 'nourl' ? null : { 'mp3-128': '/fx/mp3/track.mp3' } }] };
+  const attr = JSON.stringify(info).replace(/&/g, '&amp;').replace(/"/g, '&quot;');
+  return `<!doctype html><title>album</title><body><audio id="a"></audio>${mode === 'none' ? '' : `<script data-tralbum="${attr}"></script>`}`;
+}
+
+// The native fetch as the agent finds it at document_start, counting calls and the most in flight.
+function FETCH_SPY() {
+  const f = window.fetch, n = { calls: 0, inflight: 0, max: 0 };
+  window.__fs = n;
+  window.fetch = function fetch(...a) {
+    n.calls++; n.inflight++; n.max = Math.max(n.max, n.inflight);
+    const p = f.apply(this, a), done = () => { n.inflight--; };
+    p.then(done, done);
+    return p;
+  };
+}
 
 // ---------------------------------------------------------------- the engine's end of the port
 // chrome.runtime for agent-relay.js in a plain page (as in agent.test.mjs). Every message the
@@ -237,8 +259,13 @@ before(async () => {
     '/player.html': html(PLAYER), '/drm.html': html(DRM), '/worker.html': html(WORKER), '/blank.html': html(BLANK),
     '/mse-worker.js': (req, res) => { res.writeHead(200, { 'content-type': 'text/javascript' }); res.end(WORKER_JS); },
     '/data.json': (req, res) => { res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"ok":true}'); },
+    '/tralbum.html': (req, res, u) => html(TRALBUM(u.searchParams.get('mode')))(req, res),
+    '/hang': (req, res) => { hanging.push(res); }, // never answers
   };
-  for (const [k, buf] of Object.entries(fx.files)) routes[k] = (req, res) => serve(req, res, buf, TYPE[path.extname(k)] || 'application/octet-stream');
+  for (const [k, buf] of Object.entries(fx.files)) {
+    routes[k] = (req, res) => serve(req, res, buf, TYPE[path.extname(k)] || 'application/octet-stream');
+    routes[`/slow${k}`] = (req, res) => setTimeout(() => serve(req, res, buf, TYPE[path.extname(k)] || 'application/octet-stream'), 300);
+  }
   server = await startStaticServer(ROOT, routes);
   browser = await launchPlain();
 });
@@ -709,4 +736,237 @@ test('every wrapper the agent installs looks exactly like the native it replaces
   assert.ok(!(await p.run('Function.prototype.toString.call(SourceBuffer.prototype.appendBuffer)')).includes('capture'), 'no source text leaks');
   assert.deepEqual(errors, []);
   await p.close();
+});
+
+// ---------------------------------------------------------------- R3.2: drive, fetch, Bandcamp
+const media = (p) => p.run(`(() => { const a = document.getElementById('a');
+  return { t: a.currentTime, paused: a.paused, rate: a.playbackRate, dflt: a.defaultPlaybackRate, pp: a.preservesPitch, muted: a.muted, volume: a.volume }; })()`);
+const driveState = async (p) => { const g = await lastProgress(p); return g && g.drive ? g.drive.state : null; };
+// (Opus priming leaves a buffered range a few ms short of its segments' nominal end.)
+const bufferedTo = (p, s) => waitFor(() => p.run(`(() => { const b = document.getElementById('a').buffered; return b.length > 0 && b.end(0) >= ${s - 0.1}; })()`), 10000);
+// A player that buffers 20 s ahead of its playhead, through the 45 segments of the 3:00 its
+// manifest declares (the packager wrote a 46th of a few milliseconds of encoder padding).
+const LONG = 'set=long&n=45&dur=180&ahead=20&manual';
+
+describe('driving the player', { concurrency: 3 }, () => {
+  test('drive seekhop: the tap covers all of a 3-minute track in under 10 s without playing it; stop puts the player back', async () => {
+    const p = await tapPage(LONG);
+    await connect(p);
+    await send(p, { t: 'drive', mode: 'seekhop' }); // no tap yet: nothing to drive for
+    await send(p, { t: 'tap', on: true });
+    await p.run('window.__go()');
+    await bufferedTo(p, 20);
+    assert.equal((await media(p)).t, 0, 'a drive before the tap did nothing');
+    await p.run("(() => { const a = document.getElementById('a'); a.currentTime = 7.5; a.volume = 0.8; })()");
+    await waitFor(() => p.run("!document.getElementById('a').seeking"), 3000);
+    const t0 = Date.now();
+    await send(p, { t: 'drive', mode: 'seekhop' });
+    assert.equal((await media(p)).muted, true, 'muted while driven');
+    await waitFor(async () => (await driveState(p)) === 'done', 10000, 100);
+    const took = Date.now() - t0;
+    assert.ok(took < 10000, `${took} ms`);
+    await waitFor(async () => (await partsOf(p)).length >= 46, 3000);
+    const got = new Set(await blobShas(p, (await partsOf(p)).map((x) => x.blobUrl)));
+    assert.deepEqual([fx.long.init, ...fx.long.segs.slice(0, 45)].map(sha).filter((h) => !got.has(h)), [], "every segment of the 3:00 the manifest declares");
+    const g = await lastProgress(p);
+    assert.ok(g.buffered.length === 1 && g.buffered[0][0] < 0.05 && g.buffered[0][1] > 179.9, JSON.stringify(g.buffered));
+    const played = await p.run("(() => { const a = document.getElementById('a'); let s = 0; for (let i = 0; i < a.played.length; i++) s += a.played.end(i) - a.played.start(i); return s; })()");
+    assert.ok(played < 1, `played ${played} s of it`);
+    await send(p, { t: 'drive', mode: 'stop' });
+    assert.deepEqual(await media(p), { t: 7.5, paused: true, rate: 1, dflt: 1, pp: true, muted: false, volume: 0.8 });
+    await waitFor(async () => !(await lastProgress(p)).drive, 2000);
+    await checkPosted(p);
+    await p.close();
+  });
+
+  test('drive seekhop: a player that stops buffering is reported stalled after 3 s; when it buffers again the hop goes on', async () => {
+    const p = await tapPage(LONG);
+    await connect(p);
+    await send(p, { t: 'tap', on: true });
+    await p.run('window.__limit = 60; window.__go()');
+    await bufferedTo(p, 20);
+    const t0 = Date.now();
+    await send(p, { t: 'drive', mode: 'seekhop' });
+    await waitFor(async () => (await driveState(p)) === 'stalled', 8000, 100);
+    const s = (Date.now() - t0) / 1000;
+    assert.ok(s >= 3 && s < 7, `stalled after ${s.toFixed(1)} s`);
+    assert.ok(Math.abs((await lastProgress(p)).drive.at - 60) < 0.5, 'at the place it stopped');
+    await p.run('window.__limit = 0; window.__pump()');
+    await waitFor(async () => (await driveState(p)) === 'done', 10000, 100);
+    await send(p, { t: 'drive', mode: 'stop' });
+    await checkPosted(p);
+    await p.close();
+  });
+
+  test('drive accelerate at 8x captures the track through playback with pitch unlocked, for as long as it takes', async () => {
+    const p = await tapPage(LONG);
+    await connect(p);
+    await send(p, { t: 'tap', on: true });
+    await p.run("window.__go().then(() => document.getElementById('a').play())");
+    await waitFor(async () => !(await media(p)).paused, 5000);
+    await send(p, { t: 'drive', mode: 'accelerate', rate: 8 });
+    await p.waitForTimeout(300);
+    const m = await media(p);
+    assert.deepEqual([m.rate, m.pp, m.muted], [8, false, true]);
+    // About 20 s at 8x: longer than the 10 s the agent waits for an assist keep-alive.
+    await waitFor(async () => (await driveState(p)) === 'done', 45000, 250);
+    const got = new Set(await blobShas(p, (await partsOf(p)).map((x) => x.blobUrl)));
+    assert.deepEqual([fx.long.init, ...fx.long.segs.slice(0, 45)].map(sha).filter((h) => !got.has(h)), [], "every segment of the 3:00 the manifest declares");
+    await send(p, { t: 'drive', mode: 'stop' });
+    const b = await media(p);
+    assert.deepEqual([b.rate, b.dflt, b.pp, b.muted], [1, 1, true, false]);
+    await checkPosted(p);
+    await p.close();
+  });
+
+  test('drive accelerate on a page that resets its rate: the agent backs off after a few tries and says refused', async () => {
+    const p = await tapPage(`${LONG}&fight`);
+    await connect(p);
+    await send(p, { t: 'tap', on: true });
+    await p.run("window.__go().then(() => document.getElementById('a').play())");
+    await waitFor(async () => !(await media(p)).paused, 5000);
+    await send(p, { t: 'drive', mode: 'accelerate', rate: 8 });
+    await waitFor(async () => (await driveState(p)) === 'refused', 3000);
+    await p.waitForTimeout(500);
+    const m = await media(p);
+    assert.deepEqual([m.rate, m.pp], [1, true], 'the page keeps its rate and pitch setting');
+    assert.ok((await p.run('window.__rc')) < 20, 'no fight loop');
+    assert.equal((await posted(p, 'external-rate')).length, 1);
+    await checkPosted(p);
+    await p.close();
+  });
+
+  test('drive stop puts back everything the drive changed: position, playing state, rate, pitch, mute and volume', async () => {
+    const p = await tapPage(LONG);
+    await connect(p);
+    await send(p, { t: 'tap', on: true });
+    await p.run('window.__go()');
+    await bufferedTo(p, 20);
+    await p.run("(() => { const a = document.getElementById('a'); a.currentTime = 12.3; a.playbackRate = 1.25; a.volume = 0.7; })()");
+    await waitFor(() => p.run("!document.getElementById('a').seeking"), 3000);
+    const before = await media(p);
+    assert.deepEqual(before, { t: 12.3, paused: true, rate: 1.25, dflt: 1, pp: true, muted: false, volume: 0.7 });
+    await send(p, { t: 'drive', mode: 'accelerate', rate: 8 }); // a paused player is started for the drive
+    await waitFor(async () => { const m = await media(p); return !m.paused && m.rate === 8 && m.t > 13; }, 5000);
+    await send(p, { t: 'drive', mode: 'stop' });
+    assert.deepEqual(await media(p), before);
+    await checkPosted(p);
+    await p.close();
+  });
+
+  test('no seek-hop on an MP3 SourceBuffer (nothing in it to place it by): refused, untouched, and its type is in tap-progress', async () => {
+    const p = await tapPage('set=short&dur=30&manual&raw&mime=audio/mpeg');
+    await connect(p);
+    await p.run('window.__go()'); // the SourceBuffer is made before the tap comes on
+    await send(p, { t: 'tap', on: true });
+    await waitFor(async () => { const g = await lastProgress(p); return g && g.mimes.includes('audio/mpeg'); }, 3000);
+    await send(p, { t: 'drive', mode: 'seekhop' });
+    await waitFor(async () => (await driveState(p)) === 'refused', 3000);
+    const m = await media(p);
+    assert.deepEqual([m.t, m.muted], [0, false], 'the player was not touched');
+    await checkPosted(p);
+    await p.close();
+  });
+
+  test('an eject (stop) or the engine going away mid-drive gives the player back at once and lets the blob URLs go', async () => {
+    for (const end of ['window.__jdsStop()', 'window.__eng.die()']) {
+      const p = await tapPage(LONG);
+      await connect(p);
+      await send(p, { t: 'tap', on: true });
+      await p.run('window.__go()');
+      await bufferedTo(p, 20);
+      await p.run("document.getElementById('a').currentTime = 5");
+      await waitFor(() => p.run("!document.getElementById('a').seeking"), 3000);
+      await send(p, { t: 'drive', mode: 'accelerate', rate: 8 });
+      await waitFor(async () => { const m = await media(p); return !m.paused && m.rate === 8; }, 5000);
+      const urls = (await partsOf(p)).map((x) => x.blobUrl);
+      await p.run(end);
+      const m = await media(p);
+      assert.deepEqual([m.t, m.paused, m.rate, m.pp, m.muted], [5, true, 1, true, false], end);
+      assert.deepEqual(await blobShas(p, urls), urls.map(() => 'unreadable'), end);
+      await p.close();
+    }
+  });
+});
+
+describe('fetching from the page', { concurrency: 3 }, () => {
+  test("fetch {urls}: the page's own fetch from document_start, eight at a time, parts numbered in request order", async () => {
+    const p = await tapPage('', { page: '/blank.html', init: [FETCH_SPY] });
+    await connect(p);
+    // The page replaces fetch after load: the agent must not go through it.
+    await p.run('window.__pf = 0; { const g = window.fetch; window.fetch = function fetch(...a) { window.__pf++; return g.apply(this, a); }; } 0');
+    const urls = fx.long.segs.slice(0, 20).map((_, i) => `/slow/fx/long/seg-${String(i + 1).padStart(5, '0')}.m4s`);
+    await send(p, { t: 'fetch', urls });
+    await waitFor(async () => (await partsOf(p)).length >= 20, 15000);
+    const spy = await p.run('JSON.stringify(window.__fs)').then(JSON.parse);
+    assert.deepEqual([spy.calls, spy.max], [20, 8], 'all through the native fetch, eight at a time');
+    assert.equal(await p.run('window.__pf'), 0, "the page's own later fetch was never used");
+    const parts = (await partsOf(p)).sort((a, b) => a.seq - b.seq);
+    assert.deepEqual(parts.map((x) => [x.kind, x.sb, x.seq, x.mime]), urls.map((_, i) => ['media', -1, i, 'audio/mp4']));
+    assert.deepEqual(await blobShas(p, parts.map((x) => x.blobUrl)), fx.long.segs.slice(0, 20).map(sha));
+    await checkPosted(p);
+    await p.close();
+  });
+
+  test('fetch {urls}: a failing or non-web link is reported by its place in the list, and the rest still come', async () => {
+    const p = await tapPage('', { page: '/blank.html' });
+    await connect(p);
+    await send(p, { t: 'fetch', urls: ['/fx/short/seg-00001.m4s', '/nope.m4s', 'javascript:alert(1)', '/fx/short/seg-00002.m4s'] });
+    await waitFor(async () => (await partsOf(p)).length >= 2 && (await errorsOf(p)).length >= 2, 5000);
+    const parts = (await partsOf(p)).sort((a, b) => a.seq - b.seq);
+    assert.deepEqual(parts.map((x) => x.seq), [0, 3]);
+    assert.deepEqual(await blobShas(p, parts.map((x) => x.blobUrl)), [fx.short.segs[0], fx.short.segs[1]].map(sha));
+    const errs = (await errorsOf(p)).sort((a, b) => a.seq - b.seq);
+    assert.deepEqual(errs.map((e) => [e.reason, e.seq]), [['fetch', 1], ['fetch', 2]]);
+    assert.match(errs[0].detail, /404/);
+    assert.match(errs[1].detail, /not a web link/);
+    // Tap off while a fetch is under way: what arrives afterwards is not handed over.
+    await send(p, { t: 'fetch', urls: ['/slow/fx/short/seg-00003.m4s'] });
+    await send(p, { t: 'tap', on: false });
+    await p.waitForTimeout(800);
+    assert.equal((await partsOf(p)).length, 2);
+    await checkPosted(p);
+    await p.close();
+  });
+
+  test('fetch {urls}: a link that never answers is given up after 15 s', async () => {
+    const p = await tapPage('', { page: '/blank.html' });
+    await connect(p);
+    const t0 = Date.now();
+    await send(p, { t: 'fetch', urls: ['/hang'] });
+    await waitFor(async () => (await errorsOf(p)).length > 0, 25000, 250);
+    const s = (Date.now() - t0) / 1000;
+    assert.ok(s > 14 && s < 20, `gave up after ${s.toFixed(1)} s`);
+    assert.deepEqual((await errorsOf(p)).map((e) => [e.reason, e.seq]), [['fetch', 0]]);
+    assert.match((await errorsOf(p))[0].detail, /timed out/);
+    await checkPosted(p);
+    await p.close();
+  });
+
+  test("readTralbum: the page's own stream link comes back as one 'file' part, with the track's length", async () => {
+    const p = await tapPage('mode=ok', { page: '/tralbum.html' });
+    await connect(p);
+    await send(p, { t: 'readTralbum' });
+    await waitFor(async () => (await partsOf(p)).length >= 1, 5000);
+    const ready = await posted(p, 'tap-ready');
+    assert.equal(ready.length, 1);
+    assert.deepEqual(ready[0].parts.map((x) => [x.kind, x.sb, x.seq, x.mime]), [['file', -1, 0, 'audio/mpeg']]);
+    assert.equal(ready[0].duration, 30.04);
+    assert.deepEqual(await blobShas(p, [ready[0].parts[0].blobUrl]), [sha(fx.files['/fx/mp3/track.mp3'])]);
+    await checkPosted(p);
+    await p.close();
+  });
+
+  test('readTralbum: no data-tralbum, or no stream link in it, is tap-error none', async () => {
+    for (const mode of ['none', 'nourl']) {
+      const p = await tapPage(`mode=${mode}`, { page: '/tralbum.html' });
+      await connect(p);
+      await send(p, { t: 'readTralbum' });
+      await waitFor(async () => (await errorsOf(p)).length > 0, 3000);
+      assert.deepEqual((await errorsOf(p)).map((e) => e.reason), ['none'], mode);
+      assert.deepEqual(await partsOf(p), []);
+      await checkPosted(p);
+      await p.close();
+    }
+  });
 });
