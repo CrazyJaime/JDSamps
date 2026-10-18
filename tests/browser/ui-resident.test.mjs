@@ -750,6 +750,43 @@ test('a tab load that turns tabless (released) between two file loads never take
   }
 });
 
+test('a file load follows the deck showing its token, past tabless loading decks made before it and never seen with a tab: a recording, another deck page\'s link', async () => {
+  const answerMs = (v) => page.evaluate(async (x) => { const { ACT_MS } = await import('/ui/connection.js'); const old = ACT_MS.loadFile; ACT_MS.loadFile = ACT_MS.loadUrl = x; return old; }, v);
+  await show(kinds());
+  await spyRevoke();
+  await manual(true);
+  await ui.clearSent();
+  await clearToasts();
+  const was = await answerMs(300);
+  try {
+    await drop('.board', [{ name: 'mine.mp3', type: 'audio/mpeg' }]);
+    await wait(30);
+    const a = (await loadActs('loadFile')).at(-1);
+    // Ahead of the file's deck: a whole track recorded from a live deck's page (no tab, no token) and a link loaded on
+    // another deck page (its own token). Matched by deck order, the file's load would take the first of them.
+    const rec = (make = loadingDeck) => make({ id: 504, slot: 4, title: 'A tab (recorded from the page — reduced highs)', url: 'https://a.example/x' });
+    const other = (make = loadingDeck) => make({ id: 505, slot: 5, title: 'other', url: 'https://example.com/other.mp3', load: { token: 'other-page-token' } });
+    const mine = (make = loadingDeck) => make({ id: 506, slot: 6, title: 'mine', url: '', load: { token: a.arg.token } });
+    await show(kinds((s) => { s.decks.push(rec(), other(), mine()); }));
+    await wait(700); // past the answer time: the load follows its deck now
+    await show(kinds((s) => { s.decks.push(rec(residentDeck), other(residentDeck), mine()); }));
+    await wait(50);
+    assert.deepEqual(await revoked(), [], 'the file was let go while its own deck still loads');
+    // ✕ on its own deck: the load ends without a word, and lets go of the file.
+    await deckEl(6).locator('[data-act="loadCancel"]').click();
+    await wait(50);
+    await reply((await lastAct('loadCancel', 506)).id, true);
+    await show(kinds((s) => { s.decks.push(rec(residentDeck), other(residentDeck)); }));
+    await reply(a.id, false, 'Loading was cancelled.');
+    await wait(50);
+    assert.deepEqual(await toasts(), []);
+    assert.deepEqual(await revoked(), [a.arg.blobUrl]);
+  } finally {
+    await answerMs(was);
+    await manual(false);
+  }
+});
+
 test('a tab loaded from the Sources drawer is followed to its whole track: said once when it holds it, and not at all after a cancel the DJ asked for', async () => {
   const TAB = { id: 55, title: 'A tab', url: 'https://a.example/x', favIconUrl: '', audible: true, granted: true, deckSlot: null };
   await show(kinds());
