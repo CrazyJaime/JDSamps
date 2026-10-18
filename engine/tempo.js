@@ -64,7 +64,7 @@ function blur(x, W, k, out) {
 }
 
 const rel = (a, b) => Math.abs(a / b - 1);
-const RELATED = [1, 2, 0.5, 1.5, 2 / 3, 3, 1 / 3]; // tempo ratios that count as the same beat
+export const RELATED = [1, 2, 0.5, 1.5, 2 / 3, 3, 1 / 3]; // tempo ratios that count as the same beat
 /** The ratio in RELATED that takes tempo `a` to tempo `b`, or 0 when the two are unrelated. */
 function relatedFactor(b, a) {
   for (const f of RELATED) if (f !== 1 && Math.abs(b / (a * f) - 1) < 0.04) return f;
@@ -121,7 +121,7 @@ export class TempoTracker {
   constructor(fps, opts = {}) {
     this.o = { ...DEFAULTS, ...opts };
     this.fps = fps;
-    const cap = Math.ceil(12 * fps);
+    const cap = Math.ceil((opts.capSec || 12) * fps); // capSec: whole-track analysis holds the whole track
     this.full = new Ring(cap);
     this.low = new Ring(cap);
     // Scratch for the octave evidence: built once so evaluate() stays allocation-light.
