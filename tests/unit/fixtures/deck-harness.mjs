@@ -36,7 +36,8 @@ export function fakeTempo({ bpm, t0 = 0.0, canBeat = true }) {
   const T = 60 / bpm;
   return {
     bpm, grid: { t0, T, bar1: null },
-    get() { return { state: 'LOCKED', inBpm: this.bpm, conf: 0.9, mult: 1, tapped: false, grid: this.grid, canBeat }; },
+    get() { return { state: 'LOCKED', inBpm: this.bpm, conf: 0.9, octConf: 1, mult: 1, tapped: false, grid: this.grid, canBeat }; },
+    canBeatAt() { return canBeat; },
     sourceRateChanged(ratio) { this.bpm *= ratio; this.grid = { ...this.grid, T: this.grid.T / ratio }; },
     pushBatch() {}, tap() {}, multiply() {}, shiftGrid() {}, setBar1() {},
   };

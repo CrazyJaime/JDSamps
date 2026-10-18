@@ -46,6 +46,7 @@ function setup({ tempo = UNSURE, syncMode = 'BEAT', alone = false } = {}) {
   d.tempo = {
     st,
     get: () => ({ state: st.state, inBpm: BPM, conf: st.conf, mult: 1, tapped: st.tapped, grid, canBeat: st.canBeat }),
+    canBeatAt: () => st.canBeat,
     sourceRateChanged() {}, pushBatch() {}, tap() {}, multiply() {}, shiftGrid() {}, setBar1() {},
   };
   d.grids.update(grid);

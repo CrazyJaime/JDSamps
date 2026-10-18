@@ -29,6 +29,7 @@ function fakeTempo(bpm) {
   return {
     bpm, grid: { t0: 0, T: 60 / bpm, bar1: null },
     get() { return { state: 'LOCKED', inBpm: this.bpm, conf: 0.9, mult: 1, tapped: false, grid: this.grid, canBeat: true }; },
+    canBeatAt: () => true,
     sourceRateChanged(ratio) { this.bpm *= ratio; this.grid = { ...this.grid, T: this.grid.T / ratio }; },
     pushBatch() {}, tap() {}, multiply() {}, shiftGrid() {}, setBar1() {},
   };
