@@ -18,7 +18,7 @@ import {
 const SITES = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../fixtures/sites');
 const index = JSON.parse(fs.readFileSync(path.join(SITES, 'index.json'), 'utf8'));
 const OPUS_END = index.reps['opus-hi'].segs.at(-1).t1; // 120.0065
-let h, server, deck, rec, tmp;
+let h, server, deck, rec, multi, tmp;
 const pageErrors = [];
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const decks = async () => (await state(deck)).decks;
@@ -64,9 +64,67 @@ async function startRecServer() {
   return { origin: `http://127.0.0.1:${srv.address().port}`, close: () => new Promise((r) => srv.close(r)) };
 }
 
+/**
+ * Pages with two players, on another origin. The track (A) is an MSE player of the model track (opus-hi), fed from
+ * its HLS playlist 16 s ahead. The other player (B) is a 24 s 440 Hz tone (Opus fMP4, made here): a muted, looping
+ * one in the top frame with the track in an iframe of /m/mse (/dur), or one that starts appending when the page's
+ * window.__startB() is called: paused beside the track (/two-same) or playing muted in an iframe (/two-sub).
+ */
+async function startMultiServer() {
+  const tone = path.join(tmp, 'tone.mp4');
+  execFileSync('/usr/bin/ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'lavfi', '-i', 'sine=frequency=440:duration=24:sample_rate=48000', '-ac', '2',
+    '-c:a', 'libopus', '-b:a', '128k', '-f', 'mp4', '-movflags', '+empty_moov+default_base_moof', '-frag_duration', '4000000', tone]);
+  const rep = index.reps['opus-hi'];
+  const m3u8 = ['#EXTM3U', '#EXT-X-VERSION:7', '#EXT-X-TARGETDURATION:4', '#EXT-X-PLAYLIST-TYPE:VOD', `#EXT-X-MAP:URI="${rep.init.path}"`,
+    ...rep.segs.flatMap((x) => [`#EXTINF:${(x.t1 - x.t0).toFixed(6)},`, x.path]), '#EXT-X-ENDLIST', ''].join('\n');
+  const mse = `async function mse(el, list) {
+  const text = await (await fetch(list)).text(), base = new URL(list, location.href), segs = []; let init = null, n = 0, played = false;
+  for (const l of text.split('\\n')) { const m = /URI="([^"]+)"/.exec(l); if (m) init = new URL(m[1], base).href; else if (l && l[0] !== '#') segs.push(new URL(l, base).href); }
+  const ms = new MediaSource(); el.src = URL.createObjectURL(ms);
+  await new Promise((r) => ms.addEventListener('sourceopen', r, { once: true }));
+  const sb = ms.addSourceBuffer('audio/mp4; codecs="opus"'), app = (b) => new Promise((r) => { sb.addEventListener('updateend', r, { once: true }); sb.appendBuffer(b); });
+  ms.duration = ${rep.segs.at(-1).t1};
+  await app(await (await fetch(init)).arrayBuffer());
+  for (;;) {
+    const end = sb.buffered.length ? sb.buffered.end(sb.buffered.length - 1) : 0;
+    if (n < segs.length && end < el.currentTime + 16) { await app(await (await fetch(segs[n++])).arrayBuffer()); if (!played) { played = true; el.play().catch(() => {}); } continue; }
+    if (n >= segs.length) { try { ms.endOfStream(); } catch (_) {} return; }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+}
+/** The tone on its own MediaSource; the whole file in one append. */
+async function tone(el) {
+  const ms = new MediaSource(); el.src = URL.createObjectURL(ms);
+  await new Promise((r) => ms.addEventListener('sourceopen', r, { once: true }));
+  const sb = ms.addSourceBuffer('audio/mp4; codecs="opus"'), b = await (await fetch('/tone.mp4')).arrayBuffer();
+  await new Promise((r) => { sb.addEventListener('updateend', r, { once: true }); sb.appendBuffer(b); });
+  try { ms.endOfStream(); } catch (_) {}
+}
+window.__media = () => { const a = document.querySelector('audio'); return { t: a.currentTime, rate: a.playbackRate, pp: a.preservesPitch, paused: a.paused, duration: a.duration }; };`;
+  const html = (title, body, script) => `<!doctype html><title>${title}</title>${body}<script>${mse}\n${script}</script>`;
+  const pages = {
+    '/dur': html('Two frames', `<audio id="b" muted loop></audio><iframe src="${server.origin}/m/mse?autoplay=1" allow="autoplay"></iframe>`, `const b = document.getElementById('b'); tone(b).then(() => b.play());`),
+    '/two-same': html('Two players', '<audio id="a"></audio><audio id="b"></audio>', `mse(document.getElementById('a'), '/media/opus-hi.m3u8'); window.__startB = () => tone(document.getElementById('b'));`),
+    '/two-sub': html('Two frames', '<audio id="a"></audio><iframe src="/bframe" allow="autoplay"></iframe>', `mse(document.getElementById('a'), '/media/opus-hi.m3u8');`),
+    '/bframe': html('Another player', '<audio id="b" muted></audio>', `window.__startB = async () => { const b = document.getElementById('b'); await tone(b); await b.play(); };`),
+  };
+  const srv = http.createServer((req, res) => {
+    const u = new URL(req.url, 'http://x');
+    if (pages[u.pathname]) { res.writeHead(200, { 'content-type': 'text/html' }); res.end(pages[u.pathname]); return; }
+    if (u.pathname === '/media/opus-hi.m3u8') { res.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' }); res.end(m3u8); return; }
+    const f = u.pathname === '/tone.mp4' ? tone : /^\/media\/(opus-hi\/[\w.-]+)$/.test(u.pathname) ? path.join(SITES, u.pathname.slice(7)) : null;
+    if (!f || !fs.existsSync(f)) { res.writeHead(404); res.end(); return; }
+    res.writeHead(200, { 'content-type': 'audio/mp4', 'cache-control': 'no-store' });
+    res.end(fs.readFileSync(f));
+  });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  return { origin: `http://127.0.0.1:${srv.address().port}`, close: () => new Promise((r) => srv.close(r)) };
+}
+
 before(async () => {
   server = await startTrackServer({ seconds: 30 });
   rec = await startRecServer();
+  multi = await startMultiServer();
   h = await launchExtension({ ext: prepareExtension() });
   deck = await h.context.newPage();
   deck.on('pageerror', (e) => pageErrors.push(String(e)));
@@ -79,7 +137,7 @@ before(async () => {
     e.startResidentDeck = (o) => { if (o && o.deckId != null && o.pcm) e.__pcm.set(o.deckId, o.pcm); return s(o); }; } return true;`);
 });
 after(async () => {
-  await h?.close(); await server?.close(); await rec?.close();
+  await h?.close(); await server?.close(); await rec?.close(); await multi?.close();
   if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
 });
 
@@ -333,6 +391,23 @@ test('a SoundCloud-style preview is refused and plays live, never made resident 
   const d = await loadTab(site.tabId);
   assert.deepEqual(await engine('return [...e.__pcm.keys()];'), [], 'no preview was promoted');
   await assertLive(d, site, /SoundCloud only gives a 30-second preview of this track\./);
+});
+
+// ---------------------------------------------------------------- several players in one tab
+test('the track length is the heard player\'s: a muted player in the top frame beside the track in an iframe changes nothing', async () => {
+  const site = { tab: await h.context.newPage(), url: `${multi.origin}/dur` };
+  await site.tab.goto(site.url);
+  site.tabId = await tabIdFor(h, site.url);
+  const frame = () => site.tab.frames().find((f) => f.url().includes('/m/mse'));
+  await waitFor(() => frame() && frame().evaluate(() => { const m = window.__media && window.__media(); return !!m && !m.paused && m.t > 0.3; }), 15000);
+  await waitFor(() => site.tab.evaluate(() => { const m = window.__media(); return !m.paused && m.duration > 23 && m.duration < 25; }), 15000);
+  const d = await loadTab(site.tabId);
+  assert.equal(d.kind, 'resident', JSON.stringify(d.load));
+  assert.ok(Math.abs(d.duration - OPUS_END) < 0.015, `duration ${d.duration}`);
+  assert.match(d.load.report, /the player says 120\.007 s/);
+  const c = await compare(d.id, opusUrls());
+  assert.ok(c.corr > 0.9999 && c.maxd < 1e-3, JSON.stringify(c));
+  await assertReleased(d, site);
 });
 
 // ---------------------------------------------------------------- recording a whole track (opt-in)

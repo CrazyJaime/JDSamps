@@ -469,6 +469,18 @@ test('a length that grows mid-load is never taken at its first value: the rest i
   assert.ok(tab.sent().filter((m) => m.t === 'fetch').length >= 3, 'the pieces past 60 s were fetched too');
 });
 
+// ---------------------------------------------------------------- several players in one tab
+test('the track length is the heard player\'s, not that of a player in a frame whose agent came first', async () => {
+  const track = { kind: 'mse', rendition: hi(), preTap: 6, playing: 2, list: true, segUrls: true };
+  const other = { kind: 'mse', rendition: rendition('opus-lo', 'https://ads.example'), duration: 30, preTap: 1 };
+  for (const [what, status] of [['muted and playing', { audible: 0, muted: true }], ['heard too (the shorter is not the track)', {}]]) {
+    const { result, engine, deck } = await load({ frames: 2, framePages: [{ ...other, status }, track] });
+    assert.equal(result.kind, 'resident', `${what}: ${JSON.stringify(called(engine, 'failLoadingToLive'))}`);
+    assert.ok(near(called(engine, 'startResidentDeck')[0].frames / SR, 120, 0.02), what);
+    assert.match(deck.load.report, /look: ok in \d+\.\d s — the player says 120\.007 s/, what);
+  }
+});
+
 test('the opus pieces this harness serves are what the model sites serve', () => {
   const r = hi();
   assert.equal(r.mime, OPUS);

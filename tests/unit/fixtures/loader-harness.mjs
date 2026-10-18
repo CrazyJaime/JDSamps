@@ -56,36 +56,39 @@ export const code = (s) => Math.fround([...String(s)].reduce((n, c) => (n * 31 +
  *   list (the HLS playlist was requested), segUrls (segment requests seen), pageFetch (false: every page fetch fails),
  *   src (a progressive element source URL), tralbum ({url, duration}), files ({url: bytes}, served to the page and the engine),
  *   errors (reasons reported at tap on), seekhop ('ok' | 'stall' | 'refuse'), accelerate ('ok' | 'refuse'), mimes (override),
- *   appends (MSE parts as {bytes} the player appends on a drive, in order, for a stream with no timestamps)
+ *   appends (MSE parts as {bytes} the player appends on a drive, in order, for a stream with no timestamps),
+ *   status (the frame agent's status, over a heard playing player's), framePages ([{...}]: frame i's page, over this one)
  * }
  */
 export function makeTab({ tabId = 7, url = 'https://site.example/track', frames = 1, ...page } = {}) {
   const blobs = new Map(), log = [], net = new Map(Object.entries(page.files || {}));
-  const r = page.rendition;
-  if (r) { net.set(r.list, enc(playlist(r))); net.set(r.init.url, r.init.bytes); for (const s of r.segs) net.set(s.url, s.bytes); }
+  for (const r of [page, ...(page.framePages || [])].map((p) => p.rendition)) {
+    if (r) { net.set(r.list, enc(playlist(r))); net.set(r.init.url, r.init.bytes); for (const s of r.segs) net.set(s.url, s.bytes); }
+  }
   const tab = { tabId, url, page, blobs, log, net, frames: [], deck: null, hooks: [] };
   const mint = (bytes) => { const u = `blob:${new URL(url).origin}/${crypto.randomUUID()}`; blobs.set(u, bytes); return u; };
   for (let i = 0; i < frames; i++) {
+    const pg = { ...page, ...((page.framePages || [])[i] || {}) }, r = pg.rendition;
     // The pieces appended before the tap are in the player's buffer: a drive never makes it append them again.
-    const fr = { id: i, seq: 0, appended: new Set(Array.from({ length: page.preTap || 0 }, (_, k) => k)), left: false, a: null, duration: page.duration === undefined ? DUR : page.duration };
+    const fr = { id: i, seq: 0, appended: new Set(Array.from({ length: pg.preTap || 0 }, (_, k) => k)), left: false, a: null, duration: pg.duration === undefined ? DUR : pg.duration };
     const emit = (m) => {
       const v = validateAgentMessage(m);
       if (!v) throw new Error(`the fake agent sent an invalid message: ${JSON.stringify(m)}`);
       setImmediate(() => { const d = tab.deck; if (!fr.left && d && d.agents.get(fr.id) === fr.a && d.loader) d.loader.onTap(fr.id, v); });
     };
     const progress = (extra = {}) => emit({ t: 'tap-progress', bytes: 0, buffered: [], duration: Number.isFinite(fr.duration) ? fr.duration : null,
-      mimes: page.mimes || (page.kind === 'mse' ? [r ? r.mime : OPUS] : []), ...extra });
+      mimes: pg.mimes || (pg.kind === 'mse' ? [r ? r.mime : OPUS] : []), ...extra });
     const append = (ks) => {
       const parts = [];
       for (const k of ks) if (!fr.appended.has(k) && r.segs[k]) { fr.appended.add(k); parts.push({ blobUrl: mint(r.segs[k].bytes), mime: r.mime, kind: 'media', sb: 0, seq: fr.seq++ }); }
       if (parts.length) emit({ t: 'tap-ready', parts, duration: Number.isFinite(fr.duration) ? fr.duration : null });
     };
     const drive = (mode) => {
-      const how = page[mode] || 'ok';
-      if (how === 'refuse' || (mode === 'seekhop' && (page.mimes || []).some((m) => /mpeg|aac/.test(m)))) { progress({ drive: { mode, state: 'refused', at: 0 } }); return; }
+      const how = pg[mode] || 'ok';
+      if (how === 'refuse' || (mode === 'seekhop' && (pg.mimes || []).some((m) => /mpeg|aac/.test(m)))) { progress({ drive: { mode, state: 'refused', at: 0 } }); return; }
       if (how === 'stall') { progress({ drive: { mode, state: 'stalled', at: 24 } }); return; }
-      if (page.appends) {
-        emit({ t: 'tap-ready', parts: page.appends.map((p) => ({ blobUrl: mint(p.bytes), mime: p.mime, kind: 'media', sb: 0, seq: fr.seq++ })), duration: fr.duration });
+      if (pg.appends) {
+        emit({ t: 'tap-ready', parts: pg.appends.map((p) => ({ blobUrl: mint(p.bytes), mime: p.mime, kind: 'media', sb: 0, seq: fr.seq++ })), duration: fr.duration });
       } else append(r.segs.map((_, k) => k));
       setTimeout(() => progress({ drive: { mode, state: 'done', at: fr.duration } }), 5);
     };
@@ -94,33 +97,33 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
       for (const h of tab.hooks) h(m, i);
       if (fr.left) return;
       if (m.t === 'tap' && m.on === true) {
-        if (page.kind === 'mse' && page.preTap > 0) emit({ t: 'tap-ready', parts: [{ blobUrl: mint(r.init.bytes), mime: r.mime, kind: 'init', sb: 0, seq: fr.seq++ }], duration: Number.isFinite(fr.duration) ? fr.duration : null });
+        if (pg.kind === 'mse' && pg.preTap > 0) emit({ t: 'tap-ready', parts: [{ blobUrl: mint(r.init.bytes), mime: r.mime, kind: 'init', sb: 0, seq: fr.seq++ }], duration: Number.isFinite(fr.duration) ? fr.duration : null });
         const reqs = [];
-        if (page.list) reqs.push({ url: r.list, method: 'GET', range: null, size: null, media: false, past: true });
-        if (page.segUrls) { reqs.push({ url: r.init.url, method: 'GET', range: null, size: null, media: true, past: true }); for (let k = 0; k < (page.preTap || 0); k++) reqs.push({ url: r.segs[k].url, method: 'GET', range: null, size: null, media: true, past: true }); }
-        if (page.src) reqs.push({ url: page.src, method: 'GET', range: null, size: null, media: true, past: true });
+        if (pg.list) reqs.push({ url: r.list, method: 'GET', range: null, size: null, media: false, past: true });
+        if (pg.segUrls) { reqs.push({ url: r.init.url, method: 'GET', range: null, size: null, media: true, past: true }); for (let k = 0; k < (pg.preTap || 0); k++) reqs.push({ url: r.segs[k].url, method: 'GET', range: null, size: null, media: true, past: true }); }
+        if (pg.src) reqs.push({ url: pg.src, method: 'GET', range: null, size: null, media: true, past: true });
         for (let k = 0; k < reqs.length; k += 16) emit({ t: 'tap-urls', reqs: reqs.slice(k, k + 16) });
         progress();
-        for (const reason of page.errors || []) emit({ t: 'tap-error', reason, detail: `fake ${reason}` });
-        if (page.duration === Infinity) setTimeout(() => emit({ t: 'tap-error', reason: 'live', detail: 'the player reports no end' }), page.liveAfter ?? 30);
-        if (page.kind === 'mse' && page.playing) {
-          if (page.preTap === 0 || page.preTap == null) emit({ t: 'tap-ready', parts: [{ blobUrl: mint(r.init.bytes), mime: r.mime, kind: 'init', sb: 0, seq: fr.seq++ }], duration: fr.duration });
-          append(Array.from({ length: page.playing }, (_, k) => (page.preTap || 0) + k));
+        for (const reason of pg.errors || []) emit({ t: 'tap-error', reason, detail: `fake ${reason}` });
+        if (pg.duration === Infinity) setTimeout(() => emit({ t: 'tap-error', reason: 'live', detail: 'the player reports no end' }), pg.liveAfter ?? 30);
+        if (pg.kind === 'mse' && pg.playing) {
+          if (pg.preTap === 0 || pg.preTap == null) emit({ t: 'tap-ready', parts: [{ blobUrl: mint(r.init.bytes), mime: r.mime, kind: 'init', sb: 0, seq: fr.seq++ }], duration: fr.duration });
+          append(Array.from({ length: pg.playing }, (_, k) => (pg.preTap || 0) + k));
         }
       } else if (m.t === 'readTralbum') {
-        const t = page.tralbum;
+        const t = pg.tralbum;
         if (!t) emit({ t: 'tap-error', reason: 'none', detail: 'no stream link on the page' });
         else if (!net.has(t.url)) emit({ t: 'tap-error', reason: 'fetch', detail: 'the stream link: HTTP 404' });
         else emit({ t: 'tap-ready', parts: [{ blobUrl: mint(net.get(t.url)), mime: 'audio/mpeg', kind: 'file', sb: -1, seq: 0 }], duration: t.duration ?? null });
       } else if (m.t === 'fetch') {
         m.urls.forEach((u, seq) => setImmediate(() => {
-          if (page.pageFetch !== false && net.has(u)) emit({ t: 'tap-ready', parts: [{ blobUrl: mint(net.get(u)), mime: '', kind: 'media', sb: -1, seq }], duration: null });
+          if (pg.pageFetch !== false && net.has(u)) emit({ t: 'tap-ready', parts: [{ blobUrl: mint(net.get(u)), mime: '', kind: 'media', sb: -1, seq }], duration: null });
           else emit({ t: 'tap-error', reason: 'fetch', detail: `#${seq}: network error`, seq });
         }));
       } else if (m.t === 'drive' && m.mode !== 'stop') drive(m.mode);
     };
     fr.port = { onCommand, postMessage: (m) => onCommand(structuredClone(m)), disconnect: () => { fr.disconnected = true; } };
-    fr.emit = emit; fr.progress = progress; fr.append = append;
+    fr.emit = emit; fr.progress = progress; fr.append = append; fr.pg = pg;
     tab.frames.push(fr);
   }
   /** What deck.attachAgent does for a loading deck: register the frame's agent and tell the loader. */
@@ -129,7 +132,7 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
     if (page.kind === 'none') return;
     for (const fr of tab.frames) {
       if (fr.a || fr.left) continue;
-      fr.a = { port: fr.port, status: { t: 'status', hasMedia: true, playing: true, rate: 1, audible: 1, muted: false, volume: 1, count: 1, seq: -1 } };
+      fr.a = { port: fr.port, status: { t: 'status', hasMedia: true, playing: true, rate: 1, audible: 1, muted: false, volume: 1, count: 1, seq: -1, ...fr.pg.status } };
       deck.agents.set(fr.id, fr.a);
       if (deck.loader) deck.loader.onAttach(fr.id, fr.a);
     }

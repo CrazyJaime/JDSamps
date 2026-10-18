@@ -193,6 +193,7 @@ export class Loader extends Job {
     this.batch = 0;
     this.tapping = false;
     this.gone = null;          // the page went away mid-load
+    this.pinned = null;        // the frame whose player is the track, once the page has been looked at
     this.big = false;
     this.bytes = 0;            // read from the tab, all frames
     this.host = hostOf(deck.meta && deck.meta.url);
@@ -212,8 +213,8 @@ export class Loader extends Job {
     const f = this.frames.get(frameId);
     if (!f || f.a !== a || f.left) return;
     f.left = true;
-    // The top frame's agent going (or the last one) is the page going: navigated, reloaded or closed.
-    if (!this.done && !this.gone && (frameId === 0 || !this.attached().length)) this.gone = 'the page went away';
+    // The top frame's agent going (or the last one, or the track's) is the page going: navigated, reloaded or closed.
+    if (!this.done && !this.gone && (frameId === 0 || !this.attached().length || f === this.pinned)) this.gone = 'the page went away';
     this.poke();
   }
 
@@ -270,16 +271,25 @@ export class Loader extends Job {
 
   attached() { return [...this.frames.values()].filter((f) => !f.left); }
   top() { const f = this.frames.get(0); return f && !f.left ? f : this.attached()[0] || null; }
-  reqs() { return this.attached().flatMap((f) => f.reqs); }
-  mimes() { return [...this.rep.mimes]; }
-  /** A frame whose player uses Media Source (the tap saw a SourceBuffer, or what it appended), most bytes first. */
-  mseFrame() { return this.attached().filter((f) => (f.prog && f.prog.mimes.length) || f.parts.length).sort((a, b) => b.bytes - a.bytes)[0] || null; }
-  /** How long the player says the track is: the Media Source frame's player first, else the top frame's, else any. */
-  duration() {
-    const fs = this.attached().filter((f) => f.prog && f.prog.duration);
-    const f = fs.find((x) => x.prog.mimes.length) || fs.find((x) => x.id === 0) || fs[0];
-    return f ? f.prog.duration : null;
+  /**
+   * The frame whose player is the track: the one its agent says the user hears playing, else one playing, and of
+   * those the longest (a shorter one beside it is an advert or a jingle). Fixed once the page has been looked at.
+   * The track's length, links, pieces and drive are that frame's: another player's never become the track's.
+   */
+  track() {
+    if (this.pinned) return this.pinned.left ? null : this.pinned;
+    const rank = (f) => { const s = f.a && f.a.status; return s && s.playing ? (s.audible > 0 ? 2 : 1) : 0; };
+    const len = (f) => (f.prog && f.prog.duration) || 0;
+    let best = null;
+    for (const f of this.attached()) if (!best || rank(f) > rank(best) || (rank(f) === rank(best) && len(f) > len(best))) best = f;
+    return best;
   }
+  reqs() { const f = this.track(); return f ? f.reqs : []; }
+  mimes() { return [...this.rep.mimes]; }
+  /** The track's frame, when its player uses Media Source (the tap saw a SourceBuffer there, or what it appended). */
+  mseFrame() { const f = this.track(); return f && ((f.prog && f.prog.mimes.length) || f.parts.length) ? f : null; }
+  /** How long the track's player says the track is. */
+  duration() { const f = this.track(); return f && f.prog ? f.prog.duration : null; }
   limitSec() { return (this.engine.params['resident.limitMin'] || 15) * 60; }
   /**
    * What must be covered: the track, or its first part when it is longer than the resident limit (a second
@@ -343,6 +353,7 @@ export class Loader extends Job {
     this.check();
     await this.until(() => !!this.decisive(), this.t.settle); // errors and links still on their way
     this.check();
+    this.pinned = this.track();
     const why = this.decisive(), D = this.duration();
     this.rep.steps.push({ name: 'look', outcome: why || 'ok', why: D != null ? `the player says ${D.toFixed(3)} s` : "the player's length is not known", ms: now() - t0 });
     if (why) throw new Stop('live', LIVE[why]);
@@ -535,7 +546,7 @@ export class Loader extends Job {
     return inits.sort((a, b) => b.seq - a.seq)[0] || null;
   }
 
-  frameOf(url) { const r = this.reqs().find((x) => x.url === url); return r ? r.frame : this.top(); }
+  frameOf(url) { const r = this.reqs().find((x) => x.url === url); return r ? r.frame : this.track() || this.top(); }
 
   /** Fetch links from the page (it holds the session signed links are bound to), and from here what it could not. */
   async fetchUrls(f, urls, onCount) {
@@ -624,7 +635,7 @@ export class Loader extends Job {
   }
 
   // ---------------------------------------------------------------- assembly
-  parts() { return [...this.attached().flatMap((f) => f.parts), ...this.fetched]; }
+  parts() { const f = this.track(); return [...(f ? f.parts : []), ...this.fetched]; }
 
   /** The placement of everything captured and fetched when it covers the track (re-checked against the latest length), else null. */
   async complete() {
