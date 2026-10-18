@@ -3,7 +3,7 @@
 // end as resident decks holding the whole track, checked against the source; the rest end live with
 // their one message. A resident deck no longer depends on its tab: the tab is released, and pausing,
 // seeking and closing it afterwards changes nothing in the deck.
-import test, { before, after } from 'node:test';
+import test, { before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -139,6 +139,18 @@ before(async () => {
 after(async () => {
   await h?.close(); await server?.close(); await rec?.close(); await multi?.close();
   if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+});
+// A test that fails part way leaves nothing to the next: every deck ejected, every page but the deck page
+// closed, the settings it changed put back, the kept tracks dropped.
+afterEach(async () => {
+  if (!deck) return;
+  for (const x of await decks().catch(() => [])) await act(deck, x.id, 'eject').catch(() => {});
+  await waitFor(async () => !(await decks()).length, 8000).catch(() => {});
+  for (const p of h.context.pages()) if (p !== deck) await p.close().catch(() => {});
+  const m = (await state(deck)).master.params;
+  if (m['resident.auto'] !== true) set(deck, null, 'resident.auto', true);
+  if (m['resident.limitMin'] !== 15) set(deck, null, 'resident.limitMin', 15);
+  await engine('if (e.__pcm) e.__pcm.clear(); return true;').catch(() => {});
 });
 
 /** Open a model page; `ready` waits for its player (default: playing past 0.3 s). */
@@ -487,6 +499,8 @@ test('recording a whole track from a media page: its player run at 2× from the 
   assert.match(r.title, /recorded from the page — reduced highs/);
   assert.match(r.load.report, /recorded from the page at 2×/);
   assert.equal(r.tabId, null, 'the recording holds no tab');
+  const kicks = await kicksOf(loading.id);
+  t.diagnostic(`beat to beat (ms): ${kicks.slice(1).map((x, i) => Math.round((x - kicks[i]) * 1000)).join(' ')}; ${r.load.report.split('\n').filter((l) => /^Mended/.test(l)).join('') || 'nothing mended'}`);
   assert.ok(Math.abs(r.bpm.native - 124) < 0.5, `bpm ${r.bpm.native}`);
   // Slowed back to the track's own pitch: lined up with the source (to within a few ms), the audio matches it.
   const c = await engine(`
@@ -513,6 +527,61 @@ test('recording a whole track from a media page: its player run at 2× from the 
   assert.equal((await act(deck, r.id, 'eject')).ok, true);
   await waitFor(async () => !(await decks()).length, 8000);
   await site.tab.close();
+});
+
+/** Kick onsets (s) in a promoted deck's kept track: its envelope (2 ms) rising through 35 % of its loudest. */
+const kicksOf = (deckId) => engine(`const pcm = e.__pcm.get(${deckId}), L = pcm.L, sr = pcm.sampleRate, hop = Math.round(sr * 0.002), env = [];
+  for (let i = 0; i + hop <= L.length; i += hop) { let m = 0; for (let j = 0; j < hop; j++) m = Math.max(m, Math.abs(L[i + j])); env.push(m); }
+  const max = Math.max(...env), on = [];
+  for (let i = 1; i < env.length; i++) if (env[i] >= 0.35 * max && env[i - 1] < 0.35 * max && (!on.length || (i * hop) / sr - on[on.length - 1] > 0.15)) on.push((i * hop) / sr);
+  return on;`);
+
+/**
+ * In the engine (offscreen page): every jds-recorder made from now on gets its capture skipped as a busy computer's
+ * tab capture skips it, the page's player and the engine's clock none the wiser: before batch `ins` 10 ms of silence
+ * is put in, and from batch `lose` 10 ms is lost. Each batch keeps its length (and context frame), so all the audio
+ * after a skip comes 10 ms late (or early). undo() puts AudioWorkletNode back.
+ */
+function captureSkips(ins, lose) {
+  const W = globalThis.AudioWorkletNode, onmessage = Object.getOwnPropertyDescriptor(MessagePort.prototype, 'onmessage');
+  const skip = (frames) => { let batch = 0, q = new Int16Array(0); return (m) => {
+    if (!m || m.t !== 'data') return m;
+    const b = batch++, got = m.buf.subarray(0, m.frames * 2), add = b === lose ? got.subarray(2 * frames) : got, gap = b === ins ? 2 * frames : 0;
+    const all = new Int16Array(q.length + gap + add.length);
+    all.set(q); all.set(add, q.length + gap);
+    q = all.slice(2 * m.frames);
+    return { ...m, buf: all.slice(0, 2 * m.frames) };
+  }; };
+  globalThis.AudioWorkletNode = class extends W {
+    constructor(ctx, name, opts) {
+      super(ctx, name, opts);
+      if (name !== 'jds-recorder') return;
+      const port = this.port, edit = skip(Math.round(0.01 * ctx.sampleRate));
+      let fn = null;
+      Object.defineProperty(port, 'onmessage', { configurable: true, get: () => fn, set: (f) => { fn = f; onmessage.set.call(port, f ? (ev) => f({ data: edit(ev.data) }) : null); } });
+    }
+  };
+  window.__undoSkips = () => { globalThis.AudioWorkletNode = W; };
+}
+
+test('recording a whole track through a capture that skips (a busy computer loses or repeats 10 ms now and then): every beat in its place', async (t) => {
+  await engine(`(${captureSkips})(14, 34); return true;`); // 2.4 s and 5.8 s into the capture: 3.4 s and 10.2 s of the track
+  try {
+    const { site, d } = await liveDeck(`${rec.origin}/rec`);
+    await playing(site.tab);
+    assert.deepEqual(await act(deck, d.id, 'recordWhole'), { ok: true, error: undefined });
+    const loading = await deckWhere((x) => x.id !== d.id && x.kind === 'loading', 5000);
+    const r = await deckWhere((x) => x.id === loading.id && x.kind === 'resident', 40000);
+    const kicks = await kicksOf(loading.id), T = 60 / 124, iv = kicks.slice(1).map((x, i) => (x - kicks[i]) * 1000);
+    t.diagnostic(`beat to beat (ms): ${iv.map(Math.round).join(' ')}; bpm ${r.bpm.native}`);
+    assert.ok(kicks.length >= 32, `${kicks.length} kicks`);
+    // The first beat starts the recording (where it crosses -50 dBFS, not 35 %): the rest are a beat apart.
+    const off = iv.slice(1).filter((x) => Math.abs(x - T * 1000) > 2);
+    assert.deepEqual(off.map(Math.round), [], 'beats out of place');
+    assert.ok(Math.abs(r.bpm.native - 124) < 0.1, `bpm ${r.bpm.native}`);
+    // (A busy box may skip the real capture too: those are mended and listed beside these two.)
+    assert.match(r.load.report, /^Mended: \d+ skips in the capture \(the computer was busy\): (.*, )?20 ms put in at \d+\.\d s, (.*, )?20 ms lost at \d+\.\d s(,.*)?$/m);
+  } finally { await engine('window.__undoSkips && window.__undoSkips(); return true;'); }
 });
 
 // ---------------------------------------------------------------- races, ejects, the page going away (Review Focus 1, 2, 5)

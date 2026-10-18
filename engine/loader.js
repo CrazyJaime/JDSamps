@@ -808,6 +808,82 @@ export function findStart(L, R, from, to) {
   return -1;
 }
 
+// Under load the tab capture now and then loses or repeats one of its 10 ms buffers (20 ms of the track at 2×),
+// silently: the page's player and the engine's clock never see it, but every beat after it is that much early or
+// late, and the beat grid fitted to the whole recording comes out a few tenths of a percent off. A skip is a step:
+// one beat-to-beat interval off by SKIP_MIN or more between intervals that are steady to SKIP_STEADY.
+const SKIP_MIN = 0.006, SKIP_STEADY = 0.003; // s
+
+/**
+ * A recording's skips mended, so every beat is in its place: in the quiet between the two beats around each
+ * step, audio the capture put in (its silence, when that is there) is cut, and audio it lost is given back as
+ * silence. T: the beat period (s). -> {pcm, steps: [{at: s, ms}]}; pcm is the same object when nothing was mended.
+ */
+export function mendSteps(pcm, T) {
+  const { L, R, sampleRate: sr } = pcm, hop = Math.max(1, Math.round(0.002 * sr)), n = Math.floor(L.length / hop);
+  const amp = (i) => Math.max(Math.abs(L[i]), Math.abs(R[i]));
+  let max = 0;
+  const env = new Float32Array(n);
+  for (let k = 0; k < n; k++) { let m = 0; for (let i = k * hop; i < (k + 1) * hop; i++) m = Math.max(m, amp(i)); env[k] = m; max = Math.max(max, m); }
+  // Beats: the first sample through 35 % of the loudest after 20 ms under it, at least 0.6 T after the last.
+  const thr = 0.35 * max, on = [], q = Math.round(0.02 * sr / hop);
+  if (!(max > 0) || !(T > 0)) return { pcm, steps: [] };
+  for (let k = 0, under = q; k < n; k++) { // the track's start counts as quiet before it
+    if (env[k] < thr) { under++; continue; }
+    const after = under >= q;
+    under = 0;
+    if (!after) continue;
+    let i = Math.max(0, k - 1) * hop;
+    while (amp(i) < thr) i++;
+    if (!on.length || i - on[on.length - 1] >= 0.6 * T * sr) on.push(i);
+  }
+  if (on.length < 8) return { pcm, steps: [] };
+  const gaps = on.slice(1).map((x, i) => x - on[i]), beats = gaps.map((g) => Math.max(1, Math.round(g / (T * sr))));
+  const per = gaps.map((g, i) => g / beats[i]).sort((a, b) => a - b), P = per[per.length >> 1]; // the period, by the median
+  const d = gaps.map((g, i) => g - beats[i] * P), steady = (i) => i < 0 || i >= d.length || Math.abs(d[i]) <= SKIP_STEADY * sr;
+  const steps = [];
+  for (let i = 0; i < d.length; i++) {
+    if (Math.abs(d[i]) < SKIP_MIN * sr || Math.abs(d[i]) > 0.45 * P || !steady(i - 1) || !steady(i + 1)) continue;
+    steps.push({ a: on[i] + hop, b: on[i + 1] - hop, D: Math.round(d[i]) });
+  }
+  if (!steps.length) return { pcm, steps: [] };
+  const edits = []; // [at, frames cut (> 0) or silence put in (< 0)], in order
+  for (const step of steps) {
+    const { a, b, D } = step;
+    let at = -1, len = D;
+    if (D > 0) {
+      // The capture's own silence: a run of zeros as long as the step, or one longer (silence it fell into).
+      let best = null;
+      for (let i = a; i < b; i++) {
+        if (L[i] !== 0 || R[i] !== 0) continue;
+        let j = i; while (j < b && L[j] === 0 && R[j] === 0) j++;
+        const run = j - i;
+        if (run >= D - hop / 2 && (!best || Math.abs(run - D) < Math.abs(best.run - D))) best = { i, run };
+        i = j;
+      }
+      if (best && Math.abs(best.run - D) <= hop / 2) { at = best.i; len = best.run; } else if (best) at = best.i + ((best.run - D) >> 1);
+    }
+    if (at < 0) {
+      // The quietest stretch between the two beats: as long as the cut, or 10 ms where silence goes in.
+      const w = D > 0 ? D : Math.min(-D, Math.round(0.01 * sr)), sum = new Float64Array(Math.max(0, b - a) + 1);
+      for (let i = a; i < b; i++) sum[i - a + 1] = sum[i - a] + amp(i);
+      let low = Infinity;
+      for (let i = a; i + w <= b; i++) if (sum[i + w - a] - sum[i - a] < low) { low = sum[i + w - a] - sum[i - a]; at = i; }
+      if (at < 0) continue;
+    }
+    edits.push([at, len, step]);
+  }
+  if (!edits.length) return { pcm, steps: [] };
+  const size = edits.reduce((s, [, len]) => s - len, L.length), oL = new Float32Array(size), oR = new Float32Array(size);
+  let src = 0, dst = 0;
+  for (const [at, len] of edits) {
+    oL.set(L.subarray(src, at), dst); oR.set(R.subarray(src, at), dst); dst += at - src;
+    if (len > 0) src = at + len; else { dst -= len; src = at; } // a cut skips audio; a loss gets silence
+  }
+  oL.set(L.subarray(src), dst); oR.set(R.subarray(src), dst);
+  return { pcm: { L: oL, R: oR, sampleRate: sr }, steps: edits.map(([, , { b, D }]) => ({ at: b / sr, ms: (D / sr) * 1000 })) };
+}
+
 export class Recording extends Job {
   /** live: the live tab deck whose page is recorded; deck: the loading deck the recording becomes. */
   constructor({ engine, live, deck, signal }) {
@@ -890,15 +966,30 @@ export class Recording extends Job {
       this.send({ t: 'drive', mode: 'stop' });
       this.send({ t: 'tap', on: false, forget: true });
       this.say(0.8, 'slowing the recording back');
-      const pcm = await resample({ L: L.slice(start, start + need), R: R.slice(start, start + need), sampleRate: sr / REC_RATE }, sr);
+      const take = { L: L.slice(start, start + need), R: R.slice(start, start + need), sampleRate: sr / REC_RATE };
+      let pcm = await resample(take, sr);
       this.check();
       this.say(0.85, SAY.beat);
-      let analysis = null;
-      try { analysis = await e.analyse(pcm, this.signal); } catch (err) {
-        this.check();
-        e.event('warn', `Deck ${d.slot}: no beat grid from the whole track (${err.message}). TAP the beat.`, d.id);
-      }
+      const analyse = async () => {
+        try { return await e.analyse(pcm, this.signal); } catch (err) {
+          this.check();
+          e.event('warn', `Deck ${d.slot}: no beat grid from the whole track (${err.message}). TAP the beat.`, d.id);
+          return null;
+        }
+      };
+      let analysis = await analyse(), mended = [];
       this.check();
+      // The capture's skips, mended on its beat (a beat apart everywhere else), and the beat found again.
+      if (analysis && analysis.bpm > 0) {
+        const m = mendSteps({ L: take.L, R: take.R, sampleRate: sr }, 60 / analysis.bpm / REC_RATE);
+        if (m.steps.length) {
+          mended = m.steps;
+          pcm = await resample({ ...m.pcm, sampleRate: sr / REC_RATE }, sr);
+          this.check();
+          analysis = await analyse();
+          this.check();
+        }
+      }
       const res = await e.serial(() => e.startResidentDeck({ deckId: d.id, pcm, analysis }));
       if (!res.ok) { this.check(); throw new Stop('live', res.error); }
       this.end();
@@ -906,7 +997,10 @@ export class Recording extends Job {
       d.setLoad({ report: [
         'JD Samps load report', `Page: ${host}`, `Result: resident, ${got.toFixed(3)} s, recorded from the page at ${REC_RATE}× (reduced highs)`,
         `Track length: ${D.toFixed(3)} s (the page's player)`, ...(T < D ? [`Limit: the deck holds the first ${minutes(T / 60)}`] : []),
-        `Recorded: ${(need / sr).toFixed(3)} s of the tab's sound from deck ${live.slot}'s capture, slowed back by ${REC_RATE}`, `Total: ${secs(now() - t0)}`,
+        `Recorded: ${(need / sr).toFixed(3)} s of the tab's sound from deck ${live.slot}'s capture, slowed back by ${REC_RATE}`,
+        ...(mended.length ? [`Mended: ${mended.length} skip${mended.length === 1 ? '' : 's'} in the capture (the computer was busy): ${mended.map((x) =>
+          `${Math.round(Math.abs(x.ms) * REC_RATE)} ms ${x.ms > 0 ? 'put in' : 'lost'} at ${(x.at * REC_RATE).toFixed(1)} s`).join(', ')}`] : []),
+        `Total: ${secs(now() - t0)}`,
       ].join('\n') });
       e.event('info', `Deck ${d.slot}: the whole track was recorded from the page (reduced highs). Deck ${live.slot} is let go.`, d.id);
       e.eject(live.id); // the page paused, its capture released
