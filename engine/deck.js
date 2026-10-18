@@ -233,7 +233,18 @@ export class Deck {
     else if (g && g.inBpm) native = g.inBpm / this.assist.sourceRate;
     return { g, native, out: native ? native * (1 + this.params.pitch) : null };
   }
-  canBeat() { const g = this.tempo && this.tempo.get(); return !!(g && g.canBeat); }
+  /**
+   * Whether the deck can beat-match on the grid of the audio at input position p (the playhead
+   * by default): the grid the DJ is hearing, not the tracker's verdict on audio arriving at the
+   * live edge, which may be a quiet passage or a new track they have not reached yet.
+   */
+  canBeat(p) {
+    if (!this.tempo) return false;
+    const at = p === undefined ? this.heardPos() : p;
+    const seg = this.grids.seg(at);
+    if (!seg) return !!this.tempo.get().canBeat; // no grid map yet: the live grid is all there is
+    return !!seg.grid && this.tempo.canBeatAt(Math.round(at * this.sr));
+  }
 
   desiredRate(p) { return ((1 + this.params.pitch) / this.src.rateAt(p)) * this.nudgeFactor; }
   effRate(p) { const d = this.desiredRate(p); return this.starved ? Math.min(1, d) : d; }
@@ -371,6 +382,9 @@ export class Deck {
       case 'tap': {
         if (!this.tempo) return fail('Waiting for audio.');
         const t = this.engine.ctxTimeAtWall(arg.wallMs ?? this.engine.wallNow());
+        // A tap marks a position in the deck's input. A standing playhead stamps every tap at
+        // the same input frame, so say so rather than take taps that cannot be timed.
+        if (!this.ts.playingAt(t)) return fail('Start the deck to tap its tempo.');
         this.tapAt(this.ts.posAt(t));
         return OK;
       }

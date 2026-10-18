@@ -3,9 +3,13 @@
 // indices, so results never depend on when this code happens to run.
 
 export const DEFAULTS = Object.freeze({
-  lo: 70, hi: 180, wideLo: 55, wideHi: 220, priorCenter: 120, priorSigmaOct: 1.0,
+  lo: 70, hi: 180, wideLo: 55, wideHi: 220, priorCenter: 120, priorSigmaOct: 1.5,
   windowSec: 8, phaseSec: 6, grid: 0.05, harmonics: [1, 1, 0.5, 0.5], smoothSigma: 1.5,
   fineSpanSec: 16, phaseOffsetMs: 4,
+  // Octave evidence: least accent a grid's weaker beats may carry and still be the beat level
+  // (less of it for the level already held, so a passing bar cannot flip the octave), most
+  // subdivisions a beat may span, and how a subdivision is found in the autocorrelation.
+  octAlt: 0.55, octHyst: 0.3, octSub: 3, octSlack: 0.005, tatumMinSec: 0.055, tatumRel: 0.1, vouchSec: 300,
 });
 
 class Ring {
@@ -40,8 +44,32 @@ function onsetCurve(x, sigma) {
   return gaussSmooth(y, sigma);
 }
 
+/** Gaussian kernel for in-place smoothing: {w, R}. */
+function kernel(sigma) {
+  const R = Math.ceil(3 * sigma), w = new Float32Array(2 * R + 1);
+  let ks = 0;
+  for (let i = -R; i <= R; i++) { const v = Math.exp(-0.5 * (i / sigma) ** 2); w[i + R] = v; ks += v; }
+  for (let i = 0; i < w.length; i++) w[i] /= ks;
+  return { w, R };
+}
+
+/** Smooth x[0..W) with a precomputed kernel into out (which may not alias x). */
+function blur(x, W, k, out) {
+  const { w, R } = k;
+  for (let i = 0; i < W; i++) {
+    let s = 0;
+    for (let j = -R; j <= R; j++) { const q = i + j < 0 ? 0 : i + j > W - 1 ? W - 1 : i + j; s += x[q] * w[j + R]; }
+    out[i] = s;
+  }
+}
+
 const rel = (a, b) => Math.abs(a / b - 1);
 const RELATED = [1, 2, 0.5, 1.5, 2 / 3, 3, 1 / 3]; // tempo ratios that count as the same beat
+/** The ratio in RELATED that takes tempo `a` to tempo `b`, or 0 when the two are unrelated. */
+function relatedFactor(b, a) {
+  for (const f of RELATED) if (f !== 1 && Math.abs(b / (a * f) - 1) < 0.04) return f;
+  return 0;
+}
 const clamp01 = (v) => Math.max(0, Math.min(1, v));
 
 /** Tempos a manual ½× / 2× may reach. */
@@ -54,6 +82,41 @@ export function octaveFold(bpm, lo, hi) {
   return f;
 }
 
+/**
+ * Which metrical level of `base` is the beat, within [lo, hi]. A comb finds the beat period only
+ * up to an octave — every level of it scores well — so the level is chosen from evidence that
+ * actually separates them, supplied by the caller so a whole-file analysis can reuse this:
+ *   alt(bpm) — onset on the weaker half of that grid's beats over the stronger half. A level
+ *              twice the beat has nothing on its alternate beats, so alt is near 0.
+ *   sub(bpm) — how many of the track's shortest onset periods one beat of that level spans. A
+ *              "beat" four subdivisions long is a bar-level accent, not the pulse.
+ * Walks down from the fastest level in range while its beats are not all accented, unless
+ * halving would make the beat too long. `held` is the level the caller is already on, which
+ * keeps a passing bar from flipping the octave. Returns {bpm, conf}: conf is how clear the call
+ * was, under 0.5 when the two levels are too close to separate.
+ */
+export function pickOctave(base, lo, hi, alt, sub, o = DEFAULTS, held = 0) {
+  const folded = base * octaveFold(base, lo, hi);
+  // The ends of the range are measured, not exact: a 70 BPM track whose comb peak lands at 69.95
+  // must still have 70 among its levels, or it can only be read at double.
+  const loS = lo * (1 - o.octSlack), hiS = hi * (1 + o.octSlack), lv = [];
+  let top = folded;
+  while (top * 2 <= hiS) top *= 2;
+  for (let b = top; b >= loS; b /= 2) lv.push(b);
+  if (lv.length < 2) return { bpm: lv.length ? lv[0] : folded, conf: 1 }; // one level: nothing to choose
+  const bar = (b) => (held && rel(b, held) < 0.04 ? o.octAlt * (1 - o.octHyst) : o.octAlt);
+  const clear = (x) => clamp01(0.35 + 2.5 * x);
+  let conf = 1;
+  for (let i = 0; i < lv.length - 1; i++) {
+    const a = alt(lv[i]), t = bar(lv[i]);
+    if (a >= t) return { bpm: lv[i], conf: Math.min(conf, clear((a - t) / t)) };
+    const s = sub(lv[i + 1]);
+    if (s >= o.octSub) return { bpm: lv[i], conf: Math.min(conf, clear((s - o.octSub) / o.octSub)) };
+    conf = Math.min(conf, clear((t - a) / t));
+  }
+  return { bpm: lv[lv.length - 1], conf };
+}
+
 export class TempoTracker {
   constructor(fps, opts = {}) {
     this.o = { ...DEFAULTS, ...opts };
@@ -61,13 +124,16 @@ export class TempoTracker {
     const cap = Math.ceil(12 * fps);
     this.full = new Ring(cap);
     this.low = new Ring(cap);
+    // Scratch for the octave evidence: built once so evaluate() stays allocation-light.
+    this.ea = new Float32Array(cap); this.eb = new Float32Array(cap); this.env = new Float32Array(cap);
+    this.envBase = 0; this.ek = kernel(1);
     this.lastT = 0; this.spf = 0; this.frames = 0;
     this.reset();
   }
 
   reset() {
     this.full.clear(); this.low.clear();
-    this.state = 'search'; this.bpm = 0; this.cand = null; this.candCount = 0; this.conf = 0;
+    this.state = 'search'; this.bpm = 0; this.cand = null; this.candCount = 0; this.conf = 0; this.octConf = 0;
     this.beats = []; this.anchor = null; this.fineBpm = 0; this.fit = null; this.out = 0;
     this.holdUntil = 0; this.phaseFrom = 0;
   }
@@ -115,15 +181,85 @@ export class TempoTracker {
     let best = 0; for (let g = 1; g < nG; g++) if (Sw[g] > Sw[best]) best = g;
     let off = 0;
     if (best > 0 && best < nG - 1) { const a = Sw[best - 1], b = Sw[best], c = Sw[best + 1]; const d = a - 2 * b + c; if (d < 0) off = (0.5 * (a - c)) / d; }
-    let bpm = o.wideLo + (best + off) * o.grid;
-    while (bpm < o.lo) bpm *= 2;
-    while (bpm > o.hi) bpm /= 2;
+    // The comb has found the beat period up to an octave. Which octave is the beat is decided
+    // from evidence that tells them apart, not from the prior: accent on alternate beats, and
+    // how many subdivisions a beat would span.
+    const tatum = this.tatum(r, r0, maxLag);
+    let envReady = false; // only built when the range holds more than one level to choose from
+    const alt = (b) => { if (!envReady) { this.envelope(W); envReady = true; } return this.altBeat(b, W); };
+    const picked = pickOctave(o.wideLo + (best + off) * o.grid, o.lo, o.hi,
+      alt, (b) => (tatum ? (60 * fps) / b / tatum : 0), o, this.bpm);
+    // Sharpen the chosen level onto its own comb peak (the one the prior may not have picked).
+    let bpm = picked.bpm, peak = Math.round((bpm - o.wideLo) / o.grid);
+    if (peak >= 1 && peak <= nG - 2) {
+      const span = Math.max(1, Math.round((0.02 * bpm) / o.grid));
+      for (let g = Math.max(1, peak - span); g <= Math.min(nG - 2, peak + span); g++) if (S[g] > S[peak]) peak = g;
+      const a = S[peak - 1], b = S[peak], c = S[peak + 1], d = a - 2 * b + c;
+      const x = o.wideLo + (peak + (d < 0 ? (0.5 * (a - c)) / d : 0)) * o.grid;
+      if (x >= o.lo && x <= o.hi) bpm = x;
+    }
     const related = (b) => { for (let i = 0; i < RELATED.length; i++) if (Math.abs(b / (bpm * RELATED[i]) - 1) < 0.04) return true; return false; };
     let second = 1e-9;
     for (let g = 0; g < nG; g++) { const b = o.wideLo + g * o.grid; if (!related(b) && Sw[g] > second) second = Sw[g]; }
     const salience = S[best], peakRatio = Sw[best] / second;
-    const conf = clamp01((salience - 0.05) / 0.25) * clamp01((peakRatio - 1) / 0.6);
-    return { bpm, salience, peakRatio, conf };
+    // peakRatio says there is a beat here; it cannot say which octave, because the octaves are
+    // left out of its denominator by construction. Only the two together are a confidence.
+    const octConf = picked.conf;
+    const conf = clamp01((salience - 0.05) / 0.25) * clamp01((peakRatio - 1) / 0.6) * octConf;
+    return { bpm, salience, peakRatio, octConf, conf };
+  }
+
+  /**
+   * The shortest clear onset period in the window (frames): the first autocorrelation peak worth
+   * tatumRel of the signal's own energy. Weaker ripples are not a subdivision the music keeps.
+   */
+  tatum(r, r0, maxLag) {
+    const first = Math.max(2, Math.round(this.o.tatumMinSec * this.fps)), floor = this.o.tatumRel * r0;
+    for (let L = first; L < maxLag - 1; L++) if (r[L] >= floor && r[L] >= r[L - 1] && r[L] >= r[L + 1]) return L;
+    return 0;
+  }
+
+  /**
+   * Onset envelope over the last W frames into this.env (full and low band, each over its own
+   * mean, smoothed), with its median in this.envBase so a beat carrying no onset reads about 0.
+   */
+  envelope(W) {
+    const f = this.full.last(W, this.ea), l = this.low.last(W, this.eb);
+    let mf = 1e-9, ml = 1e-9;
+    for (let i = 0; i < W; i++) { mf += f[i]; ml += l[i]; }
+    mf /= W; ml /= W;
+    for (let i = 0; i < W; i++) this.eb[i] = f[i] / mf + l[i] / ml; // l is eb: read then write, per index
+    blur(this.eb, W, this.ek, this.env);
+    const c = this.ea.subarray(0, W);
+    c.set(this.env.subarray(0, W));
+    c.sort();
+    this.envBase = c[W >> 1];
+  }
+
+  /**
+   * Onset on the weaker half of the beats of a `bpm` grid over the stronger half (0..1), at the
+   * phase that carries most onset. Near 1 when every beat is accented; near 0 when the accents
+   * are two beats apart, which means `bpm` is twice the beat.
+   */
+  altBeat(bpm, W) {
+    const e = this.env, base = this.envBase, tau = (60 * this.fps) / bpm, last = W - 2;
+    const at = (p) => { const i = Math.floor(p), fr = p - i; return i < 0 || i + 1 >= W ? 0 : e[i] * (1 - fr) + e[i + 1] * fr; };
+    const step = 0.25;
+    let phi = 0, bv = -Infinity;
+    for (let p = 0; p * step < tau; p++) {
+      const q0 = p * step;
+      let acc = 0, n = 0;
+      for (let q = q0; q < last; q += tau) { acc += at(q); n++; }
+      if (n && acc / n > bv) { bv = acc / n; phi = q0; }
+    }
+    let sa = 0, na = 0, sb = 0, nb = 0, k = 0;
+    for (let q = phi; q < last; q += tau, k++) {
+      const v = Math.max(0, at(q) - base);
+      if (k & 1) { sb += v; nb++; } else { sa += v; na++; }
+    }
+    if (!na || !nb) return 1;
+    const ma = sa / na, mb = sb / nb;
+    return Math.min(ma, mb) / (Math.max(ma, mb) || 1e-9);
   }
 
   update(est) {
@@ -133,19 +269,20 @@ export class TempoTracker {
       if (est.conf < 0.25) return this.snapshot();
       if (this.cand && rel(est.bpm, this.cand) < 0.02) this.candCount++; else { this.cand = est.bpm; this.candCount = 1; }
       if (this.candCount >= 3) { this.state = 'locked'; this.bpm = est.bpm; this.cand = null; this.candCount = 0; }
-      this.conf = est.conf;
+      this.conf = est.conf; this.octConf = est.octConf;
       return this.snapshot();
     }
     if (rel(est.bpm, this.bpm) < 0.02) {
       this.bpm += 0.2 * (est.bpm - this.bpm);
       this.conf += 0.3 * (est.conf - this.conf);
+      this.octConf += 0.3 * (est.octConf - this.octConf);
       this.cand = null; this.candCount = 0;
     } else {
       const octave = [2, 0.5, 1.5, 2 / 3].some((m) => rel(est.bpm, this.bpm * m) < 0.03);
       const need = octave ? 6 : 3;
       if (this.cand && rel(est.bpm, this.cand) < 0.02) this.candCount++; else { this.cand = est.bpm; this.candCount = 1; }
       if (this.candCount >= need && est.conf > (octave ? 0.5 : 0.3)) {
-        this.bpm = est.bpm; this.conf = est.conf; this.cand = null; this.candCount = 0;
+        this.bpm = est.bpm; this.conf = est.conf; this.octConf = est.octConf; this.cand = null; this.candCount = 0;
         this.resetFine();
       } else this.conf *= 0.9;
     }
@@ -153,7 +290,7 @@ export class TempoTracker {
   }
 
   bestBpm() { return this.fineBpm && rel(this.fineBpm, this.bpm) < 0.01 ? this.fineBpm : this.bpm; }
-  snapshot(tag) { return { state: tag || this.state, bpm: this.bestBpm(), coarse: this.bpm, conf: this.conf }; }
+  snapshot(tag) { return { state: tag || this.state, bpm: this.bestBpm(), coarse: this.bpm, conf: this.conf, octConf: this.octConf }; }
 
   /**
    * Input frame where tempo bpmB took over from bpmA within the onset history: the split that
@@ -305,6 +442,9 @@ export class DeckTempo {
     // it: n counts them, from (input s) is where the beat phase jumped and prev the grid before.
     this.track = { n: this.track ? this.track.n + 1 : 0, from: this.tracker.lastT / this.sr, prev: null, jump: null };
     this.hist = []; // recent beat-clock states {t, t0, T} (input frames), oldest first
+    // Whether the grid was worth phase-locking to as the live edge passed each input frame, as
+    // {t, ok} runs, so the deck can ask about the audio under the playhead and not the live edge.
+    this.vouch = [];
     this.jumpsFrom(this.tracker.lastT);
   }
 
@@ -371,22 +511,74 @@ export class DeckTempo {
     this.snap = this.tracker.update(this.tracker.estimate());
     if (this.snap.state !== 'hold' && this.snap.bpm && this.recentlyQuiet()) this.snap = this.tracker.snapshot('hold');
     if (prev && this.snap.coarse && rel(this.snap.coarse, prev) > 0.03 && this.snap.state !== 'hold') {
-      // The tracker accepted a new tempo (new track): manual corrections no longer apply. The new
-      // track starts where its beats took over (the playhead may still be playing the old one),
-      // and the old track keeps the grid it had there, before the new beats could pull the clock.
-      const from = this.tracker.changePoint(prev, this.snap.coarse);
-      this.track = { n: this.track.n + 1, from: from / this.sr, prev: this.gridBefore(from), jump: null };
-      this.mult = 1; this.tapped = null; this.gridOffset = 0; this.clock = new BeatClock(); this.bar1 = null; this.hist = [];
-      this.jumpsFrom(from);
+      const f = relatedFactor(this.snap.coarse, prev);
+      if (f) this.reread(f);
+      else {
+        // The tracker accepted an unrelated tempo (new track): manual corrections no longer apply.
+        // The new track starts where its beats took over (the playhead may still be playing the
+        // old one), and the old track keeps the grid it had there, before the new beats pulled
+        // the clock.
+        const from = this.tracker.changePoint(prev, this.snap.coarse);
+        this.track = { n: this.track.n + 1, from: from / this.sr, prev: this.gridBefore(from), jump: null };
+        this.mult = 1; this.tapped = null; this.gridOffset = 0; this.clock = new BeatClock(); this.bar1 = null; this.hist = [];
+        this.jumpsFrom(from);
+      }
     }
+    this.vouchFor();
     const bpm = this.bpmIn();
     const usable = this.tapped || this.tracker.state === 'locked';
     if (!bpm || !usable || this.snap.state === 'hold') return;
     if (this.tracker.full.count < (2.2 * 60 * this.fps) / bpm) return;
     const ph = this.tracker.phase(bpm, this.tapped ? 1 : this.mult);
-    if (ph.clarity >= 2 || this.clock.t0 == null) this.clock.update(ph.beatT + this.gridOffset, ph.periodT);
+    // A tapped grid is the DJ's: detection may follow the period, never the anchor beat they set.
+    if (this.tapped) this.clock.T = ph.periodT;
+    else if (ph.clarity >= 2 || this.clock.t0 == null) this.clock.update(ph.beatT + this.gridOffset, ph.periodT);
     else this.clock.T = ph.periodT;
     this.detectJump();
+  }
+
+  /**
+   * The tracker re-read the same beats at another metrical level (½×, 2×, …). That is a
+   * correction to this track, not a new track: the DJ's TAP, ½×/2×, GRID nudge and bar 1 all
+   * stand, and the grid keeps its anchor beat and scales its period so the whole track moves
+   * with it. When the DJ had already made the same correction by hand, theirs is dropped
+   * instead, so the two cannot compound.
+   */
+  reread(f) {
+    this.tracker.resetFine();
+    if (this.tapped) return; // the tapped grid is the DJ's; detection may not re-time it
+    const next = this.mult / f;
+    if (this.mult !== 1 && Math.abs(Math.log2(next)) < Math.abs(Math.log2(this.mult))) { this.mult = next; return; }
+    if (this.clock.T > 0) {
+      this.clock.T /= f;
+      const T = this.clock.T;
+      if (Math.abs(this.gridOffset) > T / 2) this.gridOffset -= Math.round(this.gridOffset / T) * T;
+      this.clock.miss = 0;
+    }
+    for (const h of this.hist) h.T /= f;
+    this.jumpsFrom(this.tracker.lastT);
+  }
+
+  /** Record whether the audio now reaching the live edge has a grid worth phase-locking to. */
+  vouchFor() {
+    const t = this.tracker.lastT, v = this.vouch;
+    const ok = !!this.tapped || (this.tracker.state === 'locked' && this.tracker.conf >= 0.5);
+    // Nothing is recorded before the first grid: the tracker needs seconds of onsets to find one,
+    // and the grid it then finds covers the audio before it, as the grid map's own first
+    // segment does. Only losing a grid it once had says anything about the audio.
+    if (!v.length && !ok) return;
+    if (!v.length || v[v.length - 1].ok !== ok) v.push({ t, ok });
+    while (v.length > 1 && v[1].t <= t - this.tracker.o.vouchSec * this.sr) v.shift();
+  }
+
+  /** Whether the audio at input frame t had a grid worth phase-locking to when it was analysed. */
+  canBeatAt(t) {
+    if (this.tapped) return true;
+    const v = this.vouch;
+    if (!v.length) return this.tracker.state === 'locked' && this.tracker.conf >= 0.5;
+    let ok = v[0].ok;
+    for (const e of v) { if (e.t <= t) ok = e.ok; else break; }
+    return ok;
   }
 
   /**
@@ -475,7 +667,9 @@ export class DeckTempo {
   /** Record a tap (input frame) and fit the taps so far: {bpm, t0, T} (input frames) or null. */
   tapFit(inFrame) {
     const last = this.taps[this.taps.length - 1];
-    if (last != null && inFrame - last > 2 * this.sr) this.taps = [];
+    // A tap at or before the one before it cannot be timed — a standing playhead stamps them all
+    // at the same input frame — so it starts a new run instead of joining the old one.
+    if (last != null && (inFrame <= last || inFrame - last > 2 * this.sr)) this.taps = [];
     this.taps.push(inFrame);
     if (this.taps.length > 9) this.taps.shift();
     if (this.taps.length < 4) return null;
@@ -556,6 +750,9 @@ export class DeckTempo {
       ? { t0: this.clock.t0 / this.sr, T: this.clock.T / this.sr, bar1: this.bar1 == null ? null : this.bar1 / this.sr }
       : null;
     const canBeat = !!grid && (!!this.tapped || (tr.state === 'locked' && tr.conf >= 0.5));
-    return { state, inBpm: bpm || null, conf: this.tapped ? 1 : tr.conf, mult: this.mult, tapped: !!this.tapped, grid, canBeat, track: this.track };
+    return {
+      state, inBpm: bpm || null, conf: this.tapped ? 1 : tr.conf, octConf: this.tapped ? 1 : tr.octConf,
+      mult: this.mult, tapped: !!this.tapped, grid, canBeat, track: this.track,
+    };
   }
 }

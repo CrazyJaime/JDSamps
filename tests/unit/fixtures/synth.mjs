@@ -18,6 +18,10 @@ export const PATTERNS = {
   dembow: { bpm: 95, pat: [['kick', [0, 1, 2, 3], 0.9], ['snare', [0.75, 1.5, 2.75, 3.5], 0.5], ['hat', range(0, 4, 0.5), 0.15]] },
   slowhh: { bpm: 75, swing: 0.4, human: 0.008, pat: [['kick', [0, 2.25, 2.75], 0.9], ['snare', [1, 3], 0.6], ['hat', range(0, 4, 0.25), 0.15]] },
   noisy128: { bpm: 128, noiseDb: -14, padDb: -10, pat: [['kick', [0, 1, 2, 3], 0.6], ['snare', [1, 3], 0.3], ['hat', range(0, 4, 0.25), 0.1]] },
+  swing126: { bpm: 126, swing: 0.6, human: 0.004, pat: [['kick', [0, 1, 2, 3], 0.9], ['snare', [1, 3], 0.5], ['hat', range(0, 4, 0.25), 0.2], ['bass', [0.5, 1.5, 2.5, 3.5], 0.25]] },
+  // Half-time feel: the accents are two beats apart, only the 8th-note hats carry the pulse.
+  halftime140: { bpm: 140, pat: [['kick', [0, 2.5], 0.9], ['snare', [2], 0.7], ['hat', range(0, 4, 0.5), 0.12]] },
+  dense150: { bpm: 150, noiseDb: -10, padDb: -8, pat: [['kick', [0, 1, 2, 3], 0.8], ['snare', [1, 3], 0.5], ['hat', range(0, 4, 0.125), 0.15], ['bass', range(0, 4, 0.25), 0.2]] },
   ambient: { bpm: 100, padDb: -6, pat: [['chord', [0], 0.1]] },
 };
 

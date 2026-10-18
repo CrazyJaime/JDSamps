@@ -185,3 +185,70 @@ test('changing the BPM range refolds the grid the DJ hears', async () => {
   assert.ok(near(bpmOf(d.grids.at(p)), 60, 0.01));
   assert.equal(d.tempo.get().tapped, true, 'tap kept');
 });
+
+const concat = (...xs) => { const out = new Float32Array(xs.reduce((n, a) => n + a.length, 0)); let o = 0; for (const a of xs) { out.set(a, o); o += a.length; } return out; };
+
+/** Feed x into a real deck through the real input worklet; onBlock(s, d) runs every 2048 samples. */
+async function feed(d, clock, x, onBlock) {
+  const proc = new Input(), out = [[new Float32Array(128)]];
+  for (let s = 0; s + 128 <= x.length; s += 128) {
+    const blk = x.subarray(s, s + 128);
+    proc.process([[blk, blk]], out, {});
+    clock.t += 128 / FS;
+    for (const { msg } of proc.port.posted.splice(0)) d.onInput(msg);
+    if (s % 2048) continue;
+    d.tick(clock.t);
+    if (onBlock && (await onBlock(s, d))) return;
+  }
+}
+
+test('TAP on a cued, paused deck is refused out loud and cannot poison the taps after PLAY', async () => {
+  // Cue deck B up and tap it in before dropping it: a paused playhead stamps every tap at the
+  // same input frame, so the taps cannot be timed at all (engine/timeshift.js posAt).
+  const { d, clock } = realDeck();
+  await feed(d, clock, synth({ ...PATTERNS.house, bars: 14, tail: 0 }).x);
+  const T = 60 / 124, t0 = clock.t;
+  let last;
+  for (let i = 0; i < 4; i++) last = await d.act('tap', { wallMs: (t0 + i * T) * 1000 });
+  assert.equal(last.ok, false, 'the UI was told the tap worked');
+  assert.match(last.error, /deck/i, `refusal text ${JSON.stringify(last.error)}`);
+  assert.equal(d.tempo.get().tapped, false, 'no tapped tempo was set');
+  // The DJ drops the deck and taps the same tempo again: it must read 124, not a fit over the
+  // stale taps.
+  await d.act('play');
+  let t = clock.t;
+  for (let i = 0; i < 4; i++) { t += T; clock.t = t; d.tick(t); await d.act('tap', { wallMs: t * 1000 }); }
+  assert.equal(d.tempo.get().tapped, true, 'the taps on the running deck set a tempo');
+  assert.ok(near(d.tempo.get().inBpm, 124, 1), `tapped BPM ${d.tempo.get().inBpm.toFixed(2)} should be ~124`);
+});
+
+test('a deck cued at the start of its buffer can beat-match', async () => {
+  // The tracker needs a few seconds of onsets before it locks, but the grid it then finds covers
+  // the audio before it — as the grid map's own first segment does, from -Infinity.
+  const { d, clock } = realDeck();
+  await feed(d, clock, synth({ ...PATTERNS.house, bars: 16, tail: 0 }).x);
+  assert.equal(d.ts.playingAt(clock.t), false, 'the deck is still cued');
+  assert.ok(d.ts.posAt(clock.t) < 1, `cued at ${d.ts.posAt(clock.t)} s`);
+  assert.equal(d.canBeat(), true, 'the cue point is in audio the deck has a grid for');
+});
+
+test('canBeat asks about the grid under the playhead, not the tracker at the live edge', async () => {
+  // 50 s of solid 124 BPM house, then the tab moves on to an ambient pad. The deck plays 30 s
+  // behind the live edge, so the DJ is still hearing the house track.
+  const A = synth({ ...PATTERNS.house, bars: 26, tail: 0 });
+  const B = synth({ ...PATTERNS.ambient, bars: 20, tail: 0 });
+  const houseEnd = A.x.length / FS;
+  const { d, clock } = realDeck();
+  let started = false;
+  await feed(d, clock, concat(A.x, B.x), async () => {
+    if (!started && d.ts.liveEdge >= 30) { await d.act('play'); started = true; }
+    return started && d.ts.liveEdge >= houseEnd + 12;
+  });
+  const now = clock.t, p = d.ts.posAt(now);
+  assert.ok(p < houseEnd - 5, `playhead ${p.toFixed(1)} s is still well inside the house track`);
+  assert.ok(near(bpmOf(d.grids.at(p)), 124, 1.5), `the grid under the playhead is ${bpmOf(d.grids.at(p)).toFixed(2)} BPM`);
+  assert.equal(d.tempo.get().canBeat, false, 'premise: the tracker has lost the beat at the live edge');
+  assert.equal(d.canBeat(), true, 'the deck refuses BEAT SYNC while playing a perfectly gridded groove');
+  assert.equal(d.canBeat(p), true, 'the grid the DJ hears can be beat-matched');
+  assert.equal(d.canBeat(d.ts.liveEdge - 1), false, 'the audio nobody has heard yet still cannot');
+});

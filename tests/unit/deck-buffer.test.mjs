@@ -41,6 +41,7 @@ function setup({ pitch = 0, capSec = 120, liveEdge = 10 } = {}) {
   const grid = { t0: 0, T: BEAT, bar1: null };
   d.tempo = {
     get: () => ({ state: 'LOCKED', inBpm: BPM, conf: 0.9, mult: 1, tapped: false, grid, canBeat: true }),
+    canBeatAt: () => true,
     sourceRateChanged() {}, pushBatch() {}, tap() {}, multiply() {}, shiftGrid() {}, setBar1() {},
   };
   d.grids.update(grid);
