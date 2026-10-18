@@ -357,7 +357,8 @@ test('with the extension, a page that is never decked holds at most ~150 B more 
   try {
     const p = await h.context.newPage();
     await p.goto(`${server.origin}/__agent.html`);
-    assert.ok(!(await p.evaluate(() => Function.prototype.toString.call(HTMLMediaElement.prototype.play))).includes('[native code]'), 'the agent is in the page');
+    // Its wrappers look native to toString; an error thrown through one still names its file.
+    assert.ok(await p.evaluate(() => { try { HTMLMediaElement.prototype.load.call({}); } catch (e) { return /agent-main\.js/.test(e.stack); } return false; }), 'the agent is in the page');
     ext = await heapPerElement(p, await h.context.newCDPSession(p), N);
   } finally { await h.close(); }
   console.log(`JS heap per element: ${ext.toFixed(1)} B with the extension, ${base.toFixed(1)} B without`);
