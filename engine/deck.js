@@ -570,8 +570,14 @@ export class Deck {
    * paused deck can take it. The pitch stays: the tempo played changes in proportion.
    */
   setNativeBpm(p, bpm) {
+    // Refused rather than folded: what the DJ typed is what the deck shows, and the range is the
+    // DJ's own setting of which octave a tempo is counted in (detection and setRange keep to it).
     const [lo, hi] = BPM_RANGES[this.engine.params['bpm.range']] || BPM_RANGES.AUTO;
-    if (bpm < lo || bpm > hi) return fail(`${bpm.toFixed(1)} is outside the BPM range ${lo}–${hi} (Settings).`);
+    if (bpm < lo || bpm > hi) {
+      const alt = bpm * octaveFold(bpm, lo, hi);
+      const how = alt >= lo && alt <= hi ? `Type ${alt.toFixed(1)} (the same beat), or change` : 'Change';
+      return fail(`${bpm.toFixed(1)} is outside the BPM range ${lo}–${hi}. ${how} the BPM range in Settings.`);
+    }
     const g = this.grids.at(p), rate = this.src.rateAt(p), T = 60 / (bpm * rate);
     const b = g ? g.t0 + Math.round((p - g.t0) / g.T) * g.T : this.wantPlay ? p : this.cue;
     this.grids.retime(p, { t0: b, T }, (x) => this.src.rateAt(x));

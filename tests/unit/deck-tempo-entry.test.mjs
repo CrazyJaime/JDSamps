@@ -242,7 +242,13 @@ test('setNativeBpm refuses a tempo outside the BPM range, naming the range', asy
   const r = await d.act('setNativeBpm', { bpm: 64 });
   assert.equal(r.ok, false);
   assert.match(r.error, /70–180/);
+  assert.match(r.error, /Type 128\.0/, 'and offers the same beat inside the range');
   assert.equal(d.tempoInfo().native, null, 'nothing was set');
+  engine.params['bpm.range'] = '98-195';
+  const r2 = await d.act('setNativeBpm', { bpm: 195.5 }); // its half, 97.75, is outside the range too
+  assert.equal(r2.ok, false);
+  assert.doesNotMatch(r2.error, /Type/);
+  assert.match(r2.error, /98–195/);
   engine.params['bpm.range'] = '55-115';
   assert.deepEqual(await d.act('setNativeBpm', { bpm: 64 }), { ok: true });
   assert.ok(near(d.tempoInfo().native, 64, 1e-6));

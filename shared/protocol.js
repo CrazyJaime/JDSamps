@@ -72,6 +72,8 @@ export const DECK_ACTIONS = Object.freeze([
   'tap1', 'live', 'rollStart', 'rollEnd', 'recStart', 'recStop', 'eject', 'clipReset', 'playToggle',
   'setBpm', 'setNativeBpm',
 ]);
+export const MASTER_ACTIONS = Object.freeze(['mixRecStart', 'mixRecStop', 'clipReset', 'stopAll']);
+
 /** Tempos the DJ may type (setBpm: the tempo to play at; setNativeBpm: the track's own tempo). */
 export const TYPED_BPM = Object.freeze([20, 400]);
 
@@ -83,7 +85,6 @@ export function parseTypedBpm(text) {
   if (!(bpm >= TYPED_BPM[0] && bpm <= TYPED_BPM[1])) return { ok: false, error: `Type a tempo from ${TYPED_BPM[0]} to ${TYPED_BPM[1]} BPM.` };
   return { ok: true, bpm };
 }
-export const MASTER_ACTIONS = Object.freeze(['mixRecStart', 'mixRecStop', 'clipReset', 'stopAll']);
 
 const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 
