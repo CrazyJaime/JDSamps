@@ -347,13 +347,16 @@ const OCTAVE_TABLE = [
 
 for (const [name, cfg, bpm] of OCTAVE_TABLE) {
   test(`AUTO reads ${name} at ${bpm} BPM, on the beat, as one track`, () => {
-    const { x, truth } = synth({ ...cfg, bars: barsFor(bpm, 40) });
+    const { x, truth } = synth({ ...cfg, bars: barsFor(bpm, 55) });
     const { tl } = timeline(x);
     const end = x.length / FS - 0.6;
     const steady = tl.filter((e) => e.t > 12 && e.t < end && e.grid);
     assert.ok(steady.length > 20, `${name}: ${steady.length} evaluations after 12 s`);
+    // Every reading, not just most of them: an octave that flaps is as useless as a wrong one.
     const bpms = steady.map((e) => e.bpm);
-    assert.ok(Math.abs(median(bpms) / bpm - 1) < 0.006, `${name}: reads ${median(bpms).toFixed(1)} BPM, not ${bpm}`);
+    const worst = steady.reduce((w, e) => (Math.abs(e.bpm / bpm - 1) > Math.abs(w.bpm / bpm - 1) ? e : w), steady[0]);
+    assert.ok(Math.abs(worst.bpm / bpm - 1) < 0.01,
+      `${name}: reads ${median(bpms).toFixed(1)} BPM median, but ${worst.bpm.toFixed(1)} at t=${worst.t.toFixed(1)}s, not ${bpm}`);
     const errs = steady.map((e) => Math.abs(gridErrMs(e.grid, e.t - 1, truth)));
     assert.ok(median(errs) < 12, `${name}: the grid sits ${median(errs).toFixed(0)} ms off the beats`);
     // No evaluation may offer a confident, sync-ready grid at the wrong tempo (finding D2).

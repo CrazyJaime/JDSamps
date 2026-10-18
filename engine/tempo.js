@@ -6,9 +6,10 @@ export const DEFAULTS = Object.freeze({
   lo: 70, hi: 180, wideLo: 55, wideHi: 220, priorCenter: 120, priorSigmaOct: 1.5,
   windowSec: 8, phaseSec: 6, grid: 0.05, harmonics: [1, 1, 0.5, 0.5], smoothSigma: 1.5,
   fineSpanSec: 16, phaseOffsetMs: 4,
-  // Octave evidence: least accent a grid's weaker beats may carry and still be the beat level,
-  // most subdivisions a beat may span, and how a subdivision is found in the autocorrelation.
-  octAlt: 0.45, octSub: 3, tatumMinSec: 0.055, tatumRel: 0.1, vouchSec: 300,
+  // Octave evidence: least accent a grid's weaker beats may carry and still be the beat level
+  // (less of it for the level already held, so a passing bar cannot flip the octave), most
+  // subdivisions a beat may span, and how a subdivision is found in the autocorrelation.
+  octAlt: 0.55, octHyst: 0.3, octSub: 3, octSlack: 0.005, tatumMinSec: 0.055, tatumRel: 0.1, vouchSec: 300,
 });
 
 class Ring {
@@ -90,24 +91,28 @@ export function octaveFold(bpm, lo, hi) {
  *   sub(bpm) — how many of the track's shortest onset periods one beat of that level spans. A
  *              "beat" four subdivisions long is a bar-level accent, not the pulse.
  * Walks down from the fastest level in range while its beats are not all accented, unless
- * halving would make the beat too long. Returns {bpm, conf}: conf is how clear the call was,
- * under 0.5 when the two levels are too close to separate.
+ * halving would make the beat too long. `held` is the level the caller is already on, which
+ * keeps a passing bar from flipping the octave. Returns {bpm, conf}: conf is how clear the call
+ * was, under 0.5 when the two levels are too close to separate.
  */
-export function pickOctave(base, lo, hi, alt, sub, o = DEFAULTS) {
+export function pickOctave(base, lo, hi, alt, sub, o = DEFAULTS, held = 0) {
   const folded = base * octaveFold(base, lo, hi);
-  const lv = [];
+  // The ends of the range are measured, not exact: a 70 BPM track whose comb peak lands at 69.95
+  // must still have 70 among its levels, or it can only be read at double.
+  const loS = lo * (1 - o.octSlack), hiS = hi * (1 + o.octSlack), lv = [];
   let top = folded;
-  while (top * 2 <= hi) top *= 2;
-  for (let b = top; b >= lo; b /= 2) lv.push(b);
+  while (top * 2 <= hiS) top *= 2;
+  for (let b = top; b >= loS; b /= 2) lv.push(b);
   if (lv.length < 2) return { bpm: folded, conf: 1 };
+  const bar = (b) => (held && rel(b, held) < 0.04 ? o.octAlt * (1 - o.octHyst) : o.octAlt);
   const clear = (x) => clamp01(0.35 + 2.5 * x);
   let conf = 1;
   for (let i = 0; i < lv.length - 1; i++) {
-    const a = alt(lv[i]);
-    if (a >= o.octAlt) return { bpm: lv[i], conf: Math.min(conf, clear((a - o.octAlt) / o.octAlt)) };
+    const a = alt(lv[i]), t = bar(lv[i]);
+    if (a >= t) return { bpm: lv[i], conf: Math.min(conf, clear((a - t) / t)) };
     const s = sub(lv[i + 1]);
     if (s >= o.octSub) return { bpm: lv[i], conf: Math.min(conf, clear((s - o.octSub) / o.octSub)) };
-    conf = Math.min(conf, clear((o.octAlt - a) / o.octAlt));
+    conf = Math.min(conf, clear((t - a) / t));
   }
   return { bpm: lv[lv.length - 1], conf };
 }
@@ -183,7 +188,7 @@ export class TempoTracker {
     let envReady = false; // only built when the range holds more than one level to choose from
     const alt = (b) => { if (!envReady) { this.envelope(W); envReady = true; } return this.altBeat(b, W); };
     const picked = pickOctave(o.wideLo + (best + off) * o.grid, o.lo, o.hi,
-      alt, (b) => (tatum ? (60 * fps) / b / tatum : 0), o);
+      alt, (b) => (tatum ? (60 * fps) / b / tatum : 0), o, this.bpm);
     // Sharpen the chosen level onto its own comb peak (the one the prior may not have picked).
     let bpm = picked.bpm, peak = Math.round((bpm - o.wideLo) / o.grid);
     if (peak >= 1 && peak <= nG - 2) {
@@ -204,7 +209,10 @@ export class TempoTracker {
     return { bpm, salience, peakRatio, octConf, conf };
   }
 
-  /** The shortest clear onset period in the window (frames): the first autocorrelation peak. */
+  /**
+   * The shortest clear onset period in the window (frames): the first autocorrelation peak worth
+   * tatumRel of the signal's own energy. Weaker ripples are not a subdivision the music keeps.
+   */
   tatum(r, r0, maxLag) {
     const first = Math.max(2, Math.round(this.o.tatumMinSec * this.fps)), floor = this.o.tatumRel * r0;
     for (let L = first; L < maxLag - 1; L++) if (r[L] >= floor && r[L] >= r[L - 1] && r[L] >= r[L + 1]) return L;
