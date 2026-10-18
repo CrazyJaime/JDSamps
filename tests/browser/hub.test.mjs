@@ -12,6 +12,9 @@ before(async () => {
   track = await h.context.newPage();
   await track.goto(server.url('a'));
   deck = await openExtPage(h, 'deck.html');
+  // The hub and the UI stream as a live deck has them (its waveform streams in as the tab plays):
+  // tabs load live, as with resident loading turned off. Resident tab loads: resident-tabs.test.mjs.
+  await deck.evaluate(() => chrome.storage.local.set({ 'resident.auto': false }));
 });
 after(async () => { await h?.close(); await server?.close(); });
 

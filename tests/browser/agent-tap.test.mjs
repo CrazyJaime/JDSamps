@@ -694,6 +694,25 @@ describe('the URL and element layers', { concurrency: 2 }, () => {
     await checkPosted(q);
     await q.close();
   });
+
+  test("only a heard player's source is reported; one holding 30 s on a page whose JSON flags a snippet reports tap-error preview", async () => {
+    const p = await tapPage('', { page: '/blank.html' });
+    await connect(p);
+    await p.run(`(() => { const a = document.getElementById('a'); a.muted = true; a.src = '/fx/mp3/track.mp3'; return new Promise((r) => { a.onloadedmetadata = r; }); })()`);
+    await send(p, { t: 'tap', on: true });
+    await waitFor(async () => !!(await lastProgress(p)), 5000);
+    await p.waitForTimeout(400);
+    assert.deepEqual((await posted(p, 'tap-urls')).flatMap((m) => m.reqs).map((r) => r.url), [], 'a muted player is not the track');
+    assert.deepEqual(await errorsOf(p), [], 'no snippet flag on the page yet');
+    await send(p, { t: 'tap', on: false, forget: true });
+    await p.run(`(() => { const s = document.createElement('script'); s.type = 'application/json';
+      s.textContent = JSON.stringify({ title: 'x', policy: 'SNIP', snipped: true }); document.body.append(s); document.getElementById('a').muted = false; })()`);
+    await send(p, { t: 'tap', on: true });
+    await waitFor(async () => (await errorsOf(p)).some((e) => e.reason === 'preview'), 5000);
+    assert.ok((await posted(p, 'tap-urls')).flatMap((m) => m.reqs).some((r) => r.url === `${server.origin}/fx/mp3/track.mp3` && r.past), 'heard: its source is reported');
+    await checkPosted(p);
+    await p.close();
+  });
 });
 
 // ---------------------------------------------------------------- disguise
@@ -706,7 +725,7 @@ function LOOK() {
     'get currentTime': d(HTMLMediaElement.prototype, 'currentTime').get, 'get paused': d(HTMLMediaElement.prototype, 'paused').get,
     appendBuffer: SourceBuffer.prototype.appendBuffer, addSourceBuffer: MediaSource.prototype.addSourceBuffer,
     fetch: window.fetch, open: XMLHttpRequest.prototype.open, send: XMLHttpRequest.prototype.send, setRequestHeader: XMLHttpRequest.prototype.setRequestHeader,
-    requestMediaKeySystemAccess: Navigator.prototype.requestMediaKeySystemAccess, toString: Function.prototype.toString,
+    requestMediaKeySystemAccess: Navigator.prototype.requestMediaKeySystemAccess, toString: Function.prototype.toString, createObjectURL: URL.createObjectURL,
   };
   const look = (fn) => [
     Function.prototype.toString.call(fn), String(fn), fn.toString.toString(), fn.name, fn.length, Object.getOwnPropertyNames(fn),
@@ -717,7 +736,7 @@ function LOOK() {
   return JSON.stringify({
     fns: Object.fromEntries(Object.entries(fns).map(([k, f]) => [k, look(f)])),
     descs: [d(window, 'fetch'), d(Function.prototype, 'toString'), d(SourceBuffer.prototype, 'appendBuffer'), d(MediaSource.prototype, 'addSourceBuffer'),
-      d(XMLHttpRequest.prototype, 'send'), d(Navigator.prototype, 'requestMediaKeySystemAccess'), d(HTMLMediaElement.prototype, 'srcObject')].map(attrs),
+      d(XMLHttpRequest.prototype, 'send'), d(Navigator.prototype, 'requestMediaKeySystemAccess'), d(HTMLMediaElement.prototype, 'srcObject'), d(URL, 'createObjectURL')].map(attrs),
   });
 }
 
@@ -794,6 +813,28 @@ describe('driving the player', { concurrency: 3 }, () => {
     await p.run('window.__limit = 0; window.__pump()');
     await waitFor(async () => (await driveState(p)) === 'done', 10000, 100);
     await send(p, { t: 'drive', mode: 'stop' });
+    await checkPosted(p);
+    await p.close();
+  });
+
+  test('drive accelerate from a place, held and audible (recording a whole track): paused there with its sound, then played; stop puts it back', async () => {
+    const p = await tapPage(LONG);
+    await connect(p);
+    await send(p, { t: 'tap', on: true });
+    await p.run("window.__go().then(() => { const a = document.getElementById('a'); a.volume = 0.6; a.currentTime = 12; return a.play(); })");
+    await waitFor(async () => { const m = await media(p); return !m.paused && m.t > 12.2; }, 5000);
+    await send(p, { t: 'drive', mode: 'accelerate', rate: 2, from: 0, hold: true, audible: true });
+    await waitFor(() => p.run("!document.getElementById('a').seeking"), 3000);
+    let m = await media(p);
+    assert.deepEqual([m.t, m.paused, m.rate, m.pp, m.muted], [0, true, 2, false, false], 'held at 0, at 2x, with its sound');
+    await send(p, { t: 'drive', mode: 'accelerate', rate: 2, audible: true });
+    await waitFor(async () => { const x = await media(p); return !x.paused && x.t > 0.3; }, 5000);
+    m = await media(p);
+    assert.deepEqual([m.rate, m.pp, m.muted], [2, false, false]);
+    await send(p, { t: 'drive', mode: 'stop' });
+    m = await media(p);
+    assert.deepEqual([m.paused, m.rate, m.pp, m.muted, m.volume], [false, 1, true, false, 0.6]);
+    assert.ok(Math.abs(m.t - 12.2) < 1, `back near where it was: ${m.t}`);
     await checkPosted(p);
     await p.close();
   });

@@ -62,12 +62,13 @@ export const MASTER_PARAMS = Object.freeze({
   'pitch.defaultRange': oneOf(PITCH_RANGES, 0.1),
   'resident.limitMin': num(1, 60, 15), // a resident deck holds at most this many minutes of a track
   'resident.recordWhole': bool(false), // record a whole track at 2× when its bytes cannot be had
+  'resident.auto': bool(true), // loading a tab tries for the whole track (resident); off: the tab plays live
 });
 
 /** Master params saved to chrome.storage.local by the UI and restored on engine start. */
 export const PERSISTED_MASTER_KEYS = Object.freeze([
   'master.limiter', 'xfader.curve', 'rec.format', 'bpm.range', 'buffer.capSec', 'assist.on', 'pitch.defaultRange',
-  'resident.limitMin', 'resident.recordWhole',
+  'resident.limitMin', 'resident.recordWhole', 'resident.auto',
 ]);
 
 export const DECK_ACTIONS = Object.freeze([
@@ -234,6 +235,9 @@ function validateTapMessage(m) {
     if (!buffered.every((r) => Array.isArray(r) && r.length === 2 && r.every(Number.isFinite) && r[0] >= 0 && r[0] <= r[1])) return null;
     if (!Array.isArray(mimes) || mimes.length > 16 || !mimes.every(isMime)) return null;
     const out = { t: m.t, bytes, buffered: buffered.map(([a, b]) => [a, b]), duration: tapDuration(m.duration), mimes: [...mimes] };
+    // The SourceBuffers (tap-ready's sb numbers) that feed the reported player: [] when it plays a plain source;
+    // left out when the tap cannot tell. Another player's appends are on other numbers.
+    if (Array.isArray(m.sbs) && m.sbs.length <= 64 && m.sbs.every((n) => Number.isInteger(n) && n >= 0 && n < 1000)) out.sbs = [...m.sbs];
     // How a drive of the player is going: still at it, done (all of it buffered), stalled (it
     // stopped buffering) or refused (the page fights the rate, or the media cannot be seek-hopped).
     const d = m.drive;

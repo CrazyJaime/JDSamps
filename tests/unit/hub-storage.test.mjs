@@ -233,6 +233,25 @@ test('a late pause that found nothing heard keeps the mute', async () => {
   assert.deepEqual(muteRecords(), ['muted:11']);
 });
 
+test('STOP_TAB releasing a tab (its deck went resident) pauses its players but never mutes it, and undoes a mute of ours', async () => {
+  // Nothing playing (paused by the user, or its track ended): nothing to pause, and still no mute.
+  runScript = pausing(0);
+  assert.deepEqual(await hub({ type: 'STOP_TAB', tabId: 11, release: true }), { ok: true, paused: 0, muted: false });
+  assert.equal(tabs[0].mutedInfo, undefined);
+  assert.deepEqual(muteRecords(), []);
+  // A page slow to answer is waited for, not muted.
+  runScript = (o) => (o.func ? new Promise((r) => setTimeout(() => r(frames(1)), 400)) : []);
+  assert.deepEqual(await hub({ type: 'STOP_TAB', tabId: 11, release: true }), { ok: true, paused: 1, muted: false });
+  assert.equal(tabs[0].mutedInfo, undefined);
+  // A mute an earlier STOP_TAB made is taken off.
+  runScript = pausing(0);
+  await stopTab(12);
+  assert.equal(tabs[1].mutedInfo.muted, true);
+  assert.deepEqual(await hub({ type: 'STOP_TAB', tabId: 12, release: true }), { ok: true, paused: 0, muted: false });
+  assert.equal(tabs[1].mutedInfo.muted, false);
+  assert.deepEqual(muteRecords(), []);
+});
+
 test('STOP_TAB skips a closed or navigated-away tab silently', async () => {
   tabs[0].url = 'chrome://newtab/';
   for (const id of [11, 77, 'x']) {
@@ -509,6 +528,18 @@ test('a capture passes the saved settings to the engine with START', async () =>
   const [start] = toEngineOf('START');
   assert.ok(start, 'START sent');
   assert.deepEqual(start.settings, { 'pitch.defaultRange': 0.16, 'bpm.range': '78-155', 'rec.format': 'webm' });
+});
+
+test('a capture asks the engine for a whole-track (resident) load, or a live one when resident.auto is saved off', async () => {
+  chrome.action.onClicked.fire(tabs[0]);
+  await settle();
+  assert.equal(toEngineOf('START')[0].mode, 'resident');
+  sent = []; local = { 'resident.auto': false };
+  chrome.action.onClicked.fire(tabs[1]);
+  await settle();
+  const [start] = toEngineOf('START');
+  assert.equal(start.mode, 'live');
+  assert.equal(start.settings['resident.auto'], false);
 });
 
 // ---------------------------------------------------------------- incognito (platform/M6)

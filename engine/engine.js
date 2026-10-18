@@ -12,6 +12,7 @@ import { MasterClock } from './sync.js';
 import { Deck } from './deck.js';
 import { fetchArrayBuffer, decodeTo, resample, limitPcm } from './decode.js';
 import { analyseTrack, applyAnalysis } from './analysis.js';
+import { Loader, Recording } from './loader.js';
 
 const STRETCH_URL = new URL('../vendor/signalsmith-stretch/SignalsmithStretch.js', import.meta.url).href;
 SignalsmithStretch.moduleUrl = STRETCH_URL;
@@ -219,7 +220,7 @@ class Engine {
   async onHub(msg) {
     await this.ready;
     switch (msg.type) {
-      case ENGINE.START: return this.serial(() => { this.applySaved(msg.settings); return this.startDeck(msg.tabId, msg.streamId, msg.meta || {}); });
+      case ENGINE.START: return this.startTab(msg);
       case ENGINE.EJECT: { const d = this.deckByTab(msg.tabId); if (d) await this.eject(d.id, msg.reason); return { ok: true }; }
       case ENGINE.META: { const d = this.deckByTab(msg.tabId); if (d) Object.assign(d.meta, msg.meta || {}); return { ok: true }; }
       case ENGINE.PING: return { ok: true, decks: [...this.decks.values()].map((d) => ({ tabId: d.tabId, slot: d.slot })) };
@@ -279,6 +280,61 @@ class Engine {
     this.hub({ type: HUB.AGENT_CONNECT, tabId });
     this.event('info', `Loaded “${meta.title || 'tab'}” on deck ${deck.slot}. It is cued: press PLAY when you're ready.`, deck.id);
     return { ok: true, deckId: deck.id, slot: deck.slot };
+  }
+
+  /**
+   * A tab from the hub: by default a loading deck whose Loader goes for the whole track (outside serial(), so
+   * other decks never queue behind it), falling back to live; mode 'live' or resident.auto off: a live deck.
+   */
+  async startTab(msg) {
+    const meta = msg.meta || {};
+    let resident = false;
+    const r = await this.serial(() => {
+      this.applySaved(msg.settings);
+      resident = msg.mode !== 'live' && this.params['resident.auto'] !== false;
+      return resident ? this.startLoadingDeck({ tabId: msg.tabId, streamId: msg.streamId, meta }) : this.startDeck(msg.tabId, msg.streamId, meta);
+    });
+    if (r.ok && resident) this.loadTab(this.decks.get(r.deckId));
+    return r;
+  }
+
+  /** Run a loading tab deck's Loader. Its agents' tap messages reach it through deck.loader while it runs. */
+  loadTab(deck) {
+    const ac = new AbortController(), loader = new Loader({ engine: this, deck, tabId: deck.tabId, signal: ac.signal });
+    const load = { abort: () => ac.abort(), loader };
+    this.loads.set(deck.id, load);
+    deck.loader = loader;
+    return loader.run().then((r) => {
+      if (this.loads.get(deck.id) === load) this.loads.delete(deck.id);
+      if (deck.loader === loader) deck.loader = null;
+      return r;
+    });
+  }
+
+  /**
+   * Record a live tab deck's whole track from the page's sound at 2× (§4.4: opt-in, highs above a quarter of the
+   * media's rate lost) onto a new deck, which becomes resident; the live deck is then let go. Answers once the
+   * recording has started: the new deck shows its progress.
+   */
+  async recordWhole(id) {
+    const live = this.decks.get(id);
+    if (!live) return { ok: false, error: 'That deck is gone.' };
+    if (live.kind !== 'live' || live.tabId == null || !live.source) return { ok: false, error: 'Only a deck playing a tab live can record its whole track.' };
+    if (live.loader) return { ok: false, error: `Deck ${live.slot} is being recorded already.` };
+    if (live.wantPlay) return { ok: false, error: 'Pause the deck first: recording runs its page at 2×.' };
+    if (!Recording.agentOf(live)) return { ok: false, error: "This page can't be sped up, so it would record in real time." };
+    const meta = { title: `${live.meta.title || 'Tab'} (recorded from the page — reduced highs)`, url: live.meta.url, favIconUrl: live.meta.favIconUrl };
+    const r = await this.serial(() => this.startLoadingDeck({ meta }));
+    if (!r.ok) return r;
+    const deck = this.decks.get(r.deckId), ac = new AbortController();
+    const job = new Recording({ engine: this, live, deck, signal: ac.signal }), load = { abort: () => ac.abort(), loader: job };
+    this.loads.set(deck.id, load);
+    live.loader = job; // the live deck's agents' tap messages go to the recording
+    job.run().then(() => {
+      if (this.loads.get(deck.id) === load) this.loads.delete(deck.id);
+      if (live.loader === job) live.loader = null;
+    });
+    return { ok: true };
   }
 
   /** Why no new deck can start now (the tab is on a deck already, or every slot is taken), or null; wakes the context. */
@@ -508,12 +564,13 @@ class Engine {
   }
 
   /** Before a deck's capture goes, stop its tab playing (the hub pauses the page's players, or
-   *  mutes the tab), so the ejected track does not come out of the speakers. Bounded. */
-  stopTab(d) {
+   *  mutes the tab), so the ejected track does not come out of the speakers. Bounded. release: the
+   *  deck went resident and lets go of its tab, which is paused but never left muted. */
+  stopTab(d, { release = false } = {}) {
     if (d.tabId == null) return Promise.resolve(); // a deck with no tab has none to stop
     let p = this.tabStops.get(d);
     if (!p) {
-      p = withTimeout(this.hub({ type: HUB.STOP_TAB, tabId: d.tabId }), STOP_TAB_MS, 'STOP_TAB timed out').then((r) => {
+      p = withTimeout(this.hub({ type: HUB.STOP_TAB, tabId: d.tabId, ...(release ? { release } : {}) }), STOP_TAB_MS, 'STOP_TAB timed out').then((r) => {
         if (r && r.ok && r.muted) this.event('info', `Deck ${d.slot}: the tab has no pausable player, so it was muted.`);
       }, () => {});
       this.tabStops.set(d, p);

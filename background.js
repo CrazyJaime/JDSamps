@@ -99,7 +99,10 @@ async function capture(tabId) {
         : `Chrome refused to capture that tab: ${err.message}`,
     };
   }
-  const r = await toEngine({ type: ENGINE.START, tabId, streamId, meta: { title: tab.title || '', url: tab.url || '', favIconUrl: tab.favIconUrl || '' }, settings: await savedSettings() });
+  const settings = await savedSettings();
+  // A tab is loaded as its whole track (resident), unless the DJ has set tabs to play live.
+  const mode = settings['resident.auto'] === false ? 'live' : 'resident';
+  const r = await toEngine({ type: ENGINE.START, tabId, streamId, mode, meta: { title: tab.title || '', url: tab.url || '', favIconUrl: tab.favIconUrl || '' }, settings });
   if (r && r.ok) { await keepTab(tabId, 'deck'); autoStart(tabId, r.slot); }
   return r;
 }
@@ -305,8 +308,10 @@ function autoStart(tabId, slot) {
 // Once a deck lets go of its capture, the tab plays out of the speakers again. So before an eject
 // the engine asks for STOP_TAB: every frame's agent pauses its page's players, or, when nothing
 // heard could be paused in time, the tab is muted. Mutes made here are recorded per tab and undone
-// when the tab is loaded again; a mute the user made is never touched.
+// when the tab is loaded again; a mute the user made is never touched. A deck that went resident
+// releases its tab the same way (release): its players are paused, and it is never left muted.
 const STOP_MS = 250; // pause budget before muting; the engine waits up to 2.5 s for the whole STOP_TAB
+const RELEASE_MS = 2000; // pause budget for a release: the resident deck plays from memory meanwhile
 const muteKey = (tabId) => `muted:${tabId}`;
 const stopping = new Map(); // tabId → STOP_TAB in flight (never rejects)
 
@@ -347,11 +352,17 @@ async function unmuteOurs(tab) {
   if (m && m.muted && m.reason === 'extension' && m.extensionId === chrome.runtime.id) await chrome.tabs.update(tab.id, { muted: false }).catch(() => {});
 }
 
-async function stopTab(tabId) {
+async function stopTab(tabId, release = false) {
   await starting.get(tabId); // a load of this tab whose start may still be about to play it
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (!tab || !capturable(tab.url)) return { ok: true, paused: 0, muted: false }; // closed or navigated away
   const pausing = pauseTab(tabId).catch(() => 0);
+  if (release) {
+    // Nothing playing (paused, or its track over) leaves nothing to pause: still no mute, and none of ours stays.
+    const paused = await Promise.race([pausing, new Promise((r) => setTimeout(r, RELEASE_MS, 0))]);
+    await unmuteOurs((await chrome.tabs.get(tabId).catch(() => null)) || tab).catch(() => {});
+    return { ok: true, paused, muted: false };
+  }
   const paused = await Promise.race([pausing, new Promise((r) => setTimeout(r, STOP_MS, 0))]);
   if (paused > 0) return { ok: true, paused, muted: false };
   const muted = await muteTab(tab).catch(() => false);
@@ -416,7 +427,7 @@ async function handle(msg) {
     case HUB.STOP_TAB: {
       const id = msg.tabId;
       if (!Number.isInteger(id)) return { ok: false, error: 'Bad tab id.' };
-      const p = stopTab(id).catch(() => ({ ok: true, paused: 0, muted: false }));
+      const p = stopTab(id, msg.release === true).catch(() => ({ ok: true, paused: 0, muted: false }));
       stopping.set(id, p);
       p.then(() => { if (stopping.get(id) === p) stopping.delete(id); });
       return p;

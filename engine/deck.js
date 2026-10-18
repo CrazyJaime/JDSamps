@@ -101,6 +101,7 @@ export class Deck {
       inLag: Infinity,
     };
     this.agents = new Map();
+    this.loader = null; // a loading tab deck's Loader (engine/loader.js): its agents' tap messages go there
     this.pauseFought = false; // a frame's site kept pausing its player: warned once
     this.meter = { peak: 0, rms: 0, clipUntil: 0, clipFrame: Math.round(engine.ctx.currentTime * this.sr) }; // clips before this deck are not its own
     this.error = null;
@@ -522,7 +523,7 @@ export class Deck {
       case 'recStart':
         try { this.recorder.start(this.engine.params['rec.format']); return OK; } catch (err) { return fail(`Could not start recording: ${err.message}`); }
       case 'recStop': this.recorder.stop(); return OK;
-      case 'recordWhole': return fail('Recording a whole track from the page is not available yet.');
+      case 'recordWhole': return this.engine.recordWhole(this.id);
       case 'clipReset': this.meter.clipUntil = 0; return OK;
       default: return fail(`Unknown action ${a}`);
     }
@@ -1202,13 +1203,20 @@ export class Deck {
       const m = validateAgentMessage(raw);
       if (!m || this.disposed || this.agents.get(frameId) !== a) return;
       if (m.t === 'status') { a.status = m; this.onAgentStatus(a); }
+      else if (m.t.startsWith('tap-')) { if (this.loader) this.loader.onTap(frameId, m); } // the page tap: the load's
       else if (m.t === 'external-rate' && a === this.assist.agent) this.refuseAssist();
       else if (m.t === 'external-pause') this.notePauseFight();
     });
-    port.onDisconnect.addListener(() => { void chrome.runtime.lastError; if (this.agents.get(frameId) === a) this.agents.delete(frameId); });
+    port.onDisconnect.addListener(() => {
+      void chrome.runtime.lastError;
+      if (this.agents.get(frameId) !== a) return;
+      this.agents.delete(frameId);
+      if (this.loader) this.loader.onDetach(frameId, a);
+    });
     // This deck is capturing the frame's tab: until it lets go, a pause the frame's own site asks
     // for is dropped, so a site that allows one playing track at a time cannot stop the source.
     try { port.postMessage({ t: 'query' }); port.postMessage({ t: 'isolate', on: true }); } catch (_) {}
+    if (this.loader) this.loader.onAttach(frameId, a);
   }
 
   /**

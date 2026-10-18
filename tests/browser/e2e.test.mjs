@@ -75,6 +75,10 @@ before(async () => {
   deck.on('console', (m) => { if (m.type() === 'error') deckPageErrors.push(m.text()); });
   deck.on('pageerror', (e) => deckPageErrors.push(String(e)));
   await deck.goto(`chrome-extension://${h.extId}/deck.html`);
+  // Every test here is about live capture (the buffer, reserve, assist, tempo tracking, the tab's
+  // playback and eject) or plays the live decks loaded below: tabs load live, as with resident
+  // loading turned off. Resident tab loads have their own suite (resident-tabs.test.mjs).
+  await deck.evaluate(() => chrome.storage.local.set({ 'resident.auto': false }));
   for (const k of ['a', 'b']) {
     const r = await hubCall(deck, { type: 'LOAD_TAB', tabId: await tabIdFor(h, server.url(k)) });
     assert.equal(r.ok, true, JSON.stringify(r));

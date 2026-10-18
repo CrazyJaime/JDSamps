@@ -299,8 +299,9 @@
   const CAP = 600 * 2 ** 20; // bytes held per frame; past it the tap gives up rather than grow
   const INIT_MAX = 256 * 1024; // the largest init segment kept while dormant
   const tap = { on: false, bytes: 0, seq: 0, nsb: 0, gen: 0, reqs: 0, infAt: 0, told: new Set(), mimes: new Set(), srcs: new Set() };
-  const sbs = new WeakMap(); // SourceBuffer -> { i, mime, skip, init }
+  const sbs = new WeakMap(); // SourceBuffer -> { i, mime, skip, init, ms }
   let known = [], knownAt = 32; // WeakRefs to the SourceBuffers in sbs, for the tap to find them
+  const msUrls = new Map(); // a MediaSource's blob: URL -> WeakRef to it: an element's source leads to its SourceBuffers
   const wiredEls = new Set(), watched = new Set(); // what carries a tap listener this session
   const handed = new Set(); // blob: URLs handed to the engine: its to read until it says forget
   const xhrs = new WeakMap();
@@ -340,7 +341,7 @@
   function recOf(sb, mime = '') {
     let rec = sbs.get(sb);
     if (!rec) {
-      rec = { i: tap.nsb++, mime, skip: videoMime(mime), init: null };
+      rec = { i: tap.nsb++, mime, skip: videoMime(mime), init: null, ms: null };
       sbs.set(sb, rec);
       if (known.length >= knownAt) { known = known.filter((r) => r.deref() !== undefined); knownAt = Math.max(32, 2 * known.length); }
       known.push(new WeakRef(sb));
@@ -421,10 +422,34 @@
       const sb = orig.apply(this, arguments);
       try {
         const rec = recOf(sb, String(type).slice(0, 256));
+        rec.ms = this;
         if (tap.on && !rec.skip) { tap.mimes.add(rec.mime); watchSb(sb); tapDirty(); }
       } catch (_) {}
       return sb;
     } }.addSourceBuffer, orig);
+    // A player attaches its MediaSource by a blob: URL: noted (dormant or not), so the tap can tell which
+    // SourceBuffers feed the player it reports on, and keep another player's appends apart.
+    URL_.createObjectURL = disguise({ createObjectURL(obj) {
+      const u = mkUrl.apply(this, arguments);
+      try {
+        if (tagOf(obj) === '[object MediaSource]') {
+          if (msUrls.size >= 64) for (const [k, r] of msUrls) if (!r.deref() || msUrls.size >= 64) msUrls.delete(k);
+          msUrls.set(u, new WeakRef(obj));
+        }
+      } catch (_) {}
+      return u;
+    } }.createObjectURL, mkUrl);
+  }
+  /** The numbers of the SourceBuffers feeding el: [] when it plays a plain web source, null when that is not known. */
+  function sbsOf(el) {
+    let src = '';
+    try { src = el ? el.currentSrc || el.src || '' : ''; } catch (_) {}
+    if (!/^blob:/i.test(src)) return /^https?:/i.test(src) ? [] : null;
+    const r = msUrls.get(src), ms = r && r.deref();
+    if (!ms) return null; // a blob of bytes, or a MediaSource made before the agent was there
+    const out = [];
+    for (const w of known) { const sb = w.deref(), rec = sb && sbs.get(sb); if (rec && rec.ms === ms && !rec.skip && out.length < 64) out.push(rec.i); }
+    return out;
   }
 
   // The URL layer: media (and manifest) requests the page makes with fetch or XMLHttpRequest,
@@ -553,22 +578,38 @@
     try { const b = el.buffered; for (let i = 0; i < b.length && i < 64; i++) out.push([b.start(i), b.end(i)]); } catch (_) {}
     return out;
   };
-  /** What the page shows without a hook: keys, worker handles, an endless stream, element sources. */
+  /** What the page shows without a hook: keys, worker handles, an endless stream, element sources, a preview. */
   function checkPage() {
     for (const el of live()) {
       try {
         if (el.mediaKeys) tapFail('drm', 'the player uses protected media');
         noteWorker(el.srcObject);
+        // Only a player the user hears is the track: a muted decorative <audio> is not.
         const src = el.currentSrc;
-        if (/^https?:/i.test(src) && !tap.srcs.has(src)) { tap.srcs.add(src); const u = absUrl(src); if (u) noteReq(u, 'GET', null, null, '', true); }
+        if ((heard(el) || el === drv.el) && /^https?:/i.test(src) && !tap.srcs.has(src)) { tap.srcs.add(src); const u = absUrl(src); if (u) noteReq(u, 'GET', null, null, '', true); }
       } catch (_) {}
     }
+    previewCheck(mainEl());
     // An MSE player shows Infinity for a moment after its init segment, until it sets the length
     // from its manifest: only one that keeps saying so is a stream with no end.
+    // Looked at again once the 3 s are up, in case nothing else happens on the page meanwhile.
     const el = mainEl(), now = performance.now();
     if (!el || el.duration !== Infinity) tap.infAt = 0;
-    else if (!tap.infAt) tap.infAt = now;
+    else if (!tap.infAt) { tap.infAt = now; setTimeout(tapDirty, 3100); }
     else if (now - tap.infAt >= 3000) tapFail('live', 'the player reports no end');
+  }
+
+  // A preview: the player holds about 30 s, and the page says it is a snippet in its own JSON (as
+  // SoundCloud does: policy SNIP, snipped) or in the media's path. Looked for once a session, when
+  // a length in that range first shows.
+  const SNIP = /"policy"\s*:\s*"SNIP"|"snipped"\s*:\s*true/;
+  function previewCheck(el) {
+    const d = durOf(el);
+    if (tap.snip || !d || d < 25 || d > 35) return;
+    tap.snip = true;
+    let flagged = /\/preview\//i.test(el.currentSrc || '');
+    try { for (const sc of document.querySelectorAll('script')) { if (flagged) break; const t = sc.textContent; if (t.length <= 4e6 && SNIP.test(t)) flagged = true; } } catch (_) {}
+    if (flagged) tapFail('preview', 'the page offers a 30-second preview only');
   }
 
   // Up: parts and requests as soon as the task that made them is over (one microtask, so a burst
@@ -601,6 +642,8 @@
     checkPage();
     const el = mainEl();
     const msg = { t: 'tap-progress', bytes: tap.bytes, buffered: rangesOf(el), duration: durOf(el), mimes: [...tap.mimes].slice(0, 16) };
+    const own = sbsOf(el);
+    if (own) msg.sbs = own;
     if (drv.mode) msg.drive = { mode: drv.mode, state: drv.state, at: Math.max(0, drv.mode === 'seekhop' ? drv.cursor : el.currentTime) };
     const s = JSON.stringify(msg);
     if (s === tp.last) return;
@@ -624,7 +667,7 @@
 
   function tapOn() {
     if (tap.on) { tapDirty(); return; }
-    Object.assign(tap, { on: true, bytes: 0, reqs: 0, infAt: 0, told: new Set(), mimes: new Set(), srcs: new Set() });
+    Object.assign(tap, { on: true, bytes: 0, reqs: 0, infAt: 0, snip: false, told: new Set(), mimes: new Set(), srcs: new Set() });
     tp.last = '';
     activate(); scan(); watchPolling();
     for (const el of live()) wireTap(el);
@@ -640,6 +683,9 @@
   // assist rate machinery (and its back-off), pitch unlocked. Either mutes the player; stop puts
   // back its rate, pitch, mute, volume, position and playing state. Progress goes up in
   // tap-progress.drive: running, done (all of it buffered), stalled or refused.
+  // Recording a whole track from the tab's sound runs accelerate with audible (the player keeps
+  // its sound), from (it starts at that place) and hold (it waits there, paused, for the next
+  // accelerate), so the recording starts with the track.
   const HOP_WAIT = 3000, END_TOL = 0.3, START_TOL = 0.2;
   const drv = { mode: null, el: null, base: null, state: '', cursor: 0, hop: 0, since: 0, timer: 0 };
   // MP3 and ADTS carry no timestamps: their appends can only be placed in order, so no seek-hop.
@@ -664,13 +710,16 @@
     drv.mode = m.mode; drv.since = performance.now();
     if (m.mode === 'seekhop' && [...tap.mimes].some((x) => NO_STAMPS.test(x))) { drv.state = 'refused'; tapDirty(); return; }
     drv.state = 'running';
-    try { el.muted = true; } catch (_) {}
+    try { el.muted = m.audible === true ? drv.base.muted : true; } catch (_) {}
     if (m.mode === 'seekhop') {
       const t = el.currentTime, step = typeof m.step === 'number' && m.step >= 0.5 && m.step <= 600 ? m.step : 0;
       drv.hop = step || Math.max(1, bufEnd(el, t) - t); // the player's buffering goal, as it shows now
       drv.cursor = 0;
       hop();
-    } else accelerate(typeof m.rate === 'number' && m.rate > 1 && m.rate <= 16 ? m.rate : 8);
+    } else {
+      if (typeof m.from === 'number' && Number.isFinite(m.from) && m.from >= 0) { try { nativePause.call(el); el.currentTime = m.from; } catch (_) {} }
+      accelerate(typeof m.rate === 'number' && m.rate > 1 && m.rate <= 16 ? m.rate : 8, m.hold === true);
+    }
     tapDirty();
   }
   function hop() {
@@ -697,12 +746,12 @@
     if (e >= Math.min(dur - END_TOL, drv.cursor + drv.hop)) hop();
     else if (late) { if (moved) hop(); else stall(); } // slower than its goal: move on
   }
-  function accelerate(rate) {
+  function accelerate(rate, hold) {
     st.target = rate; st.enforcing = true; st.letGo = 0;
     scan();
     for (const el of live()) { const x = info.get(el); if (x) { x.off = false; x.ext = []; } apply(el); }
     const el = drv.el, refused = () => { if (drv.mode === 'accelerate') { drv.state = 'refused'; tapDirty(); } };
-    if (!el.paused) return;
+    if (hold || !el.paused) return;
     let p;
     try { p = nativePlay.call(el); } catch (_) { refused(); return; }
     if (p && typeof p.then === 'function') p.then(null, refused);

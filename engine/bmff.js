@@ -323,9 +323,9 @@ function xing(b, p, h) {
   return { delay: (b[lame + 21] << 4) | (b[lame + 22] >> 4), padding: ((b[lame + 22] & 15) << 8) | b[lame + 23] };
 }
 
-function walk(buf, header, lameTag) {
+function walk(buf, header, lameTag, until = Infinity) {
   const b = bytesOf(buf);
-  let p = 0, frames = 0, samples = 0, junk = 0, sampleRate = 0, spf = 0, end = 0, synced = false, delay = 0, padding = 0, midJunk = false, lost = false;
+  let p = 0, frames = 0, samples = 0, junk = 0, sampleRate = 0, spf = 0, end = 0, synced = false, delay = 0, padding = 0, midJunk = false, lost = false, cut = null;
   while (p + 4 <= b.length) {
     if (b[p] === 0x49 && b[p + 1] === 0x44 && b[p + 2] === 0x33 && p + 10 <= b.length) {            // ID3v2 tag
       p += 10 + ((b[p + 6] & 127) << 21 | (b[p + 7] & 127) << 14 | (b[p + 8] & 127) << 7 | (b[p + 9] & 127)) + (b[p + 5] & 0x10 ? 10 : 0);
@@ -340,14 +340,19 @@ function walk(buf, header, lameTag) {
       if (x) { delay = x.delay; padding = x.padding; }
       else { frames++; samples += h.spf; if (h.spf > spf) spf = h.spf; }
       if (lost) midJunk = true;
-      sampleRate = h.sr; p = end = next; synced = true; continue;
+      sampleRate = h.sr; p = end = next; synced = true;
+      if (!cut && samples - delay >= until * sampleRate) cut = { end, samples: samples - delay };
+      continue;
     }
     junk++; p++; synced = false; lost = frames > 0;
   }
-  return { sampleRate, frames, samples: Math.max(0, samples - delay - padding), junk, midJunk, end, spf, delay, padding };
+  return { sampleRate, frames, samples: Math.max(0, samples - delay - padding), junk, midJunk, end, spf, delay, padding, cut };
 }
 
-/** MP3 (Layer III) frame walk: {sampleRate, frames, samples, junk, midJunk, end, spf, delay, padding}. midJunk: sync was lost between frames. */
-export const mp3Frames = (buf) => walk(buf, mp3Header, xing);
-/** ADTS (AAC) header walk: {sampleRate, frames, samples, junk, midJunk, end, spf}. */
-export const adtsFrames = (buf) => walk(buf, adtsHeader, null);
+/**
+ * MP3 (Layer III) frame walk: {sampleRate, frames, samples, junk, midJunk, end, spf, delay, padding, cut}. midJunk: sync
+ * was lost between frames. until (s): cut is {end, samples} at the first frame boundary at or past it (null if none).
+ */
+export const mp3Frames = (buf, { until } = {}) => walk(buf, mp3Header, xing, until);
+/** ADTS (AAC) header walk: {sampleRate, frames, samples, junk, midJunk, end, spf, cut}. */
+export const adtsFrames = (buf, { until } = {}) => walk(buf, adtsHeader, null, until);
