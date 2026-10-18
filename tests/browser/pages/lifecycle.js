@@ -68,6 +68,27 @@ window.tests = {
       return { live, after: await env.rate(1000), delivered: env.delivered.length, errors: env.errors };
     } finally { await env.ctx.close(); }
   },
+  /** n resident decks: load a whole track → play → record → eject; odd cycles stop the recording first. */
+  async residentEjectCycles({ n }) {
+    const env = await boot();
+    try {
+      const live = [];
+      for (let i = 1; i <= n; i++) {
+        const sr = env.ctx.sampleRate, L = new Float32Array(sr * 4);
+        for (let k = 0; k < L.length; k++) L[k] = 0.2 * Math.sin((2 * Math.PI * 220 * k) / sr);
+        const deck = new Deck(env.engine, { id: i, slot: 1, tabId: null, stream: null, meta: { title: i === 2 ? '' : `Resident ${i}` }, params: defaults(DECK_PARAMS) });
+        await deck.initResident({ L, R: L.slice(), sampleRate: sr });
+        await deck.act('play');
+        deck.recorder.start('wav');
+        live.push(await env.rate(300));
+        if (i % 2) { deck.recorder.stop(); await idle(deck.recorder); }
+        await deck.dispose();
+      }
+      await gc();
+      await sleep(300);
+      return { live, after: await env.rate(1000), names: env.delivered.map((d) => d.name), errors: env.errors };
+    } finally { await env.ctx.close(); }
+  },
   /** A recording stopped while its deck stays loaded leaves no recorder processor behind. */
   async recStop() {
     const env = await boot();

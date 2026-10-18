@@ -306,8 +306,11 @@ class Engine {
   addDeck(deck) {
     this.decks.set(deck.id, deck);
     this.master.addDeck(deck.id, deck.xfGain, deck.params.xf);
-    this.hub({ type: HUB.DECKS_CHANGED, decks: [...this.decks.values()].map((d) => ({ tabId: d.tabId, slot: d.slot })) });
+    this.hub({ type: HUB.DECKS_CHANGED, decks: this.tabDecks() });
   }
+
+  /** The decks the hub keeps track of: the ones bound to a tab. */
+  tabDecks() { return [...this.decks.values()].filter((d) => d.tabId != null).map((d) => ({ tabId: d.tabId, slot: d.slot })); }
 
   async notStarted(deck, err) {
     if (deck.stream) for (const t of deck.stream.getTracks()) t.stop();
@@ -478,6 +481,7 @@ class Engine {
   /** Before a deck's capture goes, stop its tab playing (the hub pauses the page's players, or
    *  mutes the tab), so the ejected track does not come out of the speakers. Bounded. */
   stopTab(d) {
+    if (d.tabId == null) return Promise.resolve(); // a deck with no tab has none to stop
     let p = this.tabStops.get(d);
     if (!p) {
       p = withTimeout(this.hub({ type: HUB.STOP_TAB, tabId: d.tabId }), STOP_TAB_MS, 'STOP_TAB timed out').then((r) => {
@@ -499,7 +503,7 @@ class Engine {
       this.decks.delete(id);
       this.clock.release(id);
       if (reason) this.event('warn', reason);
-      this.hub({ type: HUB.DECKS_CHANGED, decks: [...this.decks.values()].map((x) => ({ tabId: x.tabId, slot: x.slot })) });
+      this.hub({ type: HUB.DECKS_CHANGED, decks: this.tabDecks() });
       await this.stopTab(d);
       await d.dispose();
     });

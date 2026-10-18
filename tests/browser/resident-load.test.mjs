@@ -10,6 +10,7 @@ import path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import {
   prepareExtension, launchExtension, makeTrackWav, parseWav, waitFor, installClient, act, set, state, events, offscreenEval, tabIdFor, hubCall,
+  downloadIds, waitForDownload, bandOnsets, medianBpm,
 } from './ext-harness.mjs';
 
 let h, deck, server, origin, tmp, slowClosed = false;
@@ -112,6 +113,51 @@ test('a resident deck plays its own audio, from its buffer', async () => {
   assert.equal(p.starved, false);
   assert.equal((await act(deck, d.id, 'live')).ok, false);
   assert.equal((await act(deck, d.id, 'pause')).ok, true);
+});
+
+test('a resident deck records under its track\'s name, with its own audio', async () => {
+  const d = (await decks()).find((x) => x.title === 'kick');
+  const known = await downloadIds(h);
+  assert.equal((await act(deck, d.id, 'play')).ok, true);
+  assert.equal((await act(deck, d.id, 'recStart')).ok, true);
+  await sleep(3000);
+  assert.equal((await act(deck, d.id, 'recStop')).ok, true);
+  const dl = await waitForDownload(h, known);
+  assert.equal((await act(deck, d.id, 'pause')).ok, true);
+  const name = path.basename(dl.filename);
+  assert.match(name, /^JDSamps-D\d-kick-/);
+  assert.doesNotMatch(name, /null/i);
+  const w = parseWav(fs.readFileSync(dl.filename));
+  assert.ok(w.seconds > 2, `recorded ${w.seconds} s`);
+  const bpm = medianBpm(bandOnsets(w.mono, w.sr, 'low'));
+  assert.ok(Math.abs(bpm - 124) < 2, `recorded ${bpm} BPM, the file is 124`);
+});
+
+test('a resident deck plays to the end of its track and stops there, quietly', async () => {
+  const d = (await decks()).find((x) => x.title === 'kick');
+  await engine(`const d = e.decks.get(${d.id}); d.setCue(d.duration - 1); return true;`); // the input clamp a seek goes through
+  await deckWhere((x) => x.id === d.id && Math.abs(x.playhead - (d.duration - 1)) < 1e-6);
+  assert.equal((await act(deck, d.id, 'play')).ok, true);
+  await sleep(1800);
+  const s = await deckWhere((x) => x.id === d.id && !x.playing, 3000);
+  assert.equal(s.engineRate, 0);
+  assert.ok(Math.abs(s.playhead - s.duration) < 1e-6, `stopped at ${s.playhead} of ${s.duration}`);
+  assert.equal((await events(deck)).filter((e) => /ran dry|reserve empty|skipped ahead|buffer/.test(e.text)).length, 0);
+});
+
+test('ejecting a resident deck stops no tab, and the hub hears only of decks bound to a tab', async () => {
+  const had = new Set((await decks()).map((x) => x.id));
+  await engine(`e.hubLog = []; const send = e.hub.bind(e); e.hub = (m) => { e.hubLog.push(m); return send(m); };`);
+  const r = await act(deck, null, 'loadUrl', { url: `${origin}/linked-kick.wav` });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  const d = await deckWhere((x) => !had.has(x.id) && x.kind === 'resident');
+  assert.equal((await act(deck, d.id, 'eject')).ok, true);
+  await waitFor(async () => !(await decks()).some((x) => x.id === d.id));
+  const log = await engine(`const l = e.hubLog.map((m) => ({ type: m.type, tabId: m.tabId, decks: m.decks })); delete e.hub; delete e.hubLog; return l;`);
+  assert.deepEqual(log.filter((m) => m.type === 'STOP_TAB'), [], JSON.stringify(log));
+  const changed = log.filter((m) => m.type === 'DECKS_CHANGED');
+  assert.ok(changed.length >= 2, `the hub was told of the load and the eject: ${JSON.stringify(log)}`);
+  for (const m of changed) assert.ok(m.decks.every((x) => Number.isInteger(x.tabId)), JSON.stringify(m));
 });
 
 test('a link that is not audio, or not there, is refused with a reason and leaves no deck', async () => {
