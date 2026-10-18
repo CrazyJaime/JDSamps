@@ -238,6 +238,8 @@ function validateTapMessage(m) {
     // The SourceBuffers (tap-ready's sb numbers) that feed the reported player: [] when it plays a plain source;
     // left out when the tap cannot tell. Another player's appends are on other numbers.
     if (Array.isArray(m.sbs) && m.sbs.length <= 64 && m.sbs.every((n) => Number.isInteger(n) && n >= 0 && n < 1000)) out.sbs = [...m.sbs];
+    // The web source (currentSrc) the reported player plays, when it plays one: the first link to fetch again.
+    if (typeof m.src === 'string' && m.src.length <= 8192 && HTTP_URL.test(m.src)) out.src = m.src;
     // How a drive of the player is going: still at it, done (all of it buffered), stalled (it
     // stopped buffering) or refused (the page fights the rate, or the media cannot be seek-hopped).
     const d = m.drive;

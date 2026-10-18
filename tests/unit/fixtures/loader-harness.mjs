@@ -68,7 +68,8 @@ export const code = (s) => Math.fround([...String(s)].reduce((n, c) => (n * 31 +
  *   other ({rendition, sb, n}: another player's SourceBuffer in the frame, appending its init and first n segments at tap on),
  *   sbs (the SourceBuffers the tap says feed the heard player: default [0] for 'mse', [] for 'progressive'; null: not said),
  *   evicts (the player lets go of what it held from before the tap while it is driven: a later drive appends that again),
- *   ts (the playlist is MPEG-TS: no init, .ts pieces)
+ *   ts (the playlist is MPEG-TS: no init, .ts pieces), fetched ([url]: media the page fetched before its player's own
+ *   source, seen first), elSrc (false: the tap does not say which source the heard player plays)
  * }
  */
 export function makeTab({ tabId = 7, url = 'https://site.example/track', frames = 1, ...page } = {}) {
@@ -89,7 +90,7 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
     };
     const sbs = pg.sbs !== undefined ? pg.sbs : pg.kind === 'mse' ? [0] : pg.kind === 'progressive' ? [] : null;
     const progress = (extra = {}) => emit({ t: 'tap-progress', bytes: 0, buffered: [], duration: Number.isFinite(fr.duration) ? fr.duration : null,
-      mimes: pg.mimes || (pg.kind === 'mse' ? [r ? r.mime : OPUS] : []), ...(sbs ? { sbs } : {}), ...extra });
+      mimes: pg.mimes || (pg.kind === 'mse' ? [r ? r.mime : OPUS] : []), ...(sbs ? { sbs } : {}), ...(pg.src && pg.elSrc !== false ? { src: pg.src } : {}), ...extra });
     const append = (ks) => {
       const parts = [];
       for (const k of ks) if (!fr.appended.has(k) && r.segs[k]) { fr.appended.add(k); parts.push({ blobUrl: mint(r.segs[k].bytes), mime: r.mime, kind: 'media', sb: 0, seq: fr.seq++ }); }
@@ -114,6 +115,7 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
         const reqs = [];
         if (pg.list) reqs.push({ url: r.list, method: 'GET', range: null, size: null, media: false, past: true });
         if (pg.segUrls) { reqs.push({ url: r.init.url, method: 'GET', range: null, size: null, media: true, past: true }); for (let k = 0; k < (pg.preTap || 0); k++) reqs.push({ url: r.segs[k].url, method: 'GET', range: null, size: null, media: true, past: true }); }
+        for (const u of pg.fetched || []) reqs.push({ url: u, method: 'GET', range: null, size: null, media: true, past: true });
         if (pg.src) reqs.push({ url: pg.src, method: 'GET', range: null, size: null, media: true, past: true });
         for (let k = 0; k < reqs.length; k += 16) emit({ t: 'tap-urls', reqs: reqs.slice(k, k + 16) });
         progress();

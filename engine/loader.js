@@ -494,11 +494,14 @@ export class Loader extends Job {
   // ---------------------------------------------------------------- rung: what the page requested, again (§4.2)
   refetch(e) { return this.mseFrame() ? this.refetchPieces(e) : this.refetchFile(e); }
 
-  /** A progressive player's media file (an <audio src> the URL layer saw), from the page, else from here. */
+  /**
+   * A progressive player's media file (an <audio src> the URL layer saw), from the page, else from here: the heard
+   * player's own source first (the tap names it), then the media links the page asked for, in order.
+   */
   async refetchFile(e) {
     e.how = SAY.media;
-    const D = this.duration();
-    const urls = uniq(this.reqs().filter((r) => r.media && r.method === 'GET' && (!r.range || /^bytes=0-$/i.test(r.range))).map((r) => r.url));
+    const D = this.duration(), f = this.held(), src = f && f.prog && f.prog.src;
+    const urls = uniq([...(src ? [src] : []), ...this.reqs().filter((r) => r.media && r.method === 'GET' && (!r.range || /^bytes=0-$/i.test(r.range))).map((r) => r.url)]);
     if (!urls.length) return { outcome: 'skipped', why: 'the page has asked for no media file' };
     if (D == null) return { outcome: 'skipped', why: NO_LENGTH };
     const why = [];

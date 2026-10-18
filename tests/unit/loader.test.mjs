@@ -87,6 +87,19 @@ test('a progressive page re-fetches its player\'s media link from the page, chec
   assert.ok(!tab.kinds().includes('drive seekhop') && !tab.kinds().includes('drive accelerate'), 'never driven');
 });
 
+test('a progressive page re-fetches its heard player\'s own source first, ahead of media the page fetched before it', async () => {
+  const link = 'https://site.example/media/track.mp3', ads = [1, 2, 3].map((k) => `https://ads.example/jingle-${k}.mp3`);
+  const files = { [link]: file('track', 120), ...Object.fromEntries(ads.map((u) => [u, file('jingle', 30)])) };
+  const { result, tab, engine } = await load({ kind: 'progressive', src: link, fetched: ads, files });
+  assert.equal(result.kind, 'resident', JSON.stringify(called(engine, 'failLoadingToLive')));
+  assert.deepEqual(tab.sent().filter((m) => m.t === 'fetch').map((m) => m.urls), [[link]], 'its own source, first and only');
+  assert.equal(called(engine, 'startResidentDeck')[0].code, code('track'));
+  // When the tap does not say which source the player plays, the links go in the order the page asked for them.
+  const blind = await load({ kind: 'progressive', src: link, fetched: ads.slice(0, 1), files, elSrc: false });
+  assert.deepEqual(blind.tab.sent().filter((m) => m.t === 'fetch').map((m) => m.urls), [[ads[0]], [link]]);
+  assert.equal(blind.result.kind, 'resident');
+});
+
 test('a media link the page cannot fetch (no CORS) is fetched by the engine itself', async () => {
   const link = 'https://cdn.example/track.mp3';
   const { result, engine } = await load({ kind: 'progressive', src: link, pageFetch: false, files: { [link]: file('cdn', 120) } });
