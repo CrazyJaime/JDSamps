@@ -3,10 +3,11 @@
 //   toolbar icon, the Alt+Shift+A command and the context-menu item all capture the current
 //   tab, then open (or focus) the full-page deck.
 // * Owns tabCapture stream ids, the offscreen engine's lifetime, the Sources list, downloads,
-//   badge, tab lifecycle, player-assist injection, and stopping a tab's playback on eject.
+//   badge, tab lifecycle, player-assist injection, and a tab's playback: started on load,
+//   stopped on eject.
 // * Registers NO runtime.onConnect listener: a receiver that disconnects a port tears it down
 //   for every receiver. UI and agent ports go straight to the offscreen engine.
-import { TARGET, HUB, ENGINE, PERSISTED_MASTER_KEYS, validateAgentMessage } from './shared/protocol.js';
+import { TARGET, HUB, ENGINE, PERSISTED_MASTER_KEYS, START_WHY, validateAgentMessage } from './shared/protocol.js';
 
 const OFFSCREEN = 'offscreen.html';
 const DECK = 'deck.html';
@@ -99,7 +100,7 @@ async function capture(tabId) {
     };
   }
   const r = await toEngine({ type: ENGINE.START, tabId, streamId, meta: { title: tab.title || '', url: tab.url || '', favIconUrl: tab.favIconUrl || '' }, settings: await savedSettings() });
-  if (r && r.ok) await keepTab(tabId, 'deck');
+  if (r && r.ok) { await keepTab(tabId, 'deck'); autoStart(tabId, r.slot); }
   return r;
 }
 
@@ -246,6 +247,60 @@ async function connectAgent(tabId) {
   }
 }
 
+// ---------------------------------------------------------------- load: start the tab playing
+// A captured tab plays into its deck, not out of the speakers, so a player the DJ forgot to start
+// would leave the deck buffering silence with nothing to explain it. Once the capture is up, every
+// frame's agent is asked to start one audible player where it stands (it never moves the
+// playhead). Bounded, and never in the way: the deck is loaded by then, whatever the page does.
+const START_MS = 400; // the whole start attempt, after which the page is left to the DJ
+const starting = new Map(); // tabId → the start in flight (never rejects)
+
+/** What the tab's frames did (the strongest claim in START_WHY), or null when none has the relay. */
+async function playFrames(tabId) {
+  const res = await chrome.scripting.executeScript({
+    target: { tabId, allFrames: true },
+    func: () => (typeof globalThis.__jdsStart === 'function' ? globalThis.__jdsStart() : null),
+  });
+  let any = false, why = 'none';
+  for (const r of res || []) {
+    if (r.result == null) continue;
+    any = true;
+    const m = validateAgentMessage(r.result); // page-adjacent data
+    if (m && m.t === 'started' && START_WHY.indexOf(m.why) > START_WHY.indexOf(why)) why = m.why;
+  }
+  return any ? why : null;
+}
+async function playTab(tabId) {
+  const why = await playFrames(tabId);
+  if (why != null) return why;
+  await injectAgent(tabId); // the tab predates install and missed the agent
+  return (await playFrames(tabId)) ?? 'timeout'; // no agent anywhere: nothing can be claimed
+}
+
+/** Why the DJ has to go to the tab themselves, or null when the deck will hear it. */
+function startNote(slot, why) {
+  if (why === 'none') return { level: 'info', text: `Deck ${slot}: this page has no media player to start — start the audio on the tab yourself.` };
+  if (why === 'ambiguous') return { level: 'info', text: `Deck ${slot}: this page has several players — start the one you want on the tab.` };
+  if (why === 'refused') return { level: 'warn', text: `Deck ${slot}: the page refused to start playback — press play on the tab.` };
+  return null; // started, already playing, or the page never answered: nothing useful to say
+}
+
+/** Starts the tab's player behind the load, and says what the DJ must do if it could not. */
+function autoStart(tabId, slot) {
+  const p = (async () => {
+    const tab = await chrome.tabs.get(tabId).catch(() => null);
+    if (!tab || !capturable(tab.url)) return 'timeout'; // closed or navigated away: nothing to say
+    const why = await Promise.race([playTab(tabId).catch(() => null), new Promise((r) => setTimeout(r, START_MS, null))]);
+    return why ?? 'timeout';
+  })().catch(() => 'timeout');
+  starting.set(tabId, p);
+  p.then((why) => {
+    if (starting.get(tabId) === p) starting.delete(tabId);
+    const note = startNote(slot, why);
+    if (note) notify(note.level, note.text);
+  });
+}
+
 // ---------------------------------------------------------------- eject: stop the tab playing
 // Once a deck lets go of its capture, the tab plays out of the speakers again. So before an eject
 // the engine asks for STOP_TAB: every frame's agent pauses its page's players, or, when nothing
@@ -293,6 +348,7 @@ async function unmuteOurs(tab) {
 }
 
 async function stopTab(tabId) {
+  await starting.get(tabId); // a load of this tab whose start may still be about to play it
   const tab = await chrome.tabs.get(tabId).catch(() => null);
   if (!tab || !capturable(tab.url)) return { ok: true, paused: 0, muted: false }; // closed or navigated away
   const pausing = pauseTab(tabId).catch(() => 0);

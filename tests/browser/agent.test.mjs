@@ -11,6 +11,7 @@ const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../..')
 const AGENT = fs.readFileSync(path.join(ROOT, 'agent/agent-main.js'), 'utf8');
 const RELAY = fs.readFileSync(path.join(ROOT, 'agent/agent-relay.js'), 'utf8');
 const WAV = makeTrackWav({ bpm: 120, seconds: 4, kind: 'low' });
+const LONG_WAV = makeTrackWav({ bpm: 120, seconds: 12, kind: 'low' });
 let server, browser, page; const errors = [];
 
 // Test stand-in for agent-relay.js: offers agent-main a channel (at document_start, like the
@@ -80,7 +81,9 @@ function COUNT_WEAKREFS() {
 
 before(async () => {
   server = await startStaticServer(ROOT, {
-    '/tone.wav': (req, res) => { res.writeHead(200, { 'content-type': 'audio/wav' }); res.end(WAV); },
+    // Content-Length: without it the response is chunked and Chrome reports duration Infinity.
+    '/tone.wav': (req, res) => { res.writeHead(200, { 'content-type': 'audio/wav', 'content-length': WAV.length }); res.end(WAV); },
+    '/long.wav': (req, res) => { res.writeHead(200, { 'content-type': 'audio/wav', 'content-length': LONG_WAV.length }); res.end(LONG_WAV); },
     '/__agent.html': (req, res) => { res.writeHead(200, { 'content-type': 'text/html' }); res.end('<!doctype html><title>agent</title><body>'); },
   });
   browser = await launchPlain();
@@ -410,6 +413,90 @@ test("stop gives the page its own rate back before pausing; a page with no media
   await p.close(); await q.close();
 });
 
+/** The agent's answer to a start, once it has one. */
+async function startedOn(p) {
+  await p.waitForFunction(() => window.__status.some((m) => m.t === 'started'), null, { timeout: 5000 });
+  return p.evaluate(() => window.__status.filter((m) => m.t === 'started'));
+}
+
+test('start resumes the paused player where it stands, leaving its rate alone', async () => {
+  const p = await agentPage();
+  await p.evaluate(async () => {
+    const a = document.createElement('audio');
+    a.id = 'el'; a.src = '/tone.wav'; a.loop = true; a.playbackRate = 1.25;
+    document.body.append(a);
+    await a.play();
+    await new Promise((r) => setTimeout(r, 300));
+    a.pause();
+    window.__from = a.currentTime;
+  });
+  assert.ok(await p.evaluate(() => window.__from > 0.05), 'the track is parked part-way in');
+  await p.evaluate(() => window.__cmd({ t: 'start' }));
+  assert.deepEqual(await startedOn(p), [{ t: 'started', count: 1, why: 'started' }]);
+  const m = await p.evaluate(() => { const a = document.getElementById('el'); return { paused: a.paused, at: a.currentTime, from: window.__from, rate: a.playbackRate, pp: a.preservesPitch }; });
+  assert.equal(m.paused, false, 'playing again');
+  assert.ok(m.at >= m.from && m.at < m.from + 1, `the playhead moved: ${m.from} -> ${m.at}`);
+  assert.deepEqual([m.rate, m.pp], [1.25, true], 'playbackRate and preservesPitch untouched');
+  assert.deepEqual(errors, []);
+  await p.close();
+});
+
+test('start leaves a muted or silent player alone; a page with no media has nothing to start', async () => {
+  const p = await agentPage();
+  await p.evaluate(() => {
+    document.body.innerHTML = '<audio id="m" src="/tone.wav" loop muted></audio><audio id="z" src="/tone.wav" loop></audio>';
+    document.getElementById('z').volume = 0;
+  });
+  await p.evaluate(() => window.__cmd({ t: 'start' }));
+  assert.deepEqual(await startedOn(p), [{ t: 'started', count: 0, why: 'none' }]);
+  await p.waitForTimeout(200);
+  assert.deepEqual(await p.evaluate(() => [document.getElementById('m').paused, document.getElementById('z').paused]), [true, true]);
+  const q = await agentPage();
+  await q.evaluate(() => window.__cmd({ t: 'start' }));
+  assert.deepEqual(await startedOn(q), [{ t: 'started', count: 0, why: 'none' }]);
+  assert.deepEqual(errors, []);
+  await p.close(); await q.close();
+});
+
+test('start reports a play() the page refuses, and starts nothing when two players are tied', async () => {
+  const p = await agentPage();
+  await p.evaluate(() => { document.body.innerHTML = '<audio id="el" src="/nope.wav" loop></audio>'; }); // 404: play() rejects
+  await p.evaluate(() => window.__cmd({ t: 'start' }));
+  assert.deepEqual(await startedOn(p), [{ t: 'started', count: 0, why: 'refused' }]);
+  const q = await agentPage();
+  await q.evaluate(async () => {
+    document.body.innerHTML = '<audio id="x" src="/tone.wav" loop></audio><audio id="y" src="/tone.wav" loop></audio>';
+    await Promise.all([...document.querySelectorAll('audio')].map((a) => new Promise((r) => a.addEventListener('loadedmetadata', r, { once: true }))));
+  });
+  await q.evaluate(() => window.__cmd({ t: 'start' }));
+  assert.deepEqual(await startedOn(q), [{ t: 'started', count: 0, why: 'ambiguous' }], 'two players of the same length: the agent picks neither');
+  assert.deepEqual(await q.evaluate(() => [...document.querySelectorAll('audio')].map((a) => a.paused)), [true, true]);
+  // One of them longer (the track, next to a short jingle): that one is started.
+  const r = await agentPage();
+  await r.evaluate(async () => {
+    document.body.innerHTML = '<audio id="short" src="/tone.wav" loop></audio><audio id="long" src="/long.wav" loop></audio>';
+    await Promise.all([...document.querySelectorAll('audio')].map((a) => new Promise((f) => a.addEventListener('loadedmetadata', f, { once: true }))));
+  });
+  await r.evaluate(() => window.__cmd({ t: 'start' }));
+  assert.deepEqual(await startedOn(r), [{ t: 'started', count: 1, why: 'started' }]);
+  await r.waitForTimeout(100);
+  assert.deepEqual(await r.evaluate(() => [document.getElementById('short').paused, document.getElementById('long').paused]), [true, false]);
+  assert.deepEqual(errors, []);
+  await q.close(); await p.close(); await r.close();
+});
+
+test('start does nothing to a page that is already playing, and says so', async () => {
+  const p = await agentPage();
+  await p.evaluate(() => { const a = new Audio('/tone.wav'); a.loop = true; window.a = a; return a.play(); });
+  await p.evaluate(() => { window.__t0 = window.a.currentTime; window.a.addEventListener('pause', () => { window.__paused = true; }); });
+  await p.evaluate(() => window.__cmd({ t: 'start' }));
+  assert.deepEqual(await startedOn(p), [{ t: 'started', count: 0, why: 'playing' }]);
+  assert.equal(await p.evaluate(() => !!window.__paused), false, 'left running');
+  assert.equal(await p.evaluate(() => window.a.paused), false);
+  assert.deepEqual(errors, []);
+  await p.close();
+});
+
 /** A page running agent-relay.js against FAKE_CHROME, with the real agent-main.js or a stand-in. */
 async function relayPage({ main = true, relayFirst = false, init = [] } = {}) {
   const p = await browser.newPage();
@@ -471,6 +558,26 @@ test('the relay passes a stop to its agent and answers with the count, or 0 when
   const pend = q.evaluate(() => window.__jdsStop());
   await q.evaluate(() => { window.__toRelay({ t: 'stopped', count: -3 }); window.__toRelay({ t: 'stopped', count: 'x' }); });
   assert.deepEqual(await pend, { t: 'stopped', count: 0 });
+  await p.close(); await q.close();
+});
+
+test('the relay passes a start to its agent and answers with what it did, or times out saying nothing', async () => {
+  const p = await relayPage();
+  await p.evaluate(() => { const a = new Audio('/tone.wav'); a.loop = true; window.a = a; return a.play().then(() => a.pause()); });
+  await p.evaluate(() => window.__eng.ask());
+  await p.waitForTimeout(200);
+  assert.deepEqual(await p.evaluate(() => window.__jdsStart()), { t: 'started', count: 1, why: 'started' });
+  assert.equal(await p.evaluate(() => a.paused), false);
+  await p.waitForTimeout(200);
+  assert.ok(!(await p.evaluate(() => window.__eng.posted)).some((m) => m.t === 'started'), 'the answer does not go up the engine port');
+  const q = await relayPage({ main: false }); // a stand-in that never answers
+  const t0 = Date.now();
+  assert.deepEqual(await q.evaluate(() => window.__jdsStart()), { t: 'started', count: 0, why: 'timeout' });
+  assert.ok(Date.now() - t0 < 1000, `answered after ${Date.now() - t0} ms`);
+  // A forged or malformed answer is not taken.
+  const pend = q.evaluate(() => window.__jdsStart());
+  await q.evaluate(() => { window.__toRelay({ t: 'started', count: -3, why: 'started' }); window.__toRelay({ t: 'started', count: 1, why: 'nonsense' }); });
+  assert.deepEqual(await pend, { t: 'started', count: 0, why: 'timeout' });
   await p.close(); await q.close();
 });
 
