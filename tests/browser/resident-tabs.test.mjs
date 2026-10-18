@@ -603,19 +603,64 @@ test('ejected while the beat is being found: the analysis Worker is terminated a
   } finally { await engine('e.analyse = e.__analyse; delete e.__analyse; return true;'); }
 });
 
-test('the page navigating away mid-load: the deck plays the tab live, saying so once, with no error', async () => {
-  const { site, deckId } = await drivenLoad();
-  const seen = (await events(deck)).length;
-  await site.tab.goto(`${server.origin}/m/progressive?autoplay=1`);
-  const d = await deckWhere((x) => x.id === deckId && x.kind === 'live', 15000);
-  assert.equal(d.tabId, site.tabId);
-  const said = (await events(deck)).slice(seen);
-  assert.equal(said.filter((e) => /^Deck \d: the page changed while the track was loading/.test(e.text)).length, 1, JSON.stringify(said));
-  assert.deepEqual(said.filter((e) => e.level === 'error'), []);
-  assert.match(d.load.report, /First failure: (drive: )?.*(page went away|page changed)/);
-  assert.equal((await act(deck, deckId, 'eject')).ok, true);
-  await waitFor(async () => !(await decks()).length, 8000);
-  await site.tab.close();
+/** The deck's kinds from now until it is gone (or ms pass), polled from the engine. */
+async function kindsUntilGone(deckId, ms = 8000) {
+  const seen = [], t0 = Date.now();
+  for (;;) {
+    const d = await engine(`const d = e.decks.get(${deckId}); return d ? d.kind : null;`);
+    if (d == null || Date.now() - t0 > ms) return seen;
+    if (seen.at(-1) !== d) seen.push(d);
+    await sleep(20);
+  }
+}
+
+/** After a test, whatever it left: every deck ejected, every model page closed (so a failure does not carry on). */
+async function tidy() {
+  for (const id of await engine('return [...e.decks.keys()];')) await engine(`await e.eject(${id}); return true;`);
+  for (const p of h.context.pages()) if (p !== deck && !p.isClosed() && p.url().startsWith(server.origin)) await p.close();
+}
+
+test('the page reloading mid-load (the same page again): the deck plays the tab live, saying so once, with no error', async () => {
+  try {
+    const { site, deckId } = await drivenLoad();
+    const seen = (await events(deck)).length;
+    await site.tab.reload();
+    const d = await deckWhere((x) => x.id === deckId && x.kind === 'live', 15000);
+    assert.equal(d.tabId, site.tabId);
+    const said = (await events(deck)).slice(seen);
+    assert.equal(said.filter((e) => /^Deck \d: the page changed while the track was loading/.test(e.text)).length, 1, JSON.stringify(said));
+    assert.deepEqual(said.filter((e) => e.level === 'error'), []);
+    assert.match(d.load.report, /First failure: (drive: )?.*(page went away|page changed)/);
+    assert.match(d.load.report, /page: reload in \d+\.\d s — the same page again/);
+  } finally { await tidy(); }
+});
+
+test('the page moving on to another page mid-load: the deck goes with one error, and never plays that page live', async () => {
+  try {
+    const { site, deckId } = await drivenLoad();
+    const seen = (await events(deck)).length;
+    const kinds = kindsUntilGone(deckId, 15000);
+    await site.tab.goto(`${server.origin}/m/progressive?autoplay=1`);
+    assert.ok(!(await kinds).includes('live'), 'it was never a live deck');
+    await sleep(500);
+    const said = (await events(deck)).slice(seen).filter((e) => e.text.startsWith('Deck '));
+    assert.deepEqual(said.map((e) => [e.level, e.text.replace(/^Deck \d/, 'Deck N')]),
+      [['error', 'Deck N: the page moved on to something else before the track was in. Add the tab again.']]);
+    assert.equal(await h.sw.evaluate(() => chrome.action.getBadgeText({})), '', 'the hub forgot the tab');
+  } finally { await tidy(); }
+});
+
+test('the tab closed mid-load: the deck goes with one error, and no live deck is built on its dying capture', async () => {
+  try {
+    const { site, deckId } = await drivenLoad();
+    const seen = (await events(deck)).length;
+    const kinds = kindsUntilGone(deckId, 15000);
+    await site.tab.close();
+    assert.ok(!(await kinds).includes('live'), 'it was never a live deck');
+    await sleep(500);
+    const said = (await events(deck)).slice(seen).filter((e) => e.text.startsWith('Deck '));
+    assert.deepEqual(said.map((e) => [e.level, e.text.replace(/^Deck \d/, 'Deck N')]), [['error', 'Deck N: the tab was closed before the track was in.']]);
+  } finally { await tidy(); }
 });
 
 test('the deck page showed every load without errors', () => { assert.deepEqual(pageErrors, []); });

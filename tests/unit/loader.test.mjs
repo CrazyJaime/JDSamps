@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SITES, firstRung, parseHls, findStart } from '../../engine/loader.js';
 import { defaults, MASTER_PARAMS, PERSISTED_MASTER_KEYS, validateUiMessage } from '../../shared/protocol.js';
-import { load, rendition, file, mp3, code, DUR, SR, OPUS, makeTab, makeEngine, loaderFor, fetcher, settle, turn, decoders } from './fixtures/loader-harness.mjs';
+import { load, rendition, file, mp3, code, DUR, SR, OPUS, makeTab, makeEngine, loaderFor, fetcher, settle, turn, decoders, FAST } from './fixtures/loader-harness.mjs';
 
 const hi = () => rendition('opus-hi');
 const called = (engine, fn) => engine.calls.filter((c) => c.fn === fn);
@@ -488,14 +488,17 @@ test('the analysis is told to stop when the deck is ejected while the beat is be
   assert.equal(signal && signal.aborted, true, 'the Worker\'s signal is aborted (analyseTrack terminates it)');
 });
 
-test('the page navigating away mid-load goes live with one message: no half-built deck, nothing unhandled', async () => {
+/** load() options: at the n-th fetch the loader sends, fn({tab, engine, deck}) runs. */
+const atFetch = (n, fn) => ({ before: (x) => { let k = 0; x.tab.hooks.push((m) => { if (m.t === 'fetch' && ++k === n) setImmediate(() => fn(x)); }); } });
+const MOVED = 'Deck 1: the page moved on to something else before the track was in. Add the tab again.';
+const OTHER = 'https://site.example/another-track';
+
+test('the page reloading mid-load (the same page again) goes live with one message: no half-built deck, nothing unhandled', async () => {
   const unhandled = [];
   const on = (e) => unhandled.push(e);
   process.on('unhandledRejection', on);
   try {
-    const { result, engine, tab } = await load({ kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true }, {
-      before: ({ tab: t }) => { let n = 0; t.hooks.push((m) => { if (m.t === 'fetch' && ++n === 2) setImmediate(() => t.navigate()); }); },
-    });
+    const { result, engine, tab, deck } = await load({ kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true }, atFetch(2, ({ tab: t }) => t.navigate()));
     await settle(30);
     assert.equal(result.kind, 'live');
     assert.deepEqual(called(engine, 'startResidentDeck'), []);
@@ -504,8 +507,63 @@ test('the page navigating away mid-load goes live with one message: no half-buil
     assert.match(f[0].reason, /the page changed while the track was loading/);
     assert.equal(engine.events.filter((e) => /^Deck 1: /.test(e.text)).length, 1);
     assert.ok(tab.frames[0].left);
+    assert.match(deck.load.report, /page: reload in \d+\.\d s — the same page again/);
   } finally { process.off('unhandledRejection', on); }
   assert.deepEqual(unhandled, []);
+});
+
+test('the page moving on to another page mid-load ejects the deck with one error: never a live deck on that page\'s audio', async () => {
+  // The hub's word of the new page (META) comes a little after the page's agents have gone, as it does in Chrome.
+  const { result, engine } = await load({ kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true },
+    atFetch(2, ({ tab: t }) => t.navigate({ to: OTHER, metaAfter: 30 })));
+  await settle(30);
+  assert.deepEqual(result, { ok: false, error: MOVED });
+  assert.deepEqual(called(engine, 'failLoadingToLive'), []);
+  assert.deepEqual(called(engine, 'startResidentDeck'), []);
+  assert.equal(called(engine, 'eject').length, 1);
+  assert.equal(engine.decks.size, 0);
+  assert.deepEqual(engine.events.filter((e) => /^Deck 1: /.test(e.text)), [{ level: 'error', text: MOVED }]);
+});
+
+test('a page that moves on while a link it gave decodes badly is ejected, never played live', async () => {
+  const link = 'https://site.example/t.mp3';
+  const { result, engine } = await load({ kind: 'progressive', src: link, files: { [link]: file('t', 120.0065) } }, {
+    before: ({ tab, loader }) => { loader.d.decodeFile = async () => { tab.navigate({ to: OTHER }); await settle(5); throw new Error('Unable to decode audio data'); }; },
+  });
+  assert.deepEqual(result, { ok: false, error: MOVED });
+  assert.deepEqual(called(engine, 'failLoadingToLive'), []);
+  assert.deepEqual(engine.events.filter((e) => /^Deck 1: /.test(e.text)), [{ level: 'error', text: MOVED }]);
+});
+for (const [what, page, opts] of [
+  ['its pieces fetched, while the beat is found', { kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true },
+    { before: ({ tab, engine }) => { const f = engine.analyse.bind(engine); engine.analyse = async (p, s) => { tab.navigate({ to: OTHER }); await settle(5); return f(p, s); }; } }],
+  ['its link read, while it is decoded', { kind: 'progressive', src: 'https://site.example/t.mp3', files: { 'https://site.example/t.mp3': file('t', 120.0065) } },
+    { before: ({ tab, loader }) => { loader.d.decodeFile = async (ctx, buf) => { tab.navigate({ to: OTHER }); await settle(5); return decoders.decodeFile(ctx, buf); }; } }],
+  // Checked only when the drive says it is done, so the page goes before the loader has looked at what it holds.
+  ['all its pieces captured from the player, before the loader looked', { kind: 'mse', rendition: hi(), preTap: 0, playing: 1 },
+    { times: { ...FAST, check: 1000 }, before: ({ tab }) => { tab.hooks.push((m) => { if (m.t === 'drive' && m.mode === 'seekhop') setTimeout(() => tab.navigate({ to: OTHER }), 2); }); } }],
+]) {
+  test(`a page that moves on once every byte of its track is in, ${what}: the deck goes resident and lets go of the tab`, async () => {
+    const { result, engine, deck } = await load(page, opts);
+    assert.equal(result.kind, 'resident', JSON.stringify([result, engine.events]));
+    assert.ok(near(called(engine, 'startResidentDeck')[0].frames / SR, 120, 0.02));
+    assert.deepEqual(called(engine, 'failLoadingToLive'), []);
+    assert.deepEqual(called(engine, 'eject'), []);
+    assert.equal(deck.tabId, null, 'released');
+    assert.deepEqual(engine.events.filter((e) => e.level === 'error'), []);
+  });
+}
+
+test('the tab closed mid-load ejects the deck with one error: no live deck on its dying capture', async () => {
+  // The page's agents go first; the capture ends 10 ms later and the hub's EJECT for the closed tab comes after that.
+  const { result, engine } = await load({ kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true },
+    atFetch(2, ({ tab: t, engine: e }) => t.close(e, { endAfter: 10, ejectAfter: 30 })));
+  await settle(30);
+  assert.equal(result.ok, false);
+  assert.deepEqual(called(engine, 'failLoadingToLive'), []);
+  assert.deepEqual(called(engine, 'startResidentDeck'), []);
+  assert.equal(engine.decks.size, 0);
+  assert.deepEqual(engine.events.filter((e) => /^Deck 1: /.test(e.text)), [{ level: 'error', text: 'Deck 1: the tab was closed before the track was in.' }]);
 });
 
 test('the page going away with the tab\'s audio gone too ejects the deck with one error, never a silent live deck', async () => {

@@ -222,7 +222,14 @@ class Engine {
     await this.ready;
     switch (msg.type) {
       case ENGINE.START: return this.startTab(msg);
-      case ENGINE.EJECT: { const d = this.deckByTab(msg.tabId); if (d) await this.eject(d.id, msg.reason); return { ok: true }; }
+      case ENGINE.EJECT: {
+        const d = this.deckByTab(msg.tabId);
+        if (!d) return { ok: true };
+        // The tab was closed: a deck still loading from it goes, said once here (its load ends cancelled, quietly).
+        if (d.kind === 'loading' && this.loads.has(d.id)) this.event('error', `Deck ${d.slot}: the tab was closed before the track was in.`, d.id);
+        await this.eject(d.id, msg.reason);
+        return { ok: true };
+      }
       case ENGINE.META: { const d = this.deckByTab(msg.tabId); if (d) Object.assign(d.meta, msg.meta || {}); return { ok: true }; }
       case ENGINE.PING: return { ok: true, decks: [...this.decks.values()].map((d) => ({ tabId: d.tabId, slot: d.slot })) };
       case ENGINE.DOWNLOAD_DONE: {

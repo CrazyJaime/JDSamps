@@ -147,14 +147,27 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
       if (deck.loader) deck.loader.onAttach(fr.id, fr.a);
     }
   };
-  /** The page navigates away: its agents' ports drop and the blob URLs it minted die. */
-  tab.navigate = () => {
+  /**
+   * The page navigates away: its agents' ports drop and the blob URLs it minted die. to: the page the tab shows now,
+   * which the hub tells the engine (META) metaAfter ms later; a reload stays on the same page.
+   */
+  tab.navigate = ({ to = null, metaAfter = 0 } = {}) => {
     blobs.clear();
     for (const fr of tab.frames) {
       fr.left = true;
       const d = tab.deck;
       if (d && d.agents.get(fr.id) === fr.a) { d.agents.delete(fr.id); if (d.loader) d.loader.onDetach(fr.id, fr.a); }
     }
+    if (to) setTimeout(() => { if (tab.deck) Object.assign(tab.deck.meta, { url: to }); }, metaAfter);
+  };
+  /**
+   * The tab is closed: its page goes as on a navigation, its capture ends endAfter ms later (null: not yet), and the
+   * hub's EJECT for it reaches the engine ejectAfter ms later (null: never).
+   */
+  tab.close = (engine, { endAfter = 0, ejectAfter = 20 } = {}) => {
+    tab.navigate();
+    if (endAfter != null) setTimeout(() => { if (tab.deck) for (const t of tab.deck.tracks) t.stop(); }, endAfter);
+    if (ejectAfter != null) setTimeout(() => engine.hubEject(tab.tabId), ejectAfter);
   };
   tab.sent = (frame = 0) => log.filter((x) => x.frame === frame).map((x) => x.m);
   tab.kinds = () => log.map((x) => (x.m.t === 'drive' ? `drive ${x.m.mode}` : x.m.t === 'tap' ? `tap ${x.m.on ? 'on' : 'off'}` : x.m.t));
@@ -245,13 +258,20 @@ export function makeEngine({ tabs = [], limitMin = 15, hubOk = true } = {}) {
         await e.stopTab(d);
       });
     },
+    /** The hub's EJECT for a closed tab, as the real engine takes it: a deck still loading from it says so, once. */
+    hubEject(tabId) {
+      const d = [...e.decks.values()].find((x) => x.tabId === tabId);
+      if (!d) return Promise.resolve();
+      if (d.kind === 'loading' && e.loads.has(d.id)) e.events.push({ level: 'error', text: `Deck ${d.slot}: the tab was closed before the track was in.` });
+      return e.eject(d.id);
+    },
     event(level, text) { e.events.push({ level, text }); },
     notify(level, text) { e.notes.push({ level, text }); },
   };
   return e;
 }
 
-export const FAST = { grace: 40, settle: 15, duration: 400, file: 400, fetchEach: 200, stall: 60, drive: 1500, drivePerSec: 0, check: 5 };
+export const FAST = { grace: 40, settle: 15, duration: 400, file: 400, fetchEach: 200, stall: 60, drive: 1500, drivePerSec: 0, check: 5, away: 80 };
 
 /** Stand-ins for the browser-only decoders. */
 export const decoders = {
