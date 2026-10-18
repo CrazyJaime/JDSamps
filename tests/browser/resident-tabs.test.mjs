@@ -575,12 +575,17 @@ test('recording a whole track through a capture that skips (a busy computer lose
     assert.deepEqual(await act(deck, d.id, 'recordWhole'), { ok: true, error: undefined });
     const loading = await deckWhere((x) => x.id !== d.id && x.kind === 'loading', 5000);
     const r = await deckWhere((x) => x.id === loading.id && x.kind === 'resident', 40000);
-    const kicks = await kicksOf(loading.id), T = 60 / 124, iv = kicks.slice(1).map((x, i) => (x - kicks[i]) * 1000);
-    t.diagnostic(`beat to beat (ms): ${iv.map(Math.round).join(' ')}; bpm ${r.bpm.native}`);
+    const kicks = await kicksOf(loading.id), iv = kicks.slice(1).map((x, i) => (x - kicks[i]) * 1000);
+    t.diagnostic(`beat to beat (ms): ${iv.map(Math.round).join(' ')}; bpm ${r.bpm.native}; ${r.load.report.split('\n').filter((l) => /^Mended/.test(l)).join('') || 'nothing mended'}`);
     assert.ok(kicks.length >= 32, `${kicks.length} kicks`);
-    // The first beat starts the recording (where it crosses -50 dBFS, not 35 %): the rest are a beat apart.
-    const off = iv.slice(1).filter((x) => Math.abs(x - T * 1000) > 2);
-    assert.deepEqual(off.map(Math.round), [], 'beats out of place');
+    // Every beat on one straight line: a skip left in moves all the beats after it 20 ms. The real capture also
+    // wanders a few ms now and then (less than a skip, and nothing to beat-matching's 20 ms), hence 6 ms. The first
+    // beat starts the recording (it crosses -50 dBFS there, not 35 %), so the line starts at the second.
+    const on = kicks.slice(1), k = on.map((x) => Math.round((x - on[0]) / (60 / 124))), n = on.length;
+    const mk = k.reduce((a, b) => a + b) / n, mt = on.reduce((a, b) => a + b) / n;
+    const P = k.reduce((a, x, i) => a + (x - mk) * (on[i] - mt), 0) / k.reduce((a, x) => a + (x - mk) ** 2, 0);
+    const off = on.map((x, i) => (x - mt - (k[i] - mk) * P) * 1000);
+    assert.ok(off.every((x) => Math.abs(x) <= 6), `beats off the line (ms): ${off.map((x) => x.toFixed(1)).join(' ')}`);
     assert.ok(Math.abs(r.bpm.native - 124) < 0.1, `bpm ${r.bpm.native}`);
     // (A busy box may skip the real capture too: those are mended and listed beside these two.)
     assert.match(r.load.report, /^Mended: \d+ skips in the capture \(the computer was busy\): (.*, )?20 ms put in at \d+\.\d s, (.*, )?20 ms lost at \d+\.\d s(,.*)?$/m);
