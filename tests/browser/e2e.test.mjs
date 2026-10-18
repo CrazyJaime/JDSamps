@@ -33,7 +33,8 @@ async function record(target, seconds) {
   return { dl, wav: parseWav(fs.readFileSync(dl.filename)) };
 }
 // Row: [time, clock mode, clock bpm, frame, ...decks: [slot, playhead, rate, pitch, sync, phaseMs, starved, edge age,
-//   reserve, source rate, assist rate sent, grid T, grid t0, tempo state, tracker bpm, dropout runs, playing, live edge]].
+//   reserve, source rate, assist rate sent, grid T, grid t0, tempo state, tracker bpm, dropout runs, playing, live edge,
+//   native BPM at the playhead, source rate of the audio there]].
 const TICK_PROBE = `(() => {
   const e = globalThis.__jdsEngine, log = window.__ticks = [], orig = e.tick.bind(e);
   e.tick = (m) => {
@@ -43,7 +44,8 @@ const TICK_PROBE = `(() => {
       if (!d.ts || d.kind === 'loading') continue;
       const p = d.ts.posAt(now), g = d.grids.at(p), ti = d.tempo ? d.tempo.get() : null;
       row.push([d.slot, p, d.ts.rateAt(now), d.params.pitch, d.syncOn, d.phaseMs, d.starved, d.edgeAt == null ? null : now - d.edgeAt,
-        d.ts.reserveAt(now), d.assist.sourceRate, d.assist.sent, g ? g.T : null, g ? g.t0 : null, ti && ti.state, ti && ti.inBpm, d.dropouts.runs, d.wantPlay, d.ts.liveEdge]);
+        d.ts.reserveAt(now), d.assist.sourceRate, d.assist.sent, g ? g.T : null, g ? g.t0 : null, ti && ti.state, ti && ti.inBpm, d.dropouts.runs, d.wantPlay, d.ts.liveEdge,
+        d.tempoInfo(p).native, d.src.rateAt(p)]);
     }
     log.push(row);
   };
