@@ -768,7 +768,7 @@ const bufferedTo = (p, s) => waitFor(() => p.run(`(() => { const b = document.ge
 const LONG = 'set=long&n=45&dur=180&ahead=20&manual';
 
 describe('driving the player', { concurrency: 3 }, () => {
-  test('drive seekhop: the tap covers all of a 3-minute track in under 10 s without playing it; stop puts the player back', async () => {
+  test('drive seekhop: the tap covers all of a 3-minute track in under 10 s without playing it; stop puts the player back', async (t) => {
     const p = await tapPage(LONG);
     await connect(p);
     await send(p, { t: 'drive', mode: 'seekhop' }); // no tap yet: nothing to drive for
@@ -778,10 +778,17 @@ describe('driving the player', { concurrency: 3 }, () => {
     assert.equal((await media(p)).t, 0, 'a drive before the tap did nothing');
     await p.run("(() => { const a = document.getElementById('a'); a.currentTime = 7.5; a.volume = 0.8; })()");
     await waitFor(() => p.run("!document.getElementById('a').seeking"), 3000);
-    const t0 = Date.now();
+    // From 7.5 s its goal reaches the end of the segment holding 27.5 s: 20.5 s ahead. From a hop (the end
+    // of a segment) the same goal is 20 s ahead, so the drive must not wait for the 20.5 it saw first.
+    await bufferedTo(p, 28);
+    const t0 = Date.now(), pt0 = await p.run('performance.now()');
     await send(p, { t: 'drive', mode: 'seekhop' });
     assert.equal((await media(p)).muted, true, 'muted while driven');
-    await waitFor(async () => (await driveState(p)) === 'done', 10000, 100);
+    await waitFor(async () => (await driveState(p)) === 'done', 10000, 100).finally(async () => {
+      // The hops as the engine saw them: seconds after the drive, at the drive's cursor (s of the track).
+      const ms = JSON.parse(await p.run('JSON.stringify(window.__eng.posted.map((m, i) => [window.__eng.times[i], m]))'));
+      t.diagnostic(`hops: ${ms.filter(([, m]) => m.t === 'tap-progress' && m.drive).map(([at, m]) => `${((at - pt0) / 1000).toFixed(2)} s at ${m.drive.at.toFixed(1)} ${m.drive.state}`).join(', ')}`);
+    });
     const took = Date.now() - t0;
     assert.ok(took < 10000, `${took} ms`);
     await waitFor(async () => (await partsOf(p)).length >= 46, 3000);
