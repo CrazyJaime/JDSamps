@@ -6,7 +6,7 @@
 // stretch ─► trim ─► EQ ─► FX rack (filter, gate/crush, flanger, echo/reverb sends) ─┬─► fader ─► xfGain ─► master bus
 //                                                                                    └─► recorder (pre-fader, post-FX)
 // All transport/tempo/phase changes are scheduled on the audio clock through Timeshift.
-import { BPM_RANGES, validateAgentMessage } from '../shared/protocol.js';
+import { BPM_RANGES, PITCH_RANGES, validateAgentMessage } from '../shared/protocol.js';
 import { DeckTempo, MANUAL_BPM, octaveFold } from './tempo.js';
 import { Timeshift, SourceMap, GridMap, GUARD, LIVE_RESERVE } from './timeshift.js';
 import { createIsolator, createTrim } from './eq.js';
@@ -397,6 +397,10 @@ export class Deck {
       case 'tap1':
         if (!this.tempo) return fail('Waiting for audio.');
         return this.bar1At(this.heardPos()) ? OK : fail(NO_GRID);
+      case 'setBpm': return this.setBpm(arg.bpm);
+      case 'setNativeBpm':
+        if (!this.tempo) return fail('Waiting for audio.');
+        return this.setNativeBpm(this.heardPos(), arg.bpm);
       case 'rollStart': return this.rollStart(arg.beats, now, T);
       case 'rollEnd': return this.rollEnd(now, T);
       case 'recStart':
@@ -534,6 +538,58 @@ export class Deck {
       if (k !== 1) this.grids.editTrack(s.track, (g) => ({ ...g, T: g.T / k }));
     }
     this.followTempo();
+  }
+
+  // ------------------------------------------------------------------ typed tempos
+  /**
+   * Play at `bpm` as heard at the playhead. A hand-moved tempo, so it goes the fader's way (SYNC
+   * off); a pitch range too narrow for it is widened to the smallest that reaches it.
+   */
+  setBpm(bpm) {
+    const native = this.tempoInfo().native, f = (v) => v.toFixed(1);
+    if (!native) return fail('No BPM yet. Wait for the deck to lock, or TAP the tempo.');
+    const pitch = bpm / native - 1, need = Math.abs(pitch) - 1e-9;
+    if (need > this.params.range) {
+      const range = PITCH_RANGES.find((r) => r >= need);
+      if (range == null) {
+        // Out of reach by that much, the track is most likely read at the wrong octave.
+        const m = bpm > native ? 2 : 0.5;
+        return fail(`${f(bpm)} is beyond the widest pitch range (±50%) for a ${f(native)} BPM track. Is it ${f(native * m)}? Press ${m === 2 ? '2×' : '½×'}.`);
+      }
+      this.setParam('range', range);
+      this.engine.event('info', `Deck ${this.slot}: range widened to ±${Math.round(range * 100)} to reach ${f(bpm)}.`, this.id);
+    }
+    this.setParam('pitch', pitch);
+    return OK;
+  }
+
+  /**
+   * The DJ says the track at heard position p is `bpm` (detection got it wrong). Its grid keeps
+   * the beat nearest p (with no grid yet: the cue of a paused deck, else p) and takes that period
+   * across the track; the tracker holds it as a manual tempo, as it holds a TAP. Tempo only, so a
+   * paused deck can take it. The pitch stays: the tempo played changes in proportion.
+   */
+  setNativeBpm(p, bpm) {
+    // Refused rather than folded: what the DJ typed is what the deck shows, and the range is the
+    // DJ's own setting of which octave a tempo is counted in (detection and setRange keep to it).
+    const [lo, hi] = BPM_RANGES[this.engine.params['bpm.range']] || BPM_RANGES.AUTO;
+    if (bpm < lo || bpm > hi) {
+      const alt = bpm * octaveFold(bpm, lo, hi);
+      const how = alt >= lo && alt <= hi ? `Type ${alt.toFixed(1)} (the same beat), or change` : 'Change';
+      return fail(`${bpm.toFixed(1)} is outside the BPM range ${lo}–${hi}. ${how} the BPM range in Settings.`);
+    }
+    const g = this.grids.at(p), rate = this.src.rateAt(p), T = 60 / (bpm * rate);
+    const b = g ? g.t0 + Math.round((p - g.t0) / g.T) * g.T : this.wantPlay ? p : this.cue;
+    this.grids.retime(p, { t0: b, T }, (x) => this.src.rateAt(x));
+    if (this.followsTrackAt(p)) {
+      const segs = this.grids.segs, live = segs.length ? segs[segs.length - 1].grid : null;
+      this.tempo.applyTap(live
+        ? { t0: live.t0 * this.sr, T: live.T * this.sr }
+        : { t0: b * this.sr, T: ((T * rate) / this.assist.sourceRate) * this.sr }, 'typed');
+    }
+    this.followTempo();
+    this.syncMult = null; // a synced deck chooses again which octave of the master it follows
+    return OK;
   }
 
   // ------------------------------------------------------------------ params
@@ -927,7 +983,7 @@ export class Deck {
       playing: this.wantPlay, previewing: this.previewing, cue: this.cue, playhead: p,
       engineRate: playingNow ? ts.rateAt(now) : 0, liveEdge: ts ? ts.liveEdge : 0, reserve: ts ? ts.reserveAt(now) : 0,
       starved: this.starved, historyStart: ts ? ts.historyStart : 0,
-      bpm: { state: g ? g.state : 'SEARCH', native: info.native, out: info.out, conf: g ? g.conf : 0, mult: g ? g.mult : 1, tapped: g ? g.tapped : false },
+      bpm: { state: g ? g.state : 'SEARCH', native: info.native, out: info.out, conf: g ? g.conf : 0, mult: g ? g.mult : 1, tapped: g ? g.tapped : false, manual: (g && g.manual) || null },
       grid: grid ? { t0: grid.t0, T: grid.T, bar1: grid.bar1 } : null,
       sync: { on: this.syncOn, mode: this.params.syncMode, isMaster: this.isMaster(), outOfRange: this.syncOn && this.outOfRange, phaseMs: this.phaseMs },
       assist: { available: this.agentAvailable(), active: this.assist.active, sourceRate: this.assist.sourceRate },

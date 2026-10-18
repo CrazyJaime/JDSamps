@@ -688,9 +688,12 @@ export class DeckTempo {
     return { bpm: (60 * this.sr) / period, t0: b0 + nLast * period, T: period };
   }
 
-  /** Use a tapped grid ({t0, T} in input frames, at the live edge's source rate) as the tempo. */
-  applyTap({ t0, T }) {
-    this.tapped = { bpm: (60 * this.sr) / T };
+  /**
+   * Use a manual grid ({t0, T} in input frames, at the live edge's source rate) as the tempo: one
+   * the DJ tapped, or typed (how = 'typed'). Either way detection may not re-time it.
+   */
+  applyTap({ t0, T }, how = 'tap') {
+    this.tapped = { bpm: (60 * this.sr) / T, how };
     this.mult = 1;
     this.gridOffset = 0;
     this.clock = new BeatClock();
@@ -752,7 +755,7 @@ export class DeckTempo {
     const canBeat = !!grid && (!!this.tapped || (tr.state === 'locked' && tr.conf >= 0.5));
     return {
       state, inBpm: bpm || null, conf: this.tapped ? 1 : tr.conf, octConf: this.tapped ? 1 : tr.octConf,
-      mult: this.mult, tapped: !!this.tapped, grid, canBeat, track: this.track,
+      mult: this.mult, tapped: !!this.tapped, manual: this.tapped ? this.tapped.how : null, grid, canBeat, track: this.track,
     };
   }
 }

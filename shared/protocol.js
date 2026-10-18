@@ -70,8 +70,21 @@ export const PERSISTED_MASTER_KEYS = Object.freeze([
 export const DECK_ACTIONS = Object.freeze([
   'play', 'pause', 'cueDown', 'cueUp', 'syncPlay', 'sync', 'master', 'nudge', 'tap', 'mult', 'gridShift',
   'tap1', 'live', 'rollStart', 'rollEnd', 'recStart', 'recStop', 'eject', 'clipReset', 'playToggle',
+  'setBpm', 'setNativeBpm',
 ]);
 export const MASTER_ACTIONS = Object.freeze(['mixRecStart', 'mixRecStop', 'clipReset', 'stopAll']);
+
+/** Tempos the DJ may type (setBpm: the tempo to play at; setNativeBpm: the track's own tempo). */
+export const TYPED_BPM = Object.freeze([20, 400]);
+
+/** A typed tempo: digits with a dot or comma decimal ("128", "128.0", "128,5"). {ok, bpm} or {ok: false, error}. */
+export function parseTypedBpm(text) {
+  const s = String(text ?? '').trim();
+  if (!/^\d{1,3}([.,]\d*)?$/.test(s)) return { ok: false, error: 'Type a tempo like 128 or 128.5.' };
+  const bpm = Number(s.replace(',', '.'));
+  if (!(bpm >= TYPED_BPM[0] && bpm <= TYPED_BPM[1])) return { ok: false, error: `Type a tempo from ${TYPED_BPM[0]} to ${TYPED_BPM[1]} BPM.` };
+  return { ok: true, bpm };
+}
 
 const has = (o, k) => Object.prototype.hasOwnProperty.call(o, k);
 
@@ -125,6 +138,9 @@ function validateActArg(a, arg) {
     case 'tap':
       if (arg.wallMs != null && (typeof arg.wallMs !== 'number' || !Number.isFinite(arg.wallMs))) return fail('tap.wallMs must be a number');
       return { ok: true, arg: arg.wallMs == null ? {} : { wallMs: arg.wallMs } };
+    case 'setBpm': case 'setNativeBpm':
+      if (typeof arg.bpm !== 'number' || !(arg.bpm >= TYPED_BPM[0] && arg.bpm <= TYPED_BPM[1])) return fail(`${a}.bpm must be a number from ${TYPED_BPM[0]} to ${TYPED_BPM[1]}`);
+      return { ok: true, arg: { bpm: arg.bpm } };
     default:
       return { ok: true, arg: {} };
   }
