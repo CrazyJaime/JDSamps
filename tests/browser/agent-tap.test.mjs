@@ -25,8 +25,9 @@ const sha = (b) => crypto.createHash('sha256').update(b).digest('hex');
 // ---------------------------------------------------------------- fixtures (ffmpeg, cached)
 // Opus in fragmented MP4, an init segment plus 4 s media segments: `short` (30 s) and `long`
 // (3 min) as a DASH packager writes them; `enc`, a ClearKey-encrypted fragmented MP4 with a pssh
-// box (so Chromium fires a real `encrypted` event); `mp3`, a progressive MP3 file.
-const RECIPE = { v: 1, seg: 4, short: [30, 330], long: [180, 220], enc: 8, mp3: 30, kid: 'a0a1a2a3a4a5a6a7a8a9aaabacadaeaf', key: '00112233445566778899aabbccddeeff' };
+// box (so Chromium fires a real `encrypted` event); `mp3`, a progressive MP3 file; `vid`, 8 s of
+// VP9 pictures in WebM.
+const RECIPE = { v: 1, seg: 4, short: [30, 330], long: [180, 220], enc: 8, mp3: 30, vid: 8, kid: 'a0a1a2a3a4a5a6a7a8a9aaabacadaeaf', key: '00112233445566778899aabbccddeeff' };
 
 function ffmpeg(...args) { execFileSync('/usr/bin/ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', ...args]); }
 
@@ -64,6 +65,8 @@ function buildFixtures(dir) {
   fs.writeFileSync(path.join(dir, 'enc', 'enc.mp4'), addPssh(fs.readFileSync(raw)));
   fs.mkdirSync(path.join(dir, 'mp3'));
   ffmpeg('-f', 'lavfi', '-i', `sine=frequency=440:sample_rate=48000:duration=${RECIPE.mp3}`, '-ac', '2', '-c:a', 'libmp3lame', '-b:a', '128k', path.join(dir, 'mp3', 'track.mp3'));
+  fs.mkdirSync(path.join(dir, 'vid'));
+  ffmpeg('-f', 'lavfi', '-i', `testsrc=size=64x48:rate=10:duration=${RECIPE.vid}`, '-c:v', 'libvpx-vp9', '-b:v', '50k', '-deadline', 'realtime', '-cpu-used', '8', path.join(dir, 'vid', 'vid.webm'));
 }
 
 function fixtures() {
@@ -90,7 +93,7 @@ function fixtures() {
 // &xhr (load with XMLHttpRequest) &raw (open a SourceBuffer and append nothing: __push does)
 // &prog (also a progressive <audio src>) &buf (choose what to fetch from the SourceBuffer's buffered
 // ranges, as real players do, not from what it has appended: what is removed is fetched again)
-// &video (a second, empty SourceBuffer of pictures on the same MediaSource). Event handlers are on*
+// &video (a second SourceBuffer, of pictures, on the same MediaSource: empty until the test appends to __vsb). Event handlers are on*
 // properties, never addEventListener, so the dormancy test can count every listener the agent adds.
 const PLAYER = `<!doctype html><title>player</title><body><audio id="a"></audio><script>
 (() => {
@@ -995,11 +998,18 @@ describe('flushing the player before a drive', { concurrency: 3 }, () => {
     const both = await tapPage(`${LONG}&buf&video`, { init: [REMOVE_SPY] });
     await connect(both);
     await both.run('window.__go()');
+    // The pictures SourceBuffer holds 8 s of VP9: a flush that took it too would empty it.
+    await both.run(`fetch('/fx/vid/vid.webm').then((r) => r.arrayBuffer()).then((b) => new Promise((res, rej) => {
+      const v = window.__vsb; v.onupdateend = () => res(); v.onerror = () => rej(new Error('the pictures would not append')); v.appendBuffer(b);
+    }))`);
+    const held = await sbRanges(both, '__vsb');
+    assert.ok(held.length === 1 && held[0][0] < 0.05 && held[0][1] > 7.5, `pictures held: ${JSON.stringify(held)}`);
     await waitFor(async () => (await sbRanges(both)).length > 0, 5000);
     await send(both, { t: 'tap', on: true });
     await send(both, { t: 'drive', mode: 'seekhop', flush: true });
     await waitFor(async () => (await driveStates(both)).includes('flushed'), 5000);
     assert.deepEqual(await removes(both), [[MIME, 0, 180]], 'only the sound');
+    assert.deepEqual(await sbRanges(both, '__vsb'), held, 'the pictures kept');
     await send(both, { t: 'drive', mode: 'stop' });
     await checkPosted(both);
     await both.close();
