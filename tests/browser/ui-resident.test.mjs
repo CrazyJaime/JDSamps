@@ -252,6 +252,32 @@ test('a live deck whose whole-track load failed offers to record the whole track
   assert.equal(await menu.isHidden(), true);
 });
 
+test('the ⓘ menu opens inside the window on the leftmost and the rightmost of six decks at 1280×720', async () => {
+  const decks = [1, 2, 3, 4, 5, 6].map((i) => deck({ id: i, slot: i, tabId: 100 + i, title: `Track number ${i} with a fairly long title here`, load: { report: REPORT } }));
+  await show(makeState({ decks }), { width: 1280, height: 720 });
+  for (const slot of [1, 6]) {
+    await deckEl(slot).locator('[data-report-btn]').click();
+    const menu = deckEl(slot).locator('[data-report-menu]');
+    assert.equal(await menu.isVisible(), true, `deck ${slot}`);
+    const out = await menu.evaluate((m) => {
+      const vw = document.documentElement.clientWidth, vh = document.documentElement.clientHeight, b = m.getBoundingClientRect(), o = [];
+      if (b.left < 0 || b.top < 0 || b.right > vw || b.bottom > vh) o.push(`menu ${Math.round(b.left)}..${Math.round(b.right)} x ${Math.round(b.top)}..${Math.round(b.bottom)} outside ${vw}x${vh}`);
+      // Each item whole and on top, at both ends: not cut off by the deck row's scroll box either.
+      for (const it of m.querySelectorAll('button')) {
+        if (it.hidden) continue;
+        const r = it.getBoundingClientRect(), y = (r.top + r.bottom) / 2;
+        for (const x of [r.left + 2, r.right - 2]) if (!it.contains(document.elementFromPoint(x, y))) o.push(`"${it.textContent}" cut off at x=${Math.round(x)}`);
+      }
+      const d = document.getElementById('decks');
+      if (d.scrollWidth > d.clientWidth + 1) o.push(`decks scroll horizontally ${d.scrollWidth} > ${d.clientWidth}`);
+      return o;
+    });
+    assert.deepEqual(out, [], `deck ${slot}`);
+    await page.keyboard.press('Escape');
+    assert.equal(await menu.isHidden(), true);
+  }
+});
+
 // ---------------------------------------------------------------- bar 1, navigation
 test('a whole-track deck offers the analysis\'s bar 1 as a "Bar 1?" chip that marks it there', async () => {
   await show(kinds());

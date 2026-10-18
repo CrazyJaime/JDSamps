@@ -227,10 +227,24 @@ export class DeckStrip {
   openReportMenu() {
     const r = this.refs;
     setHidden(r.reportMenu, false);
+    this.placeReportMenu();
     setAttr(r.reportBtn, 'aria-expanded', 'true');
     r.reportMenu.querySelector('[role="menuitem"]').focus();
     document.addEventListener('pointerdown', this.onMenuAway, true);
     document.addEventListener('keydown', this.onMenuAway, true);
+  }
+
+  /**
+   * The menu hangs from the ⓘ's right edge; where that would run off the left of the deck row (the leftmost
+   * deck) it hangs from its left edge instead, and it is kept inside the row and the window either way.
+   */
+  placeReportMenu() {
+    const m = this.refs.reportMenu, row = this.el.parentElement || document.documentElement;
+    m.style.translate = '';
+    const b = m.getBoundingClientRect(), rb = row.getBoundingClientRect(), x0 = rb.left + row.clientLeft;
+    const lo = Math.max(0, x0) + 4, hi = Math.min(document.documentElement.clientWidth, x0 + row.clientWidth) - 4;
+    const left = clamp(b.left < lo ? this.refs.report.getBoundingClientRect().left : b.left, lo, Math.max(lo, hi - b.width));
+    if (Math.abs(left - b.left) > 0.5) m.style.translate = `${left - b.left}px 0`;
   }
 
   closeReportMenu(refocus = false) {
