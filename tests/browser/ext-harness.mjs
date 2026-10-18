@@ -85,6 +85,7 @@ const TRACKS = { a: { bpm: 124, kind: 'low' }, b: { bpm: 128, kind: 'high' }, c:
  *  player assist must not mistake for the source. Tracks are `seconds` long: an <audio> loop
  *  restart leaves a ~0.1 s gap in the captured audio. */
 export async function startTrackServer({ seconds = 60 } = {}) {
+  const model = modelSites();
   const wavs = Object.fromEntries(Object.entries(TRACKS).map(([k, t]) => [k, makeTrackWav({ ...t, seconds })]));
   const media = (k, autoplay) => `<!doctype html><title>Track ${k.toUpperCase()} ${TRACKS[k].bpm} BPM</title><audio id="a" src="/${k}.wav" loop${autoplay ? ' autoplay' : ''}></audio>
 <script>window.__media = () => { const a = document.getElementById('a'); return { t: a.currentTime, rate: a.playbackRate, pp: a.preservesPitch, paused: a.paused }; };</script>`;
@@ -98,11 +99,364 @@ export async function startTrackServer({ seconds = 60 } = {}) {
     if (m) { res.writeHead(200, { 'content-type': 'audio/wav' }); res.end(wavs[m[1]]); return; }
     if (u.pathname === '/a' || u.pathname === '/b') { res.writeHead(200, { 'content-type': 'text/html' }); res.end(media(u.pathname.slice(1), u.searchParams.get('autoplay') !== '0')); return; }
     if (u.pathname === '/c') { res.writeHead(200, { 'content-type': 'text/html' }); res.end(webaudio); return; }
+    if (u.pathname.startsWith('/m/')) { model(req, res, u); return; }
     res.writeHead(404); res.end();
   });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   const origin = `http://127.0.0.1:${server.address().port}`;
   return { origin, url: (name) => `${origin}/${name}`, close: () => new Promise((r) => server.close(r)) };
+}
+
+// ---------------------------------------------------------------- model streaming sites
+// Pages that behave like the streaming sites the resident-deck loader must handle, built on the
+// media in tests/fixtures/sites (made by tests/fixtures/make-site-fixtures.mjs; index.json there
+// describes every file). Each page sets window.__model = {name, kind, duration, notes}, logs what
+// its player does in window.__page, offers window.__media(), and plays on a click or ?autoplay=1.
+//   /m/progressive  <audio src> MP3 with byte ranges
+//   /m/mse          MSE, plain GET segments from an HLS playlist, 20 s ahead
+//   /m/opaque       MSE, segments only by POST with a single-use token chain, framed
+//   /m/abr          MSE, lo rendition then hi from 12 s (second init segment)
+//   /m/ratefight    <audio src> WebM whose page resets playbackRate
+//   /m/worker       MSE inside a DedicatedWorker
+//   /m/drm          ClearKey-encrypted MSE (real EME)
+//   /m/preview      30 s excerpt flagged the way SoundCloud flags previews
+//   /m/bandcamp     data-tralbum and an <audio> on the same MP3
+//   /m/live         MSE, duration Infinity, segments loop for ever
+//   /m/webaudio     a decoded buffer through Web Audio only; bytes come scrambled from a non-media URL
+const SITES = path.join(ROOT, 'tests/fixtures/sites');
+const OPUS_MP4 = 'audio/mp4; codecs="opus"';
+const MEDIA_TYPES = { '.mp3': 'audio/mpeg', '.webm': 'audio/webm', '.mp4': 'audio/mp4', '.m4s': 'audio/mp4' };
+
+// Page-side code: injected into the pages (and the worker) as source text, never called in Node.
+function pageMedia() {
+  const a = document.querySelector('audio');
+  if (!a) return null;
+  const buffered = [];
+  for (let i = 0; i < a.buffered.length; i++) buffered.push([a.buffered.start(i), a.buffered.end(i)]);
+  return { t: a.currentTime, rate: a.playbackRate, pp: a.preservesPitch, paused: a.paused, duration: a.duration, buffered, src: a.currentSrc };
+}
+/** An HLS media playlist -> {init, segs: [{url, t0, t1}]}. */
+async function playlist(url) {
+  const base = new URL(url, location.href), text = await (await fetch(base)).text(), segs = [];
+  let init = null, dur = 0, t = 0;
+  for (const line of text.split('\n')) {
+    const map = /^#EXT-X-MAP:URI="([^"]+)"/.exec(line), inf = /^#EXTINF:([\d.]+)/.exec(line);
+    if (map) init = new URL(map[1], base).href;
+    else if (inf) dur = Number(inf[1]);
+    else if (line && line[0] !== '#') { segs.push({ url: new URL(line, base).href, t0: t, t1: t + dur }); t += dur; }
+  }
+  return { init, segs };
+}
+async function getBytes(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url}: ${r.status}`);
+  return r.arrayBuffer();
+}
+function appendTo(sb, data) {
+  return new Promise((resolve, reject) => {
+    const ok = () => { sb.removeEventListener('error', bad); resolve(); };
+    const bad = () => { sb.removeEventListener('updateend', ok); reject(new Error('appendBuffer failed')); };
+    sb.addEventListener('updateend', ok, { once: true });
+    sb.addEventListener('error', bad, { once: true });
+    sb.appendBuffer(data);
+  });
+}
+/**
+ * The tiny player: keeps `ahead` s buffered past now(), one segment at a time. Segment n spans
+ * times[n % N], one period later per lap when `loop`. A change of rep appends that rep's init first.
+ */
+function pump({ ms, sb, now, times, fetchInit, fetchSeg, repOf = () => '', ahead = 20, loop = false, log, fail }) {
+  const N = times.length, period = times[N - 1][1], have = new Set();
+  let busy = false, cur = null;
+  const startOf = (n) => times[n % N][0] + Math.floor(n / N) * period;
+  const index = (t) => {
+    if (!loop && t >= period) return N;
+    const lap = Math.floor(t / period), i = times.findIndex(([, t1]) => t - lap * period < t1);
+    return lap * N + (i < 0 ? N - 1 : i);
+  };
+  const entry = (kind, data, extra) => ({ kind, ...extra, bytes: data.byteLength, view: ArrayBuffer.isView(data), offset: data.byteOffset || 0 });
+  return async function tick() {
+    if (busy) return;
+    busy = true;
+    try {
+      for (;;) {
+        const t = now();
+        let n = index(t);
+        while (have.has(n)) n++;
+        if ((!loop && n >= N) || startOf(n) - t >= ahead) break;
+        have.add(n);
+        const rep = repOf(n);
+        if (rep !== cur) { const init = await fetchInit(rep); await appendTo(sb, init); log(entry('init', init, { rep })); cur = rep; }
+        const data = await fetchSeg(n, rep);
+        if (loop) sb.timestampOffset = Math.floor(n / N) * period;
+        await appendTo(sb, data);
+        log(entry('media', data, { n, rep }));
+      }
+      if (!loop && have.size === N && ms.readyState === 'open') ms.endOfStream();
+    } catch (e) { fail(e); } finally { busy = false; }
+  };
+}
+/** A MediaSource on `a` with one SourceBuffer, fed by pump() off the element's clock. */
+async function mseOn(a, mime, duration, { prepare, ...opts }) {
+  const ms = new MediaSource();
+  a.src = URL.createObjectURL(ms);
+  await new Promise((r) => ms.addEventListener('sourceopen', r, { once: true }));
+  const sb = ms.addSourceBuffer(mime);
+  ms.duration = duration;
+  if (prepare) prepare(ms, sb);
+  const tick = pump({ ms, sb, now: () => a.currentTime, log: (x) => P.appends.push(x), fail: (e) => P.errors.push(String(e)), ...opts });
+  for (const ev of ['timeupdate', 'seeking']) a.addEventListener(ev, tick);
+  setInterval(tick, 250);
+  tick();
+}
+function msePage({ list, mime }) {
+  const a = document.getElementById('a');
+  let ready;
+  return async () => {
+    ready ||= playlist(list).then(({ init, segs }) => mseOn(a, mime, segs.at(-1).t1, {
+      times: segs.map((s) => [s.t0, s.t1]), fetchInit: () => getBytes(init), fetchSeg: (n) => getBytes(segs[n].url),
+    }));
+    await ready;
+    await a.play();
+  };
+}
+function b64url(hex) {
+  return btoa(String.fromCharCode(...hex.match(/../g).map((h) => parseInt(h, 16)))).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function drmPage(cfg) {
+  const a = document.getElementById('a');
+  let keys;
+  P.encrypted = [];
+  a.addEventListener('encrypted', (e) => {
+    const u8 = new Uint8Array(e.initData);
+    P.encrypted.push({ initDataType: e.initDataType, bytes: u8.length, system: Array.from(u8.subarray(12, 28), (x) => x.toString(16).padStart(2, '0')).join('') });
+    keys ||= navigator.requestMediaKeySystemAccess(cfg.keySystem, [{ initDataTypes: ['cenc'], audioCapabilities: [{ contentType: cfg.mime }] }])
+      .then((access) => access.createMediaKeys()).then((mk) => a.setMediaKeys(mk));
+    keys.then(() => {
+      const s = a.mediaKeys.createSession();
+      const license = { keys: [{ kty: 'oct', kid: b64url(cfg.kid), k: b64url(cfg.key) }], type: 'temporary' };
+      s.addEventListener('message', () => s.update(new TextEncoder().encode(JSON.stringify(license))).catch((err) => P.errors.push(String(err))));
+      return s.generateRequest(e.initDataType, e.initData);
+    }).catch((err) => P.errors.push(String(err)));
+  });
+  return msePage(cfg);
+}
+function opaquePage({ token, times, mime }) {
+  const a = document.getElementById('a');
+  let ready;
+  const post = async (seg) => {
+    const r = await fetch('/m/seg', { method: 'POST', headers: { 'content-type': 'application/json', 'x-model-token': token }, body: JSON.stringify({ seg }) });
+    if (!r.ok) throw new Error(`segment ${seg}: ${r.status}`);
+    token = r.headers.get('x-model-next');
+    const buf = await r.arrayBuffer();
+    return new Uint8Array(buf, 9, new DataView(buf).getUint32(5));
+  };
+  return async () => {
+    ready ||= mseOn(a, mime, times.at(-1)[1], { times, fetchInit: () => post('init'), fetchSeg: (n) => post(n) });
+    await ready;
+    await a.play();
+  };
+}
+function abrPage({ master, mime, switchAt }) {
+  const a = document.getElementById('a');
+  let ready;
+  const setup = async () => {
+    const base = new URL(master, location.href), variants = [];
+    let bw = 0;
+    for (const line of (await (await fetch(base)).text()).split('\n')) {
+      const m = /BANDWIDTH=(\d+)/.exec(line);
+      if (m) bw = Number(m[1]);
+      else if (line && line[0] !== '#') variants.push({ bw, url: new URL(line, base).href });
+    }
+    variants.sort((x, y) => x.bw - y.bw);
+    const [lo, hi] = await Promise.all([variants[0], variants.at(-1)].map((v) => playlist(v.url)));
+    const reps = { lo, hi }, times = lo.segs.map((s) => [s.t0, s.t1]);
+    return mseOn(a, mime, times.at(-1)[1], {
+      times, repOf: (n) => (times[n][0] < switchAt ? 'lo' : 'hi'),
+      fetchInit: (rep) => getBytes(reps[rep].init), fetchSeg: (n, rep) => getBytes(reps[rep].segs[n].url),
+    });
+  };
+  return async () => { ready ||= setup(); await ready; await a.play(); };
+}
+function livePage({ list, mime }) {
+  const a = document.getElementById('a'), join = Number(qs.get('join')) || 0;
+  let ready;
+  return async () => {
+    ready ||= playlist(list).then(({ init, segs }) => mseOn(a, mime, Infinity, {
+      times: segs.map((s) => [s.t0, s.t1]), loop: true, fetchInit: () => getBytes(init), fetchSeg: (n) => getBytes(segs[n % segs.length].url),
+      prepare: (ms) => { ms.setLiveSeekableRange(0, 1e9); if (join) a.currentTime = join; },
+    }));
+    await ready;
+    await a.play();
+  };
+}
+function workerPage({ script }) {
+  const a = document.getElementById('a');
+  let ready;
+  const setup = () => new Promise((resolve, reject) => {
+    if (!MediaSource.canConstructInDedicatedWorker) { reject(new Error('this browser cannot run MSE in a worker')); return; }
+    const w = new Worker(script);
+    w.onmessage = ({ data }) => {
+      if (data.handle) { a.srcObject = data.handle; resolve(); }
+      if (data.append) P.appends.push(data.append);
+      if (data.error) P.errors.push(data.error);
+    };
+    const tell = () => w.postMessage({ t: a.currentTime });
+    for (const ev of ['timeupdate', 'seeking']) a.addEventListener(ev, tell);
+    setInterval(tell, 250);
+  });
+  return async () => { ready ||= setup(); await ready; await a.play(); };
+}
+function workerMain({ list, mime }) {
+  let now = 0, tick = () => {};
+  self.onmessage = ({ data }) => { now = data.t; tick(); };
+  (async () => {
+    const ms = new MediaSource(), handle = ms.handle;
+    self.postMessage({ handle }, [handle]);
+    await new Promise((r) => ms.addEventListener('sourceopen', r, { once: true }));
+    const { init, segs } = await playlist(list);
+    const sb = ms.addSourceBuffer(mime);
+    ms.duration = segs.at(-1).t1;
+    tick = pump({
+      ms, sb, now: () => now, times: segs.map((s) => [s.t0, s.t1]), fetchInit: () => getBytes(init), fetchSeg: (n) => getBytes(segs[n].url),
+      log: (append) => self.postMessage({ append }), fail: (e) => self.postMessage({ error: String(e) }),
+    });
+    tick();
+  })().catch((e) => self.postMessage({ error: String(e) }));
+}
+function elementPage() {
+  const a = document.getElementById('a');
+  return () => a.play();
+}
+function ratefightPage() {
+  const a = document.getElementById('a');
+  P.resets = [];
+  a.addEventListener('ratechange', () => {
+    if (a.playbackRate === 1) return;
+    P.resets.push({ why: 'ratechange', from: a.playbackRate });
+    a.playbackRate = 1;
+  });
+  a.addEventListener('seeking', () => { P.resets.push({ why: 'seeking', from: a.playbackRate }); a.playbackRate = 1; });
+  return () => a.play();
+}
+function webaudioPage({ url, xor }) {
+  let ready;
+  const setup = async () => {
+    const ctx = window.__ctx = new AudioContext();
+    const bytes = new Uint8Array(await (await fetch(url)).arrayBuffer());
+    for (let i = 0; i < bytes.length; i++) bytes[i] ^= xor;
+    const src = ctx.createBufferSource();
+    src.buffer = await ctx.decodeAudioData(bytes.buffer);
+    src.connect(ctx.destination);
+    src.start();
+    P.playing = true;
+  };
+  return async () => { ready ||= setup(); await ready; await window.__ctx.resume(); };
+}
+const MODEL_LIB = [playlist, getBytes, appendTo, pump, mseOn, msePage, b64url].join('\n');
+
+function modelPage({ name, kind, duration, notes, body = '', main, cfg = {}, lib = false }) {
+  return `<!doctype html><meta charset="utf-8"><title>Model site: ${name}</title>
+<button id="play">Play</button>
+${body}
+<script>
+window.__model = { name: ${JSON.stringify(name)}, kind: ${JSON.stringify(kind)}, duration: ${duration}, notes: ${JSON.stringify(notes)} };
+const P = window.__page = { appends: [], errors: [] }, qs = new URLSearchParams(location.search);
+window.__media = ${pageMedia};
+${lib ? MODEL_LIB : ''}
+const start = (${main})(${JSON.stringify(cfg)});
+const go = () => start().catch((e) => P.errors.push(String((e && e.message) || e)));
+document.addEventListener('click', go);
+if (qs.get('autoplay') === '1') go();
+</script>`;
+}
+
+/** The /m/* request handler; one per server, holding the opaque page's live tokens. */
+function modelSites() {
+  let ix = null;
+  const index = () => (ix ||= JSON.parse(fs.readFileSync(path.join(SITES, 'index.json'), 'utf8')));
+  const tokens = new Set();
+  const mint = () => { const t = crypto.randomBytes(12).toString('hex'); tokens.add(t); return t; };
+  const XOR = 0x5a;
+  const attr = (s) => s.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  const opus = (rep) => ({ list: `/m/media/${rep}.m3u8`, mime: OPUS_MP4 });
+  const audio = (src) => `<audio id="a"${src ? ` src="${src}"` : ''}></audio>`;
+  const pages = {
+    progressive: (S) => ({ kind: 'progressive', duration: S, main: elementPage, body: audio('/m/media/track.mp3'),
+      notes: 'A plain <audio src> MP3 served with byte ranges, like a direct file link: the URL can simply be fetched again.' }),
+    mse: (S) => ({ kind: 'mse', duration: S, main: msePage, lib: true, cfg: opus('opus-hi'), body: audio(),
+      notes: 'An MSE player that reads an HLS playlist and GETs each 4 s fMP4 segment, keeping 20 s buffered ahead, like Mixcloud or SoundCloud: every segment URL can be fetched again.' }),
+    opaque: (S) => ({ kind: 'mse-opaque', duration: S, main: opaquePage, lib: true, body: audio(),
+      cfg: { token: mint(), times: index().reps['opus-hi'].segs.map((s) => [s.t0, s.t1]), mime: OPUS_MP4 },
+      notes: 'An MSE player whose segments come only from POST /m/seg, framed, each request spending a single-use token the last response handed over, like YouTube SABR: nothing can be fetched again, so driving the player is the only way to the audio.' }),
+    abr: (S) => ({ kind: 'mse-abr', duration: S, main: abrPage, lib: true, cfg: { master: '/m/media/opus.m3u8', mime: OPUS_MP4, switchAt: 12 }, body: audio(),
+      notes: 'An MSE player that starts on the 12 kbps rendition and switches to 24 kbps at 12 s by appending the other init segment, like a DASH or HLS quality switch.' }),
+    ratefight: (S) => ({ kind: 'progressive', duration: S, main: ratefightPage, body: audio('/m/media/track.webm'),
+      notes: 'An <audio src> WebM whose page puts playbackRate back to 1 on every ratechange and on every seek.' }),
+    worker: (S) => ({ kind: 'mse-worker', duration: S, main: workerPage, cfg: { script: '/m/worker.js' }, body: audio(),
+      notes: 'An MSE player whose MediaSource lives in a DedicatedWorker and reaches the element as a MediaSourceHandle, so a page-world hook sees no SourceBuffer at all.' }),
+    drm: (S) => ({ kind: 'eme', duration: S, main: drmPage, lib: true, body: audio(),
+      cfg: { ...opus('opus-cenc'), ...index().reps['opus-cenc'].drm },
+      notes: 'An MSE player of ClearKey-encrypted fMP4: a real encrypted event fires, then the page licenses the key and plays. Protected audio must play live, never as noise.' }),
+    preview: () => ({ kind: 'progressive', duration: index().files['preview/track.mp3'].seconds, main: elementPage,
+      body: `${audio('/m/media/preview/track.mp3')}
+<script id="track" type="application/json">${JSON.stringify({ title: 'Model preview', policy: 'SNIP', duration: 30000, full_duration: 120000, snipped: true })}</script>`,
+      notes: 'A 30 s excerpt of a 2-minute track, flagged in the page JSON the way SoundCloud flags previews (policy SNIP, snipped). It must be refused, not loaded as the track.' }),
+    bandcamp: (S) => ({ kind: 'progressive', duration: S, main: elementPage,
+      body: `<script type="text/javascript" data-tralbum="${attr(JSON.stringify({ trackinfo: [{ title: 'Model track', duration: 120, file: { 'mp3-128': '/m/media/track.mp3' } }] }))}"></script>
+${audio('/m/media/track.mp3')}`,
+      notes: 'A Bandcamp-style page: the data-tralbum JSON names the stream MP3 that its <audio> player plays.' }),
+    live: () => ({ kind: 'mse-live', duration: Infinity, main: livePage, lib: true, cfg: { ...opus('opus-lo'), list: '/m/media/opus-lo.m3u8?live=1' }, body: audio(),
+      notes: 'An MSE live stream: duration is Infinity and the segments come round for ever (?join=<s> starts part way in). It can never be complete, so it must play live.' }),
+    webaudio: (S) => ({ kind: 'webaudio', duration: S, main: webaudioPage, cfg: { url: '/m/data/track', xor: XOR },
+      notes: 'Plays a decoded buffer through Web Audio with no media element; the bytes arrive scrambled from a non-media URL, so the only audio to capture is the output.' }),
+  };
+  const send = (res, type, body, status = 200) => { res.writeHead(status, { 'content-type': type, 'cache-control': 'no-store' }); res.end(body); };
+  const m3u8 = (rep, live) => {
+    const r = index().reps[rep];
+    return ['#EXTM3U', '#EXT-X-VERSION:7', '#EXT-X-TARGETDURATION:4', ...(live ? [] : ['#EXT-X-PLAYLIST-TYPE:VOD']), `#EXT-X-MAP:URI="${r.init.path}"`,
+      ...r.segs.flatMap((s) => [`#EXTINF:${(s.t1 - s.t0).toFixed(6)},`, s.path]), ...(live ? [] : ['#EXT-X-ENDLIST']), ''].join('\n');
+  };
+  const master = () => ['#EXTM3U', '#EXT-X-VERSION:7', ...['opus-lo', 'opus-hi'].flatMap((rep) =>
+    [`#EXT-X-STREAM-INF:BANDWIDTH=${index().reps[rep].bitrate},CODECS="opus"`, `${rep}.m3u8`]), ''].join('\n');
+  function file(req, res, rel) {
+    const p = path.normalize(path.join(SITES, rel));
+    if (!p.startsWith(SITES + path.sep) || !fs.existsSync(p) || fs.statSync(p).isDirectory()) { res.writeHead(404); res.end(); return; }
+    const buf = fs.readFileSync(p), head = { 'content-type': MEDIA_TYPES[path.extname(p)] || 'application/octet-stream', 'accept-ranges': 'bytes', 'cache-control': 'no-store' };
+    const r = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || '');
+    if (!r || (!r[1] && !r[2])) { res.writeHead(200, { ...head, 'content-length': buf.length }); res.end(buf); return; }
+    const from = r[1] ? Number(r[1]) : Math.max(0, buf.length - Number(r[2])), to = r[1] && r[2] ? Math.min(Number(r[2]), buf.length - 1) : buf.length - 1;
+    if (from > to) { res.writeHead(416, { 'content-range': `bytes */${buf.length}` }); res.end(); return; }
+    res.writeHead(206, { ...head, 'content-range': `bytes ${from}-${to}/${buf.length}`, 'content-length': to - from + 1 });
+    res.end(buf.subarray(from, to + 1));
+  }
+  // POST /m/seg {seg: 'init' | n} with x-model-token: answers [0x15, u32 seg+1 (0 = init), u32 length, bytes] and the next token.
+  async function opaqueSeg(req, res) {
+    const token = req.headers['x-model-token'];
+    if (!token || !tokens.delete(token)) { req.resume(); send(res, 'text/plain', 'forbidden', 403); return; }
+    let body = '';
+    for await (const c of req) body += c;
+    const { seg } = JSON.parse(body || '{}'), rep = index().reps['opus-hi'], f = seg === 'init' ? rep.init : rep.segs[seg];
+    if (!f) { send(res, 'text/plain', 'no such segment', 404); return; }
+    const bytes = fs.readFileSync(path.join(SITES, f.path)), head = Buffer.alloc(9);
+    head[0] = 0x15; head.writeUInt32BE(seg === 'init' ? 0 : seg + 1, 1); head.writeUInt32BE(bytes.length, 5);
+    res.writeHead(200, { 'content-type': 'application/octet-stream', 'cache-control': 'no-store', 'x-model-next': mint() });
+    res.end(Buffer.concat([head, bytes]));
+  }
+  return (req, res, u) => {
+    const p = u.pathname, name = p.slice('/m/'.length);
+    Promise.resolve().then(() => {
+      if (p === '/m/seg' && req.method === 'POST') return opaqueSeg(req, res);
+      if (p === '/m/worker.js') return send(res, 'text/javascript', `${MODEL_LIB}\n(${workerMain})(${JSON.stringify(opus('opus-hi'))});\n`);
+      if (p === '/m/data/track') return send(res, 'application/octet-stream', fs.readFileSync(path.join(SITES, 'track.webm')).map((b) => b ^ XOR));
+      if (p === '/m/media/opus.m3u8') return send(res, 'application/vnd.apple.mpegurl', master());
+      const pl = /^\/m\/media\/([\w-]+)\.m3u8$/.exec(p);
+      if (pl && index().reps[pl[1]]) return send(res, 'application/vnd.apple.mpegurl', m3u8(pl[1], u.searchParams.get('live') === '1'));
+      if (p.startsWith('/m/media/')) return file(req, res, decodeURIComponent(p.slice('/m/media/'.length)));
+      if (Object.hasOwn(pages, name)) return send(res, 'text/html; charset=utf-8', modelPage({ name, ...pages[name](index().signal.seconds) }));
+      res.writeHead(404); res.end();
+    }).catch((e) => { if (!res.headersSent) send(res, 'text/plain', String(e), 500); else res.destroy(); });
+  };
 }
 
 // ---------------------------------------------------------------- pages + messaging

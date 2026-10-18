@@ -27,7 +27,7 @@
   <header class="topbar">
     <div class="brand">
       <img src="icons/icon48.png" alt="" class="logo" width="28" height="28" />
-      <div class="brand-text"><h1>JD Samps</h1><span class="tag">made by godspee</span></div>
+      <div class="brand-text"><h1>JD Samps</h1><span class="tag">made by godspee</span><span class="build mono" id="build" title="Extension version loaded"></span></div>
     </div>
     <button id="sourcesBtn" class="btn" aria-haspopup="dialog" aria-controls="sources"><svg class="ic"><use href="#i-list"/></svg><span>Sources</span></button>
     <div class="clock" aria-label="Master clock">
@@ -154,11 +154,11 @@
         <button class="btn rec" data-act="rec" aria-pressed="false"><svg class="ic"><use href="#i-dot"/></svg><span>REC</span><span class="mono rec-time" data-rec-time></span></button>
       </div>
       <div class="deck-tempo">
-        <div class="bpm"><span class="bpm-val mono" data-bpm>—</span><span class="bpm-unit">BPM</span></div>
+        <div class="bpm"><span class="bpm-val mono tempo-entry" data-bpm role="button" tabindex="0" title="Click to type the tempo to play at">—</span><span class="bpm-unit">BPM</span></div>
         <div class="tempo-meta">
           <span class="badge" data-tstate>SEARCH</span>
           <span class="mono pitch" data-pitch>+0.00%</span>
-          <span class="mono native" data-native></span>
+          <span class="mono native tempo-entry" data-native role="button" tabindex="0" title="Click to correct the track's original tempo">orig —</span>
         </div>
         <div class="leds" data-leds aria-hidden="true"><i></i><i></i><i></i><i></i></div>
         <div class="phase" data-phase hidden title="Phase offset to the master clock"><span data-phase-dot></span></div>

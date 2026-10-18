@@ -159,5 +159,14 @@ window.addEventListener('beforeunload', (e) => {
 document.addEventListener('visibilitychange', syncWakeLock);
 document.addEventListener('visibilitychange', reportVisibility);
 
+/** The build in the top bar, so the DJ can always tell which version is loaded. */
+function showBuild() {
+  let m = null;
+  try { m = chrome.runtime.getManifest(); } catch (_) {}
+  const v = m && (m.version_name || m.version);
+  if (v) setText($('#build'), `v${v}`);
+}
+
+showBuild();
 conn.start();
 requestAnimationFrame(frame);
