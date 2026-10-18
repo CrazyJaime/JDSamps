@@ -519,10 +519,15 @@ export class Deck {
     return r ? r.p + r.rate * (t - r.T) : this.ts.posAt(t);
   }
 
-  /** Where navigation may put the playhead: the buffer less clampInput's margins, and for a playing deck LIVE's reserve. */
+  /**
+   * Where navigation may put the playhead: what clampInput allows (the buffer less its margins), and
+   * a playing deck keeps LIVE's reserve at the live edge so that a jump there does not starve it.
+   */
   navRange() {
-    const ts = this.ts, lo = ts.historyStart + 0.01;
-    return { lo, hi: Math.max(lo, ts.liveEdge - ts.lat - (this.wantPlay ? LIVE_RESERVE : 0.3)) };
+    const ts = this.ts, lo = ts.clampInput(-Infinity);
+    let hi = ts.clampInput(Infinity);
+    if (this.wantPlay) hi = Math.max(lo, Math.min(hi, ts.liveEdge - ts.lat - LIVE_RESERVE));
+    return { lo, hi };
   }
 
   /** Why the playhead cannot go to `target` from `at`: how much is buffered on that side. */

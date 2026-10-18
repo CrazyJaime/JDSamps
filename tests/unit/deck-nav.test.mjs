@@ -256,6 +256,25 @@ test('a seek during a CUE preview moves the preview; letting go of CUE still ret
   assert.ok(near(d.node.posAt(clock.t), 2, 1e-9), 'back at the cue');
 });
 
+test('a starved deck: a seek back refills its reserve and frees its tempo; a seek to the edge keeps LIVE\'s reserve (no emergency jump)', async () => {
+  const { clock, engine, d, go } = rig({ pitch: 0.05, cue: 50 });
+  d.ts.liveEdge = 50 + d.ts.lat + 0.45; // a Web-Audio-only page (no assist): reserve under GUARD
+  await d.act('play');
+  go(0.5);
+  assert.equal(d.starved, true, 'starved at 1x');
+  await d.act('seek', { pos: 30 });
+  go(0.5);
+  assert.equal(d.starved, false, 'the reserve is back');
+  assert.ok(near(d.node.segAt(clock.t).rate, 1.05, 1e-9), `rate ${d.node.segAt(clock.t).rate}`);
+  const jumps = d.node.log.length;
+  await d.act('seek', { pos: d.ts.liveEdge });
+  const seg = last(d.node);
+  assert.ok(d.ts.liveEdge - d.ts.lat - seg.input >= LIVE_RESERVE - 1e-9, `lands with ${d.ts.liveEdge - d.ts.lat - seg.input} s of reserve`);
+  go(1);
+  assert.equal(d.node.log.slice(jumps + 1).filter((x) => x.input !== undefined && x.input < seg.input - 0.5).length, 0, 'no emergency jump back');
+  assert.equal(engine.events.filter((e) => /dry/.test(e.text)).length, 0);
+});
+
 test('a drag (a seek every 32 ms) is heard while it lasts, not only after the hand stops', async () => {
   const { clock, d, go } = rig();
   await d.act('play');
