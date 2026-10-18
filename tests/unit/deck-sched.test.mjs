@@ -1,7 +1,7 @@
 // Deck transport/rate scheduling against a node with the real one-pending-change rule.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { Timeshift } from '../../engine/timeshift.js';
+import { Timeshift, LIVE_RESERVE } from '../../engine/timeshift.js';
 import { makeEngine, makeDeck, run, FakeNode } from './fixtures/deck-harness.mjs';
 
 const near = (a, b, eps) => Math.abs(a - b) <= eps;
@@ -120,7 +120,8 @@ test('a pending LIVE jump survives a rate restatement', async () => {
   d.applyRate();
   go(0.5);
   assertPlaying(d, clock.t, 1);
-  assert.ok(d.ts.reserveAt(clock.t) < 1, `reserve ${d.ts.reserveAt(clock.t)}: LIVE jump lost`);
+  // LIVE lands on the deck's beat: its reserve and less than one beat (124 BPM) more, plus what came in meanwhile.
+  assert.ok(d.ts.reserveAt(clock.t) < LIVE_RESERVE + 60 / 124 + 0.2, `reserve ${d.ts.reserveAt(clock.t)}: LIVE jump lost`);
 });
 
 test('a roll pad pressed inside the start window still starts the deck, looping', async () => {

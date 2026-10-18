@@ -474,9 +474,14 @@ export class Deck {
         return OK;
       case 'live': {
         if (this.kind === 'resident') return fail('A whole-track deck has no live edge.');
-        const target = this.ts.clampInput(this.ts.liveEdge - this.ts.lat - LIVE_RESERVE);
-        if (this.wantPlay) this.sched(T, { input: target });
-        else this.ts.change(now, T, { active: false, input: target });
+        let target = this.ts.clampInput(this.ts.liveEdge - this.ts.lat - LIVE_RESERVE);
+        if (this.wantPlay) {
+          // Playing on its beat grid, the deck jumps whole beats (landing up to a beat further back), so it keeps its
+          // phase: a synced deck has nothing to bend back into line out of the small reserve LIVE leaves it.
+          const p = this.ts.posAt(T), g = this.grids.at(p);
+          if (g && g.T > 0 && this.canBeat(p)) target = this.ts.clampInput(p + Math.floor((target - p) / g.T) * g.T);
+          this.sched(T, { input: target });
+        } else this.ts.change(now, T, { active: false, input: target });
         return OK;
       }
       case 'sync': return this.actSync(arg.on, now);
