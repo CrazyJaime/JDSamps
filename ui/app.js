@@ -5,6 +5,7 @@ import { EngineConnection } from './connection.js';
 import { DeckStrip } from './deck-strip.js';
 import { MasterStrip } from './master-strip.js';
 import { SourcesDrawer } from './sources.js';
+import { TrackLoader } from './load.js';
 import { bindKeys } from './keys.js';
 
 const strips = new Map();
@@ -16,8 +17,11 @@ let wakeLock = null;
 let wakeLockPending = false;
 
 const toastTimers = new WeakMap();
-/** Toasts sit top centre (no controls there), click to dismiss; a repeated text bumps a counter. */
-function toast(text, level = 'info') {
+/**
+ * Toasts sit top centre (no controls there), click to dismiss; a repeated text bumps a counter.
+ * action {label, run}: a button that runs it (an offer, such as loading a pasted link).
+ */
+function toast(text, level = 'info', action = null) {
   const box = $('#toasts');
   const msg = String(text);
   let t = [...box.children].find((x) => x.dataset.text === msg && x.dataset.level === level);
@@ -34,11 +38,18 @@ function toast(text, level = 'info') {
     body.textContent = msg;
     count.className = 'toast-count mono';
     t.append(body, count);
+    if (action) {
+      const b = document.createElement('button');
+      b.className = 'btn sm';
+      b.textContent = action.label;
+      b.addEventListener('click', (e) => { e.stopPropagation(); t.remove(); action.run(); });
+      count.before(b); // the count stays last: a repeat bumps it
+    }
     t.addEventListener('click', () => t.remove());
   }
   box.append(t);
   while (box.children.length > 3) box.firstElementChild.remove();
-  toastTimers.set(t, setTimeout(() => t.remove(), level === 'error' ? 8000 : 4000));
+  toastTimers.set(t, setTimeout(() => t.remove(), action ? 10000 : level === 'error' ? 8000 : 4000));
 }
 
 const persist = (key, value) => { try { chrome.storage.local.set({ [key]: value }); } catch (_) {} };
@@ -50,7 +61,10 @@ const conn = new EngineConnection({
   onStatus,
 });
 const master = new MasterStrip({ conn, toast, persist });
-const sources = new SourcesDrawer({ conn, toast });
+const loader = new TrackLoader({ conn, toast });
+const sources = new SourcesDrawer({ conn, toast, loader });
+loader.bindDrop();
+loader.bindPaste();
 
 function select(id) {
   selected = id;

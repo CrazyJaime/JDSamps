@@ -142,6 +142,15 @@ test('TAP 1 marks bar 1 on the analysed grid at the playhead, and holds', async 
   assert.ok(near(d.grids.at(30).bar1, b, 1e-6));
 });
 
+test('TAP 1 at a given position (the analysis\'s bar 1) marks the beat nearest it, wherever the playhead is', async () => {
+  const { d } = residentDeck({ at: 30.3 });
+  applyAnalysis(d, analysis());
+  assert.deepEqual(await d.act('tap1', { t: 2.03 }), { ok: true });
+  const b = 0.1 + Math.round((2.03 - 0.1) / T124) * T124;
+  assert.ok(near(d.grids.at(30).bar1, b, 1 / FS), `bar1 ${d.grids.at(30).bar1} vs ${b}`); // to the frame
+  assert.ok(near(d.grids.at(2).bar1, b, 1 / FS));
+});
+
 test('TAP retimes the analysed grid at the playhead, and holds', async () => {
   const { d, clock } = residentDeck();
   applyAnalysis(d, analysis());

@@ -97,16 +97,66 @@ Chrome 119 or newer is required.
 | `K` | Key lock |
 | `T` / `Shift+T` | Tap tempo / mark beat 1 |
 | `Q` / `A` / `Z` | Kill high / mid / low (tap = toggle, hold = momentary) |
-| `←` `→` | Nudge (hold) |
+| `←` `→` | Nudge (hold); search when paused |
+| `,` / `.` | Beat jump back / forward |
+| `Shift+,` / `Shift+.` | Beat jump size smaller / bigger |
 | `↑` `↓` | Tempo ±0.1 % |
 | `F` | FX on |
 | `V` `B` `N` `M` | Roll 1/8, 1/4, 1/2, 1 beat (hold) |
 | `[` / `]` / `\` | Crossfader left / right / centre |
 | `R` | Record deck (hold to stop) |
 | `Shift+R` | Record mix (hold to stop) |
+| `Ctrl+V` / `Cmd+V` | Paste a link to an audio file: offers to load it |
 | `?` | Help |
 
 Arrow keys on a focused knob or fader adjust that control instead.
+
+## Whole tracks
+
+A deck can hold a **whole track**, decoded in memory. Its header says **TRACK**; a deck that plays
+its tab live says **LIVE**.
+
+- **The tab no longer matters.** Once a deck holds the whole track, the tab can pause, seek, close
+  or be paused by its site, and the deck does not notice.
+- **Move anywhere in it.** The overview shows the whole track; click it, drag the waveform, beat
+  jump or search to go anywhere. The deck shows elapsed and remaining time (`1:23 / -2:41`)
+  instead of the reserve, has no LIVE button, and stops at the end (**END**).
+- **Beat grid from the whole track.** The track is analysed once when it loads, so the grid is
+  fitted to all of it. When the analysis finds where bar 1 is likely to be, a **BAR 1?** button
+  offers it; TAP 1 (`Shift+T`) still marks bar 1 by hand.
+
+### Loading one
+
+- **Drop an audio file** (MP3, WAV, Ogg, Opus, FLAC, M4A, WebM…) anywhere on the deck page.
+- **Paste a link** to an audio file: in **Sources → Load link**, or press `Ctrl+V` / `Cmd+V` on the
+  board and confirm.
+- **Load a tab** as before. JD Samps tries to make it a whole track, and falls back to a live deck
+  only when it cannot, saying why. What it does depends on the site:
+
+  | Site | How the whole track is fetched |
+  |---|---|
+  | Bandcamp | reads the stream link the page itself carries |
+  | Mixcloud | fetches the rest of the audio the page's player asked for |
+  | SoundCloud | the same; when that fails, runs the player through the track and keeps the audio it receives. Preview-only (30 s) tracks are refused and protected tracks play live |
+  | YouTube | runs the player through the track and keeps the audio it receives |
+  | anything else | each of those in turn, then a live deck |
+
+  None of this could be tried on the real sites from the machine JD Samps was built on.
+- While it loads, the deck shows **LOADING · 42%** and what it is doing; only eject and the cancel
+  **✕** work meanwhile. A load that fails says why. **Copy load report** (on the failed deck, or
+  in the **ⓘ** menu of a deck that has a report) copies a short plain-text report: send it in so
+  the site can be fixed.
+- When a page's audio cannot be read at all, the deck plays live. **Record whole track (2×,
+  reduced highs)** in its **ⓘ** menu records the tab at double speed instead, losing the highest
+  frequencies; Settings → **Record whole track at 2× when bytes are unavailable** (off by
+  default) does that without asking.
+
+### Memory
+
+A whole track takes about 22 MB of memory per minute. **Settings → Resident track limit**
+(default 15 minutes, about 330 MB per deck) caps each deck: a longer track loads its first part,
+and the deck says so. The top bar warns when the decks hold more than 1.5 GiB of audio; eject
+some to free memory.
 
 ## Notes and limits
 
@@ -119,7 +169,7 @@ Arrow keys on a focused knob or fader adjust that control instead.
 - **Real-world tempo.** BPM detection is tuned for music with a steady beat. Rubato or live
   recordings may stay **UNSURE**; use TAP and GRID. Until the beat grid is confident (or
   TAPped), SYNC in BEAT mode is refused with a reason; TEMPO mode still matches tempo.
-- **Resources.** Each deck keeps up to 4 minutes of audio (Settings → Deck buffer), about
+- **Resources.** Each live deck keeps up to 4 minutes of audio (Settings → Deck buffer), about
   21 MB per minute, and uses roughly 5 % of one CPU core for time-stretching. A deck that runs
   slower than its source for a long time skips ahead whole bars when its buffer is full (you
   are warned first). With no decks and no deck page, the engine goes idle.

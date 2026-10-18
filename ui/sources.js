@@ -1,9 +1,10 @@
 // ui/sources.js — the Sources drawer: open tabs, which are on decks, which can be loaded.
 import { HUB, isSafeIconUrl } from '../shared/protocol.js';
 import { $, clone, setText, setHidden, pageHidden } from './util.js';
+import { webLink } from './load.js';
 
 export class SourcesDrawer {
-  constructor({ conn, toast }) {
+  constructor({ conn, toast, loader }) {
     this.conn = conn;
     this.toast = toast;
     this.el = $('#sources');
@@ -13,6 +14,14 @@ export class SourcesDrawer {
     this.failed = false;
     for (const id of ['#sourcesBtn', '#emptySourcesBtn']) $(id).addEventListener('click', () => (this.isOpen ? this.close() : this.open()));
     this.el.querySelector('[data-close]').addEventListener('click', () => this.close());
+    // A link to an audio file: a whole track on a new deck.
+    $('#loadLinkForm').addEventListener('submit', (e) => {
+      e.preventDefault();
+      const field = $('#loadLink'), url = webLink(field.value);
+      if (!url) { this.toast('Paste a web link (http or https) to an audio file.', 'warn'); field.select(); return; }
+      field.value = '';
+      loader.loadLink(url);
+    });
     document.addEventListener('visibilitychange', () => { if (this.isOpen && !pageHidden()) this.refresh(); });
   }
 

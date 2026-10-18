@@ -133,6 +133,7 @@ kbd { font: 0.8rem var(--mono); padding: 0.05rem 0.35rem; border: 1px solid var(
 .engine .led { width: 0.55rem; height: 0.55rem; border-radius: 50%; background: var(--dim); }
 .engine[data-status="up"] .led { background: var(--play); box-shadow: 0 0 0.5rem var(--play); }
 .engine[data-status="down"] .led { background: var(--rec); box-shadow: 0 0 0.5rem var(--rec); }
+.mem-warn { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.75rem; color: var(--warn); }
 .banner { padding: 0.45rem 0.8rem; background: #3a1414; color: #fecaca; font-weight: 600; border-bottom: 1px solid #5f1d1d; }
 
 /* ---------- waveform stack ---------- */
@@ -168,7 +169,12 @@ body[data-decks="5"] .wave-bpm, body[data-decks="6"] .wave-bpm { font-size: 0.75
 .wave:hover ~ .jog-hint, .wave-row.dragging .jog-hint { visibility: visible; }
 
 /* ---------- board ---------- */
-.board { display: grid; grid-template-columns: 1fr auto; min-height: 0; }
+.board { position: relative; display: grid; grid-template-columns: 1fr auto; min-height: 0; }
+/* Files dragged over the page: the whole board takes them. */
+body.dropping .board::after {
+  content: "Drop audio files to load them as whole tracks"; position: absolute; inset: 0.5rem; z-index: 5; display: grid; place-items: center;
+  border: 2px dashed var(--sync); border-radius: 0.8rem; background: rgb(7 8 11 / 0.7); font-weight: 700; pointer-events: none;
+}
 .decks { display: flex; gap: 0.5rem; padding: 0.5rem; overflow-x: auto; overflow-y: auto; min-height: 0; }
 .empty { margin: auto; max-width: 34rem; padding: 1.6rem 1.8rem; border: 1px dashed var(--line-2); border-radius: 0.8rem; background: var(--panel); }
 .empty h2 { font-size: 1.25rem; margin-bottom: 0.6rem; }
@@ -186,7 +192,28 @@ body[data-decks="5"] .wave-bpm, body[data-decks="6"] .wave-bpm { font-size: 0.75
 .deck > .deck-head { flex: 999 1 10rem; }
 .deck > .deck-assign { flex: 1 0 auto; }
 .deck.selected { border-color: color-mix(in srgb, var(--deck) 55%, var(--line)); box-shadow: 0 0 0 1px color-mix(in srgb, var(--deck) 35%, transparent), 0 0.4rem 1.6rem rgb(0 0 0 / 0.45); }
-.deck-head { display: grid; grid-template-columns: auto auto 1fr auto; align-items: center; gap: 0.45rem; }
+/* Header: slot, then the title over what the deck is (TRACK / LIVE / LOADING · n %), then ⓘ and eject. */
+.deck-head { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 0.45rem; }
+.head-text { display: flex; flex-direction: column; gap: 0.1rem; min-width: 0; line-height: 1.15; container: head / inline-size; }
+.head-line { display: flex; align-items: center; gap: 0.35rem; min-width: 0; }
+/* The badge never runs past its column (under the buttons): its word gives way first, then the percentage alone. */
+.badge.kind { flex: 0 1 auto; min-width: 0; min-height: 0; padding: 0 0.3rem; overflow: hidden; line-height: 1.15; white-space: pre; }
+[data-kind-word] { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+[data-kind-pct] { flex: none; }
+@container head (max-width: 7.6rem) { [data-kind-word]:has(+ :not(:empty)) { display: none; } }
+/* A loading deck's A/THRU/B and REC are inert: what the load is doing, and its cancel, take their place
+   (the same row, beside the header with up to three decks, under it with more). */
+.deck-assign { position: relative; }
+.deck[data-kind="loading"] .deck-assign > :not(.load-row) { visibility: hidden; }
+.load-row { position: absolute; inset: 0; display: flex; align-items: center; gap: 0.35rem; }
+.load-line { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 0.75rem; color: var(--muted); }
+.deck[data-kind="loading"] .load-line { color: var(--txt); }
+.report { position: relative; }
+.menu { position: absolute; top: calc(100% + 0.2rem); right: 0; z-index: 15; padding: 0.25rem; background: var(--panel-2); border: 1px solid var(--line-2); border-radius: var(--r); box-shadow: 0 0.5rem 1.5rem rgb(0 0 0 / 0.5); }
+.menu { display: flex; flex-direction: column; align-items: stretch; gap: 0.25rem; }
+.menu .btn { white-space: nowrap; }
+/* A loading deck: everything but its header is inert, and looks it. */
+.deck [aria-disabled="true"], .wave-row [aria-disabled="true"] { opacity: 0.4; cursor: not-allowed; }
 .slot {
   display: inline-grid; place-items: center; width: 1.6rem; height: 1.6rem; border-radius: 0.35rem;
   background: var(--deck); color: #031015; font: 800 0.9rem var(--sans);
@@ -219,6 +246,10 @@ body[data-decks="5"] .wave-bpm, body[data-decks="6"] .wave-bpm { font-size: 0.75
 .reserve-bar span { position: absolute; inset: 0 auto 0 0; width: 0; background: var(--deck); }
 .reserve.low .reserve-bar span { background: var(--warn); }
 .reserve.low [data-reserve-text] { color: var(--warn); }
+/* A whole track shows elapsed and remaining time where a live deck shows its reserve. */
+.time { font-size: 0.85rem; white-space: nowrap; }
+.time.end { color: var(--warn); }
+.deck-status [data-copy-report] { white-space: normal; line-height: 1.05; }
 /* Beat jump: back, size, forward. The overview shows the reserve too, so a narrow deck drops the bar. */
 .jump { display: flex; gap: 0.2rem; }
 .jump-size { min-width: max(32px, 2.2rem); padding: 0 0.3rem; }
@@ -236,6 +267,8 @@ body[data-decks="5"] .wave-bpm, body[data-decks="6"] .wave-bpm { font-size: 0.75
 .tools { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 0.25rem; }
 .tools .btn { min-width: 0; padding: 0 0.15rem; white-space: normal; line-height: 1.05; text-align: center; }
 .tools > :last-child { grid-column: span 2; }
+/* The analysis's bar 1, offered where a whole-track deck has no LIVE button. */
+.tools .btn.chip { color: var(--deck); border-style: dashed; border-color: color-mix(in srgb, var(--deck) 60%, transparent); }
 @container deck (min-width: 312px) {
   .tools { grid-template-columns: repeat(9, minmax(0, 1fr)); }
   .tools > :last-child { grid-column: auto; }
@@ -363,6 +396,12 @@ body[data-decks="5"] .wave-bpm, body[data-decks="6"] .wave-bpm { font-size: 0.75
 .source .host { font-size: 0.75rem; color: var(--muted); }
 .source .audible { color: var(--play); }
 .setting { display: flex; flex-direction: column; gap: 0.35rem; font-size: 0.8rem; color: var(--muted); }
+.setting input.num { width: 6rem; }
+.load-link { display: flex; flex-direction: column; gap: 0.35rem; font-size: 0.8rem; color: var(--muted); }
+.load-link-row { display: flex; gap: 0.4rem; }
+.load-link-row input { flex: 1; }
+.drawer input { min-width: 0; min-height: max(32px, 1.9rem); padding: 0 0.5rem; border: 1px solid var(--line-2); border-radius: var(--r); background: var(--bg); color: var(--txt); font: 0.85rem var(--sans); user-select: text; }
+.drawer input:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
 .overlay { position: fixed; inset: 0; z-index: 30; display: grid; place-items: center; background: rgb(3 4 6 / 0.72); }
 .overlay-card { width: min(46rem, 94vw); padding: 1rem 1.2rem; border-radius: 0.8rem; background: var(--panel); border: 1px solid var(--line-2); }
 .keys { width: 100%; border-collapse: collapse; font-size: 0.85rem; }

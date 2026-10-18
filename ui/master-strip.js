@@ -1,8 +1,11 @@
 // ui/master-strip.js — master meters/limiter/volume, crossfader bar, REC MIX, clock and settings.
-import { $, $$, setText, toggleAttr, pageHidden, fmtBpm, fmtClock } from './util.js';
+import { MASTER_PARAMS } from '../shared/protocol.js';
+import { $, $$, setText, toggleAttr, setHidden, setAttr, pageHidden, fmtBpm, fmtClock } from './util.js';
 import { Knob, Fader, bindSeg } from './controls.js';
 import { VMeter } from './meters.js';
 import { bindHold } from './hold.js';
+
+const MEM_WARN = 1.5 * 2 ** 30; // bytes of decoded audio on decks before the top bar says so
 
 export class MasterStrip {
   constructor({ conn, toast, persist }) {
@@ -19,6 +22,21 @@ export class MasterStrip {
     this.xf = new Fader($('#crossfader'), { orientation: 'horizontal', label: 'Crossfader', min: 0, max: 1, def: 0.5, value: 0.5, center: true, step: 0.02, fine: 0.004, wheel: false, reset: false, format: (v) => `${Math.round(v * 100)}`, onChange: (v) => conn.set(null, 'xfader.pos', v) });
     this.curve = bindSeg($('#xfCurve'), { onSelect: (v) => this.setPersisted('xfader.curve', v) });
     this.settings = $$('[data-setting]').map((el) => ({ key: el.dataset.setting, seg: bindSeg(el, { onSelect: (v) => this.setPersisted(el.dataset.setting, v) }) }));
+    // Number settings: whole numbers within the parameter's range, sent when committed (Enter or leaving the field).
+    this.nums = $$('[data-setting-num]').map((el) => {
+      const key = el.dataset.settingNum, spec = MASTER_PARAMS[key];
+      el.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); el.blur(); } });
+      el.addEventListener('change', () => {
+        const v = Number(el.value);
+        if (el.value.trim() === '' || !Number.isFinite(v)) { el.value = String(this.params[key] ?? spec.def); return; }
+        const c = Math.min(spec.max, Math.max(spec.min, Math.round(v)));
+        el.value = String(c);
+        this.setPersisted(key, c);
+      });
+      return { key, el };
+    });
+    this.autoSetting = $('#residentAutoSetting');
+    this.memWarn = $('#memWarn');
     this.meter = new VMeter($('#masterMeter'), { channels: 2 });
     this.gr = new VMeter($('#grMeter'), { mode: 'gr' });
     for (const id of ['#clipL', '#clipR']) $(id).addEventListener('click', () => conn.act(null, 'clipReset'));
@@ -64,6 +82,14 @@ export class MasterStrip {
     this.xf.set(p['xfader.pos']);
     this.curve.set(p['xfader.curve']);
     for (const st of this.settings) st.seg.set(p[st.key]);
+    for (const n of this.nums) if (document.activeElement !== n.el && p[n.key] != null && n.el.value !== String(p[n.key])) n.el.value = String(p[n.key]);
+    setHidden(this.autoSetting, !('resident.auto' in p)); // the setting arrives with the tab loader
+    const mem = this.memWarn, bytes = m.residentBytes || 0;
+    setHidden(mem, !(bytes > MEM_WARN));
+    if (bytes > MEM_WARN) {
+      setText(mem, `Decks hold ${(bytes / 1e9).toFixed(1)} GB of audio; eject some to free memory`);
+      setAttr(mem, 'title', mem.textContent);
+    }
     const recBtn = $('#mixRecBtn');
     toggleAttr(recBtn, 'aria-pressed', m.rec.state === 'recording');
     const saving = m.rec.state === 'finalizing';

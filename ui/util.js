@@ -96,6 +96,11 @@ export function trapFocus(el) {
 export const fmtBpm = (b) => (b ? b.toFixed(1) : '—');
 export const fmtPct = (p) => `${p < 0 ? '−' : '+'}${Math.abs(p * 100).toFixed(2)}%`;
 export const fmtDb = (db) => (db === -Infinity || db < -99 ? '−∞' : `${db > 0 ? '+' : db < 0 ? '−' : ''}${Math.abs(db).toFixed(1)}`);
+/** m:ss, for a track's elapsed and remaining time. */
+export function fmtTime(sec) {
+  const s = Math.max(0, Math.floor(sec + 1e-6));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
 export function fmtClock(sec) {
   const s = Math.max(0, Math.floor(sec));
   return `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;

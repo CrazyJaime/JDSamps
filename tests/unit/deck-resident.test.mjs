@@ -126,6 +126,16 @@ test('snapshot reports kind, duration and load state; a live deck reports itself
   assert.equal(live.load.state, 'ready');
 });
 
+test('snapshot carries the analysis summary (bar 1 suggestion and confidence); null on a deck without one', async () => {
+  const { d, clock, engine } = await resident(42);
+  assert.equal(d.state(clock.t).analysis, null);
+  d.analysis = { bpm: 124, conf: 0.9, octConf: 0.8, bar1: { t: 2.5, conf: 0.6 }, residuals: { median: 1, max: 3 } }; // as Engine.gridResident sets it
+  assert.deepEqual(d.state(clock.t).analysis, { bar1: { t: 2.5, conf: 0.6 }, conf: 0.9 });
+  d.analysis = { ...d.analysis, bar1: null };
+  assert.deepEqual(d.state(clock.t).analysis, { bar1: null, conf: 0.9 });
+  assert.equal(makeDeck(engine, clock, { id: 5, slot: 5 }).state(clock.t).analysis, null);
+});
+
 test('with no analysis, a resident deck is unlocked and has no waveform, and ticks, sync, master and meters run without an input worklet', async () => {
   const { d, clock, engine } = await resident(60);
   engine.master.deckMeter = () => ({ peak: 0, rms: 0, clipFrame: -1 });

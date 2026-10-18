@@ -1,7 +1,7 @@
 // ui/deck-strip.js — one deck: its column in the board and its row in the waveform stack.
 // All page-derived text goes through textContent; favicons are only set after isSafeIconUrl().
 import { DECK_COLORS, PITCH_RANGES, JUMP_BEATS, MAX_BEND, isSafeIconUrl, parseTypedBpm } from '../shared/protocol.js';
-import { $, $$, clamp, clone, setText, toggleAttr, setAttr, setHidden, setClass, setStyle, pageHidden, cssSize, forgetSize, fmtBpm, fmtPct, fmtClock } from './util.js';
+import { $, $$, clamp, clone, setText, toggleAttr, setAttr, setHidden, setClass, setStyle, pageHidden, cssSize, forgetSize, fmtBpm, fmtPct, fmtClock, fmtTime } from './util.js';
 import { Knob, Fader, bindPad, bindSeg } from './controls.js';
 import { WaveStore, drawWave, drawOverview, beatIndex } from './waveform.js';
 import { VMeter } from './meters.js';
@@ -17,6 +17,17 @@ const PX_PER_BEAT = 56, PX_PER_SEC = 110; // zoomed waveform scale, CSS px (with
 const JOG_GAIN = 1e-4, JOG_STEP = 0.005, JOG_WINDOW = 80;
 // A drag's local playhead is shown until the engine's snapshot has had time to land the seek.
 const NAV_SETTLE = 150;
+// What a deck is, in its header: a whole track, a live tab, or a track on its way (or one that failed to arrive).
+const KIND = {
+  resident: ['TRACK', 'ok', 'Whole track: the deck holds all of it, so its tab no longer matters'],
+  live: ['LIVE', '', 'Live: the deck plays its tab as the tab plays, so the tab has to keep playing'],
+  loading: ['LOADING', 'info', 'Loading the whole track'],
+  failed: ['FAILED', 'warn', 'The track could not be loaded'],
+};
+// The only presses a loading deck takes.
+const LOADING_ACTS = new Set(['eject', 'loadCancel']);
+/** The input span a deck can be moved through: a whole-track deck's track, else what it has buffered. */
+const navSpan = (d) => (d.kind === 'resident' && d.duration > 0 ? [0, d.duration] : [d.historyStart, d.liveEdge]);
 
 export class DeckStrip {
   constructor(d, { conn, toast, onSelect }) {
@@ -32,6 +43,8 @@ export class DeckStrip {
     this.seekQ = null;  // the latest seek of a drag, sent once per frame
     this.seekRaf = 0;
     this.jog = null;    // a jog bend in progress
+    this.inert = d.kind === 'loading'; // a loading deck takes nothing but eject and cancel
+    this.shownInert = false;
     this.store = new WaveStore();
     this.el = clone('tpl-deck');
     this.waveRow = clone('tpl-wave-row');
@@ -55,12 +68,17 @@ export class DeckStrip {
       keyLock: this.q('[data-act="keyLock"]'), syncMode: this.q('[data-act="syncMode"]'), range: this.q('[data-act="range"]'),
       rec: this.q('[data-act="rec"]'), recLabel: this.q('[data-act="rec"] span'), recTime: this.q('[data-rec-time]'),
       wslot: $('[data-slot]', this.waveRow), wbpm: $('[data-wbpm]', this.waveRow), wave: $('[data-wave]', this.waveRow),
+      kind: this.q('[data-kind]'), kindWord: this.q('[data-kind-word]'), kindPct: this.q('[data-kind-pct]'), loadRow: this.q('[data-load-row]'), loadLine: this.q('[data-load-line]'), cancel: this.q('[data-act="loadCancel"]'),
+      report: this.q('[data-report]'), reportBtn: this.q('[data-report-btn]'), reportMenu: this.q('[data-report-menu]'), recWhole: this.q('[data-record-whole]'),
+      copyNow: this.q('.deck-status [data-copy-report]'), jump: this.q('.jump'), time: this.q('[data-time]'),
+      live: this.q('[data-act="live"]'), bar1: this.q('[data-act="bar1"]'),
     };
     setText(this.refs.slot, d.slot);
     setText(this.refs.wslot, d.slot);
     this.waveCtx = this.refs.wave.getContext('2d');
     this.ovCtx = this.refs.ov.getContext('2d');
     setAttr(this.refs.ov, 'aria-label', `Deck ${d.slot} buffer overview: click or drag to move the playhead`);
+    setAttr(this.refs.cancel, 'aria-label', `Cancel loading deck ${d.slot}`);
     this.meter = new VMeter(this.q('[data-meter]'));
     this.buildControls(d);
     this.render();
@@ -68,8 +86,9 @@ export class DeckStrip {
     document.addEventListener('visibilitychange', this.onVisible);
   }
 
-  set(key, value, hold) { this.conn.set(this.id, key, value, hold); }
+  set(key, value, hold) { if (!this.inert) this.conn.set(this.id, key, value, hold); }
   async act(a, arg) {
+    if (this.inert && !LOADING_ACTS.has(a)) return { ok: false }; // the engine would refuse it with an error toast
     const r = await this.conn.act(this.id, a, arg);
     if (!r.ok && r.error) this.toast(r.error, 'warn');
     return r;
@@ -138,6 +157,13 @@ export class DeckStrip {
     on('[data-act="master"]', () => this.act('master'));
     on('[data-act="syncPlay"]', () => this.act('syncPlay'));
     on('[data-act="live"]', () => this.act('live'));
+    on('[data-act="loadCancel"]', () => this.act('loadCancel'));
+    // The whole-track analysis's bar 1, offered while the grid has none: TAP 1 there.
+    on('[data-act="bar1"]', () => { const b = this.d.analysis && this.d.analysis.bar1; if (b) this.act('tap1', { t: b.t }); });
+    for (const el of $$('[data-copy-report]', this.el)) el.addEventListener('click', () => { this.closeReportMenu(); this.copyReport(); });
+    // A live deck whose bytes could not be had: record the track from the tab at 2× instead (spec §4.4), only when asked.
+    this.refs.recWhole.addEventListener('click', () => { this.closeReportMenu(); this.act('recordWhole'); });
+    this.bindReportMenu();
     on('[data-act="half"]', () => this.act('mult', { factor: 0.5 }));
     on('[data-act="double"]', () => this.act('mult', { factor: 2 }));
     // TAP is stamped at the press: a release-time stamp would put the grid late by the click length.
@@ -178,6 +204,55 @@ export class DeckStrip {
     });
     // Eject needs a 500 ms hold: a stray click must never kill a playing deck.
     bindHold(this.q('[data-act="eject"]'), { ms: 500, onHold: () => this.act('eject'), onShort: () => this.toast('Hold the eject button to unload this deck.', 'info') });
+    // A loading deck is inert but for its header (eject, load report) and its cancel: a press on anything else
+    // stops here, before the control's own handlers (keys are stopped in act() and set()).
+    this.inertEls = [...$$('button, [role="slider"], [role="button"]', this.el).filter((el) => !el.closest('.deck-head, [data-load-row]') && !el.hasAttribute('data-copy-report')), this.refs.ov, this.refs.wave];
+    const guard = (e) => {
+      if (!this.inert || !(e.target instanceof Element) || !e.target.closest('[aria-disabled="true"]')) return;
+      e.stopPropagation();
+      if (e.type !== 'keydown' && e.type !== 'wheel') e.preventDefault(); // Tab still moves on, the page still scrolls
+    };
+    for (const type of ['pointerdown', 'click', 'dblclick', 'wheel', 'keydown']) this.el.addEventListener(type, guard, true);
+  }
+
+  /** The ⓘ menu of a deck with a load report: one item, Copy load report. Escape, a click elsewhere or using it closes it. */
+  bindReportMenu() {
+    const r = this.refs;
+    this.onMenuAway = (e) => {
+      if (e.type === 'keydown' ? e.key === 'Escape' : !r.report.contains(e.target)) this.closeReportMenu(e.type === 'keydown');
+    };
+    r.reportBtn.addEventListener('click', () => (r.reportMenu.hidden ? this.openReportMenu() : this.closeReportMenu()));
+  }
+
+  openReportMenu() {
+    const r = this.refs;
+    setHidden(r.reportMenu, false);
+    setAttr(r.reportBtn, 'aria-expanded', 'true');
+    r.reportMenu.querySelector('[role="menuitem"]').focus();
+    document.addEventListener('pointerdown', this.onMenuAway, true);
+    document.addEventListener('keydown', this.onMenuAway, true);
+  }
+
+  closeReportMenu(refocus = false) {
+    const r = this.refs;
+    if (r.reportMenu.hidden) return;
+    setHidden(r.reportMenu, true);
+    setAttr(r.reportBtn, 'aria-expanded', 'false');
+    document.removeEventListener('pointerdown', this.onMenuAway, true);
+    document.removeEventListener('keydown', this.onMenuAway, true);
+    if (refocus) r.reportBtn.focus();
+  }
+
+  /** The load report to the clipboard: how a real site's failure gets back to be fixed. The deck page is an extension page. */
+  async copyReport() {
+    const d = this.d, l = d.load || {};
+    const text = l.report || ['JD Samps load report', `Deck ${d.slot}: ${d.title || ''}`, d.url, l.strategy && `Step: ${l.strategy}`, l.error && `Error: ${l.error}`].filter(Boolean).join('\n');
+    try {
+      await navigator.clipboard.writeText(text);
+      this.toast(`Deck ${d.slot}: load report copied.`, 'info');
+    } catch (_) {
+      this.toast('Could not copy the load report.', 'warn');
+    }
   }
 
   /** Tempo fader readout: the percentage, and the BPM it plays at once the deck has one. */
@@ -315,11 +390,12 @@ export class DeckStrip {
   bindOverview() {
     const c = this.refs.ov;
     const posAt = (ev) => {
-      const d = this.d, w = Math.max(1, cssSize(c).w);
-      return d.historyStart + clamp(ev.offsetX / w, 0, 1) * Math.max(0, d.liveEdge - d.historyStart);
+      const [lo, hi] = navSpan(this.d), w = Math.max(1, cssSize(c).w);
+      return lo + clamp(ev.offsetX / w, 0, 1) * Math.max(0, hi - lo);
     };
     c.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0 || !(this.d.liveEdge > this.d.historyStart)) return;
+      const [lo, hi] = navSpan(this.d);
+      if (e.button !== 0 || this.inert || !(hi > lo)) return;
       this.nav = { pos: posAt(e), at: performance.now(), dragging: true, sentAt: 0 };
       this.seekTo(posAt(e));
       this.drag(c, e, (ev) => this.seekTo(posAt(ev)), () => { if (this.nav) this.nav.dragging = false; this.flushSeek(); });
@@ -335,13 +411,13 @@ export class DeckStrip {
   bindWaveDrag() {
     const c = this.refs.wave;
     c.addEventListener('pointerdown', (e) => {
-      if (e.button !== 0) return;
+      if (e.button !== 0 || this.inert) return;
       const d = this.d;
       if (this.jogMode(d) === 'seek') {
         const x0 = e.clientX, p0 = this.shownPlayhead ?? d.playhead;
         const spp = d.grid ? d.grid.T / PX_PER_BEAT : 1 / PX_PER_SEC; // input s per CSS px, as drawn
         this.nav = { pos: p0, at: performance.now(), dragging: true, sentAt: 0 };
-        this.drag(c, e, (ev) => this.seekTo(clamp(p0 - (ev.clientX - x0) * spp, this.d.historyStart, this.d.liveEdge)),
+        this.drag(c, e, (ev) => this.seekTo(clamp(p0 - (ev.clientX - x0) * spp, ...navSpan(this.d))),
           () => { if (this.nav) this.nav.dragging = false; this.flushSeek(); });
         return;
       }
@@ -391,7 +467,7 @@ export class DeckStrip {
   /** From the tempo fader's local value, so key repeats never build on a stale snapshot. */
   nudgePitch(delta) {
     const r = this.d.params.range;
-    if (r) this.pitch.commit(this.pitch.value + delta / r);
+    if (r && !this.inert) this.pitch.commit(this.pitch.value + delta / r);
   }
 
   /**
@@ -401,6 +477,7 @@ export class DeckStrip {
    */
   update(d, s) {
     this.d = d;
+    this.inert = d.kind === 'loading';
     this.stale = true;
     // The hand's seek has had time to land (or was refused): the engine's playhead takes over again.
     if (this.nav && !this.nav.dragging && this.seekQ == null && performance.now() - this.nav.sentAt > NAV_SETTLE) this.nav = null;
@@ -412,12 +489,14 @@ export class DeckStrip {
     this.stale = false;
     const r = this.refs, p = d.params;
     setAttr(this.el, 'data-tstate', d.bpm.state);
-    const title = d.title || `Tab ${d.tabId}`;
+    const title = d.title || (d.tabId == null ? `Deck ${d.slot}` : `Tab ${d.tabId}`);
     setText(r.title, title);
     setAttr(r.title, 'title', d.title || ''); // the full title on hover, over the title only
     setAttr(this.el, 'aria-label', `Deck ${d.slot}: ${title}`);
     if (isSafeIconUrl(d.favIconUrl)) { if (r.fav.getAttribute('src') !== d.favIconUrl) r.fav.src = d.favIconUrl; setHidden(r.fav, false); }
     else setHidden(r.fav, true);
+
+    this.renderKind(d);
 
     const out = d.bpm.out;
     if (out == null) this.shownBpm = null;
@@ -488,6 +567,37 @@ export class DeckStrip {
     this.meter.update([d.meter]);
   }
 
+  /** What the deck is (header badge and load line) and what that changes: LIVE, the reserve or the time, inert controls. */
+  renderKind(d) {
+    const r = this.refs, kind = d.kind || 'live', load = d.load || {}, failed = kind === 'loading' && load.state === 'error';
+    const resident = kind === 'resident', [word, cls, tip] = KIND[failed ? 'failed' : kind] || KIND.live;
+    setAttr(this.el, 'data-kind', kind);
+    const loading = kind === 'loading' && !failed;
+    setText(r.kindWord, loading ? `${word} · ` : word);
+    setText(r.kindPct, loading ? `${Math.round((load.progress || 0) * 100)}%` : '');
+    setClass(r.kind, `badge kind ${cls}`);
+    setAttr(r.kind, 'title', tip);
+    const line = failed ? load.error || 'The track could not be loaded.' : kind === 'loading' ? load.strategy || 'starting' : '';
+    setHidden(r.loadRow, kind !== 'loading');
+    setText(r.loadLine, line);
+    setAttr(r.loadLine, 'title', line);
+    setHidden(r.report, !load.report || failed); // a failed deck shows the copy button itself
+    setHidden(r.recWhole, kind !== 'live');
+    if (r.report.hidden) this.closeReportMenu();
+    setHidden(r.copyNow, !failed);
+    setHidden(r.jump, failed);
+    setHidden(r.live, resident);
+    setHidden(r.reserve, resident || failed);
+    setHidden(r.time, !resident);
+    const b1 = resident && d.analysis && d.analysis.bar1;
+    setHidden(r.bar1, !(b1 && d.grid && d.grid.bar1 == null));
+    if (b1) setAttr(r.bar1, 'title', `The analysis suggests bar 1 at ${fmtTime(b1.t)}: click to mark it there`);
+    if (this.inert !== this.shownInert) {
+      this.shownInert = this.inert;
+      for (const el of this.inertEls) if (this.inert) el.setAttribute('aria-disabled', 'true'); else el.removeAttribute('aria-disabled');
+    }
+  }
+
   addWave(m) { this.store.add(m); }
 
   setSelected(on) { this.el.classList.toggle('selected', on); this.waveRow.classList.toggle('selected', on); }
@@ -516,9 +626,16 @@ export class DeckStrip {
     const oc = this.refs.ov, osz = cssSize(oc);
     const OW = Math.max(1, Math.round(osz.w * dpr)), OH = Math.max(1, Math.round(osz.h * dpr));
     if (oc.width !== OW || oc.height !== OH) { oc.width = OW; oc.height = OH; }
+    const [lo, hi] = navSpan(d);
     drawOverview(this.ovCtx, {
-      w: OW, h: OH, store: this.store, playhead, cue: d.cue, liveEdge: d.liveEdge, historyStart: d.historyStart, loop: d.loop, color: this.color, playing: d.playing,
+      w: OW, h: OH, store: this.store, playhead, cue: d.cue, liveEdge: hi, historyStart: lo, loop: d.loop, color: this.color, playing: d.playing,
     });
+    // A whole track: elapsed and remaining time (END once it has played out), at the playhead as drawn.
+    if (d.kind === 'resident' && d.duration > 0) {
+      const p = clamp(playhead, 0, d.duration), end = !d.playing && d.duration - p < 0.05;
+      setText(this.refs.time, `${fmtTime(p)} / ${end ? 'END' : `-${fmtTime(d.duration - p)}`}`);
+      setClass(this.refs.time, end ? 'time mono end' : 'time mono');
+    }
     // Beat LEDs: current beat of the bar (beat 1 white when TAP 1 set the downbeat).
     const b = beatIndex(d.grid, playhead);
     const ref = d.grid && d.grid.bar1 != null ? Math.round((d.grid.bar1 - d.grid.t0) / d.grid.T) : 0;
@@ -535,6 +652,7 @@ export class DeckStrip {
 
   destroy() {
     document.removeEventListener('visibilitychange', this.onVisible);
+    this.closeReportMenu();
     if (this.seekRaf) cancelAnimationFrame(this.seekRaf);
     if (this.jog) cancelAnimationFrame(this.jog.raf);
     forgetSize(this.refs.wave); forgetSize(this.refs.ov); forgetSize(this.meter.c);

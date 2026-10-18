@@ -283,4 +283,23 @@ test('cancelling while the beat is being found stops the load and leaves no deck
   await waitFor(async () => !(await decks()).some((x) => x.id === d.id));
 });
 
+test('an MP3 dropped on the deck page\'s board becomes a whole-track deck that shows TRACK and its elapsed and remaining time', async () => {
+  const had = new Set((await decks()).map((x) => x.id));
+  await deck.evaluate(async (u) => {
+    const dt = new DataTransfer();
+    dt.items.add(new File([await (await fetch(u)).blob()], 'dropped-kick.mp3', { type: 'audio/mpeg' }));
+    const board = document.querySelector('.board');
+    for (const type of ['dragenter', 'dragover', 'drop']) board.dispatchEvent(new DragEvent(type, { dataTransfer: dt, bubbles: true, cancelable: true }));
+  }, `${origin}/kick.mp3`);
+  const d = await deckWhere((x) => !had.has(x.id) && x.title === 'dropped-kick' && x.kind === 'resident', 20000);
+  assert.ok(Math.abs(d.duration - files.kick) < 0.1, `duration ${d.duration}, file ${files.kick}`);
+  const el = deck.locator('.deck', { has: deck.locator('[data-title]', { hasText: 'dropped-kick' }) });
+  await waitFor(async () => (await el.locator('[data-kind]').textContent()).trim() === 'TRACK');
+  await waitFor(async () => /^0:00 \/ -0:(19|20)$/.test(await el.locator('[data-time]').textContent()));
+  assert.equal(await el.locator('[data-act="live"]').isHidden(), true);
+  assert.equal(await el.locator('.reserve').isHidden(), true);
+  assert.equal((await act(deck, d.id, 'eject')).ok, true);
+  await waitFor(async () => !(await decks()).some((x) => x.id === d.id));
+});
+
 test('the deck page shows loading and resident decks without errors', () => { assert.deepEqual(pageErrors, []); });
