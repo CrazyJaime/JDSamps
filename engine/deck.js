@@ -78,6 +78,7 @@ export class Deck {
       inLag: Infinity,
     };
     this.agents = new Map();
+    this.pauseFought = false; // a frame's site kept pausing its player: warned once
     this.meter = { peak: 0, rms: 0, clipUntil: 0, clipFrame: Math.round(engine.ctx.currentTime * this.sr) }; // clips before this deck are not its own
     this.error = null;
     this.nextTrim = 0;
@@ -844,9 +845,22 @@ export class Deck {
       if (!m || this.disposed || this.agents.get(frameId) !== a) return;
       if (m.t === 'status') { a.status = m; this.onAgentStatus(a); }
       else if (m.t === 'external-rate' && a === this.assist.agent) this.refuseAssist();
+      else if (m.t === 'external-pause') this.notePauseFight();
     });
     port.onDisconnect.addListener(() => { void chrome.runtime.lastError; if (this.agents.get(frameId) === a) this.agents.delete(frameId); });
-    try { port.postMessage({ t: 'query' }); } catch (_) {}
+    // This deck is capturing the frame's tab: until it lets go, a pause the frame's own site asks
+    // for is dropped, so a site that allows one playing track at a time cannot stop the source.
+    try { port.postMessage({ t: 'query' }); port.postMessage({ t: 'isolate', on: true }); } catch (_) {}
+  }
+
+  /**
+   * A frame's site keeps pausing its player although the tab is on a deck, so its agent stopped
+   * resisting rather than fight it. Said once per deck: nothing more can be done from here.
+   */
+  notePauseFight() {
+    if (this.pauseFought) return;
+    this.pauseFought = true;
+    this.engine.event('warn', `Deck ${this.slot}: the site keeps pausing this tab — it may only allow one track at a time.`, this.id);
   }
 
   /** Assist rate commands go to the heard element's frame only. */
@@ -891,6 +905,7 @@ export class Deck {
     if (this.disposed) return;
     this.disposed = true;
     this.sendAgent({ t: 'release' });
+    this.sendAgent({ t: 'isolate', on: false });
     for (const a of this.agents.values()) { try { a.port.disconnect(); } catch (_) {} }
     this.agents.clear();
     if (this.recorder && this.recorder.state !== 'idle') {
