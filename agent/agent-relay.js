@@ -90,6 +90,10 @@
       if (Number.isInteger(m.count) && m.count >= 0 && m.count < 1000) { for (const f of stops) f(m.count); stops.clear(); }
       return;
     }
+    if (m && m.t === 'started') {
+      if (Number.isInteger(m.count) && m.count >= 0 && m.count < 1000 && WHY.includes(m.why)) { for (const f of starts) f(m); starts.clear(); }
+      return;
+    }
     if (!m || typeof m !== 'object' || (m.t !== 'status' && m.t !== 'external-rate')) return;
     if (m.t === 'status') last = e.detail;
     if (wanted && m.hasMedia) connect();
@@ -106,6 +110,17 @@
     const timer = setTimeout(() => done(0), STOP_WAIT);
     stops.add(done);
     toMain({ t: 'stop' });
+  });
+
+  // Load: resolves with {t:'started', count, why} (what agent-main.js did with the page's player),
+  // or why:'timeout' when it does not answer in time, so a load never waits on the page. play()
+  // has to begin playing before it resolves, so this waits longer than a stop.
+  const START_WAIT = 300, WHY = ['started', 'playing', 'none', 'ambiguous', 'refused'], starts = new Set();
+  globalThis.__jdsStart = () => new Promise((resolve) => {
+    const done = (m) => { clearTimeout(timer); starts.delete(done); resolve({ t: 'started', count: m ? m.count : 0, why: m ? m.why : 'timeout' }); };
+    const timer = setTimeout(() => done(null), START_WAIT);
+    starts.add(done);
+    toMain({ t: 'start' });
   });
 
   rt.onMessage.addListener((msg, sender, sendResponse) => {
