@@ -60,17 +60,21 @@ export const MASTER_PARAMS = Object.freeze({
   'buffer.capSec': oneOf([120, 240, 480], 240),
   'assist.on': bool(true),
   'pitch.defaultRange': oneOf(PITCH_RANGES, 0.1),
+  'resident.limitMin': num(1, 60, 15), // a resident deck holds at most this many minutes of a track
+  'resident.recordWhole': bool(false), // record a whole track at 2× when its bytes cannot be had
 });
 
 /** Master params saved to chrome.storage.local by the UI and restored on engine start. */
 export const PERSISTED_MASTER_KEYS = Object.freeze([
   'master.limiter', 'xfader.curve', 'rec.format', 'bpm.range', 'buffer.capSec', 'assist.on', 'pitch.defaultRange',
+  'resident.limitMin', 'resident.recordWhole',
 ]);
 
 export const DECK_ACTIONS = Object.freeze([
   'play', 'pause', 'cueDown', 'cueUp', 'syncPlay', 'sync', 'master', 'nudge', 'tap', 'mult', 'gridShift',
   'tap1', 'live', 'rollStart', 'rollEnd', 'recStart', 'recStop', 'eject', 'clipReset', 'playToggle',
   'setBpm', 'setNativeBpm',
+  'loadCancel', 'recordWhole',
   'seek', 'beatJump',
 ]);
 /** Beat-jump sizes the deck page offers (any whole number of beats up to MAX_JUMP_BEATS is accepted). */
@@ -78,7 +82,7 @@ export const JUMP_BEATS = Object.freeze([1, 4, 8, 16, 32]);
 export const MAX_JUMP_BEATS = 128;
 /** Largest jog bend (a nudge with an amount): ±10 % of the tempo. */
 export const MAX_BEND = 0.1;
-export const MASTER_ACTIONS = Object.freeze(['mixRecStart', 'mixRecStop', 'clipReset', 'stopAll']);
+export const MASTER_ACTIONS = Object.freeze(['mixRecStart', 'mixRecStop', 'clipReset', 'stopAll', 'loadFile', 'loadUrl']);
 
 /** Tempos the DJ may type (setBpm: the tempo to play at; setNativeBpm: the track's own tempo). */
 export const TYPED_BPM = Object.freeze([20, 400]);
@@ -118,6 +122,7 @@ export function validateValue(spec, value) {
 }
 
 const isDeckRef = (d) => d === null || Number.isInteger(d);
+const isHttpUrl = (u) => { try { return /^https?:$/.test(new URL(u).protocol); } catch (_) { return false; } };
 
 function validateActArg(a, arg) {
   const fail = (error) => ({ ok: false, error });
@@ -157,6 +162,14 @@ function validateActArg(a, arg) {
     case 'setBpm': case 'setNativeBpm':
       if (typeof arg.bpm !== 'number' || !(arg.bpm >= TYPED_BPM[0] && arg.bpm <= TYPED_BPM[1])) return fail(`${a}.bpm must be a number from ${TYPED_BPM[0]} to ${TYPED_BPM[1]}`);
       return { ok: true, arg: { bpm: arg.bpm } };
+    // A local file reaches the engine as a blob: URL the deck page made for it.
+    case 'loadFile':
+      if (typeof arg.name !== 'string' || !arg.name || arg.name.length > 300) return fail('loadFile.name must be a file name');
+      if (typeof arg.blobUrl !== 'string' || !arg.blobUrl.startsWith('blob:') || arg.blobUrl.length > 2048) return fail('loadFile.blobUrl must be a blob: URL');
+      return { ok: true, arg: { name: arg.name, blobUrl: arg.blobUrl } };
+    case 'loadUrl':
+      if (typeof arg.url !== 'string' || arg.url.length > 8192 || !isHttpUrl(arg.url)) return fail('That is not a web link (http or https).');
+      return { ok: true, arg: { url: arg.url } };
     default:
       return { ok: true, arg: {} };
   }

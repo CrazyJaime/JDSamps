@@ -6,7 +6,7 @@
   "description": "JD Samps \u2014 multi-tab DJ performance deck (Chrome MV3 extension). Made by godspee.",
   "scripts": {
     "test:unit": "node --test \"tests/unit/*.test.mjs\"",
-    "test:browser": "node --test --test-concurrency=1 tests/browser/offline.test.mjs tests/browser/lifecycle.test.mjs tests/browser/audio-path.test.mjs tests/browser/ui-controls.test.mjs tests/browser/ui-app.test.mjs tests/browser/ui-tempo.test.mjs tests/browser/ui-keys.test.mjs tests/browser/ui-perf.test.mjs tests/browser/ui-layout.test.mjs tests/browser/ui-nav.test.mjs tests/browser/agent.test.mjs tests/browser/isolate.test.mjs tests/browser/hub.test.mjs tests/browser/model-sites.test.mjs tests/browser/analysis-worker.test.mjs",
+    "test:browser": "node --test --test-concurrency=1 tests/browser/offline.test.mjs tests/browser/lifecycle.test.mjs tests/browser/audio-path.test.mjs tests/browser/ui-controls.test.mjs tests/browser/ui-app.test.mjs tests/browser/ui-tempo.test.mjs tests/browser/ui-keys.test.mjs tests/browser/ui-perf.test.mjs tests/browser/ui-layout.test.mjs tests/browser/ui-nav.test.mjs tests/browser/agent.test.mjs tests/browser/isolate.test.mjs tests/browser/hub.test.mjs tests/browser/model-sites.test.mjs tests/browser/analysis-worker.test.mjs tests/browser/resident-load.test.mjs tests/browser/assemble-decode.test.mjs",
     "test:e2e": "node --test --test-concurrency=1 tests/browser/e2e.test.mjs",
     "test": "npm run test:unit && npm run test:browser && npm run test:e2e"
   }

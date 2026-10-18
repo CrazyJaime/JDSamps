@@ -14,6 +14,7 @@ import { createFxRack } from './fx.js';
 import { Recorder } from './recorder.js';
 import { glide } from './params.js';
 import { syncRatio, lastBeatOut, phaseError, planCorrection, engineSemitones, assistStep, pickAutoMaster, MULT_MARGIN } from './sync.js';
+import { OdfCore } from '../worklets/odf-core.js';
 
 const OK = { ok: true };
 const fail = (error) => ({ ok: false, error });
@@ -31,6 +32,8 @@ const DRY_NOTICE_EVERY = 30; // s: at most one 'audio ran dry' notice per deck i
 // unconfirmed rate counts as refused, how long assist stays off after the page refused it, and the
 // keep-alive period (the agent lets go of the page after 3 s without a command).
 const ASSIST_EPS = 1e-4, ASSIST_CONFIRM = 2, ASSIST_REFUSE = 5, ASSIST_OFF = 30, ASSIST_KEEPALIVE = 1;
+const AUDIBLE = 0.003; // about -50 dBFS, as the input worklet's first audible sample
+const END_PLAN = 0.6; // s: a resident deck plans its stop at the end of the track this close to it
 // Search (nudge held on a paused deck): slow enough at first to place a cue, then doubling every
 // SEARCH_DOUBLE s up to SEARCH_MAX (input s per s). Fine (Shift) is five times slower.
 const SEARCH_V0 = 0.5, SEARCH_DOUBLE = 0.75, SEARCH_MAX = 16;
@@ -44,7 +47,7 @@ function searchDistance(h, fine) {
 }
 
 export class Deck {
-  constructor(engine, { id, slot, tabId, stream, meta, params }) {
+  constructor(engine, { id, slot, tabId, stream, meta, params, kind = 'live' }) {
     this.engine = engine;
     this.ctx = engine.ctx;
     this.sr = engine.ctx.sampleRate;
@@ -54,6 +57,11 @@ export class Deck {
     this.stream = stream;
     this.meta = { title: '', url: '', favIconUrl: '', ...meta };
     this.params = { ...params };
+    // 'live': a tab's capture. 'loading': a track on its way (inert but for eject). 'resident': the whole
+    // track, decoded, in the stretcher's buffer: no capture, so none of the live-window machinery runs.
+    this.kind = kind;
+    this.duration = null; // s: a resident deck's track
+    this.load = { state: kind === 'loading' ? 'loading' : 'ready', progress: kind === 'loading' ? 0 : 1, strategy: null, error: null, report: null };
     this.tempo = null;
     this.grids = new GridMap();
     this.src = new SourceMap();
@@ -109,7 +117,10 @@ export class Deck {
 
   now() { return this.ctx.currentTime; }
 
-  async init() {
+  init() { return this.initLive(); }
+
+  /** A live deck: the tab's capture feeds the stretcher through the input worklet. A loading deck has its chain already. */
+  async initLive() {
     const ctx = this.ctx, e = this.engine;
     this.source = ctx.createMediaStreamSource(this.stream);
     this.inputNode = new AudioWorkletNode(ctx, 'jds-deck-input', {
@@ -117,13 +128,25 @@ export class Deck {
       processorOptions: { pipeId: this.id },
     });
     this.inputNode.port.onmessage = (ev) => this.onInput(ev.data);
+    if (!this.ts) await this.build();
+    else if (this.ts.liveEdge > 0) await this.dropHeld();
+    // The input worklet hands its chunks to the stretcher on the audio thread, not through this (shared,
+    // sometimes busy) main thread. Registered before the capture is connected, so every chunk goes that way.
+    await withTimeout(this.stretch.attachInput(this.id), 4000, 'The time-stretcher did not take its input');
+    this.kind = 'live';
+    // Connect the capture last, so no chunk arrives before the Timeshift exists.
+    this.source.connect(this.inputNode);
+    this.inputNode.connect(e.silentSink);
+    for (const t of this.stream.getAudioTracks()) t.addEventListener('ended', () => e.eject(this.id, `Deck ${this.slot}: the tab stopped sharing audio.`));
+  }
+
+  /** The stretcher and everything after it (Timeshift, trim, EQ, FX, fader, recorder): every kind of deck has one. */
+  async build() {
+    const ctx = this.ctx, e = this.engine;
     this.stretch = await e.createStretch();
     // Timeshift models the playhead itself: the stretcher's 10/s 'time' updates would only wake the main thread.
     this.stretch.setUpdateInterval(NO_TIME_UPDATES);
     this.stretch.port.addEventListener('message', (ev) => { if (Array.isArray(ev.data) && ev.data[0] === 'dry') this.onDry(ev.data[1]); });
-    // The input worklet hands its chunks to the stretcher on the audio thread, not through this (shared,
-    // sometimes busy) main thread. Registered before the capture is connected, so every chunk goes that way.
-    await withTimeout(this.stretch.attachInput(this.id), 4000, 'The time-stretcher did not take its input');
     const lat = await withTimeout(this.stretch.latency(), 4000, 'The time-stretcher did not report its latency');
     this.ts = new Timeshift(this.stretch, { sampleRate: this.sr, latency: lat, outLatency: lat / 2, capSec: e.params['buffer.capSec'] });
     this.trimNode = createTrim(ctx);
@@ -139,14 +162,78 @@ export class Deck {
     e.master.meterIn(this.slot, this.fader);
     this.xfGain.connect(e.master.bus);
     this.recorder = new Recorder(ctx, this.rack.output, {
-      format: e.params['rec.format'], who: `D${this.slot}`, title: () => this.meta.title || `Tab ${this.tabId}`, sink: e.silentSink,
+      format: e.params['rec.format'], who: `D${this.slot}`, title: () => this.recTitle(), sink: e.silentSink,
       deliver: (blob, name) => e.deliver(blob, name), onChange: () => {}, onError: (msg) => e.event('error', msg, this.id),
     });
     for (const [k, v] of Object.entries(this.params)) this.applyParam(k, v);
-    // Connect the capture last, so no chunk arrives before the Timeshift exists.
-    this.source.connect(this.inputNode);
-    this.inputNode.connect(e.silentSink);
-    for (const t of this.stream.getAudioTracks()) t.addEventListener('ended', () => e.eject(this.id, `Deck ${this.slot}: the tab stopped sharing audio.`));
+  }
+
+  /** Recordings are named after the track, or after its tab while that has no title. */
+  recTitle() { return this.meta.title || (this.tabId == null ? `Deck ${this.slot}` : `Tab ${this.tabId}`); }
+
+  // ------------------------------------------------------------------ resident
+  /**
+   * A resident deck: the whole decoded track, pushed to the stretcher in one addBuffers call (copied, so
+   * the caller can still read it for analysis). No capture and no input worklet: the track runs from
+   * input 0 to its duration, where the deck stops.
+   */
+  async initResident({ L, R }) {
+    if (!this.ts) await this.build();
+    this.ts.hold(L, R);
+    this.noteFirstAudible(L, R, 0);
+    this.becomeResident();
+  }
+
+  /** Slow paths: more of the track, decoded, while the deck is loading. A loading deck does not tick, so nothing is trimmed. */
+  appendResident({ L, R }) {
+    if (this.kind !== 'loading') throw new Error('Only a loading deck takes more of its track.');
+    const at = this.ts.liveEdge;
+    this.ts.hold(L, R);
+    this.noteFirstAudible(L, R, at);
+  }
+
+  /** Slow paths: the whole track has arrived. */
+  finishResident({ duration } = {}) {
+    if (this.kind !== 'loading') throw new Error('Only a loading deck can finish loading.');
+    this.becomeResident(duration);
+  }
+
+  becomeResident(duration) {
+    const ts = this.ts;
+    if (duration > 0 && duration < ts.liveEdge) ts.liveEdge = duration;
+    this.kind = 'resident';
+    ts.whole = true;
+    this.duration = ts.liveEdge;
+    // The tempo starts unlocked, for TAP and the grid tools; whole-track analysis seeds it when there is one.
+    if (!this.tempo) {
+      const [lo, hi] = BPM_RANGES[this.engine.params['bpm.range']] || BPM_RANGES.AUTO;
+      this.tempo = new DeckTempo({ sampleRate: this.sr, fps: new OdfCore(this.sr, () => {}).fps, lo, hi });
+    }
+    this.setLoad({ state: 'ready', progress: 1, strategy: null, error: null });
+    if (this.cueAuto && !this.hasPlayed) this.setCue(this.firstAudible ?? 0);
+  }
+
+  noteFirstAudible(L, R, at) {
+    if (this.firstAudible != null) return;
+    for (let i = 0; i < L.length; i++) if (Math.abs(L[i]) > AUDIBLE || Math.abs(R[i]) > AUDIBLE) { this.firstAudible = at + i / this.sr; return; }
+  }
+
+  /** A loading deck going live after part of its track arrived: drop that, so the capture starts the input timeline at 0. */
+  async dropHeld() {
+    const old = this.ts;
+    await withTimeout(this.stretch.dropBuffers(), 1500, 'The time-stretcher did not let go of its buffer').catch(() => {});
+    this.ts = new Timeshift(this.stretch, { sampleRate: this.sr, latency: old.lat, outLatency: old.outLat, capSec: old.capSec });
+    this.firstAudible = null;
+    this.cue = 0;
+  }
+
+  /** What the snapshot says about a load. Fields not given are kept; progress is 0..1. */
+  setLoad({ state, progress, strategy, error, report } = {}) {
+    const l = this.load, keep = (v, old) => (v === undefined ? old : v);
+    this.load = {
+      state: keep(state, l.state), progress: clamp(Number(keep(progress, l.progress)) || 0, 0, 1),
+      strategy: keep(strategy, l.strategy), error: keep(error, l.error), report: keep(report, l.report),
+    };
   }
 
   // ------------------------------------------------------------------ input
@@ -178,7 +265,7 @@ export class Deck {
 
   /** The stretcher read past its buffered audio for `seconds` (its input came too late). Told at most every 30 s. */
   onDry(seconds) {
-    if (this.disposed || !(seconds > 0)) return;
+    if (this.disposed || !(seconds > 0) || this.kind === 'resident') return; // a whole track never waits for its input
     this.dropouts.runs++;
     this.dropouts.seconds += seconds;
     this.dryUnnoticed += seconds;
@@ -302,6 +389,8 @@ export class Deck {
   }
 
   startAt(T, p) {
+    // A resident deck stopped at the end of its track stays there until it is moved.
+    if (this.kind === 'resident' && p >= this.duration - 0.5 / this.sr) return;
     const input = this.ts.clampInput(p);
     this.ts.change(this.now(), T, { active: true, input, rate: this.effRate(input), semitones: this.semis(input) });
     this.wantPlay = true;
@@ -318,6 +407,9 @@ export class Deck {
   }
 
   async act(a, arg = {}) {
+    if (a === 'eject') { this.engine.eject(this.id); return OK; }
+    if (a === 'loadCancel') return this.engine.loadCancel(this.id);
+    if (this.kind === 'loading') return fail('The deck is still loading.');
     if (!this.ts) return fail('The deck is still starting.');
     const now = this.now(), T = this.ts.soon(now);
     switch (a) {
@@ -377,6 +469,7 @@ export class Deck {
         }
         return OK;
       case 'live': {
+        if (this.kind === 'resident') return fail('A whole-track deck has no live edge.');
         const target = this.ts.clampInput(this.ts.liveEdge - this.ts.lat - LIVE_RESERVE);
         if (this.wantPlay) this.sched(T, { input: target });
         else this.ts.change(now, T, { active: false, input: target });
@@ -426,7 +519,7 @@ export class Deck {
       case 'recStart':
         try { this.recorder.start(this.engine.params['rec.format']); return OK; } catch (err) { return fail(`Could not start recording: ${err.message}`); }
       case 'recStop': this.recorder.stop(); return OK;
-      case 'eject': this.engine.eject(this.id); return OK;
+      case 'recordWhole': return fail('Recording a whole track from the page is not available yet.');
       case 'clipReset': this.meter.clipUntil = 0; return OK;
       default: return fail(`Unknown action ${a}`);
     }
@@ -503,15 +596,21 @@ export class Deck {
    * playing one as soon as the stretcher lands it exactly (Timeshift.asap), or with the change
    * already on its way if that lands sooner, so a drag's stream of seeks (or a jog's of bends) is
    * heard every ~50 ms instead of each one pushing the last out until the hand stops. A planned
-   * start or pause keeps its time: change() folds the jump into it.
+   * start (playing) or pause (paused) keeps its time: change() folds the jump into it (navFields).
    */
   landAt(now) {
     const ts = this.ts;
     let T = now;
     if (this.wantPlay) { T = ts.asap(now); const pend = ts.pendingUntil(); if (pend > now) T = Math.min(T, pend); }
-    const planned = ts.planned(now);
+    const planned = ts.planned(now, this.wantPlay ? true : undefined);
     return planned ? Math.max(T, planned.output) : T;
   }
+
+  /**
+   * A jump's fields. A playing deck's says so, so that change() folds it into a planned start or an
+   * earlier jump but never into a planned stop (a whole track's stop at its end, replanned after it).
+   */
+  navFields(input) { return this.wantPlay ? { input, active: true } : { input }; }
 
   /** Input position the deck would be at at output time t: under a roll, where the track carries on (the slip). */
   slipAt(t) {
@@ -520,13 +619,14 @@ export class Deck {
   }
 
   /**
-   * Where navigation may put the playhead: what clampInput allows (the buffer less its margins), and
-   * a playing deck keeps LIVE's reserve at the live edge so that a jump there does not starve it.
+   * Where navigation may put the playhead: what clampInput allows (the buffer less its margins). A
+   * playing deck whose audio still arrives at the live edge keeps LIVE's reserve there, so a jump
+   * there does not starve it; a whole track (Timeshift.whole) can be played to its end.
    */
   navRange() {
     const ts = this.ts, lo = ts.clampInput(-Infinity);
     let hi = ts.clampInput(Infinity);
-    if (this.wantPlay) hi = Math.max(lo, Math.min(hi, ts.liveEdge - ts.lat - LIVE_RESERVE));
+    if (this.wantPlay && !ts.whole) hi = Math.max(lo, Math.min(hi, ts.liveEdge - ts.lat - LIVE_RESERVE));
     return { lo, hi };
   }
 
@@ -599,7 +699,7 @@ export class Deck {
     this.cueAuto = false; // the DJ has placed the playhead: the automatic cue no longer pulls it back
     this.navKeep = { p: target, T };
     if (this.rollFrom) { this.rollFrom = { ...this.rollFrom, p: target, T }; return OK; }
-    this.sched(T, { input: target });
+    this.sched(T, this.navFields(target));
     if (this.wantPlay) this.settleUntil = Math.max(this.settleUntil, T + 0.3);
     return OK;
   }
@@ -769,8 +869,8 @@ export class Deck {
 
   // ------------------------------------------------------------------ periodic
   tick(now) {
-    if (!this.ts || this.disposed) return;
-    const ts = this.ts;
+    if (!this.ts || this.disposed || this.kind === 'loading') return;
+    const ts = this.ts, live = this.kind !== 'resident'; // a resident deck has no capture to wait for, trim or speed up
     ts.flush(now);
     const p = ts.posAt(now);
     const res = ts.reserveAt(now);
@@ -780,7 +880,7 @@ export class Deck {
 
     if (this.wantPlay && !stale) {
       const desired = this.desiredRate(p);
-      if (!this.starved && desired > 1 && res < GUARD) {
+      if (live && !this.starved && desired > 1 && res < GUARD) {
         this.starved = true;
         this.applyRate();
         this.engine.event('warn', `Deck ${this.slot}: reserve empty, playing at the source's speed until it refills.`, this.id);
@@ -788,18 +888,19 @@ export class Deck {
         this.starved = false;
         this.applyRate();
       }
-      if (res < 0.15 && now > this.emergencyUntil) {
+      if (live && res < 0.15 && now > this.emergencyUntil) {
         this.emergencyUntil = now + 2;
         this.sched(ts.soon(now), { input: ts.clampInput(ts.posAt(ts.soon(now)) - 1) });
       }
       this.scheduleCrossing(now, p);
       this.reconcileRate(now);
+      if (!live) this.planEnd(now);
     } else if (!this.wantPlay && this.starved) {
       this.starved = false; // re-evaluated on the next PLAY
     }
     if (this.search && !this.wantPlay) this.searchTick(now);
 
-    if (now >= this.nextAssist) { this.nextAssist = now + 0.25; this.assistTick(now, res); }
+    if (live && now >= this.nextAssist) { this.nextAssist = now + 0.25; this.assistTick(now, res); }
     if (now >= this.nextFxClock) {
       this.nextFxClock = now + 0.5;
       const g = this.grids.at(p), rate = ts.rateAt(now);
@@ -808,7 +909,25 @@ export class Deck {
       if (out && Math.abs(out - this.lastFxBpm) > 0.05) this.applyFx();
     }
     this.rack.tick(now);
-    if (now >= this.nextTrim) { this.nextTrim = now + 2; this.trim(now, p); }
+    if (live && now >= this.nextTrim) { this.nextTrim = now + 2; this.trim(now, p); }
+  }
+
+  /**
+   * A resident deck stops at the end of its track (input = duration). The stop is planned once the end is
+   * near, after any change still pending; a later change drops it, and the next tick plans it again.
+   */
+  planEnd(now) {
+    const ts = this.ts, end = this.duration;
+    if (!ts.playingAt(now) && ts.posAt(now) >= end - 0.5 / this.sr) {
+      this.wantPlay = false; this.previewing = false; this.playingSince = Infinity;
+      return;
+    }
+    const last = ts.segs[ts.segs.length - 1];
+    if (!last.active || !(last.rate > 0) || last.loopEnd > last.loopStart) return; // stop planned already, or looping
+    const from = Math.max(last.output, now), tEnd = from + (end - ts.posAt(from)) / last.rate;
+    if (tEnd - now > END_PLAN) return;
+    if (last.output > now) ts.then(now, Math.max(tEnd, last.output + 1e-6), { active: false, input: end });
+    else ts.change(now, Math.max(tEnd, ts.soon(now)), { active: false, input: end });
   }
 
   /**
@@ -1121,6 +1240,7 @@ export class Deck {
     const playingNow = !!ts && ts.playingAt(now);
     return {
       id: this.id, slot: this.slot, tabId: this.tabId, title: this.meta.title, favIconUrl: this.meta.favIconUrl, url: this.meta.url,
+      kind: this.kind, duration: this.duration, load: { ...this.load },
       playing: this.wantPlay, previewing: this.previewing, cue: this.cue, playhead: p,
       engineRate: playingNow ? ts.rateAt(now) : 0, liveEdge: ts ? ts.liveEdge : 0, reserve: ts ? ts.reserveAt(now) : 0,
       starved: this.starved, historyStart: ts ? ts.historyStart : 0,
@@ -1150,7 +1270,7 @@ export class Deck {
       while (this.recorder.state !== 'idle' && Date.now() - t0 < 8000) await new Promise((r) => setTimeout(r, 50));
     }
     if (this.recorder) this.recorder.teardown(); // no-op when idle; a stuck finalize must not leave its processor running
-    for (const t of this.stream.getTracks()) t.stop();
+    if (this.stream) for (const t of this.stream.getTracks()) t.stop(); // a resident deck has no capture
     // Chrome keeps calling process() on a disconnected AudioWorkletNode for as long as it returns true,
     // so every processor is told to stop. The stretcher first goes silent and lets go of its buffer.
     try { this.inputNode && this.inputNode.port.postMessage({ t: 'dispose' }); } catch (_) {}

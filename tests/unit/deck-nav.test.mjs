@@ -20,7 +20,8 @@ function rig({ liveEdge = 120, historyStart = 0, pitch = 0, cue = historyStart +
   const d = makeDeck(engine, clock, { id: 1, slot: 1, liveEdge, bpm: BPM, pitch, capSec: 1e7 });
   d.ts.historyStart = historyStart;
   d.setCue(cue);
-  const go = (s) => run(engine, clock, s);
+  // A whole track does not grow: tick it without the harness's growing live edge.
+  const go = (s) => { const end = clock.t + s; while (clock.t < end - 1e-9) { clock.t += 1536 / 48000; d.tick(clock.t); } };
   go(0.2);
   return { clock, engine, d, go };
 }
@@ -292,6 +293,42 @@ test('a drag (a seek every 32 ms) is heard while it lasts, not only after the ha
   go(0.2);
   const lastTarget = target - 0.05;
   assert.ok(Math.abs(d.node.posAt(clock.t) - lastTarget) < 0.3, `ends at the last target: ${d.node.posAt(clock.t)} vs ${lastTarget}`);
+});
+
+// ---------------------------------------------------------------- whole-track (resident) decks
+const tone = (sec) => { const n = Math.round(sec * 48000), L = new Float32Array(n); for (let i = 0; i < n; i++) L[i] = 0.3 * Math.sin(i / 7); return { L, R: L.slice(), sampleRate: 48000 }; };
+async function residentRig(sec) {
+  const clock = { t: 100 };
+  const engine = makeEngine(clock);
+  const d = await makeDeck(engine, clock, { id: 1, slot: 1, resident: tone(sec) });
+  // A whole track does not grow: tick it without the harness's growing live edge.
+  const go = (s) => { const end = clock.t + s; while (clock.t < end - 1e-9) { clock.t += 1536 / 48000; d.tick(clock.t); } };
+  go(0.2);
+  return { clock, engine, d, go };
+}
+
+test('the same seek reaches the whole track on a resident deck: its last 0.1 s, paused or playing', async () => {
+  const { clock, d, go } = await residentRig(30);
+  assert.deepEqual(await d.act('seek', { pos: 29.9 }), { ok: true });
+  assert.ok(near(d.node.posAt(clock.t + 0.001), 29.9, 1e-9), `paused at ${d.node.posAt(clock.t + 0.001)}`);
+  await d.act('seek', { pos: 5 });
+  await d.act('play');
+  go(1);
+  assert.deepEqual(await d.act('seek', { pos: 29.5 }), { ok: true });
+  assert.equal(last(d.node).input, 29.5, 'no live edge to keep a reserve from');
+});
+
+test('a seek back on a resident deck about to stop at its end keeps it playing from the target', async () => {
+  const { clock, d, go } = await residentRig(20);
+  await d.act('seek', { pos: 19 });
+  await d.act('play');
+  go(0.8); // within END_PLAN of the end: the stop is planned
+  assert.ok(d.ts.segs.some((s) => s.output > clock.t && s.active === false), 'the end stop is planned');
+  assert.deepEqual(await d.act('seek', { pos: 5 }), { ok: true });
+  go(0.5);
+  assert.equal(d.node.segAt(clock.t).active, true, 'still playing');
+  assert.equal(d.wantPlay, true);
+  assert.ok(d.node.posAt(clock.t) > 5 && d.node.posAt(clock.t) < 5.6, `plays from 5: ${d.node.posAt(clock.t)}`);
 });
 
 // ---------------------------------------------------------------- search (paused nudge)

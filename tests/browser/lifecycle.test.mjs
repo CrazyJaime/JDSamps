@@ -34,6 +34,20 @@ test('ejected decks leave no stretcher, input, beatfx or recorder processor runn
   assert.deepEqual(r.errors, []);
 });
 
+test('ejected resident decks leave no processor running, never start an input worklet, and record under the track name', async () => {
+  const r = await run('residentEjectCycles', { n: 3 });
+  for (const [i, live] of r.live.entries()) {
+    for (const p of ['signalsmith-stretch', 'jds-beatfx', 'jds-recorder']) assert.ok(live[p] > 20, `cycle ${i + 1}: ${p} ran ${live[p]} quanta in 300 ms while loaded`);
+    assert.equal(live['jds-deck-input'] || 0, 0, `cycle ${i + 1}: an input worklet ran for a resident deck`);
+  }
+  for (const p of PROCS) assert.equal(r.after[p] || 0, 0, `${p}: ${r.after[p]} process() calls in the second after 3 ejects`);
+  assert.equal(r.names.length, 3, 'every recording was saved');
+  assert.match(r.names[0], /-Resident 1-/);
+  assert.match(r.names[1], /-Deck 1-/);
+  for (const n of r.names) assert.doesNotMatch(n, /null/i);
+  assert.deepEqual(r.errors, []);
+});
+
 test('stopping a recording ends its recorder processor while the deck stays loaded', async () => {
   const r = await run('recStop');
   assert.equal(r.state, 'idle');
