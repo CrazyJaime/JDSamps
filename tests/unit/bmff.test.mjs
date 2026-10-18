@@ -57,7 +57,10 @@ test('readInit gives the track, decode rate, channels, codec delay (in media tic
   assert.equal(readInit(read('hi/init.mp4')).key, a.key, 'two bitrates of one stream share a codec key');
   assert.notEqual(readInit(initSeg({ channels: 1 })).key, readInit(initSeg({ channels: 2 })).key);
   assert.equal(readInit(box('free')), null);
+  const video = initSeg(); video.set([...'vide'].map((c) => c.charCodeAt(0)), findSoun(video));
+  assert.equal(readInit(video), null, 'a SourceBuffer with no audio track is not audio');
 });
+function findSoun(u) { for (let i = 0; i + 4 <= u.length; i++) if (String.fromCharCode(...u.subarray(i, i + 4)) === 'soun') return i; return -1; }
 
 test('mp4Items splits a stream into inits and complete fragments with their media times', () => {
   const init = initSeg();

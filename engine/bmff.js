@@ -56,7 +56,7 @@ export function readInit(buf) {
   if (!moov) return null;
   const traks = kids(b, moov).filter((x) => x.type === 'trak');
   const handler = (t) => { const h = dig(b, t, ['mdia', 'hdlr']); return h ? fourcc(b, body(h) + 8) : ''; };
-  const trak = traks.find((t) => handler(t) === 'soun') || traks[0];
+  const trak = traks.find((t) => handler(t) === 'soun');
   if (!trak) return null;
   const tkhd = kid(b, trak, 'tkhd'), mdhd = dig(b, trak, ['mdia', 'mdhd']);
   if (!tkhd || !mdhd) return null;
