@@ -238,11 +238,12 @@ export class Deck {
    * by default): the grid the DJ is hearing, not the tracker's verdict on audio arriving at the
    * live edge, which may be a quiet passage or a new track they have not reached yet.
    */
-  canBeat(p = this.ts ? this.heardPos() : 0) {
+  canBeat(p) {
     if (!this.tempo) return false;
-    const seg = this.grids.seg(p);
+    const at = p === undefined ? this.heardPos() : p;
+    const seg = this.grids.seg(at);
     if (!seg) return !!this.tempo.get().canBeat; // no grid map yet: the live grid is all there is
-    return !!seg.grid && this.tempo.canBeatAt(Math.round(p * this.sr));
+    return !!seg.grid && this.tempo.canBeatAt(Math.round(at * this.sr));
   }
 
   desiredRate(p) { return ((1 + this.params.pitch) / this.src.rateAt(p)) * this.nudgeFactor; }
