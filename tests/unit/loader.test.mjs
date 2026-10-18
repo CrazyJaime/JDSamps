@@ -132,6 +132,15 @@ test('when the player had loaded the start before the tap and nothing can be fet
   assert.ok(tab.kinds().includes('drive stop'), 'the drive is always stopped');
 });
 
+test('a player that has let go of the start it buffered before the tap is run once more from that gap, and the track loads', async () => {
+  const { result, engine, tab, deck } = await load({ kind: 'mse', rendition: hi(), preTap: 6, playing: 1, evicts: true });
+  assert.equal(result.kind, 'resident', JSON.stringify(called(engine, 'failLoadingToLive')));
+  assert.ok(near(called(engine, 'startResidentDeck')[0].frames / SR, 120, 0.02));
+  assert.deepEqual(tab.sent().filter((m) => m.t === 'drive' && m.mode !== 'stop').map((m) => [m.mode, m.from]), [['seekhop', undefined], ['accelerate', 0]]);
+  assert.equal(tab.kinds().filter((k) => k === 'drive stop').length, 1);
+  assert.match(deck.load.report, /drive \(seek-hop, then accelerate 8× from 0\.0 s\): ok/);
+});
+
 // ---------------------------------------------------------------- straight to live
 for (const [reason, re] of [['drm', /protected/], ['worker', /worker/], ['preview', /SoundCloud only gives a 30-second preview of this track\./]]) {
   test(`${reason}: live at once, with its one message, and no slow rung tried`, async () => {
@@ -255,7 +264,7 @@ test('a load that ends live leaves a report naming the rung that failed first, a
   const r = deck.load.report;
   assert.match(r, /Result: live: the whole track could not be read/);
   assert.match(r, /refetch \(fetching the track's pieces\): skipped in \d+\.\d s — the player fetched nothing that can be fetched again/);
-  assert.match(r, /drive \(seek-hop\): failed in \d+\.\d s — the player buffered the whole track, but 0\.0–24\.0 s came before the deck could read it/);
+  assert.match(r, /drive \(seek-hop, then accelerate 8× from 0\.0 s\): failed in \d+\.\d s — the player buffered the whole track, but 0\.0–24\.0 s came before the deck could read it/);
   assert.match(r, /gaps: 0\.0–24\.0 s/);
   assert.match(r, /First failure: drive: the player buffered the whole track/);
 });

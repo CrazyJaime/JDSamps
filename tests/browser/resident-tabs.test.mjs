@@ -279,6 +279,17 @@ test('a YouTube-like page with single-use links ends resident by driving its pla
   await assertReleased(d, site);
 });
 
+test('a YouTube-like page already playing when it is loaded plays live, naming the start its player buffered before the deck could read it', async () => {
+  // The usual flow. Its player keeps that start and never fetches it again, even when run once more from there (a
+  // player that has let go of it fetches it, and the track loads): live, until a player can be made to append it again.
+  const site = await openSite('opaque');
+  await playing(site.tab);
+  const d = await loadTab(site.tabId);
+  const gap = /the player buffered the whole track, but 0\.0–\d+\.\d s came before the deck could read it/;
+  assert.match(d.load.report, new RegExp(`drive \\(seek-hop, then accelerate 8× from 0\\.0 s\\): failed in \\d+\\.\\d s — ${gap.source}`));
+  await assertLive(d, site, gap);
+});
+
 test('a Bandcamp-like page ends resident from its own track link', async () => {
   const site = await openSite('bandcamp');
   await playing(site.tab);

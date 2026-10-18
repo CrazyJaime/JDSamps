@@ -598,11 +598,12 @@ export class Loader extends Job {
     const T = this.target();
     if (T == null) return { outcome: 'skipped', why: NO_LENGTH };
     const stampless = !!(f.prog && f.prog.mimes.length && f.prog.mimes.every((m) => NO_STAMPS.test(m)));
-    let mode = null, placed = null, out = null;
-    const go = (m) => {
+    let mode = null, placed = null, out = null, pass = null;
+    const go = (m, from) => {
       mode = m;
-      this.send(f, m === 'seekhop' ? { t: 'drive', mode: m } : { t: 'drive', mode: m, rate: DRIVE_RATE });
-      e.how = e.how ? `${e.how}, then ${m === 'seekhop' ? 'seek-hop' : `accelerate ${DRIVE_RATE}×`}` : m === 'seekhop' ? 'seek-hop' : `accelerate ${DRIVE_RATE}×`;
+      this.send(f, m === 'seekhop' ? { t: 'drive', mode: m } : { t: 'drive', mode: m, rate: DRIVE_RATE, ...(from != null ? { from } : {}) });
+      const how = m === 'seekhop' ? 'seek-hop' : `accelerate ${DRIVE_RATE}×${from != null ? ` from ${from.toFixed(1)} s` : ''}`;
+      e.how = e.how ? `${e.how}, then ${how}` : how;
       this.say(this.progress, m === 'seekhop' ? SAY.hop : SAY.fast(DRIVE_RATE));
     };
     const band = this.band(), end = now() + this.t.drive + T * this.t.drivePerSec;
@@ -614,7 +615,7 @@ export class Loader extends Job {
         await this.until(() => f.prog !== seen || f.left, this.t.check);
         this.check();
         if (f.bytes !== bytes) { bytes = f.bytes; fresh = now(); }
-        const d = f.prog && f.prog.drive, st = d && d.mode === mode ? d.state : 'running';
+        const d = f.prog && f.prog.drive, st = d && d.mode === mode && !(pass && f.prog === pass.prog) ? d.state : 'running';
         if (st === 'done' || now() - checked >= this.t.check) {
           checked = now();
           placed = await this.complete();
@@ -626,11 +627,15 @@ export class Loader extends Job {
           this.check();
           placed = await this.complete();
           if (placed) break;
-          out = { outcome: 'failed', why: `the player buffered the whole track, but ${this.gapsNow().map(span).join(', ')} came before the deck could read it` };
+          const why = `the player buffered the whole track, but ${this.gapsNow().map(span).join(', ')} came before the deck could read it`;
+          // A player keeps only so much behind its playhead: what it held from before the tap may be gone from it by
+          // now, and run once more from the first gap it fetches that again (never for appends placed in order only).
+          if (!pass && !stampless) { pass = { why, prog: f.prog }; go('accelerate', this.gapsNow()[0][0]); fresh = now(); continue; }
+          out = { outcome: 'failed', why: pass ? pass.why : why };
           break;
         }
         if (mode === 'seekhop' && (st === 'refused' || now() - fresh > this.t.stall)) { go('accelerate'); fresh = now(); continue; }
-        if (mode === 'accelerate' && st === 'refused') { out = { outcome: 'failed', why: 'the page will not let its player run faster' }; break; }
+        if (mode === 'accelerate' && st === 'refused') { out = { outcome: 'failed', why: pass ? pass.why : 'the page will not let its player run faster' }; break; }
         if (now() > end) { out = { outcome: 'failed', why: `the player had not given the whole track after ${secs(now() - end + this.t.drive + T * this.t.drivePerSec)} (missing ${this.gapsNow().map(span).join(', ')})` }; break; }
       }
     } finally {

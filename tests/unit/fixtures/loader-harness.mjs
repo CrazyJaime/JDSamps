@@ -59,7 +59,8 @@ export const code = (s) => Math.fround([...String(s)].reduce((n, c) => (n * 31 +
  *   appends (MSE parts as {bytes} the player appends on a drive, in order, for a stream with no timestamps),
  *   status (the frame agent's status, over a heard playing player's), framePages ([{...}]: frame i's page, over this one),
  *   other ({rendition, sb, n}: another player's SourceBuffer in the frame, appending its init and first n segments at tap on),
- *   sbs (the SourceBuffers the tap says feed the heard player: default [0] for 'mse', [] for 'progressive'; null: not said)
+ *   sbs (the SourceBuffers the tap says feed the heard player: default [0] for 'mse', [] for 'progressive'; null: not said),
+ *   evicts (the player lets go of what it held from before the tap while it is driven: a later drive appends that again)
  * }
  */
 export function makeTab({ tabId = 7, url = 'https://site.example/track', frames = 1, ...page } = {}) {
@@ -93,6 +94,7 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
       if (pg.appends) {
         emit({ t: 'tap-ready', parts: pg.appends.map((p) => ({ blobUrl: mint(p.bytes), mime: p.mime, kind: 'media', sb: 0, seq: fr.seq++ })), duration: fr.duration });
       } else append(r.segs.map((_, k) => k));
+      if (pg.evicts) for (let k = 0; k < (pg.preTap || 0); k++) fr.appended.delete(k);
       setTimeout(() => progress({ drive: { mode, state: 'done', at: fr.duration } }), 5);
     };
     const onCommand = (m) => {
