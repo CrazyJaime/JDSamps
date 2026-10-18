@@ -453,7 +453,7 @@ class Engine {
     pcm = null;
     const res = await this.serial(() => this.startResidentDeck({ deckId: deck.id, pcm: lim.pcm }));
     if (!res.ok) return refuse(res.error);
-    if (lim.notice) this.event('warn', `Deck ${deck.slot}: ${lim.notice}`, deck.id);
+    if (lim.notice) this.notify('warn', `Deck ${deck.slot}: ${lim.notice}`); // waits for a deck page, if none is open
     return res;
   }
 
