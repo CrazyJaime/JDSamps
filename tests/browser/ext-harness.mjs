@@ -548,10 +548,11 @@ function bandFilter(x, sr, band) {
   return y;
 }
 
+/** RMS in one band, from 10 ms in: a recording starts wherever the music is, and the filter would hear that start as a click. */
 export function bandRms(mono, sr, band) {
-  const y = bandFilter(mono, sr, band);
-  let s = 0; for (let i = 0; i < y.length; i++) s += y[i] * y[i];
-  return Math.sqrt(s / Math.max(1, y.length));
+  const y = bandFilter(mono, sr, band), from = Math.min(y.length, Math.round(0.01 * sr));
+  let s = 0; for (let i = from; i < y.length; i++) s += y[i] * y[i];
+  return Math.sqrt(s / Math.max(1, y.length - from));
 }
 
 /** Onset times (s) in one band: 2 ms envelope, rising through 35% of max, 150 ms refractory. */
