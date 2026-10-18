@@ -77,6 +77,8 @@ test('validateAgentMessage rejects hostile payloads', () => {
   ]) assert.equal(validateAgentMessage(bad), null, JSON.stringify(bad));
   assert.deepEqual(validateAgentMessage({ t: 'status', hasMedia: true, playing: true, rate: 1, count: 1e9 }).count, 0);
   assert.deepEqual(validateAgentMessage({ t: 'external-rate', rate: 1.25 }), { t: 'external-rate', rate: 1.25 });
+  // The guard gave up on a site that keeps pausing: it carries nothing a page could use.
+  assert.deepEqual(validateAgentMessage({ t: 'external-pause', evil: 1 }), { t: 'external-pause' });
 });
 
 test('validateAgentMessage passes on an agent that let go by itself, only with a sane release time', () => {
