@@ -610,6 +610,20 @@ export function bandRms(mono, sr, band) {
   return Math.sqrt(s / Math.max(1, y.length - from));
 }
 
+/**
+ * RMS in one band, from 10 ms in, of the median beat: the take cut into windows of one beat period T (s), each holding
+ * the same energy of any sound that repeats every beat. A sound in every beat (a deck's music, or a leak of it) moves
+ * them all; a click in one or two (the box's capture dropping a few ms of a kick) moves only those, and not the median.
+ */
+export function beatBandRms(mono, sr, band, T) {
+  const y = bandFilter(mono, sr, band), from = Math.round(0.01 * sr), W = Math.round(T * sr), ms = [];
+  for (let i = from; i + W <= y.length; i += W) { let s = 0; for (let j = i; j < i + W; j++) s += y[j] * y[j]; ms.push(s / W); }
+  if (!ms.length) return bandRms(mono, sr, band);
+  ms.sort((a, b) => a - b);
+  const k = ms.length >> 1;
+  return Math.sqrt(ms.length & 1 ? ms[k] : (ms[k - 1] + ms[k]) / 2);
+}
+
 /** Onset times (s) in one band: 2 ms envelope, rising through 35% of max, 150 ms refractory. */
 export function bandOnsets(mono, sr, band) {
   const y = bandFilter(mono, sr, band);
