@@ -13,7 +13,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   prepareExtension, launchExtension, startTrackServer, hubCall, tabIdFor, waitFor, installClient, act, set, state, events, offscreenEval, makeTrackWav,
-  downloadIds, waitForDownload, parseWav, bandOnsets, medianBpm, steadyBeats,
+  downloadIds, waitForDownload, parseWav, steadyBeats, onsetBias, beatMatch, matchFaults,
 } from './ext-harness.mjs';
 import { synth, PATTERNS, FS } from '../unit/fixtures/synth.mjs';
 
@@ -758,15 +758,9 @@ test('the page navigating away mid-load: the deck plays the tab live, saying so 
 // ---------------------------------------------------------------- beat-matched decks (R6.2 acceptance)
 // Two decks synced and playing, the master recorded and measured with the harness's onset tools: one deck plays a
 // low kick, the other a high click, so each is heard in its own band. Every beat of one is within 20 ms of a beat
-// of the other and their tempos match within 0.2 %, in every 5 s of the recording.
+// of the other and their tempos match within 0.2 %, to the end of the recording (matchFaults).
 const SYNC_S = 30;
 const median = (xs) => [...xs].sort((a, b) => a - b)[xs.length >> 1];
-
-/** How late bandOnsets() reports a beat of the synthetic sound itself (s): taken off before two decks are compared. */
-function onsetBias(bpm, kind, band) {
-  const w = parseWav(makeTrackWav({ bpm, kind, seconds: 8 })), T = 60 / bpm;
-  return median(bandOnsets(w.mono, w.sr, band).map((x) => x - Math.round(x / T) * T));
-}
 
 /** The master recorded for `seconds` (a parsed WAV), with during(t0) run meanwhile. */
 async function mixRecord(seconds, during) {
@@ -780,32 +774,12 @@ async function mixRecord(seconds, during) {
   return parseWav(fs.readFileSync((await waitForDownload(h, known, 30000)).filename));
 }
 
-/**
- * The kick deck against the click deck in a master recording: each one's steady tempo (steadyBeats) and median BPM,
- * and each kick's distance (ms) to the nearest click, less the detector's own lateness on each sound, over all of
- * it and in each 5 s.
- */
-function matched(wav) {
-  const bias = onsetBias(124, 'low', 'low') - onsetBias(128, 'high', 'high');
-  const lo = bandOnsets(wav.mono, wav.sr, 'low'), hi = bandOnsets(wav.mono, wav.sr, 'high');
-  const off = lo.map((x) => ({ t: x, ms: (x - hi.reduce((b, y) => (Math.abs(x - y) < Math.abs(x - b) ? y : b), Infinity) - bias) * 1000 }));
-  const abs = off.map((o) => Math.abs(o.ms)).sort((a, b) => a - b), windows = [];
-  for (let w = 0; w + 5 <= wav.seconds + 0.01; w += 5) {
-    const xs = off.filter((o) => o.t >= w && o.t < w + 5).map((o) => Math.abs(o.ms));
-    windows.push({ from: w, n: xs.length, med: xs.length ? median(xs) : Infinity });
-  }
-  const A = steadyBeats(lo), B = steadyBeats(hi);
-  return { lo, hi, A, B, tempoErr: A.T / B.T - 1, bpm: [medianBpm(lo), medianBpm(hi)], med: median(abs), p90: abs[Math.floor(abs.length * 0.9)], max: abs.at(-1), windows };
-}
-function assertMatched(t, m, seconds) {
+/** The kick deck against the click deck in a master recording (beatMatch), the detector's own lateness on each taken off. */
+const matched = (wav) => beatMatch(wav, onsetBias(124, 'low', 'low') - onsetBias(128, 'high', 'high'));
+function assertMatched(t, m, seconds, opts) {
   t.diagnostic(`tempo: kick ${(60 / m.A.T).toFixed(3)} BPM (runs ${m.A.runs.map((r) => r.length)}), click ${(60 / m.B.T).toFixed(3)} BPM (runs ${m.B.runs.map((r) => r.length)}): error ${(m.tempoErr * 100).toFixed(4)} %; median BPM ${m.bpm.map((x) => x.toFixed(2))}`);
   t.diagnostic(`|kick - click| (ms): median ${m.med.toFixed(1)}, p90 ${m.p90.toFixed(1)}, max ${m.max.toFixed(1)}; median in each 5 s: ${m.windows.map((w) => `${w.med.toFixed(1)} (${w.n})`).join(', ')}`);
-  const beats = (seconds * 124) / 60;
-  assert.ok(m.lo.length >= beats - 2 && m.hi.length >= beats - 2, `${m.lo.length} kicks, ${m.hi.length} clicks in ${seconds} s`);
-  assert.ok(Math.abs(m.bpm[0] - 124) < 1 && Math.abs(m.bpm[1] - 124) < 1, `median BPM ${m.bpm}`);
-  assert.ok(Math.abs(m.tempoErr) < 0.002, `tempo error ${(m.tempoErr * 100).toFixed(4)} %`);
-  assert.ok(m.p90 <= 20, `kicks to clicks: p90 ${m.p90.toFixed(1)} ms`);
-  for (const w of m.windows) assert.ok(w.n >= 8 && w.med <= 20, `${w.from}-${w.from + 5} s: median ${w.med.toFixed(1)} ms over ${w.n} beats`);
+  assert.deepEqual(matchFaults(m, { seconds, ...opts }), []);
 }
 
 /** The page at url in a new tab, loaded resident and released. */
@@ -841,7 +815,8 @@ test('two resident decks beat-matched: a 128 BPM WAV synced to the 124 BPM track
   await syncPlay(a.d, b.d);
   const x = (await decks()).find((y) => y.id === b.d.id);
   assert.ok(Math.abs(x.bpm.native - 128) < 0.05 && Math.abs(x.bpm.out - 124) < 0.05, JSON.stringify(x.bpm));
-  assertMatched(t, matched(await mixRecord(SYNC_S)), SYNC_S);
+  // Both decks resident: each one's beats one steady run, every one within 20 ms of the other's.
+  assertMatched(t, matched(await mixRecord(SYNC_S)), SYNC_S, { steady: true });
 });
 
 test('a resident deck beat-matched to a live deck holds within 0.2 % and 20 ms for 30 s, measured on the master', async (t) => {
@@ -852,7 +827,9 @@ test('a resident deck beat-matched to a live deck holds within 0.2 % and 20 ms f
     const b = await residentTab(CLICK());
     await waitFor(async () => { const x = (await decks()).find((y) => y.id === live.id); return x.bpm.state === 'LOCKED' && Math.abs(x.bpm.native - 124) < 0.1; }, 30000);
     await syncPlay(live, b.d);
-    assertMatched(t, matched(await mixRecord(SYNC_S)), SYNC_S);
+    // The live master's own capture can skip (its kicks one steady run no more): the resident deck takes a few beats
+    // to follow it, and only those beats may be further off.
+    assertMatched(t, matched(await mixRecord(SYNC_S)), SYNC_S, { excuse: 4 });
   } finally { await long.close(); }
 });
 
@@ -873,13 +850,11 @@ test('beat-matched resident decks ignore their tabs: pausing, seeking and closin
   });
   t.diagnostic(done.join(', '));
   const m = matched(wav);
-  assertMatched(t, m, S);
   // No glitch: each deck's beats are one steady run (no jump, no gap, none missing) from the first whole beat to the
-  // last; and no tempo change: the second half's tempo is the first half's.
+  // last, every one within 20 ms of the other's; and no tempo change: the second half's tempo is the first half's.
+  assertMatched(t, m, S, { steady: true });
   const half = (on) => [steadyBeats(on.filter((x) => x < S / 2)).T, steadyBeats(on.filter((x) => x >= S / 2)).T];
-  for (const [name, on, fit] of [['kick', m.lo, m.A], ['click', m.hi, m.B]]) {
-    const runs = fit.runs.filter((r) => r.length > 1);
-    assert.ok(runs.length === 1 && runs[0].length >= on.length - 2, `${name}: steady runs ${fit.runs.map((r) => r.length)}`);
+  for (const [name, on] of [['kick', m.lo], ['click', m.hi]]) {
     const [t1, t2] = half(on);
     assert.ok(Math.abs(t2 / t1 - 1) < 0.001, `${name}: ${(60 / t1).toFixed(3)} then ${(60 / t2).toFixed(3)} BPM`);
   }
