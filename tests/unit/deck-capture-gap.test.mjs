@@ -100,6 +100,23 @@ test('the master BEAT followers lock to jumps a gap in its own capture, so neith
   assert.ok(pair < 1, `follower and master ${pair.toFixed(1)} ms apart across the gap`);
 });
 
+test('a master jumping back over a drop in its capture publishes its clock unmoved while it plays the audio before the gap again', async () => {
+  // A drop brings the beats after the gap early, so the master jumps back by the step and plays that much of the audio
+  // before the gap a second time. Its clock was published from the grid before the gap there, its beat that much late:
+  // a follower whose phase look fell in those ms read the master off by the step and bent (seen in the live-sync
+  // acceptance: 12.3 ms, a 3 % bend, at a master's -11.8 ms jump).
+  const { clock, engine, m } = await rig();
+  const X = gap(m, clock, 2, -40);
+  const ref = engine.clock.beat(clock.t), offs = [];
+  watch(engine, clock, m, 4, { onTick: (t) => {
+    const mb = engine.clock.beat(t), ph = (mb.lastBeat - ref.lastBeat) / ref.period;
+    offs.push({ p: m.node.posAt(t), ms: (ph - Math.round(ph)) * ref.period * 1000 });
+  } });
+  assert.ok(m.ts.posAt(clock.t) > X + 1, 'the master played through the gap');
+  const off = offs.filter((o) => Math.abs(o.ms) > 1).map((o) => `${o.ms.toFixed(1)} ms with its playhead at ${o.p.toFixed(3)} s`);
+  assert.deepEqual(off, [], `the gap is at ${X.toFixed(3)} s`);
+});
+
 test('a deck that is not beat-locked plays a capture gap as it came: unsynced, TEMPO sync, or a master nobody locks to', async () => {
   for (const [name, opts, deck] of [['unsynced', { sync: false }, 'd'], ['TEMPO sync', { mode: 'TEMPO' }, 'd'], ['lone master', { sync: false }, 'm']]) {
     const r = await rig(opts), x = r[deck];
@@ -535,3 +552,4 @@ test('a follower whose live grid takes in a gap of its own not found yet (the sa
   assert.deepEqual(off.filter((x, i) => i % 10 === 0), [], `the follower's audio off the master's beat by over 4 ms ${off.length} times`);
   assert.ok(bend < 0.002, `the follower bent ${(bend * 100).toFixed(2)} %`);
 });
+

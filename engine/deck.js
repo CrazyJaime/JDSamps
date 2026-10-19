@@ -1260,9 +1260,21 @@ export class Deck {
     return h ? { ...s.grid, t0: h.t0, T: h.T } : s.grid;
   }
 
+  /**
+   * The grid that gives the beat heard at output time now, the playhead at p: gridAt(p), but while the playhead plays
+   * again the audio before a capture gap it jumped back over (a drop: the beats after it came early), the gap's grid,
+   * where the beats it plays next are. The grid before the gap put its beat that much late there.
+   */
+  beatGridAt(now, p) {
+    const ts = this.ts, s = this.grids.segs.find((x) => x.from > p && x.shift < 0 && x.from - p <= -x.shift + 1e-6);
+    const cur = s && ts.segAt(now);
+    if (cur && cur.output > -Infinity && cur.input < s.from && ts.playingAt(cur.output - 1e-6) && ts.posAt(cur.output - 1e-6) >= s.from - 1e-4) return this.gridAt(s.from);
+    return this.gridAt(p);
+  }
+
   masterInfo(now) {
     if (!this.ts) return null;
-    const p = this.ts.posAt(now), g = this.gridAt(p), rate = this.ts.rateAt(now), out = this.tempoInfo(p).out;
+    const p = this.ts.posAt(now), g = this.beatGridAt(now, p), rate = this.ts.rateAt(now), out = this.tempoInfo(p).out;
     if (!out) return null;
     const playing = this.wantPlay && !this.previewing && this.ts.playingAt(now);
     // One clock: the tempo of the beat actually being played — nudge, bend and starve clamp
