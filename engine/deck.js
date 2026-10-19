@@ -592,7 +592,10 @@ export class Deck {
 
   rollEnd(now, T) {
     if (!this.rollFrom) return OK;
-    this.sched(T, { input: this.ts.clampInput(this.slipAt(T)), loopStart: 0, loopEnd: 0 });
+    const slip = this.slipAt(T);
+    // A whole track that carried on past its end beneath the roll has ended: it lands stopped there.
+    if (this.kind === 'resident' && slip >= this.duration) this.sched(T, { active: false, input: this.duration, loopStart: 0, loopEnd: 0 });
+    else this.sched(T, { input: this.ts.clampInput(slip), loopStart: 0, loopEnd: 0 });
     this.roll = null; this.loop = null; this.rollFrom = null;
     this.settleUntil = T + 0.3;
     return OK;
@@ -950,10 +953,12 @@ export class Deck {
    * A resident deck stops at the end of its track (input = duration). The stop is planned once the end is
    * near, after any change still pending; a later change drops it, and the next tick plans it again. Parked
    * at the end with a start still to come (CUE, then PLAY at once), it is not stopped: that start would play unseen.
+   * A CUE preview held into the end goes back to the cue there, as letting go of it would.
    */
   planEnd(now) {
     const ts = this.ts, end = this.duration;
     if (this.parkedAtEnd(now) && !ts.planned(now, true)) {
+      if (this.previewing) ts.change(now, now, { active: false, input: this.cue });
       this.wantPlay = false; this.previewing = false; this.playingSince = Infinity;
       return;
     }
@@ -961,8 +966,8 @@ export class Deck {
     if (!last.active || !(last.rate > 0) || last.loopEnd > last.loopStart) return; // stop planned already, or looping
     const from = Math.max(last.output, now), tEnd = from + (end - ts.posAt(from)) / last.rate;
     if (tEnd - now > END_PLAN) return;
-    if (last.output > now) ts.then(now, Math.max(tEnd, last.output + 1e-6), { active: false, input: end });
-    else ts.change(now, Math.max(tEnd, ts.soon(now)), { active: false, input: end });
+    if (last.output > now) ts.then(now, Math.max(tEnd, last.output + 1e-6), { active: false, input: end, end: true });
+    else ts.change(now, Math.max(tEnd, ts.soon(now)), { active: false, input: end, end: true });
   }
 
   /**
