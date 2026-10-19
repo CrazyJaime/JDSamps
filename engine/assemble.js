@@ -230,10 +230,12 @@ export async function decodePlaced(ctx, placed, { duration } = {}) {
     // boundary is a few samples off); the next run, decoded with its warm-up, must already be playing there.
     const next = runs[i + 1] ? Math.round(runs[i + 1].segs[0].t0 * rate) - Math.round(run.delay * rate) : total;
     const stop = Math.min(next, total, base + audio.length);
-    if (filled < base) {
+    if (filled < base && i > 0) {
       const t = run.segs[0].t0;
       throw new AssemblyError(`The join at ${t.toFixed(1)} s is not covered by the decoded audio.`, { reason: 'splice', gaps: [[t, t]] });
     }
+    // The first piece may start up to one frame in, as gapsFor allows: silence before it, and it at its own time.
+    filled = Math.max(filled, base);
     if (stop <= filled) continue;
     const a = audio.getChannelData(0), b = audio.numberOfChannels > 1 ? audio.getChannelData(1) : a;
     L.set(a.subarray(filled - base, stop - base), filled);

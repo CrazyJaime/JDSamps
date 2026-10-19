@@ -159,6 +159,33 @@ test('a duration that grows after placement is re-checked, not trusted', async (
   });
 });
 
+test('a first piece starting a little after 0 is covered or missing by one rule: gapsFor and decodePlaced agree across the frame tolerance', async () => {
+  // A stand-in decoder: each run's bytes carry the length it decodes to; one run decodes at the context rate.
+  const SR = 48000, tol = 0.0213, end = 30;
+  const ctx = { sampleRate: SR, async decodeAudioData(buf) {
+    const n = Number(new TextDecoder().decode(new Uint8Array(buf))), ch = new Float32Array(n).fill(0.25);
+    return { length: n, numberOfChannels: 2, sampleRate: SR, getChannelData: () => ch };
+  } };
+  for (const t0 of [0, 0.005, tol, tol + 0.0005, 0.05]) {
+    const bytes = new TextEncoder().encode(String(Math.round((end - t0) * SR))).buffer;
+    const placed = { runs: [{ mime: MP4, init: null, segs: [{ t0, t1: end, bytes }], delay: 0, rate: SR, key: 'k', preroll: null, cold: false }],
+      coverage: [[t0, end]], gaps: [], tol, tolSamples: Math.round(tol * SR), skipped: 0 };
+    const gaps = gapsFor(placed, end);
+    let out = null, err = null;
+    try { out = await decodePlaced(ctx, placed, { duration: end }); } catch (e) { err = e; }
+    if (!gaps.length) {
+      assert.equal(err, null, `${t0} s: gapsFor finds it whole, so decodePlaced must take it (${err && err.message})`);
+      const lead = Math.round(t0 * SR);
+      assert.equal(out.L.length, end * SR, `${t0} s`);
+      assert.ok(out.L.subarray(0, lead).every((x) => x === 0) && out.L[lead] === 0.25, `${t0} s: silence before the first piece, then the piece at its own time`);
+    } else {
+      assert.ok(t0 > tol, `${t0} s: a gap only past the tolerance`);
+      assert.ok(err instanceof AssemblyError && err.reason === 'gaps', `${t0} s: refused as missing audio, ${err && err.message}`);
+      assert.deepEqual(spans(err.gaps), spans([[0, t0]]));
+    }
+  }
+});
+
 test('captured audio running well past the reported duration is refused', async () => {
   const placed = placeParts(load('lo'));
   await rejects(decodePlaced(null, placed, { duration: 20 }), (e) => { assert.equal(e.reason, 'duration'); });
