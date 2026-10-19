@@ -862,11 +862,11 @@ export class Loader extends Job {
         }
         // A seek-hop stalls when it brings nothing new, or when the player says so while it appends elsewhere (shaka going on
         // from its last segment after a flush): either way, accelerate.
-        if (mode === 'seekhop' && (st === 'refused' || this.now() - fresh > this.t.stall || (stalled && this.now() - stalled > this.t.stall))) { stalledOnce = st !== 'refused'; go('accelerate'); fresh = this.now(); continue; }
+        if (mode === 'seekhop' && (st === 'refused' || this.now() - fresh > this.t.stall || (stalled && this.now() - stalled > this.t.stall))) { stalledOnce = st !== 'refused' && !!stalled; go('accelerate'); fresh = this.now(); continue; }
         if (mode === 'accelerate' && st === 'refused') { out = { outcome: 'failed', why: pass ? pass.why : 'the page will not let its player run faster' }; break; }
         // Flushed, and nothing comes even played: a player that never fetches a piece twice. The start is not to be had.
         if (mode === 'accelerate' && flushed && startOf() && this.now() - fresh > this.t.stall) { out = { outcome: 'failed', why: unfetched }; break; }
-        // Its seek-hop stalled, and run fast it brings nothing new either: the page has stopped sending the track (its
+        // Its player said its seek-hop stalled, and run fast it brings nothing new either: the page has stopped sending the track (its
         // connection dropped, or its player gave up). The long budget is for a page that keeps sending.
         if (mode === 'accelerate' && stalledOnce && !pass && this.now() - fresh > this.t.stall) {
           out = { outcome: 'failed', why: `the page stopped sending the track: nothing new came for ${secs(this.t.stall)} after its player stalled, with ${this.gapsNow().map(span).join(', ')} still missing` };

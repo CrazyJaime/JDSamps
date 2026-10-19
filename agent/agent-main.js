@@ -827,10 +827,11 @@
 
   // Our removes fire updatestart, update and updateend on the player's SourceBuffer, and a player's handlers take every
   // update on its SourceBuffers for one it asked for: hls.js reads its operation queue's current entry there (onStart,
-  // onComplete) and throws, uncaught, on ours. Listeners run in the order they were added, so none added later can come
-  // first: from document_start, the page's listeners for those events on a SourceBuffer and its on* handlers for them
-  // go through wrappers that only pass them on, except while the SourceBuffer runs our remove (hushed). No listener of
-  // ours is added for this until a flush.
+  // onComplete) and throws, uncaught, on ours. The events must still reach the player (one that looks at its buffer on
+  // updateend sees what was removed, and fetches it again), so what its handlers throw on ours is caught instead. Listeners
+  // run in the order they were added, so none added later can come first: from document_start, the page's listeners for
+  // those events on a SourceBuffer and its on* handlers for them go through wrappers that only pass them on, and while the
+  // SourceBuffer runs our remove (hushed) catch what they throw. No listener of ours is added for this until a flush.
   const SB_EVENTS = new Set(['updatestart', 'update', 'updateend', 'error', 'abort']), hushed = new WeakSet();
   const isSB = (x) => tagOf(x) === '[object SourceBuffer]';
   const capOf = (o) => (typeof o === 'boolean' ? o : !!(o && typeof o === 'object' && o.capture));
@@ -851,9 +852,9 @@
       if (!fn || !SB_EVENTS.has(type) || !isSB(this)) return origAdd.call(this, type, fn, opts);
       const capture = capOf(opts), once = !!(opts && typeof opts === 'object' && opts.once);
       const p = proxyOf(this, type, fn, capture, () => function (e) {
-        if (hushed.has(this)) return undefined;
         if (once) origRemove.call(this, type, p, capture);
-        return typeof fn === 'function' ? fn.call(this, e) : fn.handleEvent(e);
+        if (!hushed.has(this)) return typeof fn === 'function' ? fn.call(this, e) : fn.handleEvent(e);
+        try { return typeof fn === 'function' ? fn.call(this, e) : fn.handleEvent(e); } catch (_) { return undefined; }
       });
       return origAdd.call(this, type, p, once ? { ...opts, once: false } : opts);
     } }.addEventListener, origAdd);
@@ -871,7 +872,7 @@
           let o = own.get(this);
           if (!o) own.set(this, (o = {}));
           o[prop] = typeof v === 'function' ? v : null;
-          d.set.call(this, typeof v === 'function' ? function (e) { return hushed.has(this) ? undefined : v.call(this, e); } : v);
+          d.set.call(this, typeof v === 'function' ? function (e) { if (!hushed.has(this)) return v.call(this, e); try { return v.call(this, e); } catch (_) { return undefined; } } : v);
         },
       }, prop);
       Object.defineProperty(SBP, prop, { ...d, get: disguise(get, d.get), set: disguise(set, d.set) });
@@ -931,7 +932,7 @@
     await free(sb);
     return gen === drv.gen;
   }
-  /** Run op (our remove) on sb with the page's handlers for its update events not called. -> once its updateend has come (or FLUSH_WAIT). */
+  /** Run op (our remove) on sb with what the page's handlers throw on its update events caught. -> once its updateend has come (or FLUSH_WAIT). */
   function unheard(sb, op) {
     return new Promise((res) => {
       const end = () => { clearTimeout(timer); unlisten.call(sb, 'updateend', end); hushed.delete(sb); res(); };

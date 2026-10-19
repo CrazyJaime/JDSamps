@@ -1034,7 +1034,7 @@ describe('flushing the player before a drive', { concurrency: 3 }, () => {
     await p.close();
   });
 
-  test('a flush is kept from the player\'s own SourceBuffer handlers: an hls.js-like player, which takes every update for one it asked for, sees no error, and fetches again what was removed', async () => {
+  test('a flush reaches the player\'s own SourceBuffer handlers, and what they throw on it is caught: an hls.js-like player, which takes every update for one it asked for, sees no error, and fetches again what was removed', async () => {
     const p = await tapPage(`${LONG}&buf&hlsq`, { init: [REMOVE_SPY] }), seen = [];
     p.on('pageerror', (e) => seen.push(String(e)));
     await connect(p);

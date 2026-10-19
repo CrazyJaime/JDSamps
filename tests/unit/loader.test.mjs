@@ -201,6 +201,12 @@ test('a page that stops sending while it is driven (its seek-hop stalled, and ru
   assert.ok(deck.loads.some((l) => l.strategy === 'waiting for the page to send more of the track'), JSON.stringify([...new Set(deck.loads.map((l) => l.strategy))]));
 });
 
+test('a seek-hop that brings nothing without its player saying it stalled (a player busy with a flush) leaves accelerate its whole budget: resident', async () => {
+  const { result, engine, deck } = await load({ kind: 'mse', rendition: hi(), preTap: 0, playing: 1, seekhop: 'dead', accelerate: 'late' });
+  assert.equal(result.kind, 'resident', `${JSON.stringify(called(engine, 'failLoadingToLive'))} ${deck.load.report}`);
+  assert.match(deck.load.report, /drive \(seek-hop, then accelerate 16×\): ok/);
+});
+
 test('accelerate runs the player at 16×, the most the agent takes, so a 5-minute track can be in well under 30 s (§4.3)', async () => {
   const mp3 = { mimes: ['audio/mpeg'] };
   for (const [what, page] of [['after a seek-hop that stalls', { seekhop: 'stall' }], ['for appends placed in order only', mp3]]) {

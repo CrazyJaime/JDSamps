@@ -69,7 +69,8 @@ export const code = (s) => Math.fround([...String(s)].reduce((n, c) => (n * 31 +
  *   hang ([url]: links the engine's own fetch of never answers),
  *   errors (reasons reported at tap on), seekhop ('ok' | 'stall' | 'refuse' | 'slow': a piece every 10 ms | 'trickle': stalled where it hops, while the player
  *   appends on elsewhere, so bytes keep coming but never what is missing), accelerate ('ok' | 'refuse' | 'dead': it runs, and
- *   nothing more comes, as from a page whose connection dropped), mimes (override),
+ *   nothing more comes, as from a page whose connection dropped | 'late': it appends the rest after 200 ms), 'dead' for
+ *   seekhop too (it runs, nothing comes, and it never says it stalled: a player busy with a flush), mimes (override),
  *   appends (MSE parts as {bytes} the player appends on a drive, in order, for a stream with no timestamps),
  *   status (the frame agent's status, over a heard playing player's), framePages ([{...}]: frame i's page, over this one),
  *   other ({rendition, sb, n}: another player's SourceBuffer in the frame, appending its init and first n segments at tap on),
@@ -111,10 +112,11 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
       if (parts.length) emit({ t: 'tap-ready', parts, duration: Number.isFinite(fr.duration) ? fr.duration : null });
     };
     const drive = (mode, m = {}) => {
-      const how = pg[mode] || 'ok';
+      const how = m.late ? 'ok' : pg[mode] || 'ok';
       if (how === 'refuse' || (mode === 'seekhop' && (pg.mimes || []).some((m) => /mpeg|aac/.test(m)))) { progress({ drive: { mode, state: 'refused', at: 0 } }); return; }
       if (how === 'stall') { progress({ drive: { mode, state: 'stalled', at: 24 } }); return; }
       if (how === 'dead') { progress({ drive: { mode, state: 'running', at: 24 } }); return; }
+      if (how === 'late') { progress({ drive: { mode, state: 'running', at: 24 } }); tab.clock.setTimeout(() => drive(mode, { ...m, late: true }), 200); return; }
       if (how === 'slow') {
         const ks = r.segs.map((_, k) => k).filter((k) => !fr.appended.has(k));
         ks.forEach((k, i) => tab.clock.setTimeout(() => { append([k]); if (i === ks.length - 1) tab.clock.setTimeout(() => progress({ drive: { mode, state: 'done', at: fr.duration } }), 5); }, 10 * (i + 1)));
