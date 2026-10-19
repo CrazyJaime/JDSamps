@@ -238,6 +238,7 @@ export class Loader extends Job {
     this.host = hostOf(deck.meta && deck.meta.url);
     this.rep = { steps: [], mimes: new Set(), refetched: 0, placed: null, limit: null, result: null, notes: [], t0: this.now() };
     this.doing = '';           // what the load is doing now, in plain words (its report says so until it ends)
+    this.changes = [];         // the track's length changing while it decoded, said as the report says it
     this.reportedAt = -Infinity;
   }
 
@@ -524,12 +525,15 @@ export class Loader extends Job {
 
   /** Run one rung, noting how it went: its result is {done: {pcm, notice}} or {outcome, why}. */
   async step(name, fn) {
-    const t0 = this.now(), e = { name, how: '', outcome: '', why: '', ms: 0, at: t0 };
+    const t0 = this.now(), e = { name, how: '', outcome: '', why: '', ms: 0, at: t0 }, k = this.changes.length;
     this.rep.steps.push(e);
     try {
       const r = await fn(e);
       e.outcome = r.done ? 'ok' : r.outcome || 'failed';
-      e.why = r.why || (r.again ? 'the track length changed while it loaded' : e.why);
+      e.why = r.why || e.why;
+      // The length changed while it decoded: that is what happened first, whatever the rung found after it.
+      const change = this.changes.length > k && this.changes.at(-1);
+      if (change && !r.done && !e.why.startsWith(change)) e.why = e.why ? `${change}; ${e.why}` : change;
       return r.done || null;
     } catch (err) {
       e.outcome = err instanceof Stop && err.kind === 'cancel' ? 'cancelled' : 'stopped';
@@ -888,7 +892,7 @@ export class Loader extends Job {
   }
 
   /**
-   * {done: {pcm, notice}}, {again: true} when the length changed while decoding, or {outcome:'failed', why}. The
+   * {done: {pcm, notice}}, {again: true, why} when the length changed while decoding, or {outcome:'failed', why}. The
    * placement covers the track: every byte is in, so the page may go meanwhile.
    */
   decodeOr(placed) { return this.holding(() => this.decodeRuns(placed)); }
@@ -906,7 +910,12 @@ export class Loader extends Job {
     }
     this.check();
     this.rep.steps.push({ name: 'decode', outcome: 'ok', why: `${placed.runs.length} run${placed.runs.length === 1 ? '' : 's'}`, ms: this.now() - t0 });
-    if (Math.abs(this.duration() - D) > placed.tol) return { again: true }; // never resident at a length the page no longer gives
+    const len = this.duration();
+    if (!(Math.abs(len - D) <= placed.tol)) { // never resident at a length the page no longer gives
+      const why = len == null ? 'the player stopped saying how long the track is while it decoded' : `the track's length changed from ${D.toFixed(1)} s to ${len.toFixed(1)} s while it decoded`;
+      this.changes.push(why);
+      return { again: true, why };
+    }
     return { done: this.limited(pcm, D) };
   }
 

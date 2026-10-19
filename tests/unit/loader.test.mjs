@@ -815,6 +815,28 @@ test('a length that grows mid-load is never taken at its first value: the rest i
   assert.ok(tab.sent().filter((m) => m.t === 'fetch').length >= 3, 'the pieces past 60 s were fetched too');
 });
 
+test('a length that changes while the track decodes is what the report and the live message say, never a count of pieces', async () => {
+  for (const [what, page] of [
+    ['driven', { kind: 'mse', rendition: rendition(), preTap: 0, playing: 1 }],
+    ['fetched again', { kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true }],
+  ]) {
+    const { result, engine, deck } = await load(page, {
+      before: ({ tab, loader }) => {
+        loader.d.decodePlaced = async (ctx, placed, o) => {
+          const r = await decoders.decodePlaced(ctx, placed, o);
+          tab.frames[0].duration = 125; tab.frames[0].progress(); await settle(5);
+          return r;
+        };
+      },
+    });
+    assert.equal(result.kind, 'live', what);
+    const why = /the track's length changed from 120\.0 s to 125\.0 s while it decoded/;
+    assert.match(called(engine, 'failLoadingToLive')[0].reason, why, what);
+    assert.match(deck.load.report, new RegExp(`First failure: (drive|refetch): ${why.source}`), `${what}: ${deck.load.report}`);
+    assert.doesNotMatch(deck.load.report, /First failure: \w+: \d+ pieces/, what);
+  }
+});
+
 // ---------------------------------------------------------------- several players in one tab
 test('the track length is the heard player\'s, not that of a player in a frame whose agent came first', async () => {
   const track = { kind: 'mse', rendition: hi(), preTap: 6, playing: 2, list: true, segUrls: true };
