@@ -964,8 +964,10 @@ test('recording a whole track through a capture that skips (a busy computer lose
   } finally { await engine('window.__undoSkips && window.__undoSkips(); return true;'); }
 });
 
-test('recording a whole track through a capture that skips in its first beats and its last (10 ms of silence put in 1.2 s in, 10 ms lost 1 s before the end): both mended, every beat on the line', async (t) => {
-  await engine(`await (${idealCapture})('${rec.origin}/rec.mp3', { ins: 1.2, lose: 14.97 }); return true;`); // between kicks 2 and 3, and 30 and 31
+test('recording a whole track through a capture that skips in its first beats and its last (10 ms of silence put in 0.6 s in, 10 ms lost 1 s before the end): both mended, every beat on the line', async (t) => {
+  // In kick 1, and between kicks 30 and 31: steps the bars alone never mend (one 1.2 s in they do, once the take
+  // starts even 10 ms before the first sound).
+  await engine(`await (${idealCapture})('${rec.origin}/rec.mp3', { ins: 0.6, lose: 14.97 }); return true;`);
   try {
     const { site, d } = await liveDeck(`${rec.origin}/rec`);
     await playing(site.tab);
@@ -982,11 +984,10 @@ test('recording a whole track through a capture that skips in its first beats an
     const off = on.map((x, i) => (x - mt - (k[i] - mk) * P) * 1000);
     assert.ok(off.every((x) => Math.abs(x) <= 6), `beats off the line (ms): ${off.map((x) => x.toFixed(1)).join(' ')}`);
     // Both mended where they were (s of the take, which may start a little before the first sound, by the player's
-    // clock): the silence put in is cut in the middle of the silence it fell into, and the 20 ms lost is given back
-    // between kicks 30 and 31.
+    // clock): the silence put in is cut where it fell, and the 20 ms lost is given back between kicks 30 and 31.
     const lead = +/its first sound (\d+\.\d{3}) s in/.exec(r.load.report)[1];
     const m = /^Mended: 2 skips in the capture \(the computer was busy\): 20 ms put in at (\d+\.\d) s, 20 ms lost at (\d+\.\d) s$/m.exec(r.load.report);
-    assert.ok(m && Math.abs(+m[1] - lead - 1.3) <= 0.2 && Math.abs(+m[2] - lead - 14.85) <= 0.2, r.load.report);
+    assert.ok(m && Math.abs(+m[1] - lead - 0.6) <= 0.1 && Math.abs(+m[2] - lead - 14.85) <= 0.2, r.load.report);
     const seen = /^Skips: looked for between its first beat \((\d+\.\d) s in\) and its last \((\d+\.\d) s in\); one before the first or after the last cannot be seen$/m.exec(r.load.report);
     assert.ok(seen && Math.abs(+seen[1] - lead) <= 0.1 && Math.abs(+seen[2] - lead - 32 * (60 / 124)) <= 0.1, r.load.report);
     assert.match(r.load.report, /^Beat: steady all through: /m);
