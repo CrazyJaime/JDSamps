@@ -399,9 +399,13 @@ export class Deck {
     return q >= lo ? q : p + e * rate;
   }
 
+  /** A resident deck stopped at the end of its track at output time t. */
+  parkedAtEnd(t) { return !this.ts.playingAt(t) && this.ts.posAt(t) >= this.duration - 0.5 / this.sr; }
+
   startAt(T, p) {
-    // A resident deck stopped at the end of its track stays there until it is moved.
-    if (this.kind === 'resident' && p >= this.duration - 0.5 / this.sr) return;
+    // A resident deck stopped at the end of its track stays there until it is moved, wherever a phase-matched
+    // start would begin (alignForStart steps a beat back into the track).
+    if (this.kind === 'resident' && (p >= this.duration - 0.5 / this.sr || this.parkedAtEnd(T))) return;
     const input = this.ts.clampInput(p);
     this.ts.change(this.now(), T, { active: true, input, rate: this.effRate(input), semitones: this.semis(input) });
     this.wantPlay = true;
@@ -944,11 +948,12 @@ export class Deck {
 
   /**
    * A resident deck stops at the end of its track (input = duration). The stop is planned once the end is
-   * near, after any change still pending; a later change drops it, and the next tick plans it again.
+   * near, after any change still pending; a later change drops it, and the next tick plans it again. Parked
+   * at the end with a start still to come (CUE, then PLAY at once), it is not stopped: that start would play unseen.
    */
   planEnd(now) {
     const ts = this.ts, end = this.duration;
-    if (!ts.playingAt(now) && ts.posAt(now) >= end - 0.5 / this.sr) {
+    if (this.parkedAtEnd(now) && !ts.planned(now, true)) {
       this.wantPlay = false; this.previewing = false; this.playingSince = Infinity;
       return;
     }
