@@ -76,12 +76,45 @@ test('one kick out of place is a kick out of place, not a skip: nothing is cut',
   assert.equal(r.steps.length, 0, JSON.stringify(r.steps));
 });
 
-test('the first beat and the last are left alone: the capture settles as the player starts, and the track ends', () => {
+test('a first or last beat further off the rest than any skip (50 ms: the capture settling as the player starts) is left alone', () => {
   const clean = kicks();
   for (const at of [Math.round(0.3 * SR), Math.round((32 * T + 0.3) * SR)]) { // between beats 0 and 1, and the last two
     const r = mendSteps(both(clean, (x) => ins(x, at, 2400)), T);
     assert.equal(r.steps.length, 0, `${at / SR} s: ${JSON.stringify(r.steps)}`);
   }
+});
+
+// A skip in the first beats or the last has no bar before it (or after it) to be read against: each beat there is read
+// against the beat line the steady beats on the far side run on, carried on to the edge.
+test('a skip in any of the first three beats of a recording or its last two is mended: every beat in its place', () => {
+  const clean = kicks(33 * T); // 33 whole beats, the last ending the track
+  for (const b of [0.6, 1.06, 1.5, 2.48, 30.6, 31.06, 31.5]) for (const n of [960, -960]) {
+    const where = `20 ms ${n > 0 ? 'put in' : 'lost'} at beat ${b}`, at = Math.round(b * T * SR);
+    const x = both(clean, (y) => (n > 0 ? ins(y, at, n) : cut(y, at, -n)));
+    assert.ok(offBeat(x) > 15, `${where}: the beats after it are off`);
+    const r = mendSteps(x, T);
+    assert.deepEqual(r.steps.map((s) => Math.round(s.ms)), [n / 48], `${where}: ${JSON.stringify(r.steps)}`);
+    assert.equal(r.pcm.L.length, clean.L.length, where);
+    assert.ok(offBeat(r.pcm) < 0.5, `${where}: beats off by ${offBeat(r.pcm).toFixed(2)} ms`);
+    if (n > 0) assert.equal(differs(r.pcm.L, clean.L), null, `${where}: the capture's silence is cut, the track sample for sample`);
+  }
+});
+
+test('a skip before the first beat cannot be seen, nor one after the last: nothing is guessed, and mendSteps says between which beats it looked', () => {
+  const clean = kicks(33 * T), lead = Math.round(0.5 * SR), tail = Math.round(0.6 * SR), L = new Float32Array(lead + clean.L.length + tail);
+  L.set(clean.L, lead);
+  const track = { L, R: L.slice(), sampleRate: SR }, near = (r, want) => r.seen && r.seen.every((s, i) => Math.abs(s - want[i]) < 0.002);
+  let r = mendSteps(track, T);
+  assert.ok(near(r, [0.5, 0.5 + 32 * T]), JSON.stringify(r.seen));
+  // 20 ms put in at 0.25 s and lost at 0.25 s from the end: the track's own silence, longer or shorter.
+  const x = both(track, (y) => cut(ins(y, Math.round(0.25 * SR), 960), y.length + 960 - Math.round(0.25 * SR), 960));
+  r = mendSteps(x, T);
+  assert.deepEqual(r.steps, []);
+  assert.equal(r.pcm, x);
+  assert.ok(near(r, [0.52, 0.52 + 32 * T]), JSON.stringify(r.seen));
+  const n = 10 * SR, hum = new Float32Array(n); // no beat: nothing to look between
+  for (let i = 0; i < n; i++) hum[i] = 0.3 * Math.sin(2 * Math.PI * 220 * (i / SR)) * (0.5 + 0.5 * Math.sin(i / SR));
+  assert.equal(mendSteps({ L: hum, R: hum.slice(), sampleRate: SR }, T).seen, null);
 });
 
 test('a track with no steady beat is left alone', () => {
@@ -183,6 +216,23 @@ test('a burst of skips (10 ms lost, then 24 ms and 10 ms of silence put in) is m
     const r = mendSteps({ L: y, R: y.slice(), sampleRate: sr }, T), d = differs(r.pcm.L, x);
     assert.equal(r.pcm.L.length, x.length, `${name} at ${sr}: ${JSON.stringify(r.steps)}`);
     assert.ok(d && d[0] >= at && d[1] < at + T * sr, `${name} at ${sr}: differs ${d && d.map((v) => (v / sr).toFixed(3))} s`);
+  }
+});
+
+// (Its last bars: two beats from the end at the nearest, as one beat of a sparse loop, a few hats, is not read closely
+// enough to tell a skip by.)
+test('10 ms put in or lost in the first beats of a loop with a continuous bed, or in its last bars, is mended: every beat in its place', () => {
+  for (const sr of RATES) for (const name of [...STEADY, 'pop']) {
+    const { x, T } = loop(name, sr), BUF = sr / 100, beats = x.length / (T * sr);
+    for (const [b, n] of [[1.3, BUF], [2.6, -BUF], [beats - 6.6, -BUF], [beats - 5.3, BUF], [beats - 2.6, -BUF], [beats - 2.3, BUF]]) {
+      if (n < 0 && name === 'pop') continue; // a loss shows only where the loop's onsets sit on its bars
+      const where = `${name} at ${sr}, 10 ms ${n > 0 ? 'put in' : 'lost'} at beat ${b.toFixed(1)}`, y = skipped(x, [[b / beats, n]]);
+      const r = mendSteps({ L: y, R: y, sampleRate: sr }, T), d = differs(r.pcm.L, x), at = Math.round((b / beats) * x.length);
+      assert.deepEqual(r.steps.map((s) => Math.round(s.ms)), [(n / sr) * 1000], `${where}: ${JSON.stringify(r.steps)}`);
+      assert.equal(r.pcm.L.length, x.length, where);
+      if (n > 0) assert.equal(d, null, where);
+      else assert.ok(d && d[0] >= at - 2 * T * sr && d[1] < at + 2 * T * sr, `${where}: differs ${d && d.map((v) => (v / sr).toFixed(3))} s`);
+    }
   }
 });
 

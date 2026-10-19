@@ -964,6 +964,29 @@ test('recording a whole track through a capture that skips (a busy computer lose
   } finally { await engine('window.__undoSkips && window.__undoSkips(); return true;'); }
 });
 
+test('recording a whole track through a capture that skips in its first beats and its last (silence put in 1.2 s in, 10 ms lost 1 s before the end): both mended, every beat on the line', async (t) => {
+  await engine(`await (${idealCapture})('${rec.origin}/rec.mp3', { ins: 1.2, lose: 14.97 }); return true;`); // between kicks 2 and 3, and 30 and 31
+  try {
+    const { site, d } = await liveDeck(`${rec.origin}/rec`);
+    await playing(site.tab);
+    assert.deepEqual(await act(deck, d.id, 'recordWhole'), { ok: true, error: undefined });
+    const loading = await deckWhere((x) => x.id !== d.id && x.kind === 'loading', 5000);
+    const r = await deckWhere((x) => x.id === loading.id && x.kind === 'resident', 40000);
+    const kicks = await kicksOf(loading.id), iv = kicks.slice(1).map((x, i) => (x - kicks[i]) * 1000);
+    t.diagnostic(`beat to beat (ms): ${iv.map(Math.round).join(' ')}; bpm ${r.bpm.native}; ${r.load.report.split('\n').filter((l) => /^(Mended|Skips)/.test(l)).join(' | ')}`);
+    assert.ok(kicks.length >= 32, `${kicks.length} kicks`);
+    // Every beat on one straight line, the first two and the last two with them (the line starts at the second, as above).
+    const on = kicks.slice(1), k = on.map((x) => Math.round((x - on[0]) / (60 / 124))), n = on.length;
+    const mk = k.reduce((a, b) => a + b) / n, mt = on.reduce((a, b) => a + b) / n;
+    const P = k.reduce((a, x, i) => a + (x - mk) * (on[i] - mt), 0) / k.reduce((a, x) => a + (x - mk) ** 2, 0);
+    const off = on.map((x, i) => (x - mt - (k[i] - mk) * P) * 1000);
+    assert.ok(off.every((x) => Math.abs(x) <= 6), `beats off the line (ms): ${off.map((x) => x.toFixed(1)).join(' ')}`);
+    assert.match(r.load.report, /^Mended: 2 skips in the capture \(the computer was busy\): 20 ms put in at 1\.[23] s, 20 ms lost at 1[45]\.\d s$/m); // the silence it fell into is cut in the middle
+    assert.match(r.load.report, /^Skips: looked for between its first beat \(0\.0 s in\) and its last \(15\.5 s in\); one before the first or after the last cannot be seen$/m);
+    assert.match(r.load.report, /^Beat: steady all through: /m);
+  } finally { await engine('window.__undoSkips && window.__undoSkips(); return true;'); }
+});
+
 /**
  * How a promoted deck's kept track lines up with the source at `url` (decoded here, at the engine's rate): the lag of
  * the deck against it in 50 ms windows every 250 ms, both low-passed at 8 kHz (the recording lost its highs), as
