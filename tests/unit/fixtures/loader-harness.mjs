@@ -3,7 +3,9 @@
 // and hub that record what the loader asks of them; and the model sites' real Opus fMP4 bytes, so
 // the real placeParts places what the fake player "appends". decodePlaced and the file decoder are
 // stand-ins (no Web Audio in Node): a "file" is JSON {audio, seconds}; decoded PCM is filled with a
-// code naming its source, so a test can tell whose audio a deck got.
+// code naming its source, so a test can tell whose audio a deck got. The loader and every simulated
+// delay here run on one virtual clock (engine.clock, virtual-clock.mjs): what the fakes do at once
+// always comes before what is due later, however busy the machine is.
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -12,6 +14,7 @@ import { validateAgentMessage } from '../../../shared/protocol.js';
 import { gapsFor, AssemblyError } from '../../../engine/assemble.js';
 import { mp3Frames } from '../../../engine/bmff.js';
 import { Loader } from '../../../engine/loader.js';
+import { VirtualClock } from './virtual-clock.mjs';
 
 const SITES = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../fixtures/sites');
 const index = JSON.parse(fs.readFileSync(path.join(SITES, 'index.json'), 'utf8'));
@@ -83,7 +86,8 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
   for (const r of [page, ...(page.framePages || [])].flatMap((p) => [p.rendition, p.other && p.other.rendition])) {
     if (r) { net.set(r.list, enc(playlist(r, { ts: page.ts }))); net.set(r.init.url, r.init.bytes); for (const s of r.segs) net.set(page.ts ? tsUrl(s.url) : s.url, s.bytes); }
   }
-  const tab = { tabId, url, page, blobs, log, net, frames: [], deck: null, hooks: [] };
+  // Its delays run on a virtual clock: the engine's (makeEngine shares its own with the tabs it is given).
+  const tab = { tabId, url, page, blobs, log, net, frames: [], deck: null, hooks: [], clock: new VirtualClock() };
   const mint = (bytes) => { const u = `blob:${new URL(url).origin}/${crypto.randomUUID()}`; blobs.set(u, bytes); return u; };
   for (let i = 0; i < frames; i++) {
     const pg = { ...page, ...((page.framePages || [])[i] || {}) }, r = pg.rendition;
@@ -109,7 +113,7 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
       if (how === 'trickle') {
         progress({ drive: { mode, state: 'stalled', at: 0 } });
         const k = pg.preTap || 0;
-        fr.trickle = setInterval(() => emit({ t: 'tap-ready', parts: [{ blobUrl: mint(r.segs[k].bytes), mime: r.mime, kind: 'media', sb: 0, seq: fr.seq++ }], duration: fr.duration }), 20);
+        fr.trickle = tab.clock.setInterval(() => emit({ t: 'tap-ready', parts: [{ blobUrl: mint(r.segs[k].bytes), mime: r.mime, kind: 'media', sb: 0, seq: fr.seq++ }], duration: fr.duration }), 20);
         fr.trickle.unref();
         return;
       }
@@ -120,20 +124,20 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
         progress({ drive: { mode, state: 'flushed', at: 0 } });
       } else if (unflushed.unflushed) progress({ drive: { mode, state: 'running', at: 0, ...unflushed } });
       if (fr.flushed === 'dry' || pg.flush === 'sticky') { // it fetches nothing more: nothing comes
-        setTimeout(() => progress({ drive: { mode, state: mode === 'seekhop' ? 'stalled' : 'running', at: 0, ...unflushed } }), 5);
+        tab.clock.setTimeout(() => progress({ drive: { mode, state: mode === 'seekhop' ? 'stalled' : 'running', at: 0, ...unflushed } }), 5);
         return;
       }
       if (pg.appends) {
         emit({ t: 'tap-ready', parts: pg.appends.map((p) => ({ blobUrl: mint(p.bytes), mime: p.mime, kind: 'media', sb: 0, seq: fr.seq++ })), duration: fr.duration });
       } else append(r.segs.map((_, k) => k));
       if (pg.evicts) for (let k = 0; k < (pg.preTap || 0); k++) fr.appended.delete(k);
-      setTimeout(() => progress({ drive: { mode, state: 'done', at: fr.duration, ...unflushed } }), 5);
+      tab.clock.setTimeout(() => progress({ drive: { mode, state: 'done', at: fr.duration, ...unflushed } }), 5);
     };
     const onCommand = (m) => {
-      log.push({ frame: i, m, at: performance.now() });
+      log.push({ frame: i, m, at: tab.clock.now() });
       for (const h of tab.hooks) h(m, i);
       if (fr.left) return;
-      if (m.t === 'drive') clearInterval(fr.trickle);
+      if (m.t === 'drive') tab.clock.clearInterval(fr.trickle);
       if (m.t === 'tap' && m.on === true) {
         if (pg.kind === 'mse' && pg.preTap > 0) emit({ t: 'tap-ready', parts: [{ blobUrl: mint(r.init.bytes), mime: r.mime, kind: 'init', sb: 0, seq: fr.seq++ }], duration: Number.isFinite(fr.duration) ? fr.duration : null });
         const reqs = [];
@@ -144,7 +148,7 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
         for (let k = 0; k < reqs.length; k += 16) emit({ t: 'tap-urls', reqs: reqs.slice(k, k + 16) });
         progress();
         for (const reason of pg.errors || []) emit({ t: 'tap-error', reason, detail: `fake ${reason}` });
-        if (pg.duration === Infinity) setTimeout(() => emit({ t: 'tap-error', reason: 'live', detail: 'the player reports no end' }), pg.liveAfter ?? 30);
+        if (pg.duration === Infinity) tab.clock.setTimeout(() => emit({ t: 'tap-error', reason: 'live', detail: 'the player reports no end' }), pg.liveAfter ?? 30);
         if (pg.kind === 'mse' && pg.playing) {
           if (pg.preTap === 0 || pg.preTap == null) emit({ t: 'tap-ready', parts: [{ blobUrl: mint(r.init.bytes), mime: r.mime, kind: 'init', sb: 0, seq: fr.seq++ }], duration: fr.duration });
           append(Array.from({ length: pg.playing }, (_, k) => (pg.preTap || 0) + k));
@@ -192,7 +196,7 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
       const d = tab.deck;
       if (d && d.agents.get(fr.id) === fr.a) { d.agents.delete(fr.id); if (d.loader) d.loader.onDetach(fr.id, fr.a); }
     }
-    if (to) setTimeout(() => { if (tab.deck) Object.assign(tab.deck.meta, { url: to }); }, metaAfter);
+    if (to) tab.clock.setTimeout(() => { if (tab.deck) Object.assign(tab.deck.meta, { url: to }); }, metaAfter);
   };
   /**
    * A single-page site moves on to another track in place (history.pushState): the address changes, which the hub
@@ -208,7 +212,7 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
       if (fr.pg.rendition) fr.pg.rendition.segs.forEach((_, k) => fr.appended.add(k));
       if (duration !== undefined) fr.duration = duration;
       if (r2) {
-        setTimeout(() => {
+        tab.clock.setTimeout(() => {
           fr.progress({ sbs: [1], mimes: [r2.mime] });
           fr.emit({ t: 'tap-ready', parts: [r2.init, ...r2.segs].map((x, k) => ({ blobUrl: mint(x.bytes), mime: r2.mime, kind: k ? 'media' : 'init', sb: 1, seq: fr.seq++ })), duration: fr.duration });
         }, appendAfter);
@@ -221,8 +225,8 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
    */
   tab.close = (engine, { endAfter = 0, ejectAfter = 20 } = {}) => {
     tab.navigate();
-    if (endAfter != null) setTimeout(() => { if (tab.deck) for (const t of tab.deck.tracks) t.stop(); }, endAfter);
-    if (ejectAfter != null) setTimeout(() => engine.hubEject(tab.tabId), ejectAfter);
+    if (endAfter != null) tab.clock.setTimeout(() => { if (tab.deck) for (const t of tab.deck.tracks) t.stop(); }, endAfter);
+    if (ejectAfter != null) tab.clock.setTimeout(() => engine.hubEject(tab.tabId), ejectAfter);
   };
   tab.sent = (frame = 0) => log.filter((x) => x.frame === frame).map((x) => x.m);
   tab.kinds = () => log.map((x) => (x.m.t === 'drive' ? `drive ${x.m.mode}` : x.m.t === 'tap' ? `tap ${x.m.on ? 'on' : 'off'}` : x.m.t));
@@ -247,12 +251,14 @@ export function makeDeck(tab, { id = 1, slot = 1, title = 'Model track' } = {}) 
 /**
  * A fake engine: the I1 entry points, the hub (AGENT_CONNECT connects the tab), events. Its eject has the real one's
  * shape: the load is stopped and the tab's STOP_TAB started at once, and the deck goes in its turn on serial().
+ * clock: the virtual clock its loads and its tabs' delays run on (default: its first tab's).
  */
-export function makeEngine({ tabs = [], limitMin = 15, hubOk = true } = {}) {
+export function makeEngine({ tabs = [], limitMin = 15, hubOk = true, clock = (tabs[0] && tabs[0].clock) || new VirtualClock() } = {}) {
   let q = Promise.resolve();
+  for (const t of tabs) t.clock = clock;
   const stops = new WeakMap(); // deck -> its STOP_TAB, sent once (the real engine's tabStops)
   const e = {
-    ctx: { sampleRate: SR }, params: { 'resident.limitMin': limitMin, 'bpm.range': 'AUTO' }, decks: new Map(), loads: new Map(),
+    clock, ctx: { sampleRate: SR }, params: { 'resident.limitMin': limitMin, 'bpm.range': 'AUTO' }, decks: new Map(), loads: new Map(),
     hubLog: [], events: [], notes: [], calls: [], order: [], leaving: new WeakSet(),
     serial(fn) { const run = q.then(fn, fn); q = run.catch(() => {}); return run; },
     hub(m) {
@@ -374,7 +380,7 @@ export function loaderFor(tab, engine, { deckId = 1, slot = 1, fetchBytes, times
   tab.deck = deck;
   engine.decks.set(deck.id, deck);
   const ac = new AbortController();
-  const loader = new Loader({ engine, deck, tabId: tab.tabId, signal: ac.signal, deps: { fetchBytes: fetchBytes || fetcher([tab]), ...decoders, times, ...deps } });
+  const loader = new Loader({ engine, deck, tabId: tab.tabId, signal: ac.signal, deps: { fetchBytes: fetchBytes || fetcher([tab]), ...decoders, times, clock: engine.clock, ...deps } });
   engine.loads.set(deck.id, { abort: () => ac.abort(), loader });
   deck.loader = loader;
   return { deck, loader, ac };
@@ -384,7 +390,7 @@ export function loaderFor(tab, engine, { deckId = 1, slot = 1, fetchBytes, times
 export async function load(page = {}, opts = {}) {
   const tab = makeTab(page), engine = makeEngine({ tabs: [tab], limitMin: opts.limitMin, hubOk: opts.hubOk });
   const { deck, loader, ac } = loaderFor(tab, engine, opts);
-  if (opts.before) opts.before({ tab, engine, deck, loader, ac });
+  if (opts.before) opts.before({ tab, engine, deck, loader, ac, clock: engine.clock });
   const result = await loader.run();
   await settle();
   return { result, tab, engine, deck, loader, ac };

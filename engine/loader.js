@@ -92,6 +92,8 @@ class Stop extends Error {
   constructor(kind, message, noBytes = false) { super(message); this.kind = kind; this.noBytes = noBytes; }
 }
 const now = () => performance.now();
+/** Real time. A load job's tests give it a virtual clock instead (deps.clock): every wait and time read goes through it. */
+const REAL = Object.freeze({ now, setTimeout: (fn, ms) => setTimeout(fn, ms), clearTimeout: (h) => clearTimeout(h) });
 const secs = (ms) => `${(ms / 1000).toFixed(1)} s`;
 const span = ([a, b]) => `${a.toFixed(1)}–${b.toFixed(1)} s`;
 const kb = (n) => (n < 1e6 ? `${Math.round(n / 1e3)} kB` : `${(n / 1e6).toFixed(1)} MB`);
@@ -149,7 +151,8 @@ function trimPlaced(placed, until) {
 
 /** A load job's waiting and progress: what Loader and Recording share. */
 class Job {
-  constructor(engine, deck, signal) {
+  constructor(engine, deck, signal, clock = REAL) {
+    this.clock = clock;
     this.engine = engine;
     this.deck = deck;
     this.signal = signal;
@@ -158,6 +161,8 @@ class Job {
     this.progress = 0;
     signal.addEventListener('abort', () => this.poke(), { once: true });
   }
+
+  now() { return this.clock.now(); }
 
   /**
    * Resolves true once cond() holds, or something every wait gives way to (urgent(): the caller's check() says what),
@@ -168,7 +173,7 @@ class Job {
       if (this.signal.aborted) { reject(new Stop('cancel', 'Loading was cancelled.')); return; }
       if (cond() || this.urgent()) { resolve(true); return; }
       const w = { cond, resolve, reject, timer: 0 };
-      w.timer = setTimeout(() => { this.waiters.delete(w); resolve(false); }, Math.max(0, ms));
+      w.timer = this.clock.setTimeout(() => { this.waiters.delete(w); resolve(false); }, Math.max(0, ms));
       this.waiters.add(w);
     });
   }
@@ -176,16 +181,16 @@ class Job {
   poke() {
     for (const w of [...this.waiters]) {
       let go = false;
-      if (this.signal.aborted) { clearTimeout(w.timer); this.waiters.delete(w); w.reject(new Stop('cancel', 'Loading was cancelled.')); continue; }
+      if (this.signal.aborted) { this.clock.clearTimeout(w.timer); this.waiters.delete(w); w.reject(new Stop('cancel', 'Loading was cancelled.')); continue; }
       try { go = w.cond() || this.urgent(); } catch (_) {}
-      if (go) { clearTimeout(w.timer); this.waiters.delete(w); w.resolve(true); }
+      if (go) { this.clock.clearTimeout(w.timer); this.waiters.delete(w); w.resolve(true); }
     }
   }
   urgent() { return false; }
   /** No more waiting: every timer cleared. */
   end() {
     this.done = true;
-    for (const w of this.waiters) clearTimeout(w.timer);
+    for (const w of this.waiters) this.clock.clearTimeout(w.timer);
     this.waiters.clear();
   }
 
@@ -205,11 +210,11 @@ export class Loader extends Job {
   /**
    * engine: the Engine (or a stand-in with the same methods); deck: the loading deck, holding the tab's capture;
    * signal: aborted when the deck is ejected or the load cancelled. deps: fetchBytes, decodeFile, decodePlaced,
-   * placeParts, gapsFor and times, for tests.
+   * placeParts, gapsFor, times and clock ({now, setTimeout, clearTimeout}), for tests.
    */
   constructor({ engine, deck, tabId, signal, deps = {} }) {
-    super(engine, deck, signal);
-    const { times, ...d } = deps;
+    const { times, clock, ...d } = deps;
+    super(engine, deck, signal, clock);
     this.tabId = tabId;
     this.d = { fetchBytes: fetchArrayBuffer, decodeFile: decodeTo, decodePlaced, placeParts, gapsFor, ...d };
     this.t = { ...TIMES, ...times };
@@ -229,7 +234,7 @@ export class Loader extends Job {
     this.big = false;
     this.bytes = 0;            // read from the tab, all frames
     this.host = hostOf(deck.meta && deck.meta.url);
-    this.rep = { steps: [], mimes: new Set(), refetched: 0, placed: null, limit: null, result: null, notes: [], t0: now() };
+    this.rep = { steps: [], mimes: new Set(), refetched: 0, placed: null, limit: null, result: null, notes: [], t0: this.now() };
     this.doing = '';           // what the load is doing now, in plain words (its report says so until it ends)
     this.reportedAt = -Infinity;
   }
@@ -240,8 +245,8 @@ export class Loader extends Job {
    */
   also(strategy) {
     if (strategy !== undefined) this.doing = strategy;
-    if (strategy === undefined && now() - this.reportedAt < 250) return {};
-    this.reportedAt = now();
+    if (strategy === undefined && this.now() - this.reportedAt < 250) return {};
+    this.reportedAt = this.now();
     return { report: this.report() };
   }
 
@@ -411,7 +416,9 @@ export class Loader extends Job {
   async run() {
     let out;
     // While a step waits long (a look, a fetch, a page's answer), its report still keeps up with how long it has taken.
-    const tick = setInterval(() => { if (!this.done) this.deck.setLoad({ report: this.report() }); }, this.t.report);
+    let tick = 0;
+    const report = () => { if (!this.done) { this.deck.setLoad({ report: this.report() }); tick = this.clock.setTimeout(report, this.t.report); } };
+    tick = this.clock.setTimeout(report, this.t.report);
     try {
       this.say(0, SAY.wait);
       await this.connect();
@@ -424,7 +431,7 @@ export class Loader extends Job {
     } catch (err) {
       out = await this.fail(err);
     } finally {
-      clearInterval(tick);
+      this.clock.clearTimeout(tick);
       this.end();
     }
     return out;
@@ -432,14 +439,14 @@ export class Loader extends Job {
 
   /** The tab's frames' agents: asked to connect again (they did for the deck's start), then tapped. */
   async connect() {
-    const t0 = now();
+    const t0 = this.now();
     for (const [id, a] of this.deck.agents) if (!this.frames.has(id)) this.onAttach(id, a); // connected before this load began
     const r = await this.engine.hub({ type: HUB.AGENT_CONNECT, tabId: this.tabId });
     this.check();
     if (!this.attached().length) await this.until(() => this.attached().length > 0, this.t.grace);
     this.check();
     const n = this.attached().length;
-    this.rep.steps.push({ name: 'connect', outcome: n ? 'ok' : 'none', why: `${n} frame${n === 1 ? '' : 's'} with a player`, ms: now() - t0 });
+    this.rep.steps.push({ name: 'connect', outcome: n ? 'ok' : 'none', why: `${n} frame${n === 1 ? '' : 's'} with a player`, ms: this.now() - t0 });
     if (!n) throw new Stop('live', r && r.ok === false ? LIVE.unreachable : LIVE.webaudio, true);
     this.tapping = true;
     for (const f of this.attached()) this.tapOn(f);
@@ -447,7 +454,7 @@ export class Loader extends Job {
 
   /** What the tap first says: the player's length, and anything that sends the deck live at once. */
   async look() {
-    const t0 = now(), known = () => !!this.decisive() || this.duration() != null;
+    const t0 = this.now(), known = () => !!this.decisive() || this.duration() != null;
     this.say(0.02, SAY.look);
     await this.until(known, Math.min(this.t.idle, this.t.duration));
     this.check();
@@ -460,10 +467,10 @@ export class Loader extends Job {
       await this.until(() => known() || !this.idle(), this.t.start);
       this.check();
       if (!known() && this.idle()) {
-        this.rep.steps.push({ name: 'look', outcome: 'not started', why: "the page's player had nothing to play", ms: now() - t0 });
+        this.rep.steps.push({ name: 'look', outcome: 'not started', why: "the page's player had nothing to play", ms: this.now() - t0 });
         throw new Stop('live', LIVE.unstarted);
       }
-      this.rep.notes.push(`the track was started on the tab ${secs(now() - t0)} into the load`);
+      this.rep.notes.push(`the track was started on the tab ${secs(this.now() - t0)} into the load`);
       this.say(this.progress, SAY.look);
       wait = this.t.duration;
     }
@@ -473,7 +480,7 @@ export class Loader extends Job {
     this.check();
     this.pinned = this.track();
     const why = this.decisive(), D = this.duration();
-    this.rep.steps.push({ name: 'look', outcome: why || 'ok', why: D != null ? `the player says ${D.toFixed(3)} s` : "the player's length is not known", ms: now() - t0 });
+    this.rep.steps.push({ name: 'look', outcome: why || 'ok', why: D != null ? `the player says ${D.toFixed(3)} s` : "the player's length is not known", ms: this.now() - t0 });
     if (why) throw new Stop('live', LIVE[why], UNREADABLE.includes(why));
     this.looked = true;
   }
@@ -501,7 +508,7 @@ export class Loader extends Job {
 
   /** Run one rung, noting how it went: its result is {done: {pcm, notice}} or {outcome, why}. */
   async step(name, fn) {
-    const t0 = now(), e = { name, how: '', outcome: '', why: '', ms: 0, at: t0 };
+    const t0 = this.now(), e = { name, how: '', outcome: '', why: '', ms: 0, at: t0 };
     this.rep.steps.push(e);
     try {
       const r = await fn(e);
@@ -512,7 +519,7 @@ export class Loader extends Job {
       e.outcome = err instanceof Stop && err.kind === 'cancel' ? 'cancelled' : 'stopped';
       e.why = err.message;
       throw err;
-    } finally { e.ms = now() - t0; }
+    } finally { e.ms = this.now() - t0; }
   }
 
   // ---------------------------------------------------------------- rung: the page's own track link (§4.1)
@@ -550,11 +557,11 @@ export class Loader extends Job {
     const cut = own > L + 0.5 && w.cut ? w.cut : null, part = cut && cut.samples / w.sampleRate;
     if (!own && expect && expect > 2 * L) return { outcome: 'failed', why: `${what} is ${minutes(expect / 60)} long, too long to decode whole` };
     this.say(this.progress, SAY.decode);
-    const t0 = now();
+    const t0 = this.now();
     let pcm;
     try { pcm = await this.d.decodeFile(this.engine.ctx, cut ? bytes.slice(0, cut.end) : bytes); } catch (_) { this.check(); return { outcome: 'failed', why: `${what} is not audio this browser can play` }; }
     this.check();
-    this.rep.steps.push({ name: 'decode', outcome: 'ok', why: cut ? `${what}, its first ${part.toFixed(1)} s` : what, ms: now() - t0 });
+    this.rep.steps.push({ name: 'decode', outcome: 'ok', why: cut ? `${what}, its first ${part.toFixed(1)} s` : what, ms: this.now() - t0 });
     const got = pcm.L.length / pcm.sampleRate;
     if (cut && off(got, part)) return { outcome: 'failed', why: `the first ${part.toFixed(1)} s of ${what} decoded to ${got.toFixed(1)} s` };
     if (!cut && expect && off(got, expect)) return { outcome: 'failed', why: `${what} holds ${got.toFixed(1)} s, but the page's player says ${expect.toFixed(1)} s` };
@@ -769,26 +776,26 @@ export class Loader extends Job {
       e.how = e.how ? `${e.how}, then ${how}` : how;
       this.say(this.progress, m === 'seekhop' ? SAY.hop : SAY.fast(DRIVE_RATE));
     };
-    const band = this.band(), end = now() + this.t.drive + T * this.t.drivePerSec;
-    let bytes = f.bytes, fresh = now(), checked = 0, stalled = 0;
+    const band = this.band(), end = this.now() + this.t.drive + T * this.t.drivePerSec;
+    let bytes = f.bytes, fresh = this.now(), checked = 0, stalled = 0;
     try {
       go(stampless ? 'accelerate' : 'seekhop', null, !!g0);
       // Said once, and looked for in every message from the page, so it is never missed.
-      if (g0) this.until(() => { const d = f.prog && f.prog.drive; return !!d && d.state === 'flushed'; }, end - now()).then((yes) => {
+      if (g0) this.until(() => { const d = f.prog && f.prog.drive; return !!d && d.state === 'flushed'; }, end - this.now()).then((yes) => {
         if (yes) { flushed = true; e.how = e.how.replace('seek-hop', 'seek-hop after a flush'); }
       }, () => {});
       for (;;) {
         const seen = f.prog;
         await this.until(() => f.prog !== seen || f.left, this.t.check);
         this.check();
-        if (f.bytes !== bytes) { bytes = f.bytes; fresh = now(); }
+        if (f.bytes !== bytes) { bytes = f.bytes; fresh = this.now(); }
         const d = f.prog && f.prog.drive, st = d && d.mode === mode && !(pass && f.prog === pass.prog) ? d.state : 'running';
-        stalled = st === 'stalled' ? stalled || now() : 0;
+        stalled = st === 'stalled' ? stalled || this.now() : 0;
         // It did not fetch again what the flush took from behind its place (so it was left the rest): the start is not to be had.
         if (g0 && d && d.unflushed === 'sticky') { out = { outcome: 'failed', why: unfetched }; break; }
         if (d && d.unflushed && !unflushed) { unflushed = d.unflushed; this.rep.notes.push(`the player was not flushed: ${UNFLUSHED[d.unflushed]}`); }
-        if (st === 'done' || now() - checked >= this.t.check) {
-          checked = now();
+        if (st === 'done' || this.now() - checked >= this.t.check) {
+          checked = this.now();
           placed = await this.complete();
           if (placed) break;
           this.say(band(this.covered()));
@@ -804,17 +811,17 @@ export class Loader extends Job {
           const why = `the player buffered the whole track, but ${gaps.map(span).join(', ')} came before the deck could read it${flushed && gaps[0][0] < 0.05 ? ', and it would not fetch the start again after a flush' : ''}${unflushed === 'ended' && gaps[0][0] < 0.05 ? ': reload the tab, then load it again' : ''}`;
           // A player keeps only so much behind its playhead: what it held from before the tap may be gone from it by
           // now, and run once more from the first gap it fetches that again (never for appends placed in order only).
-          if (!pass && !stampless) { pass = { why, prog: f.prog }; go('accelerate', gaps[0][0]); fresh = now(); continue; }
+          if (!pass && !stampless) { pass = { why, prog: f.prog }; go('accelerate', gaps[0][0]); fresh = this.now(); continue; }
           out = { outcome: 'failed', why: pass ? pass.why : why };
           break;
         }
         // A seek-hop stalls when it brings nothing new, or when the player says so while it appends elsewhere (shaka going on
         // from its last segment after a flush): either way, accelerate.
-        if (mode === 'seekhop' && (st === 'refused' || now() - fresh > this.t.stall || (stalled && now() - stalled > this.t.stall))) { go('accelerate'); fresh = now(); continue; }
+        if (mode === 'seekhop' && (st === 'refused' || this.now() - fresh > this.t.stall || (stalled && this.now() - stalled > this.t.stall))) { go('accelerate'); fresh = this.now(); continue; }
         if (mode === 'accelerate' && st === 'refused') { out = { outcome: 'failed', why: pass ? pass.why : 'the page will not let its player run faster' }; break; }
         // Flushed, and nothing comes even played: a player that never fetches a piece twice. The start is not to be had.
-        if (mode === 'accelerate' && flushed && startOf() && now() - fresh > this.t.stall) { out = { outcome: 'failed', why: unfetched }; break; }
-        if (now() > end) { out = { outcome: 'failed', why: `the player had not given the whole track after ${secs(now() - end + this.t.drive + T * this.t.drivePerSec)} (missing ${this.gapsNow().map(span).join(', ')})` }; break; }
+        if (mode === 'accelerate' && flushed && startOf() && this.now() - fresh > this.t.stall) { out = { outcome: 'failed', why: unfetched }; break; }
+        if (this.now() > end) { out = { outcome: 'failed', why: `the player had not given the whole track after ${secs(this.now() - end + this.t.drive + T * this.t.drivePerSec)} (missing ${this.gapsNow().map(span).join(', ')})` }; break; }
       }
     } finally {
       this.send(f, { t: 'drive', mode: 'stop' }); // always: the player gets back its rate, pitch, mute and place
@@ -870,7 +877,7 @@ export class Loader extends Job {
    */
   decodeOr(placed) { return this.holding(() => this.decodeRuns(placed)); }
   async decodeRuns(placed) {
-    const D = this.duration(), T = this.target(), cut = T < D - placed.tol, t0 = now();
+    const D = this.duration(), T = this.target(), cut = T < D - placed.tol, t0 = this.now();
     this.say(0.8, SAY.decode);
     let pcm;
     try {
@@ -882,14 +889,14 @@ export class Loader extends Job {
       return { outcome: 'failed', why: err instanceof AssemblyError ? err.message : `the audio would not decode (${err.message})` };
     }
     this.check();
-    this.rep.steps.push({ name: 'decode', outcome: 'ok', why: `${placed.runs.length} run${placed.runs.length === 1 ? '' : 's'}`, ms: now() - t0 });
+    this.rep.steps.push({ name: 'decode', outcome: 'ok', why: `${placed.runs.length} run${placed.runs.length === 1 ? '' : 's'}`, ms: this.now() - t0 });
     if (Math.abs(this.duration() - D) > placed.tol) return { again: true }; // never resident at a length the page no longer gives
     return { done: this.limited(pcm, D) };
   }
 
   // ---------------------------------------------------------------- the end
   async finish({ pcm, notice }) {
-    const d = this.deck, e = this.engine, t0 = now();
+    const d = this.deck, e = this.engine, t0 = this.now();
     this.say(0.85, SAY.beat);
     let analysis = null;
     try { analysis = await e.analyse(pcm, this.signal); } catch (err) {
@@ -897,7 +904,7 @@ export class Loader extends Job {
       e.event('warn', `Deck ${d.slot}: no beat grid from the whole track (${err.message}). TAP the beat.`, d.id);
     }
     this.check();
-    this.rep.steps.push({ name: 'beat', outcome: analysis ? 'ok' : 'none', why: analysis && analysis.bpm > 0 ? `${analysis.bpm.toFixed(2)} BPM` : 'no steady beat', ms: now() - t0 });
+    this.rep.steps.push({ name: 'beat', outcome: analysis ? 'ok' : 'none', why: analysis && analysis.bpm > 0 ? `${analysis.bpm.toFixed(2)} BPM` : 'no steady beat', ms: this.now() - t0 });
     const length = pcm.L.length / pcm.sampleRate; // read first: the deck takes the arrays
     const res = await e.serial(() => e.startResidentDeck({ deckId: d.id, pcm, analysis }));
     if (!res.ok) { this.check(); throw new Stop('live', LIVE.failed(res.error)); }
@@ -945,14 +952,14 @@ export class Loader extends Job {
       `Track length: ${D != null ? `${D.toFixed(3)} s (the page's player)` : 'not known'}`,
       ...(r.limit ? [`Limit: ${r.limit}`] : []),
       'Steps:',
-      ...r.steps.map((s) => `  ${s.name}${s.how ? ` (${s.how})` : ''}: ${s.outcome ? `${s.outcome} in ${secs(s.ms)}` : `running for ${secs(now() - s.at)}`}${s.why ? ` — ${s.why}` : ''}`),
+      ...r.steps.map((s) => `  ${s.name}${s.how ? ` (${s.how})` : ''}: ${s.outcome ? `${s.outcome} in ${secs(s.ms)}` : `running for ${secs(this.now() - s.at)}`}${s.why ? ` — ${s.why}` : ''}`),
       ...r.notes.map((n) => `  note: ${n}`),
       `Media types: ${r.mimes.size ? [...r.mimes].join(', ') : 'none seen'}`,
       `Runs: ${p ? p.runs.length : 0}, segments: ${p ? p.runs.reduce((n, x) => n + x.segs.length, 0) : 0}, gaps: ${gaps.length ? gaps.map(span).join(', ') : 'none'}`,
       `Requests seen: ${media} media, ${lists} playlist${lists === 1 ? '' : 's'}`,
       `Bytes: ${kb(captured)} captured from the player, ${kb(r.refetched)} fetched again`,
       `First failure: ${failed ? `${failed.name}: ${failed.why}` : (r.result || '').startsWith('live: ') ? r.result.slice(6) : 'none'}`,
-      `Total: ${secs(now() - r.t0)}`,
+      `Total: ${secs(this.now() - r.t0)}`,
     ];
     return lines.join('\n');
   }
@@ -968,11 +975,11 @@ export class Loader extends Job {
 
   /** The track's frame has gone, or goes within a moment (word of a page's new address can come before its agent goes). */
   async frameGone() {
-    for (const t0 = now(); ;) {
+    for (const t0 = this.now(); ;) {
       const f = this.held();
       if (!f || f.left) return true;
-      if (this.signal.aborted || now() - t0 >= this.t.away) return false;
-      await new Promise((r) => setTimeout(r, Math.min(50, this.t.away / 4)));
+      if (this.signal.aborted || this.now() - t0 >= this.t.away) return false;
+      await new Promise((r) => this.clock.setTimeout(r, Math.min(50, this.t.away / 4)));
     }
   }
 
@@ -986,18 +993,18 @@ export class Loader extends Job {
    * meanwhile cancels the load, and says why itself.
    */
   async fate() {
-    const t0 = now();
+    const t0 = this.now();
     for (;;) {
       if (this.signal.aborted || this.engine.decks.get(this.deck.id) !== this.deck) throw new Stop('cancel', 'Loading was cancelled.');
       if (this.moved()) {
-        this.rep.steps.push({ name: 'page', outcome: 'moved', why: `the tab shows ${short(this.deck.meta.url)} now`, ms: now() - t0 });
+        this.rep.steps.push({ name: 'page', outcome: 'moved', why: `the tab shows ${short(this.deck.meta.url)} now`, ms: this.now() - t0 });
         return 'moved';
       }
-      if (now() - t0 >= this.t.away) break;
-      await new Promise((r) => setTimeout(r, Math.min(50, this.t.away / 4)));
+      if (this.now() - t0 >= this.t.away) break;
+      await new Promise((r) => this.clock.setTimeout(r, Math.min(50, this.t.away / 4)));
     }
     const ended = this.ended();
-    this.rep.steps.push({ name: 'page', outcome: ended ? 'ended' : 'reload', why: ended ? "the tab's capture ended" : 'the same page again', ms: now() - t0 });
+    this.rep.steps.push({ name: 'page', outcome: ended ? 'ended' : 'reload', why: ended ? "the tab's capture ended" : 'the same page again', ms: this.now() - t0 });
     return ended ? 'ended' : 'reload';
   }
 
@@ -1368,7 +1375,7 @@ export class Recording extends Job {
 
   /** -> {ok:true, deckId, slot} once the recording is a resident deck (and the live deck let go), or {ok:false, error}. */
   async run() {
-    const e = this.engine, live = this.live, d = this.deck, sr = e.ctx.sampleRate, t0 = now(), assist = live.assist.offUntil;
+    const e = this.engine, live = this.live, d = this.deck, sr = e.ctx.sampleRate, t0 = this.now(), assist = live.assist.offUntil;
     let node = null;
     try {
       this.say(0, 'getting the page ready');
@@ -1396,7 +1403,7 @@ export class Recording extends Job {
       this.send({ t: 'drive', mode: 'accelerate', rate: REC_RATE, from: 0, hold: true, audible: true });
       await this.sleep(HOLD_MS);
       this.check();
-      const mark = frames, end = now() + (T / REC_RATE + 10) * 1000;
+      const mark = frames, end = this.now() + (T / REC_RATE + 10) * 1000;
       this.send({ t: 'drive', mode: 'accelerate', rate: REC_RATE, audible: true });
       this.say(0.02, `recording from the page at ${REC_RATE}×`);
       let start = -1;
@@ -1406,7 +1413,7 @@ export class Recording extends Job {
         if (this.refused()) throw new Stop('live', 'the page will not let its player run faster');
         if (start < 0) start = findStart(L, R, mark, frames);
         if (start >= 0) { this.say(0.02 + 0.78 * Math.min(1, (frames - start) / need)); if (frames - start >= need) break; }
-        if (now() > end) throw new Stop('live', start < 0 ? 'the page played nothing' : 'the page stopped before the end of the track');
+        if (this.now() > end) throw new Stop('live', start < 0 ? 'the page played nothing' : 'the page stopped before the end of the track');
       }
       this.send({ t: 'drive', mode: 'stop' });
       this.send({ t: 'tap', on: false, forget: true });
@@ -1446,7 +1453,7 @@ export class Recording extends Job {
         `Recorded: ${(need / sr).toFixed(3)} s of the tab's sound from deck ${live.slot}'s capture, slowed back by ${REC_RATE}`,
         ...(mended.length ? [`Mended: ${mended.length} skip${mended.length === 1 ? '' : 's'} in the capture (the computer was busy): ${mended.map((x) =>
           `${Math.round(Math.abs(x.ms) * REC_RATE)} ms ${x.ms > 0 ? 'put in' : 'lost'} at ${(x.at * REC_RATE).toFixed(1)} s`).join(', ')}`] : []),
-        `Total: ${secs(now() - t0)}`,
+        `Total: ${secs(this.now() - t0)}`,
       ].join('\n') });
       e.event('info', `Deck ${d.slot}: the whole track was recorded from the page (reduced highs). Deck ${live.slot} is let go.`, d.id);
       e.eject(live.id); // the page paused, its capture released

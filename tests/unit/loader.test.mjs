@@ -262,12 +262,12 @@ const asksToStart = (engine) => engine.events.filter((e) => /^Deck 1: start the 
 test('a page whose play button was not pressed: the deck asks for the track to be started on the tab, and loads it whole once it plays', async () => {
   const link = 'https://site.example/media/t.mp3';
   const { result, engine, deck } = await load({ ...UNSTARTED, files: { [link]: file('t', 120.0065) } }, {
-    before: ({ tab, deck: d }) => {
+    before: ({ tab, deck: d, clock }) => {
       // The DJ presses play on the tab a moment after the deck asks for it: the page's player takes its source.
-      const t = setInterval(() => {
+      const t = clock.setInterval(() => {
         if (d.load.strategy !== START) return;
-        clearInterval(t);
-        setTimeout(() => { const fr = tab.frames[0]; fr.duration = 120.0065; fr.pg.src = link; fr.progress({ sbs: [] }); }, 100);
+        clock.clearInterval(t);
+        clock.setTimeout(() => { const fr = tab.frames[0]; fr.duration = 120.0065; fr.pg.src = link; fr.progress({ sbs: [] }); }, 100);
       }, 5);
       t.unref();
     },
@@ -312,12 +312,11 @@ test('a load that ends live because the page\'s bytes cannot be had says so (noB
 });
 
 test('a page with no player the tap can see (Web Audio only) goes live: no agent ever connects', async () => {
-  const t0 = performance.now();
   const { result, engine, tab } = await load({ kind: 'none' });
   assert.equal(result.kind, 'live');
   assert.deepEqual(tab.log, []);
   assert.match(called(engine, 'failLoadingToLive')[0].reason, /without a media player the deck can read/);
-  assert.ok(performance.now() - t0 < 1000);
+  assert.ok(engine.clock.now() < 1000, `${engine.clock.now()} ms`);
 });
 
 test('a page whose only element the deck could read is silent goes live like a Web-Audio page', async () => {
@@ -591,7 +590,7 @@ async function ejectAt(k, page) {
     if (n++ === k && at == null) {
       at = { what, sent: tab.log.length };
       // Another deck starting holds serial() for a moment, so the eject's turn (and its deck's going) comes later.
-      engine.serial(() => new Promise((r) => setTimeout(r, 25)));
+      engine.serial(() => engine.clock.sleep(25));
       engine.eject(deck.id);
     }
   }
@@ -707,7 +706,7 @@ test('a page that moves on while a link it gave decodes badly is ejected, never 
 test('a single-page site moving on to another track while a link it gave decodes badly is ejected, never played live', async () => {
   const link = 'https://site.example/t.mp3';
   const { result, engine } = await load({ kind: 'progressive', src: link, files: { [link]: file('t', 120.0065) } }, {
-    before: ({ tab, loader }) => { loader.d.decodeFile = async () => { tab.moveInPlace({ to: OTHER }); await new Promise((r) => setTimeout(r, 5)); throw new Error('Unable to decode audio data'); }; },
+    before: ({ tab, loader, clock }) => { loader.d.decodeFile = async () => { tab.moveInPlace({ to: OTHER }); await clock.sleep(5); throw new Error('Unable to decode audio data'); }; },
   });
   assert.deepEqual(result, { ok: false, error: MOVED }, JSON.stringify(engine.events));
   assert.deepEqual(called(engine, 'failLoadingToLive'), []);
@@ -745,15 +744,15 @@ for (const [what, page, opts] of [
     { before: ({ tab, loader }) => { loader.d.decodeFile = async (ctx, buf) => { tab.navigate({ to: OTHER }); await settle(5); return decoders.decodeFile(ctx, buf); }; } }],
   // Checked only when the drive says it is done, so the page goes before the loader has looked at what it holds.
   ['all its pieces captured from the player, before the loader looked', { kind: 'mse', rendition: hi(), preTap: 0, playing: 1 },
-    { times: { ...FAST, check: 1000 }, before: ({ tab }) => { tab.hooks.push((m) => { if (m.t === 'drive' && m.mode === 'seekhop') setTimeout(() => tab.navigate({ to: OTHER }), 2); }); } }],
+    { times: { ...FAST, check: 1000 }, before: ({ tab, clock }) => { tab.hooks.push((m) => { if (m.t === 'drive' && m.mode === 'seekhop') clock.setTimeout(() => tab.navigate({ to: OTHER }), 2); }); } }],
   // The hub's word of the new page (META) can come before the old page's agents have gone.
   ['all its pieces captured from the player, before the loader looked, word of the new page coming before its agents go', { kind: 'mse', rendition: hi(), preTap: 0, playing: 1 },
-    { times: { ...FAST, check: 1000 }, before: ({ tab }) => { tab.hooks.push((m) => { if (m.t === 'drive' && m.mode === 'seekhop') setTimeout(() => { tab.deck.meta.url = OTHER; setTimeout(() => tab.navigate(), 20); }, 2); }); } }],
+    { times: { ...FAST, check: 1000 }, before: ({ tab, clock }) => { tab.hooks.push((m) => { if (m.t === 'drive' && m.mode === 'seekhop') clock.setTimeout(() => { tab.deck.meta.url = OTHER; clock.setTimeout(() => tab.navigate(), 20); }, 2); }); } }],
   // A single-page site moving on in place: its agents stay, and its player goes on to another track.
   ['its pieces fetched, while the beat is found, on a single-page site that moves on in place', { kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true },
-    { before: ({ tab, engine }) => { const f = engine.analyse.bind(engine); engine.analyse = async (p, s) => { tab.moveInPlace({ to: OTHER }); await new Promise((r) => setTimeout(r, 5)); return f(p, s); }; } }],
+    { before: ({ tab, engine, clock }) => { const f = engine.analyse.bind(engine); engine.analyse = async (p, s) => { tab.moveInPlace({ to: OTHER }); await clock.sleep(5); return f(p, s); }; } }],
   ['its link read, while it is decoded, on a single-page site that moves on in place', { kind: 'progressive', src: 'https://site.example/t.mp3', files: { 'https://site.example/t.mp3': file('t', 120.0065) } },
-    { before: ({ tab, loader }) => { loader.d.decodeFile = async (ctx, buf) => { tab.moveInPlace({ to: OTHER }); await new Promise((r) => setTimeout(r, 5)); return decoders.decodeFile(ctx, buf); }; } }],
+    { before: ({ tab, loader, clock }) => { loader.d.decodeFile = async (ctx, buf) => { tab.moveInPlace({ to: OTHER }); await clock.sleep(5); return decoders.decodeFile(ctx, buf); }; } }],
 ]) {
   test(`a page that moves on once every byte of its track is in, ${what}: the deck goes resident and lets go of the tab`, async () => {
     const { result, engine, deck } = await load(page, opts);
@@ -791,7 +790,7 @@ test('the page going away with the tab\'s audio gone too ejects the deck with on
 
 test('a length not known at first is waited for; then the track loads', async () => {
   const { result, engine } = await load({ kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true, duration: null }, {
-    before: ({ tab: t }) => { setTimeout(() => { t.frames[0].duration = DUR; t.frames[0].progress(); }, 60); },
+    before: ({ tab: t, clock }) => { clock.setTimeout(() => { t.frames[0].duration = DUR; t.frames[0].progress(); }, 60); },
   });
   assert.equal(result.kind, 'resident');
   assert.ok(near(called(engine, 'startResidentDeck')[0].frames / SR, 120, 0.02));
