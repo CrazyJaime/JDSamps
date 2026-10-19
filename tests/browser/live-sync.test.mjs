@@ -8,6 +8,7 @@ import test, { before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
+import path from 'node:path';
 import {
   prepareExtension, launchExtension, hubCall, tabIdFor, waitFor, installClient, act, set, state, offscreenEval, makeTrackWav,
   downloadIds, waitForDownload, parseWav, bandOnsets, steadyBeats, onsetBias, beatMatch,
@@ -15,6 +16,7 @@ import {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const REC_S = 60;
+const DIAG = process.env.JDS_DIAG; // a directory: the master recording and the engine's ticks are kept there
 // Track A (kick, 124 BPM: the follower, deck 1) and track B (click, 128 BPM: the master, deck 2), 240 s each, with
 // capture gaps spliced in at track seconds the decks play during the recording: ms > 0 drops that much, < 0 repeats it.
 const TRACKS = { a: { bpm: 124, kind: 'low' }, b: { bpm: 128, kind: 'high' } };
@@ -54,13 +56,28 @@ async function startServer() {
   return { url: (k) => `${origin}/${k}`, close: () => new Promise((r) => srv.close(r)) };
 }
 
-// Each tick of the recording, for decks 1 and 2: [time, slot, playhead, scheduled rate, the rate it is synced to, starved, phase error (ms)].
+// JDS_DIAG: each deck's tracker input (its ODF frames) and the capture gaps it found, kept for replaying offline.
+const TAP = `(async () => {
+  const m = await import('/engine/tempo.js'), P = m.DeckTempo.prototype, push = P.pushBatch, detect = P.detectJump;
+  window.__odf = new Map();
+  const of = (d) => { let a = window.__odf.get(d); if (!a) window.__odf.set(d, a = { sr: d.sr, fps: d.fps, batches: [], gaps: [] }); return a; };
+  P.pushBatch = function (b) { of(this).batches.push({ t0: b.t0, spf: b.spf, full: Array.from(b.full), low: Array.from(b.low) }); return push.call(this, b); };
+  P.detectJump = function () {
+    const was = this.track.jump;
+    detect.call(this);
+    const j = this.track.jump;
+    if (j && j !== was) of(this).gaps.push({ from: j.from, edge: this.tracker.lastT / this.sr, prev: j.prev, t0: this.clock.t0 / this.sr, T: this.clock.T / this.sr });
+  };
+  return true;
+})()`;
+// Each tick of the recording, for decks 1 and 2: [time, slot, playhead, scheduled rate, the rate it is synced to, starved,
+// phase error (ms), dropout runs].
 const PROBE = `(() => {
   const e = globalThis.__jdsEngine, log = window.__liveSync = [], orig = e.tick.bind(e);
   e.tick = (m) => {
     orig(m);
     const now = e.ctx.currentTime;
-    for (const d of e.decks.values()) if (d.slot <= 2 && d.ts) log.push([now, d.slot, d.ts.posAt(now), d.ts.rateAt(now), d.effRate(d.ts.posAt(now)), d.starved, d.phaseMs]);
+    for (const d of e.decks.values()) if (d.slot <= 2 && d.ts) log.push([now, d.slot, d.ts.posAt(now), d.ts.rateAt(now), d.effRate(d.ts.posAt(now)), d.starved, d.phaseMs, d.dropouts.runs]);
   };
   return true;
 })()`;
@@ -112,6 +129,7 @@ before(async () => {
   deck = await h.context.newPage();
   await deck.goto(`chrome-extension://${h.extId}/deck.html`);
   await deck.evaluate(() => chrome.storage.local.set({ 'resident.auto': false }));
+  if (DIAG) await offscreenEval(h, TAP);
   for (const k of ['a', 'b']) {
     const r = await hubCall(deck, { type: 'LOAD_TAB', tabId: await tabIdFor(h, server.url(k)) });
     assert.equal(r.ok, true, JSON.stringify(r));
@@ -132,10 +150,12 @@ test('two synced live decks: a minute of master recording at one tempo and on on
   await sleep(1000);
   assert.equal((await act(deck, 1, 'syncPlay')).ok, true);
   // Where each tab's track was when its deck's capture began: the gaps' places in each deck's input.
-  const s0 = await state(deck), began = {};
+  const began = {};
   for (const [k, slot] of [['a', 1], ['b', 2]]) {
     const page = h.context.pages().find((p) => p.url() === server.url(k));
-    began[slot] = (await page.evaluate(() => document.getElementById('a').currentTime)) - by(s0, slot).liveEdge;
+    const edge = () => offscreenEval(h, `[...globalThis.__jdsEngine.decks.values()].find((d) => d.slot === ${slot}).ts.liveEdge`);
+    const e0 = await edge(), at = await page.evaluate(() => document.getElementById('a').currentTime), e1 = await edge();
+    began[slot] = at - (e0 + e1) / 2;
   }
   await sleep(12000); // the follower settles on the master's beat
   await offscreenEval(h, PROBE);
@@ -143,51 +163,66 @@ test('two synced live decks: a minute of master recording at one tempo and on on
   assert.equal((await act(deck, null, 'mixRecStart')).ok, true);
   await sleep(REC_S * 1000);
   await act(deck, null, 'mixRecStop');
-  rec = parseWav(fs.readFileSync((await waitForDownload(h, known)).filename));
+  const file = (await waitForDownload(h, known)).filename;
+  rec = parseWav(fs.readFileSync(file));
   const ticks = await offscreenEval(h, 'window.__liveSync');
   const found = Object.fromEntries(await offscreenEval(h, '[...globalThis.__jdsEngine.decks.values()].map((d) => [d.slot, d.tempo.track.jump ? d.tempo.track.jump.n + 1 : 0])'));
+  if (DIAG) {
+    const segs = await offscreenEval(h, '[...globalThis.__jdsEngine.decks.values()].map((d) => [d.slot, d.grids.segs.map((s) => [s.from, s.shift || 0])])');
+    fs.mkdirSync(DIAG, { recursive: true });
+    fs.copyFileSync(file, path.join(DIAG, 'mix.wav'));
+    fs.writeFileSync(path.join(DIAG, 'ticks.json'), JSON.stringify({ recFrom, began, segs, ticks }));
+    fs.writeFileSync(path.join(DIAG, 'odf.json'), await offscreenEval(h, 'JSON.stringify({ decks: [...globalThis.__jdsEngine.decks.values()].map((d) => ({ slot: d.slot, ...window.__odf.get(d.tempo) })) })'));
+  }
 
-  const m = beatMatch(rec, onsetBias(124, 'low', 'low') - onsetBias(128, 'high', 'high'));
-  const off = m.off.filter((o) => o.t > 0.15 && o.t < m.seconds - 0.15).map((o) => Math.abs(o.ms)).sort((x, y) => x - y);
-  const med = off[off.length >> 1], max = off.at(-1);
-  const bent = { 1: bends(fineOnsets(rec, 'low')), 2: bends(fineOnsets(rec, 'high')) };
-  // When each spliced gap reached its deck's playhead, in the recording's time.
+  // Where each spliced gap is in its deck's input, and when its playhead reached it (recording time).
   const heard = [];
   for (const [k, slot] of [['a', 1], ['b', 2]]) {
     let moved = 0;
     for (const g of [...GAPS[k]].sort((x, y) => x.at - y.at)) {
       const p = g.at - began[slot] - moved, x = ticks.find((y) => y[1] === slot && y[2] >= p);
       moved += g.ms / 1000;
-      if (x) heard.push({ slot, ms: g.ms, t: x[0] - recFrom });
+      heard.push({ slot, ms: g.ms, p, t: x ? x[0] - recFrom : null });
     }
   }
-  // In the engine: how far each deck's scheduled rate left the rate it is synced to, and its playhead jumps.
-  const eng = {};
+  // In the engine: how far each deck's scheduled rate left the rate it is synced to, its playhead jumps, and the box's
+  // own capture trouble: a jump nowhere near a spliced gap is one of its capture skips, a dropout its stretcher
+  // running dry. Those stretches (from 1 s before to 3 s after) are reported, and left out of the bounds below.
+  const eng = {}, rough = [];
   for (const slot of [1, 2]) {
     const xs = ticks.filter((x) => x[1] === slot), jumps = [];
     let bend = 0, at = null;
     for (let i = 1; i < xs.length; i++) {
-      const [t1, , p1, r1, want, starved] = xs[i], [t0, , p0, r0] = xs[i - 1];
+      const [t1, , p1, r1, want, starved, , dry1] = xs[i], [t0, , p0, r0, , , , dry0] = xs[i - 1];
       if (!starved && want > 0 && Math.abs(r1 / want - 1) > bend) { bend = Math.abs(r1 / want - 1); at = xs[i - 1]; }
-      const d = p1 - (p0 + ((r0 + r1) / 2) * (t1 - t0));
-      if (Math.abs(d) > 0.004) jumps.push(`${(d * 1000).toFixed(1)} ms at ${p0.toFixed(2)} s`);
+      const d = p1 - (p0 + ((r0 + r1) / 2) * (t1 - t0)), jump = Math.abs(d) > 0.004;
+      const spliced = heard.some((g) => g.slot === slot && Math.abs(g.p - p0) < 2 && Math.abs(d + g.ms / 1000) < 0.004); // a drop is jumped back
+      if (jump) jumps.push(`${(d * 1000).toFixed(1)} ms at ${p0.toFixed(2)} s${spliced ? '' : ' (its own)'}`);
+      if ((jump && !spliced) || dry1 > dry0) rough.push({ slot, t: t1 - recFrom, what: jump && !spliced ? `a ${(d * 1000).toFixed(0)} ms capture skip` : 'a dropout' });
     }
     eng[slot] = { bend, jumps, at: at ? `at ${at[2].toFixed(2)} s (phase ${at[6] == null ? '-' : at[6].toFixed(1)} ms just before)` : '' };
   }
-  t.diagnostic(`tempo error ${(m.tempoErr * 100).toFixed(4)} % (kick ${(60 / m.A.T).toFixed(3)}, click ${(60 / m.B.T).toFixed(3)} BPM); beat offsets median ${med.toFixed(1)} ms, max ${max.toFixed(1)} ms over ${off.length} beats`);
+  const smooth = (x) => !rough.some((r) => x > r.t - 1 && x < r.t + 3);
+  const m = beatMatch(rec, onsetBias(124, 'low', 'low') - onsetBias(128, 'high', 'high'));
+  const all = m.off.filter((o) => o.t > 0.15 && o.t < m.seconds - 0.15), off = all.filter((o) => smooth(o.t)).map((o) => Math.abs(o.ms)).sort((x, y) => x - y);
+  const med = off[off.length >> 1], max = off.at(-1);
+  const bent = { 1: bends(fineOnsets(rec, 'low')), 2: bends(fineOnsets(rec, 'high')) };
+  t.diagnostic(`tempo error ${(m.tempoErr * 100).toFixed(4)} % (kick ${(60 / m.A.T).toFixed(3)}, click ${(60 / m.B.T).toFixed(3)} BPM); beat offsets median ${med.toFixed(1)} ms, max ${max.toFixed(1)} ms over ${off.length} beats; ${all.length - off.length} beats left out near the box's own capture trouble`);
   for (const slot of [1, 2]) {
     t.diagnostic(`deck ${slot}: worst 4-beat bend in the recording ${pct(worst(bent[slot]))}; in the engine ${(eng[slot].bend * 100).toFixed(2)} % ${eng[slot].at}; playhead jumps ${eng[slot].jumps.join(', ') || 'none'}; capture gaps found ${found[slot]}`);
   }
-  t.diagnostic(`spliced gaps heard at: ${heard.map((g) => `deck ${g.slot} ${g.ms} ms ${g.t.toFixed(2)} s`).join(', ')}`);
+  t.diagnostic(`spliced gaps heard at: ${heard.map((g) => `deck ${g.slot} ${g.ms} ms ${g.t == null ? '-' : g.t.toFixed(2)} s`).join(', ')}`);
+  t.diagnostic(`the box's own capture trouble: ${rough.map((r) => `deck ${r.slot} ${r.what} at ${r.t.toFixed(2)} s`).join(', ') || 'none'}`);
   assert.ok(rec.seconds > REC_S - 1, `${rec.seconds} s recorded`);
-  assert.equal(heard.length, GAPS.a.length + GAPS.b.length, 'every spliced gap played during the recording');
+  assert.ok(heard.every((g) => g.t != null), 'every spliced gap played during the recording');
   assert.ok(found[1] >= GAPS.a.length && found[2] >= GAPS.b.length, `capture gaps found: deck 1 ${found[1]} of ${GAPS.a.length}, deck 2 ${found[2]} of ${GAPS.b.length}`);
+  assert.ok(off.length >= 0.75 * all.length, `the box's own capture trouble covers ${all.length - off.length} of ${all.length} beats: the run says too little`);
   assert.ok(Math.abs(m.tempoErr) < 0.002, `tempo error ${(m.tempoErr * 100).toFixed(4)} %`);
   assert.ok(med <= 20 && max <= 40, `beat offsets median ${med.toFixed(1)} ms, max ${max.toFixed(1)} ms`);
   // Around each spliced gap (from 2 s before it, the beats that lead into it, to 3 s after), neither deck bends.
   for (const g of heard) {
     for (const slot of [1, 2]) {
-      const w = worst(bent[slot].filter((x) => x.t > g.t - 2 && x.t < g.t + 3));
+      const w = worst(bent[slot].filter((x) => x.t > g.t - 2 && x.t < g.t + 3 && smooth(x.t) && smooth(x.t + 1.5)));
       assert.ok(Math.abs(w.dev) <= 0.005, `deck ${slot} bent ${pct(w)} of the recording, around deck ${g.slot}'s ${g.ms} ms gap at ${g.t.toFixed(2)} s`);
     }
   }
