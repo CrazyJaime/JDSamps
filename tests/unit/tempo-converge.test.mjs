@@ -167,14 +167,28 @@ test('a capture gap found soon after the lock: the grid before it has the tempo 
   }
 });
 
-test('the e2e Web-Audio page as one run captured it (its lock read 119.26): within 0.1 % from 2.5 s after the lock', () => {
-  // That run's "native 119.264" failure: the lock read 0.6 % slow, and the tempo shown stayed at it until the fine fit
-  // had 8 beats, 3.5 s later. Four beats whose slope is sure are enough.
-  const c = JSON.parse(fs.readFileSync(new URL('./fixtures/webaudio-capture.json', import.meta.url), 'utf8'));
+/** A recorded capture (tests/unit/fixtures) replayed: the tempo read off more than 0.1 % from `after` s past the lock. */
+function captureWander(name, bpm, after = 2.5) {
+  const c = JSON.parse(fs.readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8'));
   const deck = new DeckTempo({ sampleRate: c.sr, fps: c.fps }), rs = [], evaluate = deck.evaluate.bind(deck);
   deck.evaluate = () => { evaluate(); const g = deck.get(); rs.push({ t: deck.tracker.lastT / c.sr, state: g.state, bpm: g.inBpm }); };
   deck.pushBatch({ t0: c.t0, spf: c.spf, full: c.full, low: c.low });
   const lock = rs.find((r) => r.state === 'LOCKED');
-  const late = rs.filter((r) => r.t >= lock.t + 2.5 && Math.abs(r.bpm / 120 - 1) > 1e-3);
-  assert.deepEqual(late.map((r) => `${r.t.toFixed(1)} s ${r.bpm.toFixed(3)}`), [], `locked at ${lock.t.toFixed(1)} s on ${lock.bpm.toFixed(3)}`);
+  const late = rs.filter((r) => r.t >= lock.t + after && Math.abs(r.bpm / bpm - 1) > 1e-3);
+  return { lock, late: late.map((r) => `${r.t.toFixed(1)} s ${r.bpm.toFixed(3)}`) };
+}
+
+test('the e2e Web-Audio page as one run captured it (its lock read 119.26): within 0.1 % from 2.5 s after the lock', () => {
+  // That run's "native 119.264" failure: the lock read 0.6 % slow, and the tempo shown stayed at it until the fine fit
+  // had 8 beats, 3.5 s later. Four beats whose slope is sure are enough.
+  const { lock, late } = captureWander('webaudio-capture.json', 120);
+  assert.deepEqual(late, [], `locked at ${lock.t.toFixed(1)} s on ${lock.bpm.toFixed(3)}`);
+});
+
+test('a live deck through capture gaps as one run captured it (one gap found a few ms off, the next missed): within 0.1 %', () => {
+  // The fine fit used to move the beats before a gap by the step found there: a step a few ms off (or a second gap
+  // not found, its step taken into the first) tilted the fit, 0.18 % off for ten seconds. The beats now step at the
+  // gap by however much their own onsets say.
+  const { lock, late } = captureWander('live-gaps-capture.json', 124);
+  assert.deepEqual(late, [], `locked at ${lock.t.toFixed(1)} s on ${lock.bpm.toFixed(3)}`);
 });

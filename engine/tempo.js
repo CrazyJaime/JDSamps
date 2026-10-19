@@ -134,11 +134,11 @@ export class TempoTracker {
   reset() {
     this.full.clear(); this.low.clear();
     this.state = 'search'; this.bpm = 0; this.cand = null; this.candCount = 0; this.conf = 0; this.octConf = 0;
-    this.beats = []; this.anchor = null; this.fineBpm = 0; this.fit = null; this.out = 0; this.carried = false; this.shown = 0;
+    this.beats = []; this.cuts = []; this.anchor = null; this.fineBpm = 0; this.fit = null; this.out = 0; this.carried = false; this.shown = 0;
     this.holdUntil = 0; this.phaseFrom = 0;
   }
 
-  resetFine() { this.beats = []; this.fit = null; this.anchor = null; this.fineBpm = 0; this.out = 0; this.carried = false; this.shown = this.bpm; }
+  resetFine() { this.beats = []; this.cuts = []; this.fit = null; this.anchor = null; this.fineBpm = 0; this.out = 0; this.carried = false; this.shown = this.bpm; }
 
   /** The input tempo changed by `ratio` at input frame tChange (assist step). */
   rateChanged(ratio, tChange, marginSec = 0.3) {
@@ -375,7 +375,7 @@ export class TempoTracker {
       const n = Math.round((t - ref.b) / ref.a);
       const resid = t - (ref.b + n * ref.a);
       if (Math.abs(resid) > 0.1 * T) {
-        if (++this.out >= 4) { this.beats = []; this.anchor = t; this.fit = null; this.fineBpm = 0; this.out = 0; this.shown = this.bpm; }
+        if (++this.out >= 4) { this.beats = []; this.cuts = []; this.anchor = t; this.fit = null; this.fineBpm = 0; this.out = 0; this.shown = this.bpm; }
         return;
       }
       this.out = 0;
@@ -383,11 +383,12 @@ export class TempoTracker {
     const n = Math.round((t - this.anchor) / T);
     if (last && last.n === n) last.t = t; else this.beats.push({ n, t });
     while (this.beats.length && t - this.beats[0].t > this.o.fineSpanSec * sr) this.beats.shift();
+    while (this.cuts.length && this.cuts[0] <= this.beats[0].t) this.cuts.shift();
     // Four beats are enough once their slope is sure to a tenth of a percent (each beat's own onset, at least a
     // millisecond's jitter): a lock can read 0.6 % off, and the tempo shown is the lock's until the fit is there.
     const m = this.beats.length;
     if (m < (this.carried ? 16 : 4)) return;
-    const f = stepFit(this.beats, JUMP.min * sr, m >= 8 ? 3 : 0, 0.001 * sr);
+    const f = stepFit(this.beats, JUMP.min * sr, m >= 8 ? 3 : 0, 0.001 * sr, this.cuts);
     if (!(f.a > 0) || (m < 8 && f.se > 1e-3 * f.a)) return;
     this.carried = false;
     this.fit = { a: f.a, b: f.b }; this.fineBpm = (60 * sr) / f.a / mult;
@@ -484,17 +485,19 @@ function phaseSteps2(r, K) {
  * Least-squares line t = b + a·n through beats {n, t} (oldest first) that allows for capture gaps: the beats may step
  * between runs, each run with its own level and one slope for all. A step is taken only when it is at least minStep
  * and stands out of the jitter (JUMP.z standard deviations), with 3 beats on each side but at either end of the window
- * (a gap the newest beats have just come through, or one about to leave); at most maxSteps. Returns {a, b, se}, b the
- * newest run's level, se the slope's standard error (jitter taken as at least `floor`). Allocation-free but for the
- * result: prefix sums over the beats in SF.
+ * (a gap the newest beats have just come through, or one about to leave); at most maxSteps. The beats step at each
+ * time in `at` (capture gaps already found) whatever the size. Returns {a, b, se}, b the newest run's level, se the
+ * slope's standard error (jitter taken as at least `floor`). Allocation-free but for the result: prefix sums over the
+ * beats in SF.
  */
-const SF = { cap: 0 };
-function stepFit(beats, minStep, maxSteps = 3, floor = 0) {
+const SF = { cap: 0, cuts: new Int32Array(8), cand: new Int32Array(8), s: new Float64Array(3) };
+function stepFit(beats, minStep, maxSteps = 3, floor = 0, at = []) {
   const m = beats.length;
   if (SF.cap < m + 1) {
     const c = 2 * m + 2;
-    Object.assign(SF, { cap: c, n: new Float64Array(c), t: new Float64Array(c), nn: new Float64Array(c), nt: new Float64Array(c), tt: new Float64Array(c), cuts: new Int32Array(8), cand: new Int32Array(8), s: new Float64Array(3) });
+    Object.assign(SF, { cap: c, n: new Float64Array(c), t: new Float64Array(c), nn: new Float64Array(c), nt: new Float64Array(c), tt: new Float64Array(c) });
   }
+  if (SF.cuts.length < at.length + maxSteps + 3) Object.assign(SF, { cuts: new Int32Array(2 * (at.length + maxSteps + 3)), cand: new Int32Array(2 * (at.length + maxSteps + 3)) });
   const { n: Pn, t: Pt, nn: Pnn, nt: Pnt, tt: Ptt, cuts, cand, s } = SF, n0 = beats[0].n, t0 = beats[0].t;
   for (let i = 0; i < m; i++) {
     const x = beats[i].n - n0, y = beats[i].t - t0;
@@ -509,8 +512,13 @@ function stepFit(beats, minStep, maxSteps = 3, floor = 0) {
   };
   const split = (L, k, j) => { for (let q = 0; q <= k; q++) cand[q] = cuts[q]; cand[k + 1] = j; for (let q = k + 1; q < L; q++) cand[q + 1] = cuts[q]; };
   const level = (i0, i1, a) => (Pt[i1] - Pt[i0] - a * (Pn[i1] - Pn[i0])) / (i1 - i0);
-  let L = 2;
-  cuts[0] = 0; cuts[1] = m;
+  let L = 1, i = 0;
+  cuts[0] = 0;
+  for (const x of at) { // at, oldest first: a cut before the first beat at or after each
+    while (i < m && beats[i].t < x) i++;
+    if (i > cuts[L - 1] && i < m) cuts[L++] = i;
+  }
+  cuts[L++] = m;
   sums(cuts, L);
   let a = s[0] > 0 ? s[1] / s[0] : 0;
   for (let pass = 0; pass < maxSteps; pass++) {
@@ -798,7 +806,7 @@ export class DeckTempo {
     this.jumpCand = null;
     gaps.push({ at, D });
     tr.phaseFrom = at;
-    tr.beats = tr.beats.map((x) => (x.t < at ? { n: x.n, t: x.t + D } : x)); // each beat its own onset: those after it stand
+    tr.cuts.push(at); // the fine fit's beats step there, by however much their own onsets say
     tr.fit = null;
     clock.t0 = t0 + Math.round((clock.t0 - t0) / T) * T + D;
     clock.miss = 0;
