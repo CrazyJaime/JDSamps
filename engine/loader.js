@@ -547,6 +547,7 @@ export class Loader extends Job {
     }
     // A player of MPEG-TS transmuxes each piece before it appends it: fetched as they are, the pieces would not decode.
     if (this.plan && this.plan.ts) return { outcome: 'skipped', why: "the playlist's pieces are MPEG-TS, which cannot be decoded directly" };
+    if (this.plan && !this.plan.init) return this.refetchPacked(this.plan);
     let fetched = 0, failed = 0;
     const counts = () => `${fetched} pieces fetched${failed ? `, ${failed} failed` : ''}`;
     for (let round = 0; round < 3; round++) {
@@ -560,6 +561,40 @@ export class Loader extends Job {
     const placed = await this.complete();
     if (placed) return { why: counts(), ...(await this.decodeOr(placed)) };
     return { outcome: 'failed', why: `${counts()}, still missing ${this.gapsNow().map(span).join(', ') || 'the track length'}` };
+  }
+
+  /**
+   * Packed audio (a playlist with no init that is not MPEG-TS: MP3 or ADTS pieces) has no timestamps: its pieces place
+   * only back to back, from 0. So every piece from the first is fetched, those the tap holds too (where its capture
+   * starts in the track cannot be known), and once all are in they are placed alone: never beside the capture, and
+   * never kept where a drive's placement would find them starting at 0 beside it.
+   */
+  async refetchPacked(plan) {
+    const got = this.packed || (this.packed = new Map()); // link -> bytes
+    const want = () => { const T = this.target(); return plan.segs.filter((s, i) => i === 0 || s.t0 < T - 1e-3); };
+    const place = (segs) => this.d.placeParts(segs.map((s, seq) => ({ bytes: got.get(s.url), mime: '', kind: 'media', sb: FETCHED, seq })));
+    const counts = (miss) => `${got.size} pieces fetched${miss.length ? `, ${miss.length} failed` : ''}`;
+    for (let round = 0; round <= 3; round++) {
+      const segs = want(), miss = segs.filter((s) => !got.has(s.url));
+      if (!miss.length) {
+        const placed = place(segs), gaps = this.d.gapsFor(placed, this.target());
+        if (gaps.length) return { outcome: 'failed', why: `${counts(miss)}, still missing ${gaps.map(span).join(', ')}` };
+        this.rep.placed = placed;
+        const r = await this.decodeOr(placed);
+        if (!r.again) return { why: counts(miss), ...r };
+        continue;
+      }
+      if (round === 3) {
+        const spans = miss.reduce((a, s) => { const l = a.at(-1); if (l && Math.abs(l[1] - s.t0) < 1e-3) l[1] = s.t1; else a.push([s.t0, s.t1]); return a; }, []);
+        return { outcome: 'failed', why: `${counts(miss)}, still missing ${spans.map(span).join(', ')}` };
+      }
+      const urls = miss.map((s) => s.url), band = this.band();
+      for (const u of urls) this.tried.add(u);
+      this.say(this.progress, SAY.pieces);
+      const bytes = await this.fetchUrls(plan.frame, urls, (n) => this.say(band(n / urls.length)));
+      bytes.forEach((b, i) => { if (b) { got.set(urls[i], b); this.rep.refetched += b.byteLength; } });
+    }
+    return { outcome: 'failed', why: 'the track length kept changing while it loaded' };
   }
 
   /** A playlist the page requested: its best variant's init and timed segments, or null. */
