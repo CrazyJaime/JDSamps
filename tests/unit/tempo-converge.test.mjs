@@ -306,12 +306,9 @@ test('a live deck through capture gaps as one run captured it (one gap found a f
   assert.deepEqual(late, [], `locked at ${lock.t.toFixed(1)} s on ${lock.bpm.toFixed(3)}`);
 });
 
-test('a capture step that comes over two beats, as one run captured it: found, and so is the gap after it; within 0.1 %', () => {
-  // The box's capture moved the beats -10.8 ms at 40.92 s over two beats (-4 and -6 ms, then a few ms more over the next
-  // three). The window's step fit leaves out at most one beat next to a step, so it was never clear; the clock and the
-  // fine fit took it in instead, the fit read 124.34 (0.27 % fast), and the beats then drifted a millisecond a beat off
-  // the clock: the -20 ms gap spliced in at 47.7 s was never clear either, and nothing was found for 16 s.
-  const c = JSON.parse(fs.readFileSync(new URL('./fixtures/live-ramp-gap-capture.json', import.meta.url), 'utf8'));
+/** A recorded capture (tests/unit/fixtures) replayed: each evaluation {t, state, bpm}, and the capture gaps found {from, D (ms)}. */
+function captureGaps(name) {
+  const c = JSON.parse(fs.readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8'));
   const deck = new DeckTempo({ sampleRate: c.sr, fps: c.fps }), rs = [], gaps = [], evaluate = deck.evaluate.bind(deck);
   deck.evaluate = () => {
     const was = deck.track.jump;
@@ -321,7 +318,16 @@ test('a capture step that comes over two beats, as one run captured it: found, a
     if (j && j !== was) gaps.push({ from: j.from, D: (deck.gaps.at(-1).D / c.sr) * 1000 });
   };
   deck.pushBatch({ t0: c.t0, spf: c.spf, full: c.full, low: c.low });
-  const say = `found ${gaps.map((g) => `${g.D.toFixed(1)} ms at ${g.from.toFixed(2)} s`).join(', ')}`;
+  gaps.say = `found ${gaps.map((g) => `${g.D.toFixed(1)} ms at ${g.from.toFixed(2)} s`).join(', ')}`;
+  return { rs, gaps };
+}
+
+test('a capture step that comes over two beats, as one run captured it: found, and so is the gap after it; within 0.1 %', () => {
+  // The box's capture moved the beats -10.8 ms at 40.92 s over two beats (-4 and -6 ms, then a few ms more over the next
+  // three). The window's step fit leaves out at most one beat next to a step, so it was never clear; the clock and the
+  // fine fit took it in instead, the fit read 124.34 (0.27 % fast), and the beats then drifted a millisecond a beat off
+  // the clock: the -20 ms gap spliced in at 47.7 s was never clear either, and nothing was found for 16 s.
+  const { rs, gaps } = captureGaps('live-ramp-gap-capture.json'), say = gaps.say;
   // where the capture stepped, and by how much (the live-sync judge's reading of these frames)
   for (const [at, ms] of [[23.52, -14.5], [24.96, -11.1], [36.09, 11.2], [37.06, -9.5], [40.92, -10.8], [47.67, -19.8]]) {
     assert.ok(gaps.some((g) => Math.abs(g.from - at) < 0.6 && Math.abs(g.D - ms) <= 3), `the capture stepped ${ms} ms at ${at} s; ${say}`);
@@ -329,4 +335,17 @@ test('a capture step that comes over two beats, as one run captured it: found, a
   const lock = rs.find((r) => r.state === 'LOCKED');
   const late = rs.filter((r) => r.t >= lock.t + 2.5 && Math.abs(r.bpm / 124 - 1) > 1e-3).map((r) => `${r.t.toFixed(1)} s ${r.bpm.toFixed(3)}`);
   assert.deepEqual(late, [], `locked at ${lock.t.toFixed(1)} s on ${lock.bpm.toFixed(3)}`);
+});
+
+test('capture gaps while the clock\'s period is off (a burst the fine fit took in, as one run captured it): each is found', () => {
+  // A spliced gap and three of the box's own capture skips over three seconds were never found: the fine fit took them in
+  // and read 0.4-0.6 % fast, so the beats drifted 2-3 ms a beat off the clock. The window's step fit allows for a drift,
+  // but a step was taken only when it outweighed the drift across the window: the box's -29.6 ms skip and the 10 ms gap
+  // spliced in after it were never found (the live-sync deck did not jump the gap). A step that fits the beats ten times
+  // better than any bend is a step however they drift.
+  const { gaps } = captureGaps('live-drift-gaps-capture.json');
+  // where the capture stepped, and by how much (the live-sync judge's reading of these frames)
+  for (const [at, ms] of [[35.94, 12.2], [37.87, -21.1], [55.22, -29.6], [59.57, 10.5]]) {
+    assert.ok(gaps.some((g) => Math.abs(g.from - at) < 0.6 && Math.abs(g.D - ms) <= 3), `the capture stepped ${ms} ms at ${at} s; ${gaps.say}`);
+  }
 });

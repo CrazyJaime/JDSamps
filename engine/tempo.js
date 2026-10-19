@@ -415,17 +415,17 @@ export class BeatClock {
 }
 
 // Capture gaps: smallest phase jump (s) acted on, largest (beats), how far it must stand out of
-// the per-beat jitter (standard deviations), and how many times better than a bend (a real tempo
-// change) its step must fit the beats.
-const JUMP = { min: 0.005, max: 1 / 8, z: 6, bend: 3 };
+// the per-beat jitter (standard deviations), how many times better than a bend (a real tempo
+// change) its step must fit the beats, and how many times better when they drift off the clock.
+const JUMP = { min: 0.005, max: 1 / 8, z: 6, bend: 3, drift: 10 };
 
 /**
  * Where per-beat onset offsets r (oldest first; the first K of them) step: the least-squares fit
  * r_i = a + b·i + D·[i ≥ j] (a level, a drift from a slightly wrong period, and a step) over every
  * split j with at least 4 beats before it and 3 after, leaving out the w beats from `skip`. Returns the best
- * {j, D, a, b, clear, worst, sse} or null; clear when the step stands out of the jitter, outweighs the drift
- * across the window and every beat sits nearer its own side of the step; worst is the beat farthest
- * off the fit, sse its squared error.
+ * {j, D, a, b, clear, drifts, worst, sse} or null; clear when the step stands out of the jitter, outweighs the drift
+ * across the window and every beat sits nearer its own side of the step (drifts when all but the drift hold); worst
+ * is the beat farthest off the fit, sse its squared error.
  */
 const det3 = (a, b, c, d, e, f, g, h, i) => a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
 function phaseStep(r, skip = -1, K = r.length, w = 1) {
@@ -452,8 +452,9 @@ function phaseStep(r, skip = -1, K = r.length, w = 1) {
     const e = out(i) ? 0 : Math.abs(r[i] - a - b * i - (i >= j ? D : 0));
     if (e > we) { we = e; worst = i; }
   }
-  const clear = Math.abs(D) >= JUMP.z * Math.sqrt(Math.max(0, sse) / (n - 3)) && Math.max(we, Math.abs(b) * (K - 1)) < Math.abs(D) / 2;
-  return { j, D, a, b, worst, clear, sse };
+  const stands = Math.abs(D) >= JUMP.z * Math.sqrt(Math.max(0, sse) / (n - 3)) && we < Math.abs(D) / 2;
+  const drifts = stands && Math.abs(b) * (K - 1) >= Math.abs(D) / 2;
+  return { j, D, a, b, worst, clear: stands && !drifts, drifts, sse };
 }
 
 /**
@@ -862,6 +863,9 @@ export class DeckTempo {
       // capture can also move two beats in a row part of the way each: both may be left out when they sit between.
       let s = phaseStep(r, -1, k), sk = -1, w = 1;
       if (k === r.length) big = !!s && Math.abs(s.D) >= JUMP.min * sr;
+      // Beats that drift off the fine fit's clock (a gap it took in put its period off) can still step: when no bend
+      // comes near. (Off the lock's, they wait for the fit: the grid before the gap keeps the period the clock has.)
+      if (s && s.drifts && this.clockFine && bendSse(r, k) > JUMP.drift * s.sse) s.clear = true;
       if (s && !s.clear) {
         const j = s.j;
         sk = s.worst; s = phaseStep(r, sk, k); if (s && sk !== s.j - 1 && sk !== s.j) s = null;
