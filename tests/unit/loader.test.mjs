@@ -293,6 +293,24 @@ test('a page whose play button is never pressed goes live saying its player had 
   assert.match(called(started.engine, 'failLoadingToLive')[0].reason, /does not say how long the track is/);
 });
 
+test('a load that ends live because the page\'s bytes cannot be had says so (noBytes), for the 2× recording setting; other reasons do not', async () => {
+  const link = 'https://site.example/stream.mp3';
+  for (const [what, page, noBytes] of [
+    ['protected', { kind: 'mse', rendition: hi(), errors: ['drm'] }, true],
+    ['Media Source in a worker', { kind: 'mse', rendition: hi(), errors: ['worker'] }, true],
+    ['Web Audio only', { kind: 'none' }, true],
+    ['every rung failed', { kind: 'mse', rendition: hi(), preTap: 6, playing: 1 }, true],
+    ['a preview', { kind: 'mse', rendition: hi(), errors: ['preview'] }, false],
+    ['a live stream', { kind: 'mse', rendition: hi(), preTap: 6, duration: Infinity, liveAfter: 30 }, false],
+    ['a player that gives no length', { kind: 'progressive', src: link, duration: null, files: { [link]: file('x', 60) } }, false],
+    ['a player never started', UNSTARTED, false],
+  ]) {
+    const { result } = await load(page);
+    assert.equal(result.kind, 'live', what);
+    assert.equal(result.noBytes === true, noBytes, `${what}: ${JSON.stringify(result)}`);
+  }
+});
+
 test('a page with no player the tap can see (Web Audio only) goes live: no agent ever connects', async () => {
   const t0 = performance.now();
   const { result, engine, tab } = await load({ kind: 'none' });

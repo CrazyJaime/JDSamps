@@ -175,6 +175,7 @@ afterEach(async () => {
   const m = (await state(deck)).master.params;
   if (m['resident.auto'] !== true) set(deck, null, 'resident.auto', true);
   if (m['resident.limitMin'] !== 15) set(deck, null, 'resident.limitMin', 15);
+  if (m['resident.recordWhole'] !== false) set(deck, null, 'resident.recordWhole', false);
   await engine('if (e.__pcm) e.__pcm.clear(); return true;').catch(() => {});
 });
 
@@ -684,6 +685,46 @@ test('recording a whole track from a media page: its player run at 2× from the 
   assert.equal((await act(deck, r.id, 'eject')).ok, true);
   await waitFor(async () => !(await decks()).length, 8000);
   await site.tab.close();
+});
+
+/** Settings → Record whole track at 2× when bytes are unavailable, on or off (and waited for). */
+async function recordWholeSetting(on) {
+  set(deck, null, 'resident.recordWhole', on);
+  await waitFor(async () => (await state(deck)).master.params['resident.recordWhole'] === on);
+}
+
+test('with "Record whole track at 2× when bytes are unavailable" on, a protected page that plays live is recorded at 2× without asking', async () => {
+  await recordWholeSetting(true);
+  const site = await openSite('drm');
+  await playing(site.tab);
+  const d = await loadTab(site.tabId);
+  assert.equal(d.kind, 'live', JSON.stringify(d.load));
+  const recording = await deckWhere((x) => x.id !== d.id && x.kind === 'loading', 10000);
+  assert.match(recording.title, /recorded from the page — reduced highs/);
+  await deckWhere((x) => x.id === recording.id && /recording from the page at 2×/.test(x.load.strategy || ''), 15000);
+  const said = (await events(deck)).slice(d.seen).map((e) => e.text);
+  assert.equal(said.filter((t) => t === `Deck ${d.slot}: recording its whole track from the page at 2× (reduced highs), as the settings ask.`).length, 1, JSON.stringify(said));
+  // The 2-minute track would take a minute at 2×: that it started is what is checked here.
+  assert.equal((await act(deck, recording.id, 'loadCancel')).ok, true);
+  await recordWholeSetting(false);
+});
+
+test('with that setting on, a page that cannot be sped up plays live and says why it was not recorded; with it off, nothing is recorded', async () => {
+  await recordWholeSetting(true);
+  let site = await openSite('webaudio');
+  await waitFor(() => site.tab.evaluate(() => window.__ctx?.state === 'running' && window.__ctx.currentTime > 0.3), 15000);
+  let d = await loadTab(site.tabId);
+  assert.equal(d.kind, 'live');
+  await waitFor(async () => (await events(deck)).slice(d.seen).some((e) => e.text === `Deck ${d.slot}: its whole track is not recorded at 2×. This page can't be sped up, so it would record in real time.`), 5000);
+  assert.equal((await decks()).length, 1, 'no deck was started for it');
+  await assertLive(d, site, /without a media player/);
+  await recordWholeSetting(false);
+  site = await openSite('drm');
+  await playing(site.tab);
+  d = await loadTab(site.tabId);
+  await sleep(1500);
+  assert.deepEqual((await decks()).map((x) => x.id), [d.id], 'the setting is off: nothing is recorded');
+  await assertLive(d, site, /protected/);
 });
 
 /** Kick onsets (s) in a promoted deck's kept track: its envelope (2 ms) rising through 35 % of its loudest. */

@@ -75,6 +75,7 @@ const UNFLUSHED = {
   sticky: 'it would not fetch again what was taken from behind its place',
 };
 const DECISIVE = ['drm', 'worker', 'preview', 'live'];
+const UNREADABLE = ['drm', 'worker']; // decisive, and the page's bytes cannot be had: only its sound can be recorded
 const NO_LENGTH = "the page's player has not said how long the track is";
 const TAB_CAP = 600 * 2 ** 20;       // bytes from one tab: each frame's tap holds at most this, and so does the whole tab
 const NO_STAMPS = /^audio\/(mpeg|mp3|aac|x-aac)\b/i; // placed in append order only: never seek-hopped
@@ -84,9 +85,10 @@ const FETCHED = 1e6;                 // placement keys of fetched batches, clear
 class Stop extends Error {
   /**
    * kind: 'cancel' (the deck was ejected or the load cancelled), 'live' (play the tab live, saying why) or 'away' (the
-   * page went away before the track was in: what follows depends on what became of the tab).
+   * page went away before the track was in: what follows depends on what became of the tab). noBytes (live): the page's
+   * bytes cannot be had, so only its sound can be recorded (the setting "Record whole track at 2× when bytes are unavailable").
    */
-  constructor(kind, message) { super(message); this.kind = kind; }
+  constructor(kind, message, noBytes = false) { super(message); this.kind = kind; this.noBytes = noBytes; }
 }
 const now = () => performance.now();
 const secs = (ms) => `${(ms / 1000).toFixed(1)} s`;
@@ -360,7 +362,7 @@ export class Loader extends Job {
   check() {
     if (this.signal.aborted || this.engine.decks.get(this.deck.id) !== this.deck) throw new Stop('cancel', 'Loading was cancelled.');
     const why = this.looked && this.decisive();
-    if (why) throw new Stop('live', LIVE[why]);
+    if (why) throw new Stop('live', LIVE[why], UNREADABLE.includes(why));
     if (!this.gone && !this.have && this.moved()) { this.gone = 'the page moved on'; this.inPlace = true; }
     if (this.gone && !this.have) throw new Stop('away', this.gone);
     if (this.big) throw new Stop('live', LIVE.big);
@@ -419,7 +421,7 @@ export class Loader extends Job {
     this.check();
     const n = this.attached().length;
     this.rep.steps.push({ name: 'connect', outcome: n ? 'ok' : 'none', why: `${n} frame${n === 1 ? '' : 's'} with a player`, ms: now() - t0 });
-    if (!n) throw new Stop('live', r && r.ok === false ? LIVE.unreachable : LIVE.webaudio);
+    if (!n) throw new Stop('live', r && r.ok === false ? LIVE.unreachable : LIVE.webaudio, true);
     this.tapping = true;
     for (const f of this.attached()) this.tapOn(f);
   }
@@ -453,7 +455,7 @@ export class Loader extends Job {
     this.pinned = this.track();
     const why = this.decisive(), D = this.duration();
     this.rep.steps.push({ name: 'look', outcome: why || 'ok', why: D != null ? `the player says ${D.toFixed(3)} s` : "the player's length is not known", ms: now() - t0 });
-    if (why) throw new Stop('live', LIVE[why]);
+    if (why) throw new Stop('live', LIVE[why], UNREADABLE.includes(why));
     this.looked = true;
   }
 
@@ -471,8 +473,11 @@ export class Loader extends Job {
       if (got) return got;
     }
     const tried = this.rep.steps.filter((s) => RUNGS.includes(s.name) && s.outcome !== 'skipped');
-    if (!tried.length) throw new Stop('live', this.rep.steps.some((s) => s.why === NO_LENGTH) ? LIVE.length : LIVE.webaudio);
-    throw new Stop('live', LIVE.failed(tried.find((s) => s.outcome === 'failed').why));
+    if (!tried.length) {
+      const length = this.rep.steps.some((s) => s.why === NO_LENGTH);
+      throw new Stop('live', length ? LIVE.length : LIVE.webaudio, !length);
+    }
+    throw new Stop('live', LIVE.failed(tried.find((s) => s.outcome === 'failed').why), true);
   }
 
   /** Run one rung, noting how it went: its result is {done: {pcm, notice}} or {outcome, why}. */
@@ -1009,7 +1014,7 @@ export class Loader extends Job {
       if (e.decks.get(d.id) === d) e.eject(d.id);
       return r;
     }
-    return { ok: true, kind: 'live', deckId: d.id, slot: d.slot };
+    return { ok: true, kind: 'live', deckId: d.id, slot: d.slot, ...(err instanceof Stop && err.noBytes ? { noBytes: true } : {}) };
   }
 }
 

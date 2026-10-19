@@ -322,8 +322,20 @@ class Engine {
     return loader.run().then((r) => {
       if (this.loads.get(deck.id) === load) this.loads.delete(deck.id);
       if (deck.loader === loader) deck.loader = null;
+      if (r.ok && r.kind === 'live' && r.noBytes && this.params['resident.recordWhole']) this.recordUnread(deck);
       return r;
     });
+  }
+
+  /**
+   * Settings → Record whole track at 2× when bytes are unavailable (§11): a tab deck that went live because its page's
+   * bytes cannot be had is recorded without asking, or says why it cannot be.
+   */
+  async recordUnread(live) {
+    const r = await this.recordWhole(live.id);
+    if (this.decks.get(live.id) !== live) return;
+    if (r.ok) this.event('info', `Deck ${live.slot}: recording its whole track from the page at 2× (reduced highs), as the settings ask.`, live.id);
+    else this.event('info', `Deck ${live.slot}: its whole track is not recorded at 2×. ${r.error}`, live.id);
   }
 
   /**
