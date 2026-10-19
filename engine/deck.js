@@ -387,10 +387,16 @@ export class Deck {
     // without the master, so the master drops back in on it like any other deck.
     if (!(this.isMaster() ? this.engine.clock.state().mode === 'free' : this.syncOn)) return p;
     const mb = this.engine.clock.beat(T), g = this.grids.at(p);
-    if (!mb || !g) return p;
+    if (!mb || !g || !(g.T > 0)) return p;
     const rate = this.effRate(p);
     const e = phaseError(lastBeatOut(g, p, rate, T), g.T / rate, mb.lastBeat, mb.period);
-    return p + e * rate;
+    // Outside what can be played (a deck cued at its first beat), the start would be clamped off the
+    // beat: a whole beat later (or earlier) keeps the phase, as seek() has it.
+    const lo = this.ts.clampInput(-Infinity), hi = this.ts.clampInput(Infinity);
+    let q = p + e * rate;
+    while (q < lo) q += g.T;
+    while (q > hi) q -= g.T;
+    return q >= lo ? q : p + e * rate;
   }
 
   startAt(T, p) {
