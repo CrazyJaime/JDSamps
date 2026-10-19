@@ -812,11 +812,13 @@ test('a player at the very start of the track is not flushed (nothing behind its
   assert.match(deck.load.report, /note: the player was not flushed: it had only just started, with nothing behind its place to try a flush on/);
 });
 
-test('a flush the player refuses (it has ended its stream) is noted in the report, and the drive goes on as it did before', async () => {
-  const { result, deck } = await load({ kind: 'mse', rendition: hi(), preTap: 6, playing: 1, flush: 'ended' });
+test('a flush the player refuses (it has ended its stream) is noted in the report, the drive goes on as it did before, and the DJ is told to reload the tab', async () => {
+  const { result, engine, deck } = await load({ kind: 'mse', rendition: hi(), preTap: 6, playing: 1, flush: 'ended' });
   assert.equal(result.kind, 'live');
   assert.match(deck.load.report, /note: the player was not flushed: it had loaded the whole track and ended its stream/);
-  assert.match(deck.load.report, /drive \(seek-hop, then accelerate 8× from 0\.0 s\): failed in \d+\.\d s — the player buffered the whole track, but 0\.0–24\.0 s came before the deck could read it\n/);
+  const why = /the player buffered the whole track, but 0\.0–24\.0 s came before the deck could read it: reload the tab, then load it again/;
+  assert.match(deck.load.report, new RegExp(`drive \\(seek-hop, then accelerate 8× from 0\\.0 s\\): failed in \\d+\\.\\d s — ${why.source}\\n`));
+  assert.match(called(engine, 'failLoadingToLive')[0].reason, why);
 });
 
 test('a seek-hop the player says has stalled goes to accelerate after a stall, even while bytes keep coming from elsewhere (shaka going on from its last segment)', async () => {
