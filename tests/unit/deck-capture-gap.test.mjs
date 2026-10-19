@@ -44,7 +44,7 @@ const bendOf = (x, t) => { const seg = x.node.segAt(t); return seg.active ? Math
  * playhead is within `quiet` (input s) of it, where no beat falls (the tracker puts a gap between two beats).
  */
 function watch(engine, clock, x, s, { quiet = null, onTick = () => {} } = {}) {
-  const from = x.node.log.length;
+  const t0 = clock.t;
   let err = 0, bend = 0;
   run(engine, clock, s, (t) => {
     const e = clockErrMs(engine, x, t);
@@ -52,10 +52,12 @@ function watch(engine, clock, x, s, { quiet = null, onTick = () => {} } = {}) {
     bend = Math.max(bend, bendOf(x, t));
     onTick(t);
   });
-  // A jump: a change whose input is off where the segment before it would have been at its output time.
-  const jumps = [];
-  for (let i = Math.max(1, from); i < x.node.log.length; i++) {
-    const a = x.node.log[i - 1], b = x.node.log[i];
+  // A jump: a change the node played whose input is off where the segment before it would have been at its output time
+  // (the node's own schedule: a planned change that a later one dropped was never played).
+  const jumps = [], map = x.node.map;
+  for (let i = 1; i < map.length; i++) {
+    const a = map[i - 1], b = map[i];
+    if (b.output <= t0) continue;
     if (!a.active || b.active === false) continue;
     const at = a.input + a.rate * (b.output - a.output);
     if (Math.abs(b.input - at) > 1e-4) jumps.push({ output: b.output, at, by: b.input - at });
@@ -128,6 +130,72 @@ test('under a held nudge the gap is played as it came', async () => {
   const w = watch(engine, clock, d, 2);
   await d.act('nudge', { dir: 0 });
   assert.deepEqual(w.jumps, []);
+});
+
+// The DJ's hand on a beat-locked deck (a nudge, a roll, a beat jump, the master's tempo fader) is heard as soon as with
+// no gap coming. A gap jump planned ahead used to take every later change into itself, so the hand waited for the
+// jump (up to 0.6 s), and a short nudge tap was lost in it. Planned 0.6 s ahead, it also held back what waits for a
+// planned change to pass: a follower following the master's tempo move.
+const HANDS = {
+  nudge: { on: 'd', press: ({ d }) => d.act('nudge', { dir: 1 }), heard: (x, s, r0) => s.rate > r0 * 1.03 },
+  roll: { on: 'd', press: ({ d }) => d.act('rollStart', { beats: 0.25 }), heard: (x, s) => s.loopEnd > s.loopStart },
+  'beat jump': { on: 'd', press: ({ d }) => d.act('beatJump', { beats: 4 }), heard: (x, s, r0, p0, t0, t) => x.node.posAt(t) - (p0 + r0 * (t - t0)) > 1.5 },
+  "the master's tempo fader": { on: 'm', press: ({ m }) => m.setParam('pitch', 0.02), heard: (x, s, r0) => s.rate > r0 * 1.015 },
+  "the master's tempo fader, on its follower": { on: 'd', aheads: [0.5], press: ({ m }) => m.setParam('pitch', 0.02), heard: (x, s, r0) => s.rate > r0 * 1.015 },
+};
+
+/** Output s from `hand` pressed until the node of the deck it is on plays it: with no gap coming in that deck's capture, or one `ahead` input s ahead. */
+async function handDelay(hand, ahead) {
+  const r = await rig(), x = r[hand.on];
+  if (ahead != null) {
+    const X = gap(x, r.clock, 1, 15);
+    while (X - x.ts.posAt(r.clock.t) > ahead) run(r.engine, r.clock, TICK);
+  }
+  const t0 = r.clock.t, r0 = x.node.segAt(t0).rate, p0 = x.node.posAt(t0);
+  await hand.press(r);
+  let at = null;
+  run(r.engine, r.clock, 1, (t) => { if (at == null && hand.heard(x, x.node.segAt(t), r0, p0, t0, t)) at = t; });
+  return at == null ? Infinity : at - t0;
+}
+
+for (const [name, hand] of Object.entries(HANDS)) {
+  test(`${name}: with a capture gap coming, heard as soon as with none`, async () => {
+    const base = await handDelay(hand, null);
+    assert.ok(base < 0.4, `heard after ${base} s with no gap`);
+    for (const ahead of hand.aheads || [0.5, 0.3, 0.2, 0.12]) {
+      const delay = await handDelay(hand, ahead);
+      assert.ok(delay <= base + 0.01, `gap ${ahead} s ahead: heard after ${delay.toFixed(3)} s, with no gap ${base.toFixed(3)} s`);
+    }
+  });
+}
+
+test('a nudge tapped just before a gap is heard, and the gap jump never lands under it', async () => {
+  for (const ahead of [0.3, 0.2, 0.12]) {
+    const { clock, engine, d } = await rig();
+    const X = gap(d, clock, 1, 15);
+    while (X - d.ts.posAt(clock.t) > ahead) run(engine, clock, TICK);
+    const r0 = d.node.segAt(clock.t).rate;
+    await d.act('nudge', { dir: 1 });
+    let nudged = false;
+    const held = watch(engine, clock, d, 0.15, { onTick: (t) => { nudged ||= d.node.segAt(t).rate > r0 * 1.03; } });
+    await d.act('nudge', { dir: 0 });
+    run(engine, clock, 0.3, (t) => { nudged ||= d.node.segAt(t).rate > r0 * 1.03; });
+    assert.ok(nudged, `gap ${ahead} s ahead: the nudge was never played`);
+    assert.deepEqual(held.jumps, [], `gap ${ahead} s ahead: jumped under the nudge`);
+  }
+});
+
+test('a gap jump that the DJ\'s change dropped is planned again: after a beat jump back, where the playhead next reaches the gap', async () => {
+  for (const ahead of [0.2, 0.12, 0.06]) {
+    const { clock, engine, d } = await rig();
+    const X = gap(d, clock, 1, 15);
+    while (X - d.ts.posAt(clock.t) > ahead) run(engine, clock, TICK);
+    await d.act('beatJump', { beats: -4 });
+    const w = watch(engine, clock, d, 4), skips = w.jumps.filter((j) => Math.abs(j.by) < 0.1);
+    assert.equal(skips.length, 1, `gap ${ahead} s ahead: ${JSON.stringify(w.jumps)}`);
+    assert.ok(Math.abs(skips[0].at - X) < 1e-3 && Math.abs(skips[0].by - 0.015) < 1e-6, `gap ${ahead} s ahead: ${JSON.stringify(skips[0])}`);
+    assert.ok(w.bend < 0.002, `bent ${(w.bend * 100).toFixed(2)} %`);
+  }
 });
 
 test('a follower sitting a few ms off the beat (inside the phase loop\'s deadband) jumps that off with the gap', async () => {

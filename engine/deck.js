@@ -38,6 +38,7 @@ const END_PLAN = 0.6; // s: a resident deck plans its stop at the end of the tra
 // SEARCH_DOUBLE s up to SEARCH_MAX (input s per s). Fine (Shift) is five times slower.
 const SEARCH_V0 = 0.5, SEARCH_DOUBLE = 0.75, SEARCH_MAX = 16;
 const SKIP_MAX = 0.06; // s: the largest capture gap a beat-locked deck jumps across; a bigger step is not a gap
+const SKIP_LEAD = 0.05; // s: a gap jump is planned once it would land within this of soon(), a tick and a bit
 const frac = (x) => x - Math.floor(x);
 
 /** Input seconds a search held for h s has covered. */
@@ -115,6 +116,7 @@ export class Deck {
     this.crossingSeg = null;
     this.skips = new WeakSet(); // grid segments past a capture gap that the deck has dealt with
     this.skipAt = -Infinity;    // output time of its latest jump across one
+    this.skipPlan = null;       // the jump planned and not yet landed: {seg, s, prevAt}
     this.wave = { tStart: null, hop: 0, data: new Uint8Array(0), n: 0 };
     this.disposed = false;
   }
@@ -982,13 +984,20 @@ export class Deck {
    * of the phase loop bending it back into line by up to 4 %. The size is the step the two grids give now (gapStep):
    * the tracker refines the newer one after the gap was found. Gaps up to SKIP_MAX, at most one jump a beat; under a
    * nudge, roll or loop the gap is played as it came.
+   *
+   * The jump is the deck's own, never in the DJ's way: planned as late as a tick allows (SKIP_LEAD), and no later
+   * change folds into it and waits for it (a nudge, roll, beat jump or tempo move is heard as soon as ever). Such a
+   * change drops it instead, and the gap is seen to again: planned anew, or by the phase loop.
    */
   scheduleSkip(now, p) {
+    const ts = this.ts, plan = this.skipPlan;
+    if (plan && !ts.segs.includes(plan.seg)) { this.skips.delete(plan.s); this.skipAt = plan.prevAt; this.skipPlan = null; }
+    else if (plan && plan.seg.output <= now) this.skipPlan = null;
     if (!this.beatLocked() || this.nudge || this.rollFrom || this.loop || (this.outOfRange && !this.isMaster())) return;
-    const ts = this.ts, s = this.grids.segs.find((x) => x.from > p && x.shift && !this.skips.has(x));
+    const s = this.grids.segs.find((x) => x.from > p && x.shift && !this.skips.has(x));
     if (!s) return;
     const tc = this.reachAt(now, s.from);
-    if (tc == null || tc - now > 0.6) return; // planned once near, through whatever is planned before it
+    if (tc == null || tc - ts.soon(now) > SKIP_LEAD) return; // through whatever is planned before it
     const T = Math.max(tc, ts.soon(now)), pend = ts.pendingUntil();
     if (!this.skipFits(s, T)) { this.skips.add(s); return; } // the phase loop sees to it
     if (pend >= T) return; // a change lands after the gap: jumped by the phase loop once it is through
@@ -997,7 +1006,9 @@ export class Deck {
     // error can tip it over, and the loop bends right after the gap.
     const off = this.isMaster() ? 0 : this.offBefore(s, T);
     const input = ts.clampInput(ts.posAt(T) + this.gapStep(s) + off), fields = { input, rate: this.effRate(input), semitones: this.semis(input) };
-    if (pend >= now) ts.then(now, T, fields); else ts.change(now, T, fields);
+    const seg = pend >= now ? ts.then(now, T, fields) : ts.change(now, T, fields);
+    seg.transport = false; // not a planned transport change for later ones to fold into: they drop it
+    this.skipPlan = { seg, s, prevAt: this.skipAt };
     this.skipAt = T;
     this.settleUntil = Math.max(this.settleUntil, T + 0.3);
   }
