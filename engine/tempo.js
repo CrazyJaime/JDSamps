@@ -888,18 +888,19 @@ export class DeckTempo {
     this.jumpCand = { at, D };
     // (Leaving out a beat next to the step moves `at` by half a beat.)
     if (!cand || Math.abs(cand.at - at) > 0.75 * clock.T || Math.abs(cand.D - D) > Math.max(0.3 * Math.abs(D), 0.002 * sr)) return;
-    // The grid before the gap is the clock as the live edge passed it, at its period put where the window's beats before
-    // the gap are (since the gap before them): passed soon after the gap before it was found, that clock was that gap's
+    // The grid before the gap is the clock as the live edge passed it, at its period put where the last beats before the
+    // gap are (since the gap before them): passed soon after the gap before it was found, that clock was that gap's
     // re-phase by the step found there, a few ms off the beats when the step was.
     const prev = this.gridBefore(at), since = gaps.reduce((x, g) => (g.at < at && g.at > x ? g.at : x), -Infinity);
-    const Tp = prev.T * sr, last = rs[ib].beat + rs[ib].r;
-    let lv = 0, nb = 0;
-    for (let i = 0; i <= ib; i++) {
-      if (out(i) || rs[i].beat <= since + 0.6 * clock.T) continue;
+    const Tp = prev.T * sr, last = rs[ib].beat + rs[ib].r, near = [];
+    for (let i = ib; i >= 0 && near.length < 4; i--) {
+      if (out(i)) continue;
+      if (rs[i].beat <= since + 0.6 * clock.T) break;
       const x = rs[i].beat + rs[i].r; // where the audio puts this beat
-      lv += x + Math.round((last - x) / Tp) * Tp; nb++;
+      near.push(x + Math.round((last - x) / Tp) * Tp);
     }
-    if (nb >= 2) prev.t0 = lv / nb / sr;
+    near.sort((x, y) => x - y);
+    if (near.length >= 2) prev.t0 = (near.length > 2 ? near[near.length >> 1] : (near[0] + near[1]) / 2) / sr;
     const t0 = prev.t0 * sr, T = prev.T * sr;
     this.track.jump = { n: this.track.jump ? this.track.jump.n + 1 : 0, from: at / sr, prev, step: D / sr };
     this.jumpCand = null;
