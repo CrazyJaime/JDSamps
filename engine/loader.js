@@ -1157,7 +1157,7 @@ const REC_RATE = 2;
 const AUDIBLE = 0.003; // about -50 dBFS, as a deck's first audible sample
 const HOLD_MS = 700;   // the player held silent at the start: longer than a recorder batch and the capture's delay
 const CAP_LAG = 0.03;  // s: by how much the player's clock puts its time 0 early in the capture (measured: 28-35 ms)
-const LEAD_MIN = 0.02; // s of the capture: a silence before the first sound shorter than this is not told from the clock's scatter
+const LEAD_MIN = 0.1;  // s of the capture: a silence before the first sound shorter than this is not told from the clock's error (on a busy computer the capture comes up to 70 ms later than the clock puts it)
 const DISTURBED = 'the recording was disturbed (the computer was busy); try again';
 
 /** The first audible frame in [from, to) of a recording, or -1. */
