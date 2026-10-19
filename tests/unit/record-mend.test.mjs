@@ -3,7 +3,7 @@
 // mendSteps finds those steps between steady beats and puts the audio back on the beat.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mendSteps, keepsTime } from '../../engine/loader.js';
+import { mendSteps, keepsTime, keptPace } from '../../engine/loader.js';
 
 const SR = 48000, BPM = 124, T = 60 / BPM;
 
@@ -188,10 +188,11 @@ test('a burst of skips (10 ms lost, then 24 ms and 10 ms of silence put in) is m
 
 // ---------------------------------------------------------------- the recording checked after it is mended (keepsTime)
 // A capture that went wrong in a way mendSteps cannot mend (the speed wandering, a stream of losses too small to see
-// one by one) must never become a deck at the wrong speed: every bar must sit where the bar before it puts it, the
-// premise mendSteps mends by, all through the track.
+// one by one) must never become a deck at the wrong speed. keepsTime says whether every bar sits where the bar before
+// it puts it, the premise mendSteps mends by, all through the track; a beat that wanders is then put to the player's
+// own clock (keptPace), since a track whose own tempo moves wanders the same way.
 
-/** Kicks whose beat goes from T0 to T1 (s) over the recording: a capture at the wrong, changing speed. */
+/** Kicks whose beat goes from T0 to T1 (s) over the recording: a capture at a changing speed, or a tempo that moves. */
 function drifting(T0, T1, seconds = 16) {
   const n = Math.round(seconds * SR), L = new Float32Array(n), beats = [];
   for (let t = 0; t < seconds; t += T0 + (T1 - T0) * (t / seconds)) beats.push(t);
@@ -224,4 +225,53 @@ test('a recording at a wandering speed, or that starts losing a little all the t
   assert.equal(keepsTime(mendSteps(lossy, T).pcm, T).steady, false);
   const { x, T: Tl } = loop('techno', 48000), y = leaky(x, Math.round(0.002 * 48000), 0.2, 4);
   assert.equal(keepsTime({ L: y, R: y, sampleRate: 48000 }, Tl, { tol: 0.0015 }).steady, false, 'a loop with a bed losing 2 ms every 200 ms from 4 s on');
+});
+
+// ---------------------------------------------------------------- the capture's pace, by the player's clock (keptPace)
+// Each report of the player's place, against the frame recorded when it came, puts the track's time 0 somewhere in the
+// capture. It stays put while the capture keeps the player's pace, whatever the music's own tempo does, and moves when
+// the capture runs at another speed. The reports come late by however long they took, never early.
+
+/** Reports every 250 ms over a take of `secs` s of capture at 48 kHz from frame 10000: [frame, time 0] as Recording.run
+ *  gathers them, time 0 at 5000, each late by 2-12 ms and one in eight by up to 150 ms more. lost(p): frames the capture
+ *  had lost by take frame p (a capture slower than the player). */
+function reports(secs, lost = () => 0, seed = 5) {
+  let s = seed;
+  const rnd = () => { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+  const out = [];
+  for (let t = 0.1; t < secs; t += 0.25) {
+    const p = Math.round(t * SR), late = Math.round((0.002 + 0.01 * rnd() + (rnd() < 0.125 ? 0.15 * rnd() : 0)) * SR);
+    out.push([10000 + p - lost(p) + late, 5000 - lost(p) + late]);
+  }
+  return out;
+}
+const take = (secs) => ({ start: 10000, need: Math.round(secs * SR), sr: SR });
+
+test('a capture that keeps the player\'s pace is level by its clock, however late the reports come; one that falls behind it is not', () => {
+  const level = keptPace(reports(30), take(30));
+  assert.ok(level != null && level < 0.01, `level: ${level}`);
+  // From half way, 1 ms lost every 8192 frames: about 88 ms of the capture, 176 ms of the track at 2x.
+  const leak = (p) => (p < 15 * SR ? 0 : 48 * Math.ceil((p - 15 * SR) / 8192));
+  const behind = keptPace(reports(30, leak), take(30));
+  assert.ok(behind > 0.1, `fell behind: ${behind}`);
+});
+
+test('a skip mendSteps mended may have moved the capture against the player\'s clock by its own length: that much is no drift', () => {
+  const lost = (p) => 480 * [8, 16, 24].filter((t) => p > t * SR).length; // 10 ms lost at 8, 16 and 24 s of the capture
+  const steps = [8, 16, 24].map((t) => ({ at: t, ms: -10 }));
+  const unmended = keptPace(reports(30, lost), take(30)), mended = keptPace(reports(30, lost), { ...take(30), steps });
+  assert.ok(unmended > 0.05, `unmended: ${unmended}`);
+  assert.ok(mended < 0.01, `mended: ${mended}`);
+  // Silence put in while the player was late, mended, moved nothing: still level.
+  assert.ok(keptPace(reports(30), { ...take(30), steps: [{ at: 8, ms: 10 }, { at: 20, ms: -10 }] }) < 0.01);
+  // A capture falling behind all the time is not let off by two mended skips.
+  const leak = (p) => (p < 15 * SR ? 0 : 48 * Math.ceil((p - 15 * SR) / 8192));
+  assert.ok(keptPace(reports(30, leak), { ...take(30), steps: [{ at: 8, ms: 10 }, { at: 20, ms: -10 }] }) > 0.1);
+});
+
+test('a player that said its place too seldom gives no pace to tell by', () => {
+  assert.equal(keptPace(reports(30).filter((_, i) => i % 12 === 0), take(30)), null);
+  assert.equal(keptPace([], take(30)), null);
+  // Reports outside the take (before its start, after its end) do not count.
+  assert.equal(keptPace(reports(30), { ...take(30), start: 10000 + 31 * SR }), null);
 });

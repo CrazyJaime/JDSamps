@@ -15,7 +15,7 @@ import {
   prepareExtension, launchExtension, startTrackServer, hubCall, tabIdFor, waitFor, installClient, act, set, state, events, offscreenEval, makeTrackWav,
   downloadIds, waitForDownload, parseWav, steadyBeats, onsetBias, beatMatch, matchFaults, levelFaults,
 } from './ext-harness.mjs';
-import { synth, PATTERNS, FS } from '../unit/fixtures/synth.mjs';
+import { synth, PATTERNS, FS, makeRng } from '../unit/fixtures/synth.mjs';
 
 const SITES = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../fixtures/sites');
 const index = JSON.parse(fs.readFileSync(path.join(SITES, 'index.json'), 'utf8'));
@@ -50,11 +50,23 @@ function leadTrack() {
   return x;
 }
 
+/** 24 s of kicks with off-beat hats on a tempo map: at t s the beat is 60 / bpm(t) long (a track whose own tempo moves). */
+function tempoTrack(bpm, seconds = 24) {
+  const x = new Float32Array(Math.round(seconds * FS)), rnd = makeRng(99);
+  const add = (t0, len, fn) => { const s0 = Math.round(t0 * FS); for (let i = 0; i < len * FS && s0 + i < x.length; i++) x[s0 + i] += fn(i / FS); };
+  for (let t = 0; t < seconds; t += 60 / bpm(t)) {
+    add(t, 0.2, (u) => 0.8 * Math.sin(2 * Math.PI * (45 + 70 * Math.exp(-u * 35)) * u) * Math.exp(-u * 18));
+    add(t + 30 / bpm(t), 0.05, (u) => 0.15 * (2 * rnd() - 1) * Math.exp(-u / 0.015));
+  }
+  return x;
+}
+
 /**
  * MP3s behind <audio src> pages, served with byte ranges (so their players know their length): 16 s at /rec (124 BPM
  * kick) and /rec2 (128 BPM click); 150 s at /long, and behind a Bandcamp-like page (data-tralbum) at /bc-long. And
  * WAVs the same way: 60 s of the 128 BPM click at /click128, and 12 bars of a techno loop with a continuous bed (kick,
- * hats, bass and a pad: PATTERNS.techno, 132.7 BPM) at /techno.
+ * hats, bass and a pad: PATTERNS.techno, 132.7 BPM) at /techno; 24 s whose tempo rises from 124 to 126 BPM at /ramp, and
+ * 24 s at 124 BPM, then 126 from 12 s, at /step.
  */
 async function startRecServer() {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'jds-rec-'));
@@ -68,10 +80,12 @@ async function startRecServer() {
     'click128.wav': { type: 'audio/wav', buf: makeTrackWav({ bpm: 128, kind: 'high', seconds: 60 }) },
     'techno.wav': { type: 'audio/wav', buf: loopWav(synth({ ...PATTERNS.techno, bars: 12, tail: 0.5 }).x) },
     'lead.wav': { type: 'audio/wav', buf: loopWav(leadTrack()) },
+    'ramp.wav': { type: 'audio/wav', buf: loopWav(tempoTrack((t) => 124 + (2 * t) / 24)) },
+    'step.wav': { type: 'audio/wav', buf: loopWav(tempoTrack((t) => (t < 12 ? 124 : 126))) },
     'tone.wav': { type: 'audio/wav', buf: loopWav(Float32Array.from({ length: 4 * FS }, (_, i) => Math.sin((2 * Math.PI * 800 * i) / FS))) } };
   const media = `<script>window.__media = () => { const a = document.getElementById('a'); return { t: a.currentTime, rate: a.playbackRate, pp: a.preservesPitch, paused: a.paused, duration: a.duration }; };</script>`;
   const srv = http.createServer((req, res) => {
-    const u = new URL(req.url, 'http://x'), page = /^\/(rec2?|long|click128|techno)$/.exec(u.pathname), file = files[u.pathname.slice(1)];
+    const u = new URL(req.url, 'http://x'), page = /^\/(rec2?|long|click128|techno|ramp|step)$/.exec(u.pathname), file = files[u.pathname.slice(1)];
     if (page) {
       res.writeHead(200, { 'content-type': 'text/html' });
       res.end(`<!doctype html><title>Track ${page[1]}</title><audio id="a" src="/${page[1]}.${files[`${page[1]}.wav`] ? 'wav' : 'mp3'}" autoplay></audio>${media}`);
@@ -802,6 +816,21 @@ test('recording a whole track keeps its leading silence and ends at its own end:
   await site.tab.close();
 });
 
+test('recording a whole track whose own tempo moves (rising through it, or stepping from 124 to 126 BPM) keeps a clean recording: its beat moves with the track, and the capture kept the player\'s pace', async (t) => {
+  for (const name of ['ramp', 'step']) {
+    const { site, d } = await liveDeck(`${rec.origin}/${name}`);
+    await playing(site.tab);
+    const { r } = await recordWholeTrack(t, d);
+    t.diagnostic(`${name}: ${r.load.report.split('\n').filter((l) => /^(Result|Mended|Beat|Pace)/.test(l)).join(' | ')}`);
+    assert.equal(r.kind, 'resident', r.load.report);
+    assert.match(r.load.report, /^Beat: moving: the beat about a bar up to \d+\.\d ms of the track's \(the track's own tempo: the capture kept the player's pace\)$/m, name);
+    assert.match(r.load.report, /^Pace: by the player's clock, the recording kept its pace within \d+\.\d ms$/m, name);
+    assert.equal((await act(deck, r.id, 'eject')).ok, true);
+    await waitFor(async () => !(await decks()).length, 8000);
+    await site.tab.close();
+  }
+});
+
 /** Settings → Record whole track at 2× when bytes are unavailable, on or off (and waited for). */
 async function recordWholeSetting(on) {
   set(deck, null, 'resident.recordWhole', on);
@@ -855,8 +884,10 @@ const kicksOf = (deckId) => engine(`const pcm = e.__pcm.get(${deckId}), L = pcm.
  * the real capture passes through). So no busy computer's own skips get into it, and what is done to it is all that is
  * done to it, at fixed places in the track (s of it, from its first sound), however long the page took to start: at
  * `ins` 10 ms of the capture's silence is put in, and at `lose` 10 ms of it is lost, as a busy computer's tab capture
- * skips; from `leak` on, 1 ms is lost from every 8192 frames (a capture whose speed changes). The recorder's batches
- * keep their length, so all the audio after a skip comes late (or early). undo() puts AudioWorkletNode back.
+ * skips: the recorder's batches keep their length, so all the audio after a skip comes late (or early). From `leak` on,
+ * 1 ms is lost every 2048 frames as an engine too busy to keep up loses it (a capture whose speed changes): the audio
+ * jumps on by it, and the batches come that much short, the capture falling behind the player's clock. undo() puts
+ * AudioWorkletNode back.
  */
 async function idealCapture(url, { ins = -1, lose = -1, leak = -1 } = {}) {
   const ctx = globalThis.__jdsEngine.ctx, sr = ctx.sampleRate;
@@ -871,24 +902,28 @@ async function idealCapture(url, { ins = -1, lose = -1, leak = -1 } = {}) {
   // Where frame r (from the first sound) of the edited capture is read from in the perfect one, or -1 for silence put in.
   const from = (r) => {
     if (r >= INS && r < INS + BUF) return -1;
-    return r + s0 - (r >= INS ? BUF : 0) + (r >= LOSE ? BUF : 0) + (r >= LEAKS ? LEAK * (1 + Math.floor((r - LEAKS) / 8192)) : 0);
+    return r + s0 - (r >= INS ? BUF : 0) + (r >= LOSE ? BUF : 0) + (r >= LEAKS ? LEAK * (1 + Math.floor((r - LEAKS) / 2048)) : 0);
   };
   const edit = () => {
-    let pos = 0, quiet = 0, anchor = -1;
+    let pos = 0, quiet = 0, anchor = -1, q = 0, owed = 0; // q: frames given from the anchor; owed: frames the engine lost, not given
     return (m) => {
       if (!m || m.t !== 'data') return m;
       const n = m.frames, real = m.buf, out = new Int16Array(2 * n);
+      let w = 0;
       for (let i = 0; i < n; i++) {
         if (anchor < 0) {
           const loud = Math.abs(real[2 * i]) > 98 || Math.abs(real[2 * i + 1]) > 98; // above -50 dBFS
           if (loud && quiet >= 0.3 * sr) anchor = pos + i; else quiet = loud ? 0 : quiet + 1;
-          if (anchor < 0) { out[2 * i] = real[2 * i]; out[2 * i + 1] = real[2 * i + 1]; continue; }
+          if (anchor < 0) { out[2 * w] = real[2 * i]; out[2 * w + 1] = real[2 * i + 1]; w++; continue; }
         }
-        const k = from(pos + i - anchor);
-        if (k >= 0 && k < A.length) { out[2 * i] = i16(A[k]); out[2 * i + 1] = i16(B[k]); }
+        if (owed > 0) { owed--; continue; }
+        if (q >= LEAKS && (q - LEAKS) % 2048 === 0) owed += LEAK;
+        const k = from(q++);
+        if (k >= 0 && k < A.length) { out[2 * w] = i16(A[k]); out[2 * w + 1] = i16(B[k]); }
+        w++;
       }
       pos += n;
-      return { ...m, buf: out };
+      return { ...m, frames: w, buf: out.slice(0, 2 * w) };
     };
   };
   const W = globalThis.AudioWorkletNode, onmessage = Object.getOwnPropertyDescriptor(MessagePort.prototype, 'onmessage');
@@ -973,7 +1008,7 @@ test('recording a whole track of a loop with a continuous bed through a capture 
   } finally { await engine('window.__undoSkips && window.__undoSkips(); return true;'); }
 });
 
-test('a recording whose capture ran at a changing speed (losing a little all the time from half way) is refused, saying so once, with its report: never a deck at the wrong speed', async () => {
+test('a recording whose capture ran at a changing speed (losing a little all the time from half way) is refused, saying so once, with its report: never a deck at the wrong speed', async (t) => {
   await engine(`await (${idealCapture})('${rec.origin}/rec.mp3', { leak: 6.5 }); return true;`);
   try {
     const { site, d } = await liveDeck(`${rec.origin}/rec`);
@@ -982,11 +1017,13 @@ test('a recording whose capture ran at a changing speed (losing a little all the
     assert.deepEqual(await act(deck, d.id, 'recordWhole'), { ok: true, error: undefined });
     const loading = await deckWhere((x) => x.id !== d.id && x.kind === 'loading', 5000);
     const r = await deckWhere((x) => x.id === loading.id && (x.load.state === 'error' || x.kind === 'resident'), 40000);
+    t.diagnostic(r.load.report.split('\n').filter((l) => /^(Mended|Beat|Pace)/.test(l)).join(' | '));
     assert.equal(r.kind, 'loading', `never resident: ${r.load.report}`);
     assert.equal(r.kind, 'loading', 'never resident');
     assert.equal(r.load.error, 'The recording was disturbed (the computer was busy); try again.');
     assert.match(r.load.report, /^JD Samps load report\n[^]*Result: failed: the recording was disturbed \(the computer was busy\); try again\n/);
     assert.match(r.load.report, /^Beat: not steady: the beat about a bar up to \d+\.\d ms of the track's \(the capture ran at a changing speed\)$/m);
+    assert.match(r.load.report, /^Pace: by the player's clock, the recording drifted \d+\.\d ms$/m);
     await sleep(300);
     const said = (await events(deck)).slice(seen).filter((e) => e.level === 'error');
     assert.deepEqual(said.map((e) => e.text), [`Deck ${r.slot}: recording the whole track failed: the recording was disturbed (the computer was busy); try again.`]);

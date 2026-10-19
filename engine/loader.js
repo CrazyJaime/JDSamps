@@ -1416,11 +1416,11 @@ const GRID_MIN = 0.5;    // of the bars matched to the bar before: fewer in ever
 /**
  * Whether a recording (mended) keeps time: on music with a beat, the beat about each bar (how far the bars about it sit
  * from the bar before, their median: what mendSteps reads a step against) is the same all through the track. A beat
- * that wanders (a capture at a changing speed) moves it; a beat played by hand, or a lone step left as it was, does
- * not. Looked for further than a skip, so a beat far off still shows. T: the beat period (s); tol: the most the beat
- * about a bar may sit off (s, in the recording's own time: half DRIFT_TOL for a 2x capture). -> {steady, spread (s, the
- * 90th percentile of how far the beat about a bar sits from the track's, in the steadiest reading; null when there is
- * no beat to tell by, which passes)}.
+ * that wanders (a capture at a changing speed, or a track whose own tempo moves: keptPace tells them apart) moves it; a
+ * beat played by hand, or a lone step left as it was, does not. Looked for further than a skip, so a beat far off still
+ * shows. T: the beat period (s); tol: the most the beat about a bar may sit off (s, in the recording's own time: half
+ * DRIFT_TOL for a 2x capture). -> {steady, spread (s, the 90th percentile of how far the beat about a bar sits from the
+ * track's, in the steadiest reading; null when there is no beat to tell by, which passes)}.
  */
 export function keepsTime(pcm, T, { tol = DRIFT_TOL } = {}) {
   const sr = pcm.sampleRate, hop = Math.max(1, Math.round(0.0005 * sr));
@@ -1440,6 +1440,32 @@ export function keepsTime(pcm, T, { tol = DRIFT_TOL } = {}) {
   return { steady: spread == null || spread <= tol, spread };
 }
 
+// s (of the track): how far apart the player's clock may put the track's start across a recording that kept its pace
+// (on a busy computer its reports scatter by up to 40 ms)
+const PACE_TOL = 0.1;
+
+/**
+ * How far a recording kept its player's pace, by the player's own clock. Each report of its place, against the frame
+ * recorded when it came, puts the track's time 0 somewhere in the capture (marks: [frame, time 0], capture frames). On
+ * the take [start, start + need), time 0 stays put while the capture keeps the player's pace, whatever the music's own
+ * tempo does, and moves when the capture runs at another speed. A skip mendSteps mended (steps) may have moved it by its
+ * own length, or not (silence put in while the player was late, audio lost while the capture caught up), so each is
+ * allowed that much either way. The reports come late by however long they took, never early: each quarter of the take
+ * is read by its earliest quarter of them. -> how far apart the quarters put time 0 beyond what the mended skips
+ * allow (s of the track), or null when the player said its place too seldom to tell (fewer than 3 times in a quarter).
+ */
+export function keptPace(marks, { start, need, steps = [], sr, rate = REC_RATE }) {
+  const qs = [[], [], [], []];
+  for (const [at, zero] of marks) {
+    const p = at - start;
+    if (p >= 0 && p < need) qs[Math.min(3, Math.floor((4 * p) / need))].push(zero);
+  }
+  if (qs.some((q) => q.length < 3)) return null;
+  const low = qs.map((q) => q.sort((a, b) => a - b)[Math.floor(0.25 * (q.length - 1))]);
+  const skips = steps.reduce((n, s) => n + Math.abs(s.ms) / 1000, 0);
+  return Math.max(0, ((Math.max(...low) - Math.min(...low)) / sr - skips) * rate);
+}
+
 export class Recording extends Job {
   /** live: the live tab deck whose page is recorded; deck: the loading deck the recording becomes. */
   constructor({ engine, live, deck, signal }) {
@@ -1450,7 +1476,7 @@ export class Recording extends Job {
     this.gone = false;
     this.cap = { frames: 0, ctxAt: 0 }; // frames recorded, and the context's time when the last of them came
     this.timing = false;                // the player runs the track from its time 0: its place is read against the capture
-    this.zero = [];                     // where each report of its place puts its time 0 in the capture (frames)
+    this.marks = [];                    // each report of its place: [the frame recorded when it came, where it puts time 0] (frames)
   }
 
   /** The live deck's frame agent whose player the user hears, or null: a page with none cannot be sped up. */
@@ -1474,7 +1500,7 @@ export class Recording extends Job {
       const d = m.drive, sr = this.engine.ctx.sampleRate;
       if (this.timing && d && d.mode === 'accelerate' && (d.state === 'running' || d.state === 'done') && d.at > 0 && d.at < m.duration - 0.5) { // running, not at its end
         const now = this.cap.frames + Math.max(0, this.engine.ctx.currentTime - this.cap.ctxAt) * sr; // the frame recorded now
-        this.zero.push(now - (d.at / REC_RATE) * sr);
+        this.marks.push([now, now - (d.at / REC_RATE) * sr]);
       }
     }
     this.poke();
@@ -1528,8 +1554,8 @@ export class Recording extends Job {
       // its own scatter; never before the player was let go.
       let first = -1;
       const startAt = () => {
-        if (first < 0 || this.zero.length < 3) return first;
-        const z = medianOf(this.zero), scatter = medianOf(this.zero.map((v) => Math.abs(v - z))), at = z + CAP_LAG * sr;
+        if (first < 0 || this.marks.length < 3) return first;
+        const zero = this.marks.map(([, v]) => v), z = medianOf(zero), scatter = medianOf(zero.map((v) => Math.abs(v - z))), at = z + CAP_LAG * sr;
         return first - at > Math.max(LEAD_MIN * sr, 3 * scatter) ? Math.max(mark, Math.round(at)) : first;
       };
       for (;;) {
@@ -1577,12 +1603,19 @@ export class Recording extends Job {
         `Recorded: ${(need / sr).toFixed(3)} s of the tab's sound from deck ${live.slot}'s capture, slowed back by ${REC_RATE}, from the player's time 0 (its first sound ${lead.toFixed(3)} s in)`,
         ...(mended.length ? [`Mended: ${mended.length} skip${mended.length === 1 ? '' : 's'} in the capture (the computer was busy): ${mended.map((x) =>
           `${Math.round(Math.abs(x.ms) * REC_RATE)} ms ${x.ms > 0 ? 'put in' : 'lost'} at ${(x.at * REC_RATE).toFixed(1)} s`).join(', ')}`] : []),
-        ...(kept && kept.spread != null ? [`Beat: ${kept.steady ? 'steady all through' : 'not steady'}: the beat about a bar ${kept.steady ? 'within' : 'up to'} ${(kept.spread * REC_RATE * 1000).toFixed(1)} ms of the track's${kept.steady ? '' : ' (the capture ran at a changing speed)'}`] : []),
+        ...(kept && kept.spread != null ? [`Beat: ${kept.steady ? 'steady all through' : kept.ok ? 'moving' : 'not steady'}: the beat about a bar ${kept.steady ? 'within' : 'up to'} ${(kept.spread * REC_RATE * 1000).toFixed(1)} ms of the track's${
+          kept.steady ? '' : kept.ok ? " (the track's own tempo: the capture kept the player's pace)" : ' (the capture ran at a changing speed)'}`] : []),
+        ...(kept ? [kept.pace == null ? "Pace: not known (the player said where it was too seldom)"
+          : `Pace: by the player's clock, the recording ${kept.pace <= PACE_TOL ? 'kept its pace within' : 'drifted'} ${(kept.pace * 1000).toFixed(1)} ms`] : []),
         `Total: ${secs(this.now() - t0)}`,
       ].join('\n');
-      // Checked as mended: a recording that does not keep time all through would be a deck at the wrong speed.
-      const kept = keepsTime(held, analysis && analysis.bpm > 0 ? 60 / analysis.bpm / REC_RATE : 0, { tol: DRIFT_TOL / REC_RATE });
-      if (!kept.steady) {
+      // Checked as mended: a recording that does not keep time all through would be a deck at the wrong speed. A beat that
+      // wanders is the capture's speed changing only when the player's clock says so (or cannot say): a track whose own
+      // tempo moves, recorded at the player's pace, is kept.
+      const beat = analysis && analysis.bpm > 0 ? 60 / analysis.bpm / REC_RATE : 0;
+      const kept = { ...keepsTime(held, beat, { tol: DRIFT_TOL / REC_RATE }), pace: keptPace(this.marks, { start, need, steps: mended, sr }) };
+      kept.ok = kept.steady || (kept.pace != null && kept.pace <= PACE_TOL);
+      if (!kept.ok) {
         const error = `${DISTURBED[0].toUpperCase()}${DISTURBED.slice(1)}.`;
         this.end();
         d.setLoad({ state: 'error', error, strategy: null, report: report(`failed: ${DISTURBED}`, kept) });
