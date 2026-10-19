@@ -17,11 +17,11 @@ const routes = {
   '/stall': (req, res) => { res.writeHead(200, { 'content-type': 'audio/mpeg' }); res.flushHeaders(); },
   // Never even answers.
   '/silent': () => {},
-  // A body that keeps coming slowly: never stalls for long, ends after a second.
+  // A body that keeps coming slowly: never stalls for long, ends after about 3 s.
   '/trickle': (req, res) => {
     res.writeHead(200, { 'content-type': 'audio/mpeg' });
     let n = 0;
-    const t = setInterval(() => { res.write(Buffer.alloc(KB, 1)); if (++n === 50) { clearInterval(t); res.end(); } }, 20);
+    const t = setInterval(() => { res.write(Buffer.alloc(KB, 1)); if (++n === 150) { clearInterval(t); res.end(); } }, 20);
     req.on('close', () => clearInterval(t));
   },
   // An internet radio station: no length, bytes forever.
@@ -82,8 +82,9 @@ test('a link that stops sending (or never answers) is given up after the stall, 
     await refused(fetchArrayBuffer(`${origin}${path}`, { stall: 300 }), 'stall', /^nothing came from the link for 0\.3 s$/);
     assert.ok(performance.now() - t0 < 3000, path);
   }
-  // A slow body that keeps coming is not a stall.
-  assert.equal((await fetchArrayBuffer(`${origin}/trickle`, { stall: 2000 })).byteLength, 50 * KB);
+  // A slow body that keeps coming is not a stall, however long it takes: the stall starts again with every byte that
+  // comes (it lasts three stalls).
+  assert.equal((await fetchArrayBuffer(`${origin}/trickle`, { stall: 1000 })).byteLength, 150 * KB);
 });
 
 test('a body with no length that passes the cap is a stream with no end: refused, and no more of it is read', async () => {
