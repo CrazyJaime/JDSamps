@@ -75,7 +75,7 @@ const DECISIVE = ['drm', 'worker', 'preview', 'live'];
 const NO_LENGTH = "the page's player has not said how long the track is";
 const TAB_CAP = 600 * 2 ** 20;       // bytes from one tab: each frame's tap holds at most this, and so does the whole tab
 const NO_STAMPS = /^audio\/(mpeg|mp3|aac|x-aac)\b/i; // placed in append order only: never seek-hopped
-const DRIVE_RATE = 8;
+const DRIVE_RATE = 16;             // accelerate: the most a media element takes (the agent's limit too); byte capture is lossless at any rate
 const FETCHED = 1e6;                 // placement keys of fetched batches, clear of the tap's SourceBuffers (frame * 1000 + sb)
 
 class Stop extends Error {

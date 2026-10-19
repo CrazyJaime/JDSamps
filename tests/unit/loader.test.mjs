@@ -150,6 +150,17 @@ test('a seek-hop that stalls goes on to accelerate, with the pitch unlocked thro
   assert.equal(tab.kinds().filter((k) => k === 'drive stop').length, 1);
 });
 
+test('accelerate runs the player at 16×, the most the agent takes, so a 5-minute track can be in well under 30 s (§4.3)', async () => {
+  const mp3 = { mimes: ['audio/mpeg'] };
+  for (const [what, page] of [['after a seek-hop that stalls', { seekhop: 'stall' }], ['for appends placed in order only', mp3]]) {
+    const { result, tab, deck } = await load({ kind: 'mse', rendition: hi(), preTap: 0, playing: 2, ...page });
+    assert.equal(result.kind, 'resident', what);
+    assert.deepEqual(tab.sent().filter((m) => m.t === 'drive' && m.mode === 'accelerate').map((m) => m.rate), [16], what);
+    assert.match(deck.load.report, /accelerate 16×/, what);
+    assert.ok(deck.loads.some((l) => l.strategy === 'running the player through the track (16×)'), what);
+  }
+});
+
 test('a site-table host starts at its rung: a YouTube page is driven without asking for a track link or re-fetching', async () => {
   const { result, tab, loader } = await load({ url: 'https://www.youtube.com/watch?v=x', kind: 'mse', rendition: hi(), preTap: 0, playing: 1, list: true, segUrls: true });
   assert.equal(result.kind, 'resident');
@@ -171,7 +182,7 @@ test('a player that has let go of the start it buffered before the tap is run on
   assert.ok(near(called(engine, 'startResidentDeck')[0].frames / SR, 120, 0.02));
   assert.deepEqual(tab.sent().filter((m) => m.t === 'drive' && m.mode !== 'stop').map((m) => [m.mode, m.from]), [['seekhop', undefined], ['accelerate', 0]]);
   assert.equal(tab.kinds().filter((k) => k === 'drive stop').length, 1);
-  assert.match(deck.load.report, /drive \(seek-hop, then accelerate 8× from 0\.0 s\): ok/);
+  assert.match(deck.load.report, /drive \(seek-hop, then accelerate 16× from 0\.0 s\): ok/);
 });
 
 test('a player that stops saying how long its track is while it is driven ends live with a plain reason', async () => {
@@ -361,7 +372,7 @@ test('MP3 pieces from a playlist that cannot all be fetched are never placed bes
     { before: (o) => { before(o); o.tab.net.delete(lost.url); } });
   assert.equal(result.kind, 'resident', deck.load.report);
   assert.match(deck.load.report, /refetch \(fetching the track's pieces\): failed in \d+\.\d s — 29 pieces fetched, 1 failed, still missing 40\.3–44\.4 s/);
-  assert.match(deck.load.report, /drive \(accelerate 8×\): ok/);
+  assert.match(deck.load.report, /drive \(accelerate 16×\): ok/);
   assert.deepEqual(tab.sent().filter((m) => m.t === 'drive' && m.mode !== 'stop').map((m) => m.mode), ['accelerate']);
   assert.ok(near(called(engine, 'startResidentDeck')[0].frames / SR, D, 0.01));
 });
@@ -392,7 +403,7 @@ test('a load that ends live leaves a report naming the rung that failed first, a
   const r = deck.load.report;
   assert.match(r, /Result: live: the whole track could not be read/);
   assert.match(r, /refetch \(fetching the track's pieces\): skipped in \d+\.\d s — the player fetched nothing that can be fetched again/);
-  assert.match(r, /drive \(seek-hop, then accelerate 8× from 0\.0 s\): failed in \d+\.\d s — the player buffered the whole track, but 0\.0–24\.0 s came before the deck could read it/);
+  assert.match(r, /drive \(seek-hop, then accelerate 16× from 0\.0 s\): failed in \d+\.\d s — the player buffered the whole track, but 0\.0–24\.0 s came before the deck could read it/);
   assert.match(r, /gaps: 0\.0–24\.0 s/);
   assert.match(r, /First failure: drive: the player buffered the whole track/);
 });
@@ -801,7 +812,7 @@ test('flushed, a player that then fetches nothing more ends live, the report nam
   assert.deepEqual(called(engine, 'startResidentDeck'), []);
   const why = /the player would not fetch the start again after a flush: 0\.0–24\.0 s came before the deck could read it/;
   assert.match(called(engine, 'failLoadingToLive')[0].reason, why);
-  assert.match(deck.load.report, new RegExp(`drive \\(seek-hop after a flush, then accelerate 8×\\): failed in \\d+\\.\\d s — ${why.source}`));
+  assert.match(deck.load.report, new RegExp(`drive \\(seek-hop after a flush, then accelerate 16×\\): failed in \\d+\\.\\d s — ${why.source}`));
   assert.match(deck.load.report, new RegExp(`First failure: drive: ${why.source}`));
   assert.ok(tab.kinds().lastIndexOf('drive stop') > tab.kinds().lastIndexOf('drive accelerate'), 'the drive is stopped');
 });
@@ -816,7 +827,7 @@ test('a flush the player refuses (it has ended its stream) is noted in the repor
   const { result, deck } = await load({ kind: 'mse', rendition: hi(), preTap: 6, playing: 1, flush: 'ended' });
   assert.equal(result.kind, 'live');
   assert.match(deck.load.report, /note: the player was not flushed: it had loaded the whole track and ended its stream/);
-  assert.match(deck.load.report, /drive \(seek-hop, then accelerate 8× from 0\.0 s\): failed in \d+\.\d s — the player buffered the whole track, but 0\.0–24\.0 s came before the deck could read it\n/);
+  assert.match(deck.load.report, /drive \(seek-hop, then accelerate 16× from 0\.0 s\): failed in \d+\.\d s — the player buffered the whole track, but 0\.0–24\.0 s came before the deck could read it\n/);
 });
 
 test('a seek-hop the player says has stalled goes to accelerate after a stall, even while bytes keep coming from elsewhere (shaka going on from its last segment)', async () => {
