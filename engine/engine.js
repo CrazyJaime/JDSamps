@@ -12,7 +12,7 @@ import { MasterClock } from './sync.js';
 import { Deck } from './deck.js';
 import { fetchArrayBuffer, decodeTo, resample, limitPcm } from './decode.js';
 import { analyseTrack, applyAnalysis } from './analysis.js';
-import { Loader, Recording } from './loader.js';
+import { Loader, Recording, framesOf } from './loader.js';
 
 const STRETCH_URL = new URL('../vendor/signalsmith-stretch/SignalsmithStretch.js', import.meta.url).href;
 SignalsmithStretch.moduleUrl = STRETCH_URL;
@@ -225,7 +225,10 @@ class Engine {
       case ENGINE.EJECT: {
         const d = this.deckByTab(msg.tabId);
         if (!d) return { ok: true };
-        // The tab was closed: a deck still loading from it goes, said once here (its load ends cancelled, quietly).
+        // The tab was closed. A deck holding its whole track needs it no more: one resident (letting go of the tab), or
+        // one whose load has every byte in hand (it goes on, and lets go of the tab once resident).
+        if (d.kind === 'resident' || (d.kind === 'loading' && d.loader && d.loader.tabClosed())) return { ok: true };
+        // Else a deck still loading from it goes, said once here (its load ends cancelled, quietly).
         if (d.kind === 'loading' && this.loads.has(d.id)) this.event('error', `Deck ${d.slot}: the tab was closed before the track was in.`, d.id);
         await this.eject(d.id, msg.reason);
         return { ok: true };
@@ -531,13 +534,19 @@ class Engine {
     }
     if (gone()) return refuse();
     deck.setLoad({ progress: 0.5, strategy: 'decoding' });
+    // Longer than the resident limit, an MP3 or ADTS file is cut at the frame a second past it and only that part
+    // is decoded, as a tab's file is (a file in any other format is decoded whole).
+    const limitMin = this.params['resident.limitMin'], w = framesOf(buf, limitMin * 60 + 1);
+    const own = w ? w.samples / w.sampleRate : 0, cut = own > limitMin * 60 + 0.5 && w.cut ? w.cut : null;
+    if (cut) buf = buf.slice(0, cut.end);
     try {
       pcm = await decodeTo(this.ctx, buf);
     } catch (_) {
       return refuse(`“${meta.title}” is not audio this browser can play.`);
     }
+    buf = null;
     if (gone()) return refuse();
-    const lim = limitPcm(pcm, this.params['resident.limitMin']);
+    const lim = limitPcm(pcm, limitMin, cut ? own : undefined);
     pcm = null;
     // Found here rather than in startResidentDeck, so other decks' starts and ejects never queue behind it.
     deck.setLoad({ progress: 0.8, strategy: 'finding the beat' });

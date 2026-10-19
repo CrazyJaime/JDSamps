@@ -313,10 +313,14 @@ export function makeEngine({ tabs = [], limitMin = 15, hubOk = true } = {}) {
         await e.stopTab(d);
       });
     },
-    /** The hub's EJECT for a closed tab, as the real engine takes it: a deck still loading from it says so, once. */
+    /**
+     * The hub's EJECT for a closed tab, as the real engine takes it: a deck holding its whole track (resident, or its
+     * load with every byte in hand) stays; a deck still loading from it says so, once.
+     */
     hubEject(tabId) {
       const d = [...e.decks.values()].find((x) => x.tabId === tabId);
       if (!d) return Promise.resolve();
+      if (d.kind === 'resident' || (d.kind === 'loading' && d.loader && d.loader.tabClosed())) return Promise.resolve();
       if (d.kind === 'loading' && e.loads.has(d.id)) e.events.push({ level: 'error', text: `Deck ${d.slot}: the tab was closed before the track was in.` });
       return e.eject(d.id);
     },

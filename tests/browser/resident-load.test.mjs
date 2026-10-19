@@ -34,11 +34,15 @@ before(async () => {
     files.lateLead = 0.37;
   }
   execFileSync('/usr/bin/ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', path.join(tmp, 'kick.wav'), '-codec:a', 'libmp3lame', '-b:a', '160k', path.join(tmp, 'kick.mp3')]);
+  // A 280 s MP3 (the 70 s track four times over), a mix longer than the resident limit the test sets.
+  execFileSync('/usr/bin/ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-stream_loop', '3', '-i', path.join(tmp, 'long.wav'), '-codec:a', 'libmp3lame', '-b:a', '64k', path.join(tmp, 'mix.mp3')]);
+  files.mixBytes = fs.statSync(path.join(tmp, 'mix.mp3')).size;
   const send = (res, type, file) => { res.writeHead(200, { 'content-type': type, 'cache-control': 'no-store' }); res.end(fs.readFileSync(path.join(tmp, file))); };
   server = http.createServer((req, res) => {
     const u = new URL(req.url, 'http://x');
     switch (u.pathname) {
       case '/kick.mp3': return send(res, 'audio/mpeg', 'kick.mp3');
+      case '/mix.mp3': return send(res, 'audio/mpeg', 'mix.mp3');
       case '/linked-kick.wav': return send(res, 'audio/wav', 'kick.wav');
       case '/long.wav': return send(res, 'audio/wav', 'long.wav');
       case '/five.wav': return send(res, 'audio/wav', 'five.wav');
@@ -225,6 +229,30 @@ test('a track longer than the resident limit is cut to it, and the deck says so 
   set(deck, null, 'resident.limitMin', 15);
   assert.equal((await act(deck, d.id, 'eject')).ok, true);
   await waitFor(async () => !(await decks()).some((x) => x.id === d.id));
+});
+
+test('a long MP3 link decodes only its first part, a second past the resident limit, and says how long the whole track is', async () => {
+  set(deck, null, 'resident.limitMin', 1);
+  await waitFor(async () => (await state(deck)).master.params['resident.limitMin'] === 1);
+  // Every buffer the engine's context decodes, by its size.
+  await engine(`window.__decoded = []; const dad = e.ctx.decodeAudioData;
+    e.ctx.decodeAudioData = function (b, ...a) { window.__decoded.push(b.byteLength); return dad.call(this, b, ...a); }; return true;`);
+  try {
+    const seen = (await events(deck)).length;
+    const r = await act(deck, null, 'loadUrl', { url: `${origin}/mix.mp3` });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    const d = await deckWhere((x) => x.title === 'mix' && x.kind === 'resident');
+    assert.ok(Math.abs(d.duration - 60) < 1e-3, `duration ${d.duration}`);
+    const decoded = await engine('return window.__decoded;');
+    assert.equal(decoded.length, 1, JSON.stringify(decoded));
+    assert.ok(decoded[0] < 0.3 * files.mixBytes, `decoded ${decoded[0]} of the file's ${files.mixBytes} bytes`);
+    await waitFor(async () => (await events(deck)).slice(seen).some((e) => /this track is 4\.7 minutes long: the deck holds its first 1 minute\b/.test(e.text)));
+    assert.equal((await act(deck, d.id, 'eject')).ok, true);
+    await waitFor(async () => !(await decks()).some((x) => x.id === d.id));
+  } finally {
+    await engine('delete e.ctx.decodeAudioData; return true;');
+    set(deck, null, 'resident.limitMin', 15);
+  }
 });
 
 test('a decoded track at another sample rate is resampled to the engine\'s before it goes on a deck', async () => {
