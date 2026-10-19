@@ -450,7 +450,7 @@ test('settings are restored again when the engine is re-created while the page s
 });
 
 // Spec §3.9: DOM nodes are updated only when their values change.
-test('six decks: an unchanged snapshot writes nothing to the deck or master DOM', async () => {
+test('six decks: an unchanged snapshot writes nothing to the deck or master DOM, nor to the page around them (#empty, body, title)', async () => {
   const decks = Array.from({ length: 6 }, (_, i) => deck({
     id: i + 1, slot: i + 1, tabId: 100 + i, title: `Track ${i + 1}`, favIconUrl: i === 0 ? 'data:image/gif;base64,R0lGODlhAQABAAAAACw=' : '',
     ...(i === 1 ? { sync: { on: false, mode: 'BEAT', isMaster: true, outOfRange: false, phaseMs: null }, rec: { state: 'recording', format: 'wav', seconds: 73.4 } } : {}),
@@ -465,14 +465,18 @@ test('six decks: an unchanged snapshot writes nothing to the deck or master DOM'
     await u.page.waitForTimeout(100);
     const r = await u.page.evaluate(async (s) => {
       const frame = () => new Promise((res) => requestAnimationFrame(() => res()));
-      const mo = new MutationObserver(() => {});
-      for (const el of document.querySelectorAll('.deck, .wave-row, #master, .xfader-bar, #mixRecBtn, .clock')) mo.observe(el, { subtree: true, attributes: true, childList: true, characterData: true });
+      // Records are delivered to the callback at each microtask checkpoint, before takeRecords() could see them.
+      const recs = [];
+      const mo = new MutationObserver((rs) => recs.push(...rs));
+      for (const el of document.querySelectorAll('.deck, .wave-row, #master, .xfader-bar, #mixRecBtn, .clock, #empty, head > title')) mo.observe(el, { subtree: true, attributes: true, childList: true, characterData: true });
+      mo.observe(document.body, { attributes: true }); // body[data-decks] and its classes drive the page's layout
       window.__fake.push({ t: 'state', s });
       await frame(); // the DOM follows once per frame
-      mo.takeRecords();
+      recs.push(...mo.takeRecords());
+      recs.length = 0;
       const N = 10;
-      const recs = [];
-      for (let i = 0; i < N; i++) { window.__fake.push({ t: 'state', s }); await frame(); recs.push(...mo.takeRecords()); }
+      for (let i = 0; i < N; i++) { window.__fake.push({ t: 'state', s }); await frame(); }
+      recs.push(...mo.takeRecords());
       mo.disconnect();
       const what = [...new Set(recs.map((m) => `${m.type} ${m.target.nodeName}.${m.target.getAttribute ? m.target.getAttribute('class') || '' : ''} ${m.attributeName || ''}`))];
       return { perSnapshot: recs.length / N, what };

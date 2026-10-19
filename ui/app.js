@@ -1,6 +1,6 @@
 // ui/app.js — deck page entry point.
 import { PERSISTED_MASTER_KEYS } from '../shared/protocol.js';
-import { $, setText, wallNow, trapFocus } from './util.js';
+import { $, setText, setAttr, setHidden, wallNow, trapFocus } from './util.js';
 import { EngineConnection } from './connection.js';
 import { DeckStrip } from './deck-strip.js';
 import { MasterStrip } from './master-strip.js';
@@ -109,13 +109,13 @@ function onState(s) {
   });
   if (!strips.has(selected)) select(s.decks.length ? s.decks[0].id : null);
   else select(selected);
-  $('#empty').hidden = s.decks.length > 0;
-  document.body.dataset.decks = String(s.decks.length); // deck.css: wave row height, compact decks above 3
+  setHidden($('#empty'), s.decks.length > 0);
+  setAttr(document.body, 'data-decks', s.decks.length); // deck.css: wave row height, compact decks above 3
   document.body.classList.toggle('compact', s.decks.length > 3);
   master.update(s);
   setText($('#engineText'), `${s.engineState === 'running' ? 'Engine' : `Engine ${s.engineState}`} · ${(s.sampleRate / 1000).toFixed(1)} kHz · ${Math.round(s.outputLatency * 1000)} ms`);
-  const n = s.decks.length;
-  document.title = n ? `JD Samps — ${n} deck${n > 1 ? 's' : ''}` : 'JD Samps — Deck';
+  const n = s.decks.length, title = n ? `JD Samps — ${n} deck${n > 1 ? 's' : ''}` : 'JD Samps — Deck';
+  if (document.title !== title) document.title = title;
   syncWakeLock();
 }
 
