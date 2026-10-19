@@ -97,3 +97,51 @@ test('a capture gap of 10-40 ms after the lock does not move the tempo off by mo
     }
   }
 });
+
+// Under a load spike the capture skips in bursts: two or three gaps a few beats apart (seen in both e2e decks at once).
+// Each one is found with its own step, so the deck can jump each: one found step for the lot, or none, leaves beats
+// off the master's for the phase loop to bend back.
+
+/** x with several gaps {ms, at} (track seconds) and where each lands in the capture (s). */
+function gaps(x, sr, list) {
+  let y = x, moved = 0;
+  const at = [];
+  for (const g of [...list].sort((p, q) => p.at - q.at)) { y = gap(y, sr, g.at - moved, g.ms); at.push(g.at - moved); moved += g.ms / 1000; }
+  return { y, at };
+}
+
+/** Every capture gap the tracker records: {from (s), D (ms)}. */
+function found(x, sr) {
+  let deck;
+  const odf = new OdfCore(sr, (f, l, t) => deck.pushFrame(f, l, t));
+  deck = new DeckTempo({ sampleRate: sr, fps: odf.fps });
+  const out = [], detect = deck.detectJump.bind(deck);
+  deck.detectJump = () => {
+    const was = deck.track.jump;
+    detect();
+    const j = deck.track.jump;
+    if (!j || j === was) return;
+    const p = j.prev, b = p.t0 + Math.round((j.from - p.t0) / p.T) * p.T, t0 = deck.clock.t0 / sr, T = deck.clock.T / sr;
+    out.push({ from: j.from, D: (t0 + Math.round((b - t0) / T) * T - b) * 1000 });
+  };
+  for (let s = 0; s + 128 <= x.length; s += 128) odf.push(x.subarray(s, s + 128), s);
+  return out;
+}
+
+test('capture gaps a few beats apart are each found, each with its own step', () => {
+  for (const [kind, bpm] of [['high', 128], ['low', 124]]) {
+    const T = 60 / bpm;
+    for (const list of [
+      [{ ms: -20, at: 20.1 }, { ms: -20, at: 20.1 + 2 * T }],
+      [{ ms: 22, at: 20.3 }, { ms: 30, at: 20.3 + 3 * T }, { ms: 10, at: 20.3 + 8 * T }],
+      [{ ms: -15, at: 18.2 }, { ms: 10, at: 18.2 + 4 * T }],
+    ]) {
+      const { y, at } = gaps(blips({ kind, bpm, seconds: 40, lead: 0.0052 }), 44100, list);
+      const f = found(y, 44100), want = [...list].sort((p, q) => p.at - q.at);
+      const say = `${kind} ${bpm} BPM, gaps ${want.map((g, i) => `${g.ms} ms at ${at[i].toFixed(2)} s`).join(', ')}: found ${f.map((g) => `${g.D.toFixed(1)} ms at ${g.from.toFixed(2)} s`).join(', ') || 'none'}`;
+      assert.equal(f.length, want.length, say);
+      // A drop (ms > 0) brings the beats after it early: the grid's beats step by -ms.
+      for (const [i, g] of want.entries()) assert.ok(Math.abs(f[i].D + g.ms) < 3 && Math.abs(f[i].from - at[i]) < T, say);
+    }
+  }
+});
