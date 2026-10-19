@@ -154,9 +154,9 @@ before(async () => {
   await deck.goto(`chrome-extension://${h.extId}/deck.html`);
   await hubCall(deck, { type: 'ENSURE_ENGINE' });
   await installClient(deck);
-  // Keep each promoted deck's decoded track, to check it against the source.
+  // Keep a copy of each promoted deck's decoded track (the deck takes the arrays), to check it against the source.
   await engine(`if (!e.__pcm) { e.__pcm = new Map(); const s = e.startResidentDeck.bind(e);
-    e.startResidentDeck = (o) => { if (o && o.deckId != null && o.pcm) e.__pcm.set(o.deckId, o.pcm); return s(o); }; } return true;`);
+    e.startResidentDeck = (o) => { if (o && o.deckId != null && o.pcm) e.__pcm.set(o.deckId, { L: o.pcm.L.slice(), R: o.pcm.R.slice(), sampleRate: o.pcm.sampleRate }); return s(o); }; } return true;`);
   // And each tab load's Loader, to check the pieces a track was assembled from.
   await engine(`if (!e.__loaders) { e.__loaders = new Map(); const lt = e.loadTab.bind(e);
     e.loadTab = (d) => { const p = lt(d); e.__loaders.set(d.id, d.loader); return p; }; } return true;`);
@@ -634,7 +634,8 @@ test('recording a whole track from a media page: its player run at 2× from the 
   assert.ok(took > 7.5 && took < 25, `recorded in ${took.toFixed(1)} s (half the track's length, plus setting up)`);
   assert.ok(Math.abs(r.duration - Math.min(D, 16.1)) < 0.1, `deck ${r.duration} s, the track ${D} s`);
   assert.match(r.title, /recorded from the page — reduced highs/);
-  assert.match(r.load.report, /recorded from the page at 2×/);
+  const said = r.load.report.match(/Result: resident, (\d+\.\d{3}) s, recorded from the page at 2×/);
+  assert.ok(said && Math.abs(+said[1] - r.duration) < 0.01, r.load.report);
   assert.equal(r.tabId, null, 'the recording holds no tab');
   const kicks = await kicksOf(loading.id);
   t.diagnostic(`beat to beat (ms): ${kicks.slice(1).map((x, i) => Math.round((x - kicks[i]) * 1000)).join(' ')}; ${r.load.report.split('\n').filter((l) => /^Mended/.test(l)).join('') || 'nothing mended'}`);

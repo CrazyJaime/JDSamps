@@ -40,10 +40,13 @@ export class Timeshift {
     return this.liveEdge;
   }
 
-  /** Audio the deck keeps (a resident track), copied to the node so the caller's arrays stay readable. */
+  /**
+   * Audio the deck keeps (a resident track), handed to the node: its buffers are transferred, so the caller's arrays
+   * are empty afterwards. A copy would be made on the audio thread, which every deck renders on (15 minutes: 250 ms).
+   */
   hold(L, R) {
     this.liveEdge += L.length / this.sr;
-    this.node.addBuffers([L, R]);
+    this.node.addBuffers([L, R], L.buffer === R.buffer ? [L.buffer] : [L.buffer, R.buffer]);
     return this.liveEdge;
   }
 

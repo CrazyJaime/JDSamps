@@ -420,7 +420,8 @@ class Engine {
    * A deck holding a whole decoded track, pcm {L, R, sampleRate}: a new deck, or the loading deck
    * deckId promoted (a failed promotion leaves it loading, for its loader to decide). Its beat grid
    * comes from gridResident() before it is reported ready: from `analysis` when given (null: none),
-   * else from analysing pcm here.
+   * else from analysing pcm here. The deck takes pcm's arrays (they are transferred to its stretcher),
+   * so the caller reads what it needs of them first.
    */
   async startResidentDeck({ deckId = null, tabId = null, pcm, meta = {}, analysis } = {}) {
     if (!pcm || !(pcm.L && pcm.L.length) || !pcm.R || pcm.R.length !== pcm.L.length) return { ok: false, error: 'There is no audio to load.' };
@@ -435,6 +436,8 @@ class Engine {
     }
     // The stretcher runs at the context's rate.
     if (pcm.sampleRate !== this.ctx.sampleRate) pcm = await resample(pcm, this.ctx.sampleRate);
+    let unfit = null; // analysed before the stretcher takes the track
+    if (analysis === undefined) analysis = await this.analyse(pcm).catch((err) => { unfit = err; return null; });
     if (deck) {
       if (this.decks.get(deck.id) !== deck) return { ok: false, error: 'That deck is gone.' };
       Object.assign(deck.meta, meta);
@@ -447,7 +450,8 @@ class Engine {
       return { ok: false, error: `Deck ${deck.slot} could not take the track: ${err.message}` };
     }
     try {
-      await this.gridResident(deck, pcm, analysis);
+      if (unfit) throw unfit;
+      this.gridResident(deck, analysis);
     } catch (err) {
       this.event('warn', `Deck ${deck.slot}: no beat grid from the whole track (${err.message}). TAP the beat.`, deck.id);
     }
@@ -458,11 +462,10 @@ class Engine {
   }
 
   /**
-   * A resident deck's beat grid, tempo and whole waveform, from whole-track analysis (given, null for
-   * none, or run on pcm). The automatic cue moves to the first beat, as a live deck's does.
+   * A resident deck's beat grid, tempo and whole waveform, from whole-track analysis (null for none).
+   * The automatic cue moves to the first beat, as a live deck's does.
    */
-  async gridResident(deck, pcm, analysis) {
-    if (analysis === undefined) analysis = await this.analyse(pcm);
+  gridResident(deck, analysis) {
     if (!analysis || deck.disposed) return;
     applyAnalysis(deck, analysis);
     deck.analysis = { bpm: analysis.bpm, conf: analysis.conf, octConf: analysis.octConf, bar1: analysis.bar1, residuals: analysis.residuals };

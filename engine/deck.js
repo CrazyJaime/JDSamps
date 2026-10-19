@@ -174,14 +174,14 @@ export class Deck {
 
   // ------------------------------------------------------------------ resident
   /**
-   * A resident deck: the whole decoded track, pushed to the stretcher in one addBuffers call (copied, so
-   * the caller can still read it for analysis). No capture and no input worklet: the track runs from
+   * A resident deck: the whole decoded track, pushed to the stretcher in one addBuffers call (transferred:
+   * the caller's arrays are empty afterwards). No capture and no input worklet: the track runs from
    * input 0 to its duration, where the deck stops.
    */
   async initResident({ L, R }) {
     if (!this.ts) await this.build();
-    this.ts.hold(L, R);
     this.noteFirstAudible(L, R, 0);
+    this.ts.hold(L, R);
     this.becomeResident();
   }
 
@@ -189,8 +189,8 @@ export class Deck {
   appendResident({ L, R }) {
     if (this.kind !== 'loading') throw new Error('Only a loading deck takes more of its track.');
     const at = this.ts.liveEdge;
-    this.ts.hold(L, R);
     this.noteFirstAudible(L, R, at);
+    this.ts.hold(L, R);
   }
 
   /** Slow paths: the whole track has arrived. */

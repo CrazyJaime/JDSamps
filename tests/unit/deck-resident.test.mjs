@@ -31,6 +31,39 @@ test('a resident deck holds the whole track from one addBuffers call, cued at it
   assert.ok(d.cue < 0.02, `cue ${d.cue}`);
 });
 
+/** A stretch node whose addBuffers posts as the real one does: a structured clone, moving what the transfer list names. */
+class PortNode extends FakeNode {
+  addBuffers(bufs, transfer) { this.posts = (this.posts || []).concat({ transfer }); const got = structuredClone(bufs, { transfer: transfer || [] }); this.adds.push(got[0].length); return got; }
+}
+async function handOff(pcm) {
+  const clock = { t: 1 }, engine = makeEngine(clock);
+  const d = new Deck(engine, { id: 3, slot: 3, tabId: null, stream: null, meta: { title: 'whole' }, params: { ...PARAMS }, kind: 'loading' });
+  d.node = new PortNode(clock);
+  d.ts = new Timeshift(d.node, { sampleRate: SR, latency: 0.12, outLatency: 0.06, capSec: 240 });
+  await d.initResident(pcm);
+  return d;
+}
+
+test('a resident track is handed to the stretcher, not copied (a copy of 15 minutes stalls the audio thread), and its first sound is still found', async () => {
+  const pcm = tone(60), lead = 1.5;
+  pcm.L.fill(0, 0, lead * SR); pcm.R.fill(0, 0, lead * SR);
+  const bufs = [pcm.L.buffer, pcm.R.buffer];
+  const d = await handOff(pcm);
+  assert.equal(d.node.posts.length, 1, 'one addBuffers call');
+  assert.ok(d.node.posts[0].transfer && bufs.every((b) => d.node.posts[0].transfer.includes(b)), 'the track was posted as a copy');
+  assert.equal(pcm.L.byteLength + pcm.R.byteLength, 0, 'the caller still holds the track: it was copied');
+  assert.deepEqual(d.node.adds, [60 * SR]);
+  assert.equal(d.duration, 60);
+  assert.ok(Math.abs(d.firstAudible - lead) < 1e-3, `first sound ${d.firstAudible}`);
+  assert.ok(Math.abs(d.cue - lead) < 1e-3, `cue ${d.cue}`);
+  // Channels sharing one buffer (or one array for both) are moved once.
+  const both = new Float32Array(20 * SR).fill(0.25), shared = await handOff({ L: both.subarray(0, 10 * SR), R: both.subarray(10 * SR), sampleRate: SR });
+  assert.deepEqual(shared.node.adds, [10 * SR]);
+  assert.equal(shared.duration, 10);
+  const mono = new Float32Array(5 * SR).fill(0.25), one = await handOff({ L: mono, R: mono, sampleRate: SR });
+  assert.equal(one.duration, 5);
+});
+
 test('a resident 300 s track never triggers the buffer-cap skip on first PLAY', async () => {
   const { d, clock, engine } = await resident(300);
   assert.equal(d.kind, 'resident');

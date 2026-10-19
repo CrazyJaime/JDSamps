@@ -844,11 +844,12 @@ export class Loader extends Job {
     }
     this.check();
     this.rep.steps.push({ name: 'beat', outcome: analysis ? 'ok' : 'none', why: analysis && analysis.bpm > 0 ? `${analysis.bpm.toFixed(2)} BPM` : 'no steady beat', ms: now() - t0 });
+    const length = pcm.L.length / pcm.sampleRate; // read first: the deck takes the arrays
     const res = await e.serial(() => e.startResidentDeck({ deckId: d.id, pcm, analysis }));
     if (!res.ok) { this.check(); throw new Stop('live', LIVE.failed(res.error)); }
     this.done = true; // the tap's messages are not this load's any more
     // With the promotion, before any other task: no snapshot shows the resident deck without its report.
-    this.rep.result = `resident, ${(pcm.L.length / pcm.sampleRate).toFixed(3)} s`;
+    this.rep.result = `resident, ${length.toFixed(3)} s`;
     d.setLoad({ report: this.report() });
     await this.release();
     if (notice) e.notify('warn', `Deck ${d.slot}: ${notice}`);
@@ -1348,10 +1349,11 @@ export class Recording extends Job {
           this.check();
         }
       }
+      const got = pcm.L.length / pcm.sampleRate; // read first: the deck takes the arrays
       const res = await e.serial(() => e.startResidentDeck({ deckId: d.id, pcm, analysis }));
       if (!res.ok) { this.check(); throw new Stop('live', res.error); }
       this.end();
-      const host = hostOf(live.meta && live.meta.url) || 'unknown', got = pcm.L.length / pcm.sampleRate;
+      const host = hostOf(live.meta && live.meta.url) || 'unknown';
       d.setLoad({ report: [
         'JD Samps load report', `Page: ${host}`, `Result: resident, ${got.toFixed(3)} s, recorded from the page at ${REC_RATE}× (reduced highs)`,
         `Track length: ${D.toFixed(3)} s (the page's player)`, ...(T < D ? [`Limit: the deck holds the first ${minutes(T / 60)}`] : []),

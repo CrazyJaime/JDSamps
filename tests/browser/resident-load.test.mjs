@@ -60,7 +60,9 @@ before(async () => {
   });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   origin = `http://127.0.0.1:${server.address().port}`;
-  h = await launchExtension({ ext: prepareExtension() });
+  const ext = prepareExtension();
+  fs.copyFileSync(new URL('./pages/gap-worklet.js', import.meta.url), path.join(ext.dir, 'gap-worklet.js')); // measures the audio thread
+  h = await launchExtension({ ext });
   deck = await h.context.newPage();
   deck.on('pageerror', (e) => pageErrors.push(String(e)));
   deck.on('console', (m) => { if (m.type() === 'error') pageErrors.push(m.text()); });
@@ -267,6 +269,45 @@ test('a decoded track at another sample rate is resampled to the engine\'s befor
   assert.ok(Math.abs(r.duration - 3) < 1e-3, JSON.stringify(r));
   assert.ok(Math.abs(r.frames - 3 * r.to) <= 1, JSON.stringify(r));
   assert.equal((await act(deck, r.res.deckId, 'eject')).ok, true);
+});
+
+test('a 15-minute track goes resident without holding up the audio thread: it is handed to the stretcher, not copied', async () => {
+  const r = await engine(`
+    if (!window.__gap) {
+      await e.ctx.audioWorklet.addModule(chrome.runtime.getURL('gap-worklet.js'));
+      const n = new AudioWorkletNode(e.ctx, 'jds-test-gap'); n.connect(e.silentSink);
+      window.__gap = () => new Promise((r) => { n.port.onmessage = (ev) => r(ev.data); n.port.postMessage(0); });
+    }
+    const sr = e.ctx.sampleRate, n = sr * 900, L = new Float32Array(n);
+    for (let i = 0; i < sr; i++) L[i] = 0.2 * Math.sin(2 * Math.PI * 220 * i / sr);
+    for (let k = sr; k < n; k *= 2) L.copyWithin(k, 0, Math.min(k, n - k));
+    const R = L.slice();
+    await new Promise((r) => setTimeout(r, 300));
+    const quiet = await window.__gap();
+    const res = await e.serial(() => e.startResidentDeck({ pcm: { L, R, sampleRate: sr }, meta: { title: 'fifteen' }, analysis: null }));
+    await new Promise((r) => setTimeout(r, 500));
+    return { res, quiet, gap: await window.__gap(), handed: L.byteLength + R.byteLength === 0, duration: res.ok && e.decks.get(res.deckId).duration };
+  `);
+  assert.equal(r.res.ok, true, JSON.stringify(r));
+  assert.ok(Math.abs(r.duration - 900) < 1e-3, JSON.stringify(r));
+  assert.ok(r.gap < 150, `the audio thread was held up ${r.gap} ms (${r.quiet} ms before the load)`);
+  assert.equal(r.handed, true, 'the engine kept its own copy of the track');
+  assert.equal((await act(deck, r.res.deckId, 'eject')).ok, true);
+  await waitFor(async () => !(await decks()).some((x) => x.id === r.res.deckId));
+});
+
+test('a track given with no analysis is analysed before the stretcher takes it: the deck has its beat grid', async () => {
+  const r = await engine(`
+    const ab = await e.ctx.decodeAudioData(await (await fetch('${origin}/linked-kick.wav?grid')).arrayBuffer());
+    const L = ab.getChannelData(0).slice(), R = L.slice();
+    const res = await e.serial(() => e.startResidentDeck({ pcm: { L, R, sampleRate: ab.sampleRate }, meta: { title: 'gridded' } }));
+    return { res, bpm: res.ok && e.decks.get(res.deckId).state(e.ctx.currentTime).bpm };
+  `);
+  assert.equal(r.res.ok, true, JSON.stringify(r));
+  assert.equal(r.bpm.state, 'LOCKED', JSON.stringify(r.bpm));
+  assert.ok(Math.abs(r.bpm.native - 124) < 0.05, JSON.stringify(r.bpm));
+  assert.equal((await act(deck, r.res.deckId, 'eject')).ok, true);
+  await waitFor(async () => !(await decks()).some((x) => x.id === r.res.deckId));
 });
 
 test('a loading deck that holds a tab\'s capture falls back to live, saying why once', async () => {
