@@ -106,6 +106,33 @@ test('a whole-track deck synced to a faster master shows no ASSIST warning: it h
   await show(kinds());
 });
 
+/** The jog hint, tooltip and cursor of deck `slot`'s zoomed waveform, the pointer over it. */
+async function waveHover(slot) {
+  const box = await row(slot).locator('[data-wave]').boundingBox();
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await wait(60);
+  return row(slot).evaluate((el) => {
+    const wave = el.querySelector('[data-wave]'), hint = el.querySelector('[data-jog-hint]');
+    return { hint: hint.textContent, shown: !hint.hidden && getComputedStyle(hint).visibility === 'visible', title: wave.getAttribute('title') || '', cursor: getComputedStyle(wave).cursor };
+  });
+}
+
+test('a loading deck\'s waveform offers no drag: no hint, no drag tooltip, no drag cursor; once loaded it offers one again', async () => {
+  try {
+    await show(kinds());
+    const h = await waveHover(3);
+    assert.equal(h.shown, false, `hint shown: ${JSON.stringify(h)}`);
+    assert.doesNotMatch(`${h.hint} ${h.title}`, /drag/i, JSON.stringify(h));
+    assert.ok(!['ew-resize', 'col-resize'].includes(h.cursor), JSON.stringify(h));
+    assert.deepEqual(await waveHover(2), { hint: 'DRAG: MOVE PLAYHEAD', shown: true, title: 'Drag to move the playhead', cursor: 'ew-resize' }, 'a whole-track deck beside it');
+    await show(kinds((s) => { s.decks[2] = residentDeck({ id: 3, slot: 3 }); }));
+    assert.deepEqual(await waveHover(3), { hint: 'DRAG: MOVE PLAYHEAD', shown: true, title: 'Drag to move the playhead', cursor: 'ew-resize' }, 'loaded');
+  } finally {
+    await page.mouse.move(0, 0);
+    await show(kinds());
+  }
+});
+
 // ---------------------------------------------------------------- loading: inert, cancel
 test('a loading deck is inert but for eject and cancel: the rest is dimmed and aria-disabled, and pressing it sends nothing', async () => {
   await show(kinds());
