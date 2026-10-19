@@ -979,7 +979,8 @@ export class Deck {
    * A capture gap the tracker found ahead of the playhead (a grid segment whose beats come `shift` s later than the
    * grid before it) is played across by a playhead jump of the same size, landing where the playhead reaches it: a
    * beat-locked deck (a BEAT follower, or the master such followers lock to) keeps its beats where they were, instead
-   * of the phase loop bending it back into line by up to 4 %. Gaps up to SKIP_MAX, at most one jump a beat; under a
+   * of the phase loop bending it back into line by up to 4 %. The size is the step the two grids give now (gapStep):
+   * the tracker refines the newer one after the gap was found. Gaps up to SKIP_MAX, at most one jump a beat; under a
    * nudge, roll or loop the gap is played as it came.
    */
   scheduleSkip(now, p) {
@@ -995,7 +996,7 @@ export class Deck {
     // A follower a few ms off the beat, inside the phase loop's deadband, takes that off too: else the jump's own ms of
     // error can tip it over, and the loop bends right after the gap.
     const off = !this.isMaster() && this.phaseMs != null && Math.abs(this.phaseMs) <= PHASE_DEADBAND * 1000 ? (this.phaseMs / 1000) * ts.rateAt(T) : 0;
-    const input = ts.clampInput(ts.posAt(T) + s.shift + off), fields = { input, rate: this.effRate(input), semitones: this.semis(input) };
+    const input = ts.clampInput(ts.posAt(T) + this.gapStep(s) + off), fields = { input, rate: this.effRate(input), semitones: this.semis(input) };
     if (pend >= now) ts.then(now, T, fields); else ts.change(now, T, fields);
     this.skipAt = T;
     this.settleUntil = Math.max(this.settleUntil, T + 0.3);
@@ -1004,7 +1005,15 @@ export class Deck {
   /** Whether grid segment s's capture gap may be jumped at output time T: small enough, and a beat after the last jump. */
   skipFits(s, T) {
     const r = this.ts.rateAt(T);
-    return Math.abs(s.shift) <= SKIP_MAX && r > 0 && !!s.grid && T - this.skipAt >= s.grid.T / r;
+    return Math.abs(this.gapStep(s)) <= SKIP_MAX && r > 0 && !!s.grid && T - this.skipAt >= s.grid.T / r;
+  }
+
+  /** The step grid segment s's capture gap makes now: its grid's beat nearest the gap against the grid's before it. */
+  gapStep(s) {
+    const segs = this.grids.segs, i = segs.indexOf(s), p = i > 0 ? segs[i - 1].grid : null, g = s.grid;
+    if (!p || !g || !(p.T > 0) || !(g.T > 0)) return s.shift;
+    const b = p.t0 + Math.round((s.from - p.t0) / p.T) * p.T;
+    return g.t0 + Math.round((b - g.t0) / g.T) * g.T - b;
   }
 
   /** Output time (from now on) at which the planned playhead reaches input x, or null if a pause, loop or jump comes first. */
@@ -1155,7 +1164,7 @@ export class Deck {
     // A capture gap the playhead went through before the tracker found it (or before it could be planned): when
     // the error is that gap's step, it is jumped back into line as scheduleSkip would have.
     const gap = this.grids.segs.find((x) => x.shift && x.from <= p && p - x.from < 2 && !this.skips.has(x)
-      && Math.abs(e * rate - x.shift) <= Math.max(0.003, 0.3 * Math.abs(x.shift)));
+      && Math.abs(e * rate - this.gapStep(x)) <= Math.max(0.003, 0.3 * Math.abs(this.gapStep(x))));
     if (gap) {
       this.skips.add(gap);
       if (this.skipFits(gap, T)) {

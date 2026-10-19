@@ -29,7 +29,7 @@ async function rig({ mode = 'BEAT', sync = true } = {}) {
  * `ms` later (a repeat) or earlier (a drop), as the tracker reports one (track.jump) and the grid map splits on it.
  */
 function gap(x, clock, ahead, ms, n = 0) {
-  const p = x.ts.posAt(clock.t), g = x.grids.at(p), X = p + ahead;
+  const p = x.ts.posAt(clock.t), g = x.grids.segs.at(-1).grid, X = p + ahead; // the live grid, as the tracker's
   x.grids.update({ ...g, t0: g.t0 + ms / 1000 }, { n: 0, from: -Infinity, prev: null, jump: { n, from: X, prev: { ...g } } });
   assert.ok(Math.abs(x.grids.seg(X + 1e-6).shift - ms / 1000) < 1e-9, 'the grid map split on the gap');
   return X;
@@ -142,6 +142,30 @@ test('a follower sitting a few ms off the beat (inside the phase loop\'s deadban
   assert.ok(Math.abs(clockErrMs(engine, d, clock.t)) < 1, `${clockErrMs(engine, d, clock.t).toFixed(2)} ms off after the gap`);
   assert.ok(w.bend < 0.002, `bent ${(w.bend * 100).toFixed(2)} %`);
 });
+
+// The tracker refines the grid after a gap for as long as it is the live one; by the time the playhead reaches the gap
+// the step between the two grids is no longer quite the one found (seen in the browser: 15 ms found, 13 ms a few
+// seconds later). A jump of the old step would leave the deck that far off the beat its grid shows, and the phase loop
+// bends it back. It jumps the step the grids give where the playhead reaches the gap.
+for (const [who, moved] of [['follower', 3], ['follower', -2.5], ['master', 3]]) {
+  test(`the grid after a gap moved ${moved} ms since the gap was found: the ${who} jumps the step the grids give now and stays on the beat`, async () => {
+    const { clock, engine, m, d } = await rig();
+    const x = who === 'master' ? m : d, X = gap(x, clock, 2, 12), live = x.grids.segs.at(-1);
+    x.grids.update({ ...live.grid, t0: live.grid.t0 + moved / 1000 }, { n: 0, from: -Infinity, prev: null, jump: x.grids.jump });
+    assert.ok(Math.abs(live.shift - 0.012) < 1e-9, 'the step stored when the gap was found stands');
+    let pair = 0, dBend = 0;
+    const w = watch(engine, clock, x, 5, { quiet: { X, w: 0.02 }, onTick: (t) => {
+      const e = pairErrMs(d, m, t);
+      if (e != null && Math.abs(x.node.posAt(t) - X) >= 0.02) pair = Math.max(pair, Math.abs(e));
+      dBend = Math.max(dBend, bendOf(d, t));
+    } });
+    assert.equal(w.jumps.length, 1, JSON.stringify(w.jumps));
+    assert.ok(Math.abs(w.jumps[0].by - (12 + moved) / 1000) < 2e-4, `jumped ${(w.jumps[0].by * 1000).toFixed(2)} ms, the grids step ${12 + moved} ms`);
+    if (who === 'follower') assert.ok(Math.abs(clockErrMs(engine, d, clock.t)) < 1, `${clockErrMs(engine, d, clock.t).toFixed(2)} ms off after the gap`);
+    assert.ok(pair < 1, `follower and master ${pair.toFixed(1)} ms apart across the gap`);
+    assert.ok(w.bend < 0.002 && dBend < 0.002, `bent: ${(w.bend * 100).toFixed(2)} %, follower ${(dBend * 100).toFixed(2)} %`);
+  });
+}
 
 test('a gap found after the playhead went through it: the phase loop jumps the step when its error is that step', async () => {
   const { clock, engine, d } = await rig();
