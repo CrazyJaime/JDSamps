@@ -267,9 +267,9 @@ export class GridMap {
       }
     }
   }
-  split(inPos, grid) {
+  /** A new grid from inPos on (an assist step; a whole-track analysis's segment, with its own track). */
+  split(inPos, grid, track = this.segs.length ? this.segs[this.segs.length - 1].track : 0) {
     if (!grid) return;
-    const track = this.segs.length ? this.segs[this.segs.length - 1].track : 0;
     this.segs = this.segs.filter((s) => s.from < inPos);
     this.segs.push({ from: this.segs.length ? inPos : -Infinity, grid: { ...grid }, track });
   }

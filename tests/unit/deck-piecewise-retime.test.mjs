@@ -86,8 +86,8 @@ async function tapBeats(d, clock, truth, from) {
 // tol (ms): 125 is 0.06 % off the tempo analysed at 90 s on the drifting track, and every piece is scaled by that
 // much, which moves the last beats of a 20-beat piece by a few ms.
 const CASES = [
-  { name: 'a mix of 124, 126 and 128 BPM tracks', make: mix, probes: [10, 40, 60, 100, 120], at: 60, bpm: 126, tol: 4 },
-  { name: 'a track drifting from 124 to 126 BPM', make: drifting, probes: [10, 40, 90, 120, 150], at: 90, bpm: 125, tol: 8 },
+  { name: 'a mix of 124, 126 and 128 BPM tracks', make: mix, probes: [10, 40, 60, 100, 120], at: 60, bpm: 126, tol: 4, tracker: false },
+  { name: 'a track drifting from 124 to 126 BPM', make: drifting, probes: [10, 40, 90, 120, 150], at: 90, bpm: 125, tol: 8, tracker: true },
 ];
 
 for (const c of CASES) {
@@ -105,7 +105,9 @@ for (const c of CASES) {
   test(`${c.name}: TAPping the beat at ${c.at} s leaves the analysed grid on the beats everywhere`, async () => {
     const { d, clock, truth } = await resident(c);
     const p = await tapBeats(d, clock, truth, c.at - 3);
-    assert.equal(d.tempo.get().tapped, true);
+    // The tempo tracker holds the TAP when it follows the piece tapped (one song); the mix's tracker follows its
+    // 128 BPM track, which the analysis reads as another tempo (deck-tempo-parts), so it is left alone.
+    assert.equal(d.tempo.get().tapped, c.tracker);
     assertOnBeats(d, truth, [...c.probes, p], `tapped at ${p.toFixed(1)} s`);
     assert.ok(periods(d) > 1, 'each piece keeps a tempo of its own');
   });
