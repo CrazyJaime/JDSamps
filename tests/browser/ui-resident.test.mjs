@@ -96,6 +96,16 @@ test('a whole-track deck that has played to its end says END', async () => {
   assert.match(await t.getAttribute('class'), /\bend\b/);
 });
 
+test('a whole-track deck synced to a faster master shows no ASSIST warning: it has no player to assist; a live deck still does', async () => {
+  const faster = { playing: true, engineRate: 1.0667, sync: { on: true, mode: 'BEAT', isMaster: false, outOfRange: false, phaseMs: 0.4 }, assist: { available: false, active: false, sourceRate: 1 } };
+  await show(kinds((s) => { Object.assign(s.decks[0], faster); Object.assign(s.decks[1], faster); }));
+  const badge = (slot) => row(slot).locator('[data-assist]');
+  assert.equal(await badge(2).isHidden(), true, 'TRACK deck: no ASSIST badge');
+  assert.equal(await badge(1).isVisible(), true, 'LIVE deck: its tab cannot be sped up, so it says so');
+  assert.equal(await text(badge(1)), 'ASSIST n/a');
+  await show(kinds());
+});
+
 // ---------------------------------------------------------------- loading: inert, cancel
 test('a loading deck is inert but for eject and cancel: the rest is dimmed and aria-disabled, and pressing it sends nothing', async () => {
   await show(kinds());
