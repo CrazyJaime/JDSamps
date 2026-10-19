@@ -609,7 +609,8 @@ export class DeckTempo {
     this.snap = { state: 'search', bpm: 0, coarse: 0, conf: 0 };
     // The track the tracker follows: n counts tracks, from (input s) is where this one took over
     // and prev is the previous track's grid as it stood there. jump is the latest capture gap in
-    // it: n counts them, from (input s) is where the beat phase jumped and prev the grid before.
+    // it: n counts them, from (input s) is where the beat phase jumped, prev the grid before and
+    // step (s) the step found there, from the beats on both sides.
     this.track = { n: this.track ? this.track.n + 1 : 0, from: this.tracker.lastT / this.sr, prev: null, jump: null };
     this.hist = []; // recent beat-clock states {t, t0, T} (input frames), oldest first; fine: T was the fine fit's
     this.clockFine = false; // the clock's period is the fine fit's
@@ -853,7 +854,7 @@ export class DeckTempo {
     // (Leaving out a beat next to the step moves `at` by half a beat.)
     if (!cand || Math.abs(cand.at - at) > 0.75 * clock.T || Math.abs(cand.D - D) > Math.max(0.3 * Math.abs(D), 0.002 * sr)) return;
     const prev = this.gridBefore(at), t0 = prev.t0 * sr, T = prev.T * sr;
-    this.track.jump = { n: this.track.jump ? this.track.jump.n + 1 : 0, from: at / sr, prev };
+    this.track.jump = { n: this.track.jump ? this.track.jump.n + 1 : 0, from: at / sr, prev, step: D / sr };
     this.jumpCand = null;
     gaps.push({ at, D });
     tr.phaseFrom = at;

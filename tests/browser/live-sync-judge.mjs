@@ -160,7 +160,10 @@ export function judge({ rec, ticks, began, recFrom, odf, gaps = GAPS, seconds = 
       const d = p1 - (p0 + ((r0 + r1) / 2) * (t1 - t0));
       if (Math.abs(d) <= 0.004) continue;
       const ms = d * 1000, after = (s) => p0 > s.p - NEAR && p0 < s.p + AFTER;
-      const g = heard.find((x) => x.slot === slot && after(x)), b = own.find((x) => x.slot === slot && after(x));
+      // The step it answers: of the spliced gaps and the box's own steps whose place it is near, the nearest one (a jump
+      // for the box's own step seconds after a spliced gap is not that gap's).
+      const s = [...heard, ...own].filter((x) => x.slot === slot && after(x)).sort((x, y) => Math.abs(p0 - x.p) - Math.abs(p0 - y.p))[0];
+      const g = heard.includes(s) ? s : null, b = s && !g ? s : null;
       if (g && !g.boxy) {
         const tol = 3 + (follower ? Math.min(5, Math.abs(ph0 ?? 0)) : 0);
         jumps.push(`${ms.toFixed(1)} ms at ${p0.toFixed(2)} s`);

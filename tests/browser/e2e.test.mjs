@@ -6,7 +6,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import {
   prepareExtension, launchExtension, startTrackServer, hubCall, tabIdFor, waitFor, installClient,
-  act, set, state, events, downloadIds, waitForDownload, parseWav, bandOnsets, bandRms, medianBpm, offscreenEval,
+  act, set, state, events, downloadIds, waitForDownload, parseWav, bandOnsets, bandRms, beatBandRms, medianBpm, offscreenEval,
   offscreenHeap, steadyBeats, wavHeader, makeTrackWav,
 } from './ext-harness.mjs';
 
@@ -366,7 +366,9 @@ test('the mix recording has both decks at 128 BPM with aligned beats', async (t)
 
 test('crossfader extremes isolate the A and B sides', async (t) => {
   // Deck 1 (A) is the low kick, deck 2 (B) the high click: each side is measured in its own band.
-  // The side cut is silent: its gain is 0 (under -120 dB), not merely small.
+  // The side cut is silent: its gain is 0 (under -120 dB), not merely small. Each band is read in its median beat
+  // (both decks play at 128 BPM): the box's capture now and then drops a few ms inside a kick of A, and that one click
+  // reached -19 dB of B's band in a take where B's post-crossfader signal was all zeros; a leak of B is in every beat.
   const gains = () => offscreenEval(h, 'Object.fromEntries([...globalThis.__jdsEngine.decks.values()].map((d) => [d.slot, d.xfGain.gain.value]))');
   let both, onlyB, onlyA;
   try {
@@ -384,7 +386,8 @@ test('crossfader extremes isolate the A and B sides', async (t) => {
     assert.ok(gA[2] < 1e-6, `B's gain at the A end: ${gA[2]}`);
     onlyA = await record('mix', 3);
   } finally { await Promise.all([set(deck, null, 'xfader.pos', 0.5), set(deck, 1, 'xf', 'THRU'), set(deck, 2, 'xf', 'THRU')]); }
-  const db = (x, y, band) => 20 * Math.log10(bandRms(x.wav.mono, x.wav.sr, band) / bandRms(y.wav.mono, y.wav.sr, band));
+  const rms = (x, band) => beatBandRms(x.wav.mono, x.wav.sr, band, 60 / 128);
+  const db = (x, y, band) => 20 * Math.log10(rms(x, band) / rms(y, band));
   const aDrop = db(onlyB, both, 'low'), bDrop = db(onlyA, both, 'high');
   t.diagnostic(`at B: A (low band) ${aDrop.toFixed(1)} dB; at A: B (high band) ${bDrop.toFixed(1)} dB`);
   assert.ok(aDrop < -30, `A drop ${aDrop.toFixed(1)} dB`);

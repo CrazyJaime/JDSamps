@@ -241,7 +241,10 @@ export class GridMap {
    * Follow the tracker's live grid. A new track.n starts a segment at track.from, with the old
    * track's grid track.prev before it; assist steps already past track.from become part of the
    * new track, carried from the live grid at their source rates (rateAt(input)). A new
-   * track.jump starts a segment at jump.from, with the grid jump.prev before it.
+   * track.jump starts a segment at jump.from, with the grid jump.prev before it and the step
+   * jump.step found there as its shift. (Not the live grid's step against jump.prev at the gap:
+   * that grid is anchored at its newest beat, seconds on, and a gap found late can leave its
+   * period off, by 12 ms over 12 beats in one run.)
    */
   update(grid, track, rateAt = () => 1) {
     const last = this.segs[this.segs.length - 1];
@@ -263,7 +266,7 @@ export class GridMap {
       if (s && s.grid && jump.prev && s.track === n && s.from < jump.from) {
         const g = s.grid, p = jump.prev, b = p.t0 + Math.round((jump.from - p.t0) / p.T) * p.T;
         s.grid = { ...p };
-        this.segs.push({ from: jump.from, grid: g, track: n, shift: g.t0 + Math.round((b - g.t0) / g.T) * g.T - b });
+        this.segs.push({ from: jump.from, grid: g, track: n, shift: jump.step != null ? jump.step : g.t0 + Math.round((b - g.t0) / g.T) * g.T - b });
       }
     }
   }

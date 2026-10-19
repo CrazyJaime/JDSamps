@@ -1021,9 +1021,8 @@ export class Deck {
    * A capture gap the tracker found ahead of the playhead (a grid segment whose beats come `shift` s later than the
    * grid before it) is played across by a playhead jump of the same size, landing where the playhead reaches it: a
    * beat-locked deck (a BEAT follower, or the master such followers lock to) keeps its beats where they were, instead
-   * of the phase loop bending it back into line by up to 4 %. The size is the step the two grids give now (gapStep):
-   * the tracker refines the newer one after the gap was found. Gaps up to SKIP_MAX, at most one jump a beat; under a
-   * nudge, roll or loop the gap is played as it came.
+   * of the phase loop bending it back into line by up to 4 %. The size is the step the tracker found there (gapStep).
+   * Gaps up to SKIP_MAX, at most one jump a beat; under a nudge, roll or loop the gap is played as it came.
    *
    * The jump is the deck's own, never in the DJ's way: planned as late as a tick allows (SKIP_LEAD), and no later
    * change folds into it and waits for it (a nudge, roll, beat jump or tempo move is heard as soon as ever). Such a
@@ -1071,13 +1070,13 @@ export class Deck {
     return Math.abs(e) <= PHASE_DEADBAND ? e * rate : 0;
   }
 
-  /** The step grid segment s's capture gap makes now: its grid's beat nearest the gap against the grid's before it. */
-  gapStep(s) {
-    const segs = this.grids.segs, i = segs.indexOf(s), p = i > 0 ? segs[i - 1].grid : null, g = s.grid;
-    if (!p || !g || !(p.T > 0) || !(g.T > 0)) return s.shift;
-    const b = p.t0 + Math.round((s.from - p.t0) / p.T) * p.T;
-    return g.t0 + Math.round((b - g.t0) / g.T) * g.T - b;
-  }
+  /**
+   * The step of grid segment s's capture gap: the one the tracker found there, from the beats on both sides of it. Not
+   * the step its grid gives against the grid before it when the playhead gets there: until a later gap is found, that
+   * grid is the tracker's live clock, which by then follows the beats at the live edge, seconds past the gap, and has
+   * partly taken in any later gap it has not found yet (a jump of -19.5 ms seen for a gap found -11.5 ms).
+   */
+  gapStep(s) { return s.shift; }
 
   /** Output time (from now on) at which the planned playhead reaches input x, or null if a pause, loop or jump comes first. */
   reachAt(now, x) {
