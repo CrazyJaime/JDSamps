@@ -1,7 +1,7 @@
 // The harness's own audio measures (tests/browser/ext-harness.mjs), on synthetic tracks: no browser.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { makeTrackWav, parseWav, bandRms, onsetBias, beatMatch, matchFaults } from './ext-harness.mjs';
+import { makeTrackWav, parseWav, bandRms, onsetBias, beatMatch, matchFaults, levelFaults } from './ext-harness.mjs';
 
 const db = (x) => 20 * Math.log10(x);
 
@@ -69,4 +69,32 @@ test('matchFaults: a recording a little short of 30 s is judged to its end', () 
   // Six beats 25 ms off in its last 4.9 s: under the 90th percentile, and past the last whole 5 s.
   const wav = master({ seconds: 29.9, click: (k) => (k >= 54 && k < 60 ? 0.025 : 0) });
   assert.notDeepEqual(faults(wav, { steady: true }), []);
+});
+
+// ---------------------------------------------------------------- the master's level (R6.2 glitch test): what the check catches
+const levels = (wav) => levelFaults(wav, beatMatch(wav, BIAS));
+/** wav with [from, to) s scaled by g (0: silence). */
+const scaled = (wav, from, to, g) => { const y = wav.mono.slice(); for (let i = Math.round(from * wav.sr); i < Math.round(to * wav.sr); i++) y[i] *= g; return { ...wav, mono: y }; };
+const T124 = 60 / 124, between = (k) => 0.1 + k * T124 + 0.06; // 60 ms after beat k's kick: its tail, and the floor under it
+
+test('levelFaults: a steady master holds, over a floor or with silence between its beats', () => {
+  assert.deepEqual(levels(master({ click: () => 0.003 })), []);
+  assert.deepEqual(levels(master({ click: () => 0.003, floor: 0 })), []);
+});
+
+test('levelFaults: 150 ms of the master gone between two beats is caught, as is one deck going under the other', () => {
+  const w = master({ click: () => 0.003 });
+  assert.notDeepEqual(levels(scaled(w, between(20), between(20) + 0.15, 0)), []);
+  // The kick deck (its tail and the floor) silent for 150 ms; the clicks go on.
+  const a = master({ click: () => null }), b = master({ kick: () => null, floor: 0, click: () => 0.003 }), y = scaled(a, between(30), between(30) + 0.15, 0);
+  for (let i = 0; i < y.mono.length; i++) y.mono[i] += b.mono[i];
+  assert.notDeepEqual(levels(y), []);
+});
+
+test('levelFaults: a 15 dB dip for 200 ms, and a click between two beats, are caught', () => {
+  const w = master({ click: () => 0.003 });
+  assert.notDeepEqual(levels(scaled(w, between(12), between(12) + 0.2, 10 ** (-15 / 20))), []);
+  const y = { ...w, mono: w.mono.slice() }, at = Math.round((between(40) + 0.1) * w.sr);
+  for (let i = 0; i < 88; i++) y.mono[at + i] += i % 2 ? -0.5 : 0.5;
+  assert.notDeepEqual(levels(y), []);
 });

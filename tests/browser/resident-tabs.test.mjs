@@ -13,7 +13,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   prepareExtension, launchExtension, startTrackServer, hubCall, tabIdFor, waitFor, installClient, act, set, state, events, offscreenEval, makeTrackWav,
-  downloadIds, waitForDownload, parseWav, steadyBeats, onsetBias, beatMatch, matchFaults,
+  downloadIds, waitForDownload, parseWav, steadyBeats, onsetBias, beatMatch, matchFaults, levelFaults,
 } from './ext-harness.mjs';
 import { synth, PATTERNS, FS } from '../unit/fixtures/synth.mjs';
 
@@ -833,7 +833,7 @@ test('a resident deck beat-matched to a live deck holds within 0.2 % and 20 ms f
   } finally { await long.close(); }
 });
 
-test('beat-matched resident decks ignore their tabs: pausing, seeking and closing each source tab leaves no glitch and no tempo change on the master', async (t) => {
+test('beat-matched resident decks ignore their tabs: pausing, seeking and closing each source tab leaves no glitch (in time or level) and no tempo change on the master', async (t) => {
   const a = await residentTab(MODEL()), b = await residentTab(CLICK());
   await syncPlay(a.d, b.d);
   const S = 24, done = [];
@@ -851,8 +851,11 @@ test('beat-matched resident decks ignore their tabs: pausing, seeking and closin
   t.diagnostic(done.join(', '));
   const m = matched(wav);
   // No glitch: each deck's beats are one steady run (no jump, no gap, none missing) from the first whole beat to the
-  // last, every one within 20 ms of the other's; and no tempo change: the second half's tempo is the first half's.
+  // last, every one within 20 ms of the other's; the level never leaves its beat (no dropout, dip or click between
+  // the beats either: the model track's chirp keeps it near -20 dBFS there); and no tempo change: the second half's
+  // tempo is the first half's.
   assertMatched(t, m, S, { steady: true });
+  assert.deepEqual(levelFaults(wav, m), []);
   const half = (on) => [steadyBeats(on.filter((x) => x < S / 2)).T, steadyBeats(on.filter((x) => x >= S / 2)).T];
   for (const [name, on] of [['kick', m.lo], ['click', m.hi]]) {
     const [t1, t2] = half(on);

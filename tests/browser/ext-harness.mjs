@@ -648,6 +648,44 @@ export function matchFaults(m, { seconds, bpm = 124, tol = 20, steady = false, e
   return out;
 }
 
+/**
+ * Where a master recording's level leaves its own beat, as plain sentences ([] when it doesn't): its RMS in each
+ * 1/48 of a beat of the kicks' steady tempo (beatMatch), over the whole band and above 1.5 kHz, against the same
+ * 48th in the 8 beats either side (median), more than `db` below (a dropout, a dip) or above (a click, a jump), all
+ * under -60 dBFS (-40 above 1.5 kHz, where a click's tail can sit a few ms on) taken as silence. The first and last
+ * `edge` s are left out.
+ */
+export function levelFaults(wav, m, { db = 10, edge = 0.5 } = {}) {
+  const T = m.A.T, B = 48, sr = wav.sr, t0 = median(m.lo.map((t) => t - Math.round((t - m.lo[0]) / T) * T));
+  const k0 = Math.ceil((edge - t0) / T), k1 = Math.floor((wav.seconds - edge - t0) / T) - 1, out = [];
+  for (const [band, x, floor] of [['', wav.mono, -60], ['above 1.5 kHz ', bandFilter(wav.mono, sr, 'high'), -40]]) {
+    const lv = [];
+    for (let k = k0; k <= k1; k++) {
+      const row = new Float64Array(B);
+      for (let j = 0; j < B; j++) {
+        const a = Math.round((t0 + (k + j / B) * T) * sr), b = Math.round((t0 + (k + (j + 1) / B) * T) * sr);
+        let s = 0;
+        for (let i = a; i < b; i++) s += x[i] * x[i];
+        row[j] = Math.max(floor, 10 * Math.log10(s / Math.max(1, b - a) + 1e-12)); // silence is silence, however quiet
+      }
+      lv.push(row);
+    }
+    const found = [];
+    for (let k = 0; k < lv.length; k++) {
+      for (let j = 0; j < B; j++) {
+        const near = [];
+        for (let q = Math.max(0, k - 8); q <= Math.min(lv.length - 1, k + 8); q++) if (q !== k) near.push(lv[q][j]);
+        const dev = lv[k][j] - median(near);
+        if (Math.abs(dev) <= db) continue;
+        const t = t0 + (k0 + k + j / B) * T, last = found[found.length - 1];
+        if (last && t - last.to < T / B + 1e-6 && Math.sign(dev) === Math.sign(last.dev)) { last.to = t + T / B; if (Math.abs(dev) > Math.abs(last.dev)) last.dev = dev; } else found.push({ from: t, to: t + T / B, dev });
+      }
+    }
+    for (const f of found) out.push(`${f.from.toFixed(2)} s: ${Math.round((f.to - f.from) * 1000)} ms ${band}${f.dev < 0 ? 'below' : 'above'} its beat by up to ${Math.abs(f.dev).toFixed(0)} dB`);
+  }
+  return out;
+}
+
 /** The RIFF/WAVE header fields, as written, plus the file length. */
 export function wavHeader(buf) {
   return {
