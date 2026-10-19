@@ -35,7 +35,9 @@ export const TIMES = Object.freeze({
   grace: 2000,       // after the hub has asked the tab's frames to connect: their agents' ports follow at once
   settle: 700,       // after the player's length is known: the tap's errors, links and kept inits are on their way
   duration: 8000,    // the most to wait for the player to say how long the track is (a stream says it has no end after 3 s)
-  file: 65000,       // the page's track link (the agent gives it 60 s)
+  idle: 2000,        // a player that still holds nothing this long after the tap is on has not been started (its play button not pressed)
+  start: 30000,      // the most to wait for the DJ to start such a player on the tab
+  file: 65000,      // the page's track link (the agent gives it 60 s)
   fetchEach: 15000,  // per eight links fetched by the page (the agent gives each 15 s)
   stall: 5000,       // a seek-hop that brings no new audio this long is given up for accelerate
   drive: 30000,      // a drive's budget: this, plus drivePerSec for each second of the track
@@ -46,7 +48,7 @@ export const TIMES = Object.freeze({
 
 /** Plain words for the deck's loading state. */
 const SAY = {
-  wait: 'waiting for the page', look: "looking at the page's player", file: "reading the page's track link",
+  wait: 'waiting for the page', look: "looking at the page's player", start: 'start the track on the tab', file: "reading the page's track link",
   media: 'fetching the track', pieces: "fetching the track's pieces", hop: 'running the player through the track',
   fast: (r) => `running the player through the track (${r}×)`, decode: 'decoding', beat: 'finding the beat',
 };
@@ -59,6 +61,7 @@ const LIVE = {
   webaudio: 'this page makes its sound without a media player the deck can read, so it plays live from the tab.',
   unreachable: "the deck cannot reach this page's player, so it plays live from the tab.",
   length: "the page's player does not say how long the track is, so it plays live from the tab.",
+  unstarted: "the page's player had not started, so it plays live from the tab. For the whole track, press play on the tab, eject this deck and load the tab again.",
   gone: 'the page changed while the track was loading, so it plays live from the tab.',
   big: 'the track is too large to hold, so it plays live from the tab.',
   failed: (why) => `the whole track could not be read from this page (${why}), so it plays live from the tab.`,
@@ -320,6 +323,14 @@ export class Loader extends Job {
   own(f) { return f.own ? f.parts.filter((p) => f.own.has(p.sb - f.n * 1000)) : f.parts; }
   /** The track's frame, or once the page has been looked at, its pinned frame even after it left (what it gave stays good). */
   held() { return this.pinned || this.track(); }
+  /**
+   * The track's player holds nothing yet: no length, no source, nothing appended or asked for. A page whose play button
+   * was not pressed (a track page that does not autoplay): the hub's start finds no source to play.
+   */
+  idle() {
+    const f = this.track(), p = f && f.prog;
+    return !!p && p.duration == null && !p.src && !p.mimes.length && !f.own && !f.parts.length && !f.reqs.some((r) => r.media);
+  }
   /** How long the track's player says the track is. */
   duration() { const f = this.held(); return f && f.prog ? f.prog.duration : null; }
   limitSec() { return (this.engine.params['resident.limitMin'] || 15) * 60; }
@@ -415,9 +426,27 @@ export class Loader extends Job {
 
   /** What the tap first says: the player's length, and anything that sends the deck live at once. */
   async look() {
-    const t0 = now();
+    const t0 = now(), known = () => !!this.decisive() || this.duration() != null;
     this.say(0.02, SAY.look);
-    await this.until(() => !!this.decisive() || this.duration() != null, this.t.duration);
+    await this.until(known, Math.min(this.t.idle, this.t.duration));
+    this.check();
+    let wait = this.t.duration - this.t.idle;
+    if (!known() && this.idle()) {
+      // Not started: the DJ is asked to start it on the tab, and the load goes on once it plays. It has a player, so it
+      // is never said to make its sound without one.
+      this.say(this.progress, SAY.start);
+      this.engine.event('info', `Deck ${this.deck.slot}: start the track on the tab. The deck loads it once it plays.`, this.deck.id);
+      await this.until(() => known() || !this.idle(), this.t.start);
+      this.check();
+      if (!known() && this.idle()) {
+        this.rep.steps.push({ name: 'look', outcome: 'not started', why: "the page's player had nothing to play", ms: now() - t0 });
+        throw new Stop('live', LIVE.unstarted);
+      }
+      this.rep.notes.push(`the track was started on the tab ${secs(now() - t0)} into the load`);
+      this.say(this.progress, SAY.look);
+      wait = this.t.duration;
+    }
+    await this.until(known, wait);
     this.check();
     await this.until(() => !!this.decisive(), this.t.settle); // errors and links still on their way
     this.check();

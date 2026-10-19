@@ -253,6 +253,46 @@ test('a player that never says how long its track is goes live, saying so, with 
   assert.ok(!tab.kinds().includes('fetch'));
 });
 
+// A track page that does not autoplay (as SoundCloud's), loaded before its play button was pressed: its <audio> has no
+// source yet, so the tap says no length, no source, nothing appended (and no SourceBuffers, as it says of no source).
+const UNSTARTED = { kind: 'progressive', duration: null, sbs: null };
+const START = 'start the track on the tab';
+const asksToStart = (engine) => engine.events.filter((e) => /^Deck 1: start the track on the tab\b/.test(e.text));
+
+test('a page whose play button was not pressed: the deck asks for the track to be started on the tab, and loads it whole once it plays', async () => {
+  const link = 'https://site.example/media/t.mp3';
+  const { result, engine, deck } = await load({ ...UNSTARTED, files: { [link]: file('t', 120.0065) } }, {
+    before: ({ tab, deck: d }) => {
+      // The DJ presses play on the tab a moment after the deck asks for it: the page's player takes its source.
+      const t = setInterval(() => {
+        if (d.load.strategy !== START) return;
+        clearInterval(t);
+        setTimeout(() => { const fr = tab.frames[0]; fr.duration = 120.0065; fr.pg.src = link; fr.progress({ sbs: [] }); }, 100);
+      }, 5);
+      t.unref();
+    },
+  });
+  assert.equal(result.kind, 'resident', JSON.stringify(called(engine, 'failLoadingToLive')));
+  assert.equal(called(engine, 'startResidentDeck')[0].code, code('t'));
+  assert.equal(asksToStart(engine).length, 1, 'asked once');
+  assert.ok(deck.loads.some((l) => l.strategy === START));
+  assert.match(deck.load.report, /note: the track was started on the tab \d+\.\d s into the load/);
+});
+
+test('a page whose play button is never pressed goes live saying its player had not started, never that it has no media player', async () => {
+  const { result, engine, deck } = await load(UNSTARTED);
+  assert.equal(result.kind, 'live');
+  assert.equal(asksToStart(engine).length, 1);
+  const [f] = called(engine, 'failLoadingToLive');
+  assert.match(f.reason, /^the page's player had not started, so it plays live from the tab\. For the whole track, press play on the tab, eject this deck and load the tab again\.$/);
+  assert.match(deck.load.report, /look: not started in \d+\.\d s — the page's player had nothing to play/);
+  // A player with a source whose length is not known yet has started: it is not asked about.
+  const link = 'https://site.example/stream.mp3';
+  const started = await load({ kind: 'progressive', src: link, duration: null, files: { [link]: file('x', 60) } });
+  assert.deepEqual(asksToStart(started.engine), []);
+  assert.match(called(started.engine, 'failLoadingToLive')[0].reason, /does not say how long the track is/);
+});
+
 test('a page with no player the tap can see (Web Audio only) goes live: no agent ever connects', async () => {
   const t0 = performance.now();
   const { result, engine, tab } = await load({ kind: 'none' });

@@ -142,6 +142,8 @@ its tab live says **LIVE**.
   | anything else | each of those in turn, then a live deck |
 
   None of this could be tried on the real sites from the machine JD Samps was built on.
+- A track page loaded before its play button was pressed has nothing to fetch yet: the deck says
+  **start the track on the tab**, and loads it once it plays (it waits 30 seconds).
 - While it loads, the deck shows **LOADING · 42%** and what it is doing; only eject and the cancel
   **✕** work meanwhile. A load that fails says why. **Copy load report** (on the failed deck, or
   in the **ⓘ** menu of a deck that has a report) copies a short plain-text report: send it in so

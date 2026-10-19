@@ -362,6 +362,26 @@ test('a YouTube-like page with single-use links ends resident by driving its pla
   await assertReleased(d, site);
 });
 
+test('a page loaded before its play button was pressed asks for the track to be started on the tab, then ends resident once it is', async () => {
+  const site = await openSite('mse', '');
+  const d = await loadTab(site.tabId, {
+    // The DJ presses play on the tab only once the deck asks for it.
+    during: async (r) => {
+      await deckWhere((x) => x.id === r.deckId && x.load.strategy === 'start the track on the tab', 15000);
+      await site.tab.click('#play');
+    },
+  });
+  assert.equal(d.kind, 'resident', JSON.stringify(d.load));
+  assert.ok(Math.abs(d.duration - OPUS_END) < 0.015, `duration ${d.duration}`);
+  const c = await compare(d.id, opusUrls());
+  assert.ok(c.corr > 0.9999 && c.maxd < 1e-3, JSON.stringify(c));
+  const said = (await events(deck)).slice(d.seen).map((e) => e.text).filter((t) => t.startsWith(`Deck ${d.slot}: `));
+  assert.equal(said.filter((t) => /start the track on the tab/.test(t)).length, 1, JSON.stringify(said));
+  assert.deepEqual(said.filter((t) => /without a media player|plays live/.test(t)), []);
+  assert.match(d.load.report, /note: the track was started on the tab/);
+  await assertReleased(d, site);
+});
+
 /**
  * Every piece the deck's track was assembled from, against index.json: each byte-identical to a segment (or init) of
  * a rendition at the same media time, and together covering 0 to the end of the track with no gap.

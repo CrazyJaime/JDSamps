@@ -330,7 +330,7 @@ export function makeEngine({ tabs = [], limitMin = 15, hubOk = true } = {}) {
   return e;
 }
 
-export const FAST = { grace: 40, settle: 15, duration: 400, file: 400, fetchEach: 200, stall: 60, drive: 1500, drivePerSec: 0, check: 5, away: 80 };
+export const FAST = { grace: 40, settle: 15, duration: 400, idle: 60, start: 500, file: 400, fetchEach: 200, stall: 60, drive: 1500, drivePerSec: 0, check: 5, away: 80 };
 
 /** Stand-ins for the browser-only decoders. */
 export const decoders = {
