@@ -216,6 +216,7 @@ export class Loader extends Job {
     this.pinned = null;        // the frame whose player is the track, once the page has been looked at
     this.looked = false;       // past the first look: a decisive tap error ends the load wherever it is
     this.have = false;         // every byte of the track is in hand: the page going away no longer matters
+    this.closed = false;       // the hub said the tab was closed while every byte was in hand (tabClosed)
     this.url0 = (deck.meta && deck.meta.url) || '';
     this.big = false;
     this.bytes = 0;            // read from the tab, all frames
@@ -352,6 +353,17 @@ export class Loader extends Job {
     if (!this.gone && !this.have && this.moved()) { this.gone = 'the page moved on'; this.inPlace = true; }
     if (this.gone && !this.have) throw new Stop('away', this.gone);
     if (this.big) throw new Stop('live', LIVE.big);
+  }
+  /**
+   * The hub says the tab was closed: true when the load goes on without it (every byte of the track is in hand), so
+   * the deck stays; false when the deck must go.
+   */
+  tabClosed() {
+    if (this.done || !this.have) return false;
+    this.closed = true;
+    this.gone = this.gone || 'the tab was closed';
+    this.poke();
+    return true;
   }
   /** Work on a whole track's bytes, all in hand: meanwhile (and after, when it gives the track) the page going away does not matter. */
   async holding(fn) {
@@ -904,7 +916,7 @@ export class Loader extends Job {
     this.quiet();
     let away = null;
     // A page that moved on in place says so only by its address: looked at here too, whatever ended the load.
-    if ((this.gone || this.moved()) && !this.signal.aborted && e.decks.get(d.id) === d) {
+    if (!this.closed && (this.gone || this.moved()) && !this.signal.aborted && e.decks.get(d.id) === d) {
       try { away = await this.fate(); } catch (x) { err = x; }
     }
     const cancelled = (err instanceof Stop && err.kind === 'cancel') || this.signal.aborted || e.decks.get(d.id) !== d;
@@ -915,7 +927,8 @@ export class Loader extends Job {
     // The deck goes, with one error, rather than play live: a tab showing another page plays something else, and a
     // tab whose capture ended (closed, or its audio gone) would make a silent live deck.
     const gone = away === 'moved' ? 'the page moved on to something else before the track was in. Add the tab again.'
-      : this.ended() ? "the tab's audio went away while the track was loading." : null;
+      : this.closed ? 'the tab was closed before the track was in.'
+        : this.ended() ? "the tab's audio went away while the track was loading." : null;
     if (gone) {
       const error = `Deck ${d.slot}: ${gone}`;
       this.rep.result = `ejected: ${gone}`;

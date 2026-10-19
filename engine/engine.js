@@ -225,7 +225,10 @@ class Engine {
       case ENGINE.EJECT: {
         const d = this.deckByTab(msg.tabId);
         if (!d) return { ok: true };
-        // The tab was closed: a deck still loading from it goes, said once here (its load ends cancelled, quietly).
+        // The tab was closed. A deck holding its whole track needs it no more: one resident (letting go of the tab), or
+        // one whose load has every byte in hand (it goes on, and lets go of the tab once resident).
+        if (d.kind === 'resident' || (d.kind === 'loading' && d.loader && d.loader.tabClosed())) return { ok: true };
+        // Else a deck still loading from it goes, said once here (its load ends cancelled, quietly).
         if (d.kind === 'loading' && this.loads.has(d.id)) this.event('error', `Deck ${d.slot}: the tab was closed before the track was in.`, d.id);
         await this.eject(d.id, msg.reason);
         return { ok: true };

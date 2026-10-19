@@ -998,6 +998,41 @@ test('the tab closed mid-load: the deck goes with one error, and no live deck is
   } finally { await tidy(); }
 });
 
+// The tab closed once every byte of the track is in: the load is held at a stage until the hub's EJECT for the closed
+// tab has been taken, then let go on.
+for (const [stage, hold] of [
+  ['while it decodes', `const lt = e.loadTab; e.__unhold = () => { e.loadTab = lt; };
+    e.loadTab = (d) => { const p = lt.call(e, d), L = d.loader, df = L.d.decodeFile;
+      L.d.decodeFile = (...a) => { window.__held = true; return new Promise((r) => { window.__go = r; }).then(() => df(...a)); }; return p; };`],
+  ['while the beat is found', `const f = e.analyse; e.__unhold = () => { e.analyse = f; };
+    e.analyse = (...a) => { window.__held = true; return new Promise((r) => { window.__go = r; }).then(() => f.apply(e, a)); };`],
+]) {
+  test(`the tab closed ${stage}, every byte of the track in: the deck goes resident all the same, with no error`, async () => {
+    await engine(`window.__held = false; window.__ejects = 0; const oh = e.onHub; e.__onHub = oh;
+      e.onHub = async (m) => { const r = await oh.call(e, m); if (m.type === 'EJECT') window.__ejects++; return r; }; ${hold} return true;`);
+    try {
+      const site = await openSite('progressive');
+      await playing(site.tab);
+      const seen = (await events(deck)).length;
+      const r = await hubCall(deck, { type: 'LOAD_TAB', tabId: site.tabId });
+      assert.equal(r.ok, true, JSON.stringify(r));
+      await waitFor(() => engine('return window.__held;'), 30000);
+      await site.tab.close();
+      await waitFor(() => engine('return window.__ejects > 0;'), 5000); // the hub's EJECT for the closed tab is taken
+      await engine('window.__go(); return true;');
+      assert.equal(await endOf(r.deckId), 'resident');
+      const d = await deckWhere((x) => x.id === r.deckId && x.tabId === null, 5000);
+      assert.ok(Math.abs(d.duration - 120) < 0.05, `duration ${d.duration}`);
+      await sleep(300);
+      assert.deepEqual((await events(deck)).slice(seen).filter((e) => e.level === 'error').map((e) => e.text), []);
+      assert.equal(await h.sw.evaluate(() => chrome.action.getBadgeText({})), '', 'the hub forgot the tab');
+    } finally {
+      await engine('e.onHub = e.__onHub; delete e.__onHub; e.__unhold(); delete e.__unhold; return true;');
+      await tidy();
+    }
+  });
+}
+
 // ---------------------------------------------------------------- beat-matched decks (R6.2 acceptance)
 // Two decks synced and playing, the master recorded and measured with the harness's onset tools: one deck plays a
 // low kick, the other a high click, so each is heard in its own band. Every beat of one is within 20 ms of a beat
