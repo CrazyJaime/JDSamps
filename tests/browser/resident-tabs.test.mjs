@@ -3,7 +3,7 @@
 // end as resident decks holding the whole track, checked against the source; the rest end live with
 // their one message. A resident deck no longer depends on its tab: the tab is released, and pausing,
 // seeking and closing it afterwards changes nothing in the deck.
-import test, { before, after } from 'node:test';
+import test, { before, after, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -13,7 +13,9 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   prepareExtension, launchExtension, startTrackServer, hubCall, tabIdFor, waitFor, installClient, act, set, state, events, offscreenEval, makeTrackWav,
+  downloadIds, waitForDownload, parseWav, steadyBeats, onsetBias, beatMatch, matchFaults, levelFaults,
 } from './ext-harness.mjs';
+import { synth, PATTERNS, FS } from '../unit/fixtures/synth.mjs';
 
 const SITES = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../fixtures/sites');
 const index = JSON.parse(fs.readFileSync(path.join(SITES, 'index.json'), 'utf8'));
@@ -25,9 +27,23 @@ const decks = async () => (await state(deck)).decks;
 const deckWhere = (fn, ms = 60000) => waitFor(async () => (await decks()).find(fn), ms, 150);
 const engine = (body) => offscreenEval(h, `(async () => { const e = globalThis.__jdsEngine; ${body} })()`);
 
+/** A 16-bit mono WAV of x (at the synth's rate), peak-normalised to -2 dBFS. */
+function loopWav(x) {
+  let peak = 0;
+  for (const v of x) peak = Math.max(peak, Math.abs(v));
+  const g = 0.8 / peak, n = x.length, buf = Buffer.alloc(44 + n * 2);
+  for (let i = 0; i < n; i++) buf.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(x[i] * g * 32767))), 44 + i * 2);
+  buf.write('RIFF', 0); buf.writeUInt32LE(36 + n * 2, 4); buf.write('WAVE', 8); buf.write('fmt ', 12);
+  buf.writeUInt32LE(16, 16); buf.writeUInt16LE(1, 20); buf.writeUInt16LE(1, 22); buf.writeUInt32LE(FS, 24);
+  buf.writeUInt32LE(FS * 2, 28); buf.writeUInt16LE(2, 32); buf.writeUInt16LE(16, 34); buf.write('data', 36); buf.writeUInt32LE(n * 2, 40);
+  return buf;
+}
+
 /**
  * MP3s behind <audio src> pages, served with byte ranges (so their players know their length): 16 s at /rec (124 BPM
- * kick) and /rec2 (128 BPM click); 150 s at /long, and behind a Bandcamp-like page (data-tralbum) at /bc-long.
+ * kick) and /rec2 (128 BPM click); 150 s at /long, and behind a Bandcamp-like page (data-tralbum) at /bc-long. And
+ * WAVs the same way: 60 s of the 128 BPM click at /click128, and 12 bars of a techno loop with a continuous bed (kick,
+ * hats, bass and a pad: PATTERNS.techno, 132.7 BPM) at /techno.
  */
 async function startRecServer() {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'jds-rec-'));
@@ -37,12 +53,15 @@ async function startRecServer() {
     execFileSync('/usr/bin/ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', path.join(tmp, `${name}.wav`), '-codec:a', 'libmp3lame', '-b:a', rate, path.join(tmp, `${name}.mp3`)]);
     mp3s[name] = fs.readFileSync(path.join(tmp, `${name}.mp3`));
   }
+  const files = { ...Object.fromEntries(Object.entries(mp3s).map(([k, v]) => [`${k}.mp3`, { type: 'audio/mpeg', buf: v }])),
+    'click128.wav': { type: 'audio/wav', buf: makeTrackWav({ bpm: 128, kind: 'high', seconds: 60 }) },
+    'techno.wav': { type: 'audio/wav', buf: loopWav(synth({ ...PATTERNS.techno, bars: 12, tail: 0.5 }).x) } };
   const media = `<script>window.__media = () => { const a = document.getElementById('a'); return { t: a.currentTime, rate: a.playbackRate, pp: a.preservesPitch, paused: a.paused, duration: a.duration }; };</script>`;
   const srv = http.createServer((req, res) => {
-    const u = new URL(req.url, 'http://x'), page = /^\/(rec2?|long)$/.exec(u.pathname), file = /^\/(rec2?|long)\.mp3$/.exec(u.pathname);
+    const u = new URL(req.url, 'http://x'), page = /^\/(rec2?|long|click128|techno)$/.exec(u.pathname), file = files[u.pathname.slice(1)];
     if (page) {
       res.writeHead(200, { 'content-type': 'text/html' });
-      res.end(`<!doctype html><title>Track ${page[1]}</title><audio id="a" src="/${page[1]}.mp3" autoplay></audio>${media}`);
+      res.end(`<!doctype html><title>Track ${page[1]}</title><audio id="a" src="/${page[1]}.${files[`${page[1]}.wav`] ? 'wav' : 'mp3'}" autoplay></audio>${media}`);
       return;
     }
     if (u.pathname === '/bc-long') {
@@ -52,13 +71,12 @@ async function startRecServer() {
       return;
     }
     if (!file) { res.writeHead(404); res.end(); return; }
-    const mp3 = mp3s[file[1]];
-    const head = { 'content-type': 'audio/mpeg', 'accept-ranges': 'bytes', 'cache-control': 'no-store' };
+    const { buf } = file, head = { 'content-type': file.type, 'accept-ranges': 'bytes', 'cache-control': 'no-store' };
     const r = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range || '');
-    if (!r) { res.writeHead(200, { ...head, 'content-length': mp3.length }); res.end(mp3); return; }
-    const from = Number(r[1]), to = r[2] ? Math.min(Number(r[2]), mp3.length - 1) : mp3.length - 1;
-    res.writeHead(206, { ...head, 'content-range': `bytes ${from}-${to}/${mp3.length}`, 'content-length': to - from + 1 });
-    res.end(mp3.subarray(from, to + 1));
+    if (!r) { res.writeHead(200, { ...head, 'content-length': buf.length }); res.end(buf); return; }
+    const from = Number(r[1]), to = r[2] ? Math.min(Number(r[2]), buf.length - 1) : buf.length - 1;
+    res.writeHead(206, { ...head, 'content-range': `bytes ${from}-${to}/${buf.length}`, 'content-length': to - from + 1 });
+    res.end(buf.subarray(from, to + 1));
   });
   await new Promise((r) => srv.listen(0, '127.0.0.1', r));
   return { origin: `http://127.0.0.1:${srv.address().port}`, close: () => new Promise((r) => srv.close(r)) };
@@ -146,6 +164,18 @@ before(async () => {
 after(async () => {
   await h?.close(); await server?.close(); await rec?.close(); await multi?.close();
   if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+});
+// A test that fails part way leaves nothing to the next: every deck ejected, every page but the deck page
+// closed, the settings it changed put back, the kept tracks dropped.
+afterEach(async () => {
+  if (!deck) return;
+  for (const x of await decks().catch(() => [])) await act(deck, x.id, 'eject').catch(() => {});
+  await waitFor(async () => !(await decks()).length, 8000).catch(() => {});
+  for (const p of h.context.pages()) if (p !== deck) await p.close().catch(() => {});
+  const m = (await state(deck)).master.params;
+  if (m['resident.auto'] !== true) set(deck, null, 'resident.auto', true);
+  if (m['resident.limitMin'] !== 15) set(deck, null, 'resident.limitMin', 15);
+  await engine('if (e.__pcm) e.__pcm.clear(); return true;').catch(() => {});
 });
 
 /** Open a model page; `ready` waits for its player (default: playing past 0.3 s). */
@@ -606,6 +636,8 @@ test('recording a whole track from a media page: its player run at 2× from the 
   assert.match(r.title, /recorded from the page — reduced highs/);
   assert.match(r.load.report, /recorded from the page at 2×/);
   assert.equal(r.tabId, null, 'the recording holds no tab');
+  const kicks = await kicksOf(loading.id);
+  t.diagnostic(`beat to beat (ms): ${kicks.slice(1).map((x, i) => Math.round((x - kicks[i]) * 1000)).join(' ')}; ${r.load.report.split('\n').filter((l) => /^Mended/.test(l)).join('') || 'nothing mended'}`);
   assert.ok(Math.abs(r.bpm.native - 124) < 0.5, `bpm ${r.bpm.native}`);
   // Slowed back to the track's own pitch: lined up with the source (to within a few ms), the audio matches it.
   const c = await engine(`
@@ -632,6 +664,111 @@ test('recording a whole track from a media page: its player run at 2× from the 
   assert.equal((await act(deck, r.id, 'eject')).ok, true);
   await waitFor(async () => !(await decks()).length, 8000);
   await site.tab.close();
+});
+
+/** Kick onsets (s) in a promoted deck's kept track: its envelope (2 ms) rising through 35 % of its loudest. */
+const kicksOf = (deckId) => engine(`const pcm = e.__pcm.get(${deckId}), L = pcm.L, sr = pcm.sampleRate, hop = Math.round(sr * 0.002), env = [];
+  for (let i = 0; i + hop <= L.length; i += hop) { let m = 0; for (let j = 0; j < hop; j++) m = Math.max(m, Math.abs(L[i + j])); env.push(m); }
+  const max = Math.max(...env), on = [];
+  for (let i = 1; i < env.length; i++) if (env[i] >= 0.35 * max && env[i - 1] < 0.35 * max && (!on.length || (i * hop) / sr - on[on.length - 1] > 0.15)) on.push((i * hop) / sr);
+  return on;`);
+
+/**
+ * In the engine (offscreen page): every jds-recorder made from now on gets its capture skipped as a busy computer's
+ * tab capture skips it, the page's player and the engine's clock none the wiser: before batch `ins` 10 ms of silence
+ * is put in, and from batch `lose` 10 ms is lost. Each batch keeps its length (and context frame), so all the audio
+ * after a skip comes 10 ms late (or early). undo() puts AudioWorkletNode back.
+ */
+function captureSkips(ins, lose) {
+  const W = globalThis.AudioWorkletNode, onmessage = Object.getOwnPropertyDescriptor(MessagePort.prototype, 'onmessage');
+  const skip = (frames) => { let batch = 0, q = new Int16Array(0); return (m) => {
+    if (!m || m.t !== 'data') return m;
+    const b = batch++, got = m.buf.subarray(0, m.frames * 2), add = b === lose ? got.subarray(2 * frames) : got, gap = b === ins ? 2 * frames : 0;
+    const all = new Int16Array(q.length + gap + add.length);
+    all.set(q); all.set(add, q.length + gap);
+    q = all.slice(2 * m.frames);
+    return { ...m, buf: all.slice(0, 2 * m.frames) };
+  }; };
+  globalThis.AudioWorkletNode = class extends W {
+    constructor(ctx, name, opts) {
+      super(ctx, name, opts);
+      if (name !== 'jds-recorder') return;
+      const port = this.port, edit = skip(Math.round(0.01 * ctx.sampleRate));
+      let fn = null;
+      Object.defineProperty(port, 'onmessage', { configurable: true, get: () => fn, set: (f) => { fn = f; onmessage.set.call(port, f ? (ev) => f({ data: edit(ev.data) }) : null); } });
+    }
+  };
+  window.__undoSkips = () => { globalThis.AudioWorkletNode = W; };
+}
+
+test('recording a whole track through a capture that skips (a busy computer loses or repeats 10 ms now and then): every beat in its place', async (t) => {
+  await engine(`(${captureSkips})(14, 34); return true;`); // 2.4 s and 5.8 s into the capture: 3.4 s and 10.2 s of the track
+  try {
+    const { site, d } = await liveDeck(`${rec.origin}/rec`);
+    await playing(site.tab);
+    assert.deepEqual(await act(deck, d.id, 'recordWhole'), { ok: true, error: undefined });
+    const loading = await deckWhere((x) => x.id !== d.id && x.kind === 'loading', 5000);
+    const r = await deckWhere((x) => x.id === loading.id && x.kind === 'resident', 40000);
+    const kicks = await kicksOf(loading.id), iv = kicks.slice(1).map((x, i) => (x - kicks[i]) * 1000);
+    t.diagnostic(`beat to beat (ms): ${iv.map(Math.round).join(' ')}; bpm ${r.bpm.native}; ${r.load.report.split('\n').filter((l) => /^Mended/.test(l)).join('') || 'nothing mended'}`);
+    assert.ok(kicks.length >= 32, `${kicks.length} kicks`);
+    // Every beat on one straight line: a skip left in moves all the beats after it 20 ms. The real capture also
+    // wanders a few ms now and then (less than a skip, and nothing to beat-matching's 20 ms), hence 6 ms. The first
+    // beat starts the recording (it crosses -50 dBFS there, not 35 %), so the line starts at the second.
+    const on = kicks.slice(1), k = on.map((x) => Math.round((x - on[0]) / (60 / 124))), n = on.length;
+    const mk = k.reduce((a, b) => a + b) / n, mt = on.reduce((a, b) => a + b) / n;
+    const P = k.reduce((a, x, i) => a + (x - mk) * (on[i] - mt), 0) / k.reduce((a, x) => a + (x - mk) ** 2, 0);
+    const off = on.map((x, i) => (x - mt - (k[i] - mk) * P) * 1000);
+    assert.ok(off.every((x) => Math.abs(x) <= 6), `beats off the line (ms): ${off.map((x) => x.toFixed(1)).join(' ')}`);
+    assert.ok(Math.abs(r.bpm.native - 124) < 0.1, `bpm ${r.bpm.native}`);
+    // (A busy box may skip the real capture too: those are mended and listed beside these two.)
+    assert.match(r.load.report, /^Mended: \d+ skips in the capture \(the computer was busy\): (.*, )?20 ms put in at \d+\.\d s, (.*, )?20 ms lost at \d+\.\d s(,.*)?$/m);
+  } finally { await engine('window.__undoSkips && window.__undoSkips(); return true;'); }
+});
+
+/**
+ * How a promoted deck's kept track lines up with the source at `url` (decoded here, at the engine's rate): the lag of
+ * the deck against it in 50 ms windows every 250 ms, both low-passed at 8 kHz (the recording lost its highs), as
+ * [s, ms, correlation]. The lag is followed from window to window, and looked for over ±40 ms where it is lost.
+ */
+const lagsOf = (deckId, url) => engine(`
+  const pcm = e.__pcm.get(${deckId}), ref = await e.ctx.decodeAudioData(await (await fetch('${url}')).arrayBuffer()), sr = pcm.sampleRate;
+  const lp = (x) => { const y = new Float32Array(x.length), k = Math.exp(-2 * Math.PI * 8000 / sr); let s1 = 0, s2 = 0;
+    for (let i = 0; i < x.length; i++) { s1 = (1 - k) * x[i] + k * s1; s2 = (1 - k) * s1 + k * s2; y[i] = s2; } return y; };
+  const a = lp(pcm.L), b = lp(ref.getChannelData(0)), W = Math.round(0.05 * sr), out = [];
+  const corr = (l, s) => { let ab = 0, aa = 0, bb = 0; for (let i = 0; i < W; i++) { const x = a[s + l + i], y = b[s + i]; ab += x * y; aa += x * x; bb += y * y; } return ab / Math.sqrt(aa * bb + 1e-20); };
+  const search = (s, from, to, step) => { let best = { l: 0, c: -2 }; for (let l = from; l <= to; l += step) { if (s + l < 0 || s + l + W > a.length) continue; const c = corr(l, s); if (c > best.c) best = { l, c }; } return best; };
+  let cur = 0;
+  for (let s = Math.round(0.3 * sr); s + W + Math.round(0.05 * sr) < Math.min(a.length, b.length); s += Math.round(0.25 * sr)) {
+    let best = search(s, cur - Math.round(0.003 * sr), cur + Math.round(0.003 * sr), 1);
+    if (best.c < 0.9) { const wide = search(s, -Math.round(0.04 * sr), Math.round(0.04 * sr), 3); if (wide.c > best.c) best = search(s, wide.l - 3, wide.l + 3, 1); }
+    out.push([+(s / sr).toFixed(2), +((best.l / sr) * 1000).toFixed(1), +best.c.toFixed(3)]);
+    if (best.c > 0.9) cur = best.l;
+  }
+  e.__pcm.delete(${deckId});
+  return out;`);
+
+test('recording a whole track of a loop with a continuous bed through a capture that skips: each skip mended, nothing else touched, the deck on the track', async (t) => {
+  await engine(`(${captureSkips})(14, 34); return true;`);
+  try {
+    const { site, d } = await liveDeck(`${rec.origin}/techno`);
+    await playing(site.tab);
+    assert.deepEqual(await act(deck, d.id, 'recordWhole'), { ok: true, error: undefined });
+    const loading = await deckWhere((x) => x.id !== d.id && x.kind === 'loading', 5000);
+    const r = await deckWhere((x) => x.id === loading.id && x.kind === 'resident', 40000);
+    const mended = r.load.report.split('\n').find((l) => /^Mended/.test(l)) || 'nothing mended', lags = await lagsOf(loading.id, `${rec.origin}/techno.wav`);
+    t.diagnostic(`bpm ${r.bpm.native}; ${mended}`);
+    t.diagnostic(`[s, lag ms, corr]: ${JSON.stringify(lags)}`);
+    // Both skips played in are mended, and nothing else bigger than a burst of them (a clean beat is never cut).
+    assert.match(mended, /^Mended: \d+ skips in the capture \(the computer was busy\): (.*, )?20 ms put in at \d+\.\d s, (.*, )?20 ms lost at \d+\.\d s(,.*)?$/);
+    for (const [, ms] of mended.matchAll(/(\d+) ms (put in|lost)/g)) assert.ok(+ms <= 52, mended);
+    // The deck's audio is the track's, in place: the lag in nine windows out of ten within 3 ms of where it starts
+    // (the stretch between a loss and the silence given back is up to two beats off).
+    const good = lags.filter(([, , c]) => c >= 0.8), at = median(good.slice(0, 8).map(([, l]) => l)), off = good.filter(([, l]) => Math.abs(l - at) > 3);
+    assert.ok(good.length >= 0.9 * lags.length, `${lags.length - good.length} of ${lags.length} windows don't match the source`);
+    assert.ok(off.length <= 0.1 * good.length, `${off.length} windows off the track: ${JSON.stringify(off)}`);
+    assert.ok(Math.abs(r.bpm.native - PATTERNS.techno.bpm) < 0.15, `bpm ${r.bpm.native}`);
+  } finally { await engine('window.__undoSkips && window.__undoSkips(); return true;'); }
 });
 
 // ---------------------------------------------------------------- races, ejects, the page going away (Review Focus 1, 2, 5)
@@ -859,6 +996,118 @@ test('the tab closed mid-load: the deck goes with one error, and no live deck is
     const said = (await events(deck)).slice(seen).filter((e) => e.text.startsWith('Deck '));
     assert.deepEqual(said.map((e) => [e.level, e.text.replace(/^Deck \d/, 'Deck N')]), [['error', 'Deck N: the tab was closed before the track was in.']]);
   } finally { await tidy(); }
+});
+
+// ---------------------------------------------------------------- beat-matched decks (R6.2 acceptance)
+// Two decks synced and playing, the master recorded and measured with the harness's onset tools: one deck plays a
+// low kick, the other a high click, so each is heard in its own band. Every beat of one is within 20 ms of a beat
+// of the other and their tempos match within 0.2 %, to the end of the recording (matchFaults).
+const SYNC_S = 30;
+const median = (xs) => [...xs].sort((a, b) => a - b)[xs.length >> 1];
+
+/** The master recorded for `seconds` (a parsed WAV), with during(t0) run meanwhile. */
+async function mixRecord(seconds, during) {
+  const known = await downloadIds(h);
+  assert.equal((await act(deck, null, 'mixRecStart')).ok, true);
+  const t0 = Date.now();
+  try {
+    if (during) await during(t0);
+    await sleep(Math.max(0, seconds * 1000 - (Date.now() - t0)));
+  } finally { await act(deck, null, 'mixRecStop'); }
+  return parseWav(fs.readFileSync((await waitForDownload(h, known, 30000)).filename));
+}
+
+/** The kick deck against the click deck in a master recording (beatMatch), the detector's own lateness on each taken off. */
+const matched = (wav) => beatMatch(wav, onsetBias(124, 'low', 'low') - onsetBias(128, 'high', 'high'));
+function assertMatched(t, m, seconds, opts) {
+  t.diagnostic(`tempo: kick ${(60 / m.A.T).toFixed(3)} BPM (runs ${m.A.runs.map((r) => r.length)}), click ${(60 / m.B.T).toFixed(3)} BPM (runs ${m.B.runs.map((r) => r.length)}): error ${(m.tempoErr * 100).toFixed(4)} %; median BPM ${m.bpm.map((x) => x.toFixed(2))}`);
+  t.diagnostic(`|kick - click| (ms): median ${m.med.toFixed(1)}, p90 ${m.p90.toFixed(1)}, max ${m.max.toFixed(1)}; median in each 5 s: ${m.windows.map((w) => `${w.med.toFixed(1)} (${w.n})`).join(', ')}`);
+  assert.deepEqual(matchFaults(m, { seconds, ...opts }), []);
+}
+
+/** The page at url in a new tab, loaded resident and released. */
+async function residentTab(url) {
+  const site = { tab: await h.context.newPage(), url };
+  await site.tab.goto(url);
+  site.tabId = await tabIdFor(h, url);
+  await playing(site.tab);
+  const d = await loadTab(site.tabId);
+  assert.equal(d.kind, 'resident', `${url}: ${JSON.stringify(d.load)}`);
+  await deckWhere((x) => x.id === d.id && x.tabId === null, 5000);
+  return { site, d };
+}
+const MODEL = () => `${server.origin}/m/progressive?autoplay=1`; // the 124 BPM model track (kick and chirp), 120 s
+const CLICK = () => `${rec.origin}/click128`;                     // a 128 BPM click, a 60 s WAV
+
+/** a plays as the master; b is synced to it (SYNC▶) and plays, until its phase has settled. */
+async function syncPlay(a, b) {
+  assert.equal((await act(deck, a.id, 'master')).ok, true);
+  assert.equal((await act(deck, a.id, 'play')).ok, true);
+  await sleep(500);
+  assert.equal((await act(deck, b.id, 'syncPlay')).ok, true);
+  const ph = [];
+  await waitFor(async () => {
+    const x = (await decks()).find((y) => y.id === b.id);
+    if (x.sync.phaseMs != null) ph.push(Math.abs(x.sync.phaseMs));
+    return x.playing && x.sync.on && ph.length >= 5 && median(ph.slice(-5)) < 5;
+  }, 15000, 200).catch(() => assert.fail(`deck ${b.slot} phase (ms): ${JSON.stringify(ph.slice(-5))}`));
+}
+
+test('two resident decks beat-matched: a 128 BPM WAV synced to the 124 BPM track holds within 0.2 % and 20 ms for 30 s, measured on the master', async (t) => {
+  const a = await residentTab(MODEL()), b = await residentTab(CLICK());
+  await syncPlay(a.d, b.d);
+  const x = (await decks()).find((y) => y.id === b.d.id);
+  assert.ok(Math.abs(x.bpm.native - 128) < 0.05 && Math.abs(x.bpm.out - 124) < 0.05, JSON.stringify(x.bpm));
+  // Both decks resident: each one's beats one steady run, every one within 20 ms of the other's.
+  assertMatched(t, matched(await mixRecord(SYNC_S)), SYNC_S, { steady: true });
+});
+
+test('a resident deck beat-matched to a live deck holds within 0.2 % and 20 ms for 30 s, measured on the master', async (t) => {
+  // The live deck: the 124 BPM kick played by its tab (a WAV with no byte ranges), long enough that it never loops here.
+  const long = await startTrackServer({ seconds: 120 });
+  try {
+    const { d: live } = await liveDeck(long.url('a'));
+    const b = await residentTab(CLICK());
+    await waitFor(async () => { const x = (await decks()).find((y) => y.id === live.id); return x.bpm.state === 'LOCKED' && Math.abs(x.bpm.native - 124) < 0.1; }, 30000);
+    await syncPlay(live, b.d);
+    // The live master's own capture can skip (its kicks one steady run no more): the resident deck takes a few beats
+    // to follow it, and only those beats may be further off.
+    assertMatched(t, matched(await mixRecord(SYNC_S)), SYNC_S, { excuse: 4 });
+  } finally { await long.close(); }
+});
+
+test('beat-matched resident decks ignore their tabs: pausing, seeking and closing each source tab leaves no glitch (in time or level) and no tempo change on the master', async (t) => {
+  const a = await residentTab(MODEL()), b = await residentTab(CLICK());
+  await syncPlay(a.d, b.d);
+  const S = 24, done = [];
+  // Each tab in turn, 9 s apart: its player played (out loud: the tab is not captured any more), paused, seeked, then the tab closed.
+  const wav = await mixRecord(S, async (t0) => {
+    const at = (s) => sleep(Math.max(0, t0 + s * 1000 - Date.now()));
+    for (const [k, x] of [a, b].entries()) {
+      const s0 = 3 + 9 * k;
+      await at(s0); await x.site.tab.evaluate(() => document.querySelector('audio').play()); done.push(`tab ${k + 1} played at ${s0} s`);
+      await at(s0 + 2); await x.site.tab.evaluate(() => document.querySelector('audio').pause()); done.push(`paused at ${s0 + 2} s`);
+      await at(s0 + 4); await x.site.tab.evaluate(() => { document.querySelector('audio').currentTime = 40; }); done.push(`seeked at ${s0 + 4} s`);
+      await at(s0 + 6); await x.site.tab.close(); done.push(`closed at ${s0 + 6} s`);
+    }
+  });
+  t.diagnostic(done.join(', '));
+  const m = matched(wav);
+  // No glitch: each deck's beats are one steady run (no jump, no gap, none missing) from the first whole beat to the
+  // last, every one within 20 ms of the other's; the level never leaves its beat (no dropout, dip or click between
+  // the beats either: the model track's chirp keeps it near -20 dBFS there); and no tempo change: the second half's
+  // tempo is the first half's.
+  assertMatched(t, m, S, { steady: true });
+  assert.deepEqual(levelFaults(wav, m), []);
+  const half = (on) => [steadyBeats(on.filter((x) => x < S / 2)).T, steadyBeats(on.filter((x) => x >= S / 2)).T];
+  for (const [name, on] of [['kick', m.lo], ['click', m.hi]]) {
+    const [t1, t2] = half(on);
+    assert.ok(Math.abs(t2 / t1 - 1) < 0.001, `${name}: ${(60 / t1).toFixed(3)} then ${(60 / t2).toFixed(3)} BPM`);
+  }
+  for (const x of [a.d, b.d]) {
+    const y = (await decks()).find((z) => z.id === x.id);
+    assert.deepEqual([y.kind, y.playing, y.tabId], ['resident', true, null], `deck ${x.slot}`);
+  }
 });
 
 test('the deck page showed every load without errors', () => { assert.deepEqual(pageErrors, []); });

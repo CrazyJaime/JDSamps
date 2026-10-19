@@ -559,7 +559,10 @@
     watched.add(sb);
     listen.call(sb, 'updateend', onSbUpdate);
   }
-  function onSbUpdate() { driveCheck(); tapDirty(); }
+  function onSbUpdate() {
+    if (drv.mode) { const t = performance.now(); drv.gap = Math.max(drv.gap, t - drv.upd); drv.upd = t; }
+    driveCheck(); tapDirty();
+  }
 
   /** The player the tap reports on: the driven one; else playing and heard, loaded, longest. */
   function mainEl() {
@@ -695,8 +698,12 @@
   // accelerate), so the recording starts with the track.
   // flush: a player that was playing before the tap holds media the tap never saw, and would never
   // fetch it again (see "flush"): its buffer is emptied first, then it is driven from near 0.
-  const HOP_WAIT = 3000, END_TOL = 0.3, START_TOL = 0.2;
-  const drv = { mode: null, el: null, base: null, state: '', cursor: 0, hop: 0, since: 0, timer: 0, gen: 0, flushing: false, told: false, unflushed: '' };
+  // A hop is done when the player has buffered the step, or has buffered some of it and gone quiet: its goal,
+  // counted from a hop, can be shorter than the step it showed first (it fetches whole segments, so its goal
+  // from the middle of one reaches further). Then the step it did buffer is the step from then on.
+  const HOP_WAIT = 3000, HOP_QUIET = 500, HOP_TOL = 0.25, END_TOL = 0.3, START_TOL = 0.2;
+  // upd: when its SourceBuffers last finished an update (or the hop was made); gap: the longest wait for one since.
+  const drv = { mode: null, el: null, base: null, state: '', cursor: 0, hop: 0, since: 0, timer: 0, upd: 0, gap: 0, gen: 0, flushing: false, told: false, unflushed: '' };
   // MP3 and ADTS carry no timestamps: their appends can only be placed in order, so no seek-hop.
   const NO_STAMPS = /^audio\/(mpeg|mp3|aac|x-aac)\b/i;
 
@@ -743,7 +750,7 @@
     if (!dur) return; // no length yet: driveCheck waits for one
     const e = bufEnd(el, drv.cursor);
     if (e >= dur - END_TOL) { drv.state = 'done'; tapDirty(); return; }
-    drv.cursor = e; drv.since = performance.now();
+    drv.cursor = e; drv.since = drv.upd = performance.now(); drv.gap = 0;
     try { el.currentTime = e; } catch (_) {}
     tapDirty();
   }
@@ -759,7 +766,9 @@
     if (!dur) { if (late) stall(); return; }
     const e = bufEnd(el, drv.cursor), moved = e > drv.cursor + 0.05;
     if (drv.state === 'stalled') { if (moved) { drv.state = 'running'; hop(); } return; }
-    if (e >= Math.min(dur - END_TOL, drv.cursor + drv.hop)) hop();
+    const quiet = performance.now() - drv.upd >= Math.max(HOP_QUIET, 2 * drv.gap);
+    if (e >= Math.min(dur - END_TOL, drv.cursor + drv.hop - HOP_TOL)) hop();
+    else if (moved && quiet) { drv.hop = Math.max(1, e - drv.cursor); hop(); } // its goal from here is short of the step
     else if (late) { if (moved) hop(); else stall(); } // slower than its goal: move on
   }
   function accelerate(rate, hold) {

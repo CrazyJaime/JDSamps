@@ -134,18 +134,22 @@ export class TempoTracker {
   reset() {
     this.full.clear(); this.low.clear();
     this.state = 'search'; this.bpm = 0; this.cand = null; this.candCount = 0; this.conf = 0; this.octConf = 0;
-    this.beats = []; this.anchor = null; this.fineBpm = 0; this.fit = null; this.out = 0;
+    this.beats = []; this.anchor = null; this.fineBpm = 0; this.fit = null; this.out = 0; this.carried = false;
     this.holdUntil = 0; this.phaseFrom = 0;
   }
 
-  resetFine() { this.beats = []; this.fit = null; this.anchor = null; this.fineBpm = 0; this.out = 0; }
+  resetFine() { this.beats = []; this.fit = null; this.anchor = null; this.fineBpm = 0; this.out = 0; this.carried = false; }
 
   /** The input tempo changed by `ratio` at input frame tChange (assist step). */
   rateChanged(ratio, tChange, marginSec = 0.3) {
-    const sr = this.spf * this.fps || 48000;
+    const sr = this.spf * this.fps || 48000, fine = this.fineBpm;
     if (this.bpm) this.bpm *= ratio;
     if (this.cand) this.cand *= ratio;
+    // The beats before the change are at the old rate, so the fine fit starts again. Until it has twice its usual
+    // beats (a fit of 8 is a tenth of a percent off), its last value, scaled, stays the tempo: the coarse one can be
+    // a few tenths of a percent off.
     this.resetFine();
+    if (fine) { this.fineBpm = fine * ratio; this.carried = true; }
     this.holdUntil = tChange + this.o.windowSec * sr;
     this.phaseFrom = tChange + marginSec * sr;
   }
@@ -355,7 +359,8 @@ export class TempoTracker {
     const last = this.beats[this.beats.length - 1];
     if (last && last.n === n) last.t = t; else this.beats.push({ n, t });
     while (this.beats.length && t - this.beats[0].t > this.o.fineSpanSec * sr) this.beats.shift();
-    if (this.beats.length < 8) return;
+    if (this.beats.length < (this.carried ? 16 : 8)) return;
+    this.carried = false;
     let sn = 0, st = 0, snn = 0, snt = 0; const m = this.beats.length;
     for (const bt of this.beats) { sn += bt.n; st += bt.t; snn += bt.n * bt.n; snt += bt.n * bt.t; }
     const a = (m * snt - sn * st) / (m * snn - sn * sn);

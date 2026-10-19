@@ -950,6 +950,250 @@ export function findStart(L, R, from, to) {
   return -1;
 }
 
+// Under load the tab capture now and then puts in or loses some of its 10 ms buffers (20 ms of the track at 2×),
+// silently: the page's player and the engine's clock never see it, but every beat after it is that much late or
+// early, and the beat grid fitted to the whole recording comes out a few tenths of a percent off. What it puts in is
+// silence, exact zeros; what it loses leaves nothing behind. A skip shows against the music itself: a bar from the
+// skip on sits that much off the bar before it, while every other bar sits on the one before. Music that is not on
+// a grid (played by hand, or a reading of it that is not clear) is left alone.
+const SKIP_MIN = 0.006, SKIP_MAX = 0.026; // s: a step mended (a buffer or two, or a burst adding up to that)
+const SKIP_TOL = 0.0015;                 // s: bars that sit together
+const SKIP_NOISE = 0.001;                // s: how closely the bars about a step must sit (90 % of them)
+const SKIP_LAG = 0.03;                   // s: how far a bar is looked for from where the beat puts it
+const medianOf = (xs) => { const s = Float64Array.from(xs).sort(); return s.length ? s[s.length >> 1] : 0; };
+
+/** Two envelopes of a recording at `hop` frames: the loudest sample of either channel, and the low band's (300 Hz). */
+function skipEnvelopes({ L, R, sampleRate: sr }, hop) {
+  const n = Math.floor(L.length / hop), env = new Float32Array(n), low = new Float32Array(n), a = Math.exp((-2 * Math.PI * 300) / sr);
+  let y1 = 0, y2 = 0;
+  for (let k = 0; k < n; k++) {
+    let m = 0, ml = 0;
+    for (let i = k * hop; i < (k + 1) * hop; i++) {
+      m = Math.max(m, Math.abs(L[i]), Math.abs(R[i]));
+      y1 = (1 - a) * 0.5 * (L[i] + R[i]) + a * y1;
+      y2 = (1 - a) * y1 + a * y2;
+      ml = Math.max(ml, Math.abs(y2));
+    }
+    env[k] = m; low[k] = ml;
+  }
+  return [env, low];
+}
+
+/**
+ * One reading of envelope f: how far window k (span beats from k·Tb, in hops) sits from window k − 4, a bar before:
+ * d[k] (hops; NaN where the two don't match well), and base[k], the median of d about it (the beat's own error).
+ */
+function barShifts(f, Tb, span, lag) {
+  const W = Math.floor(Tb * span), nb = Math.max(0, Math.floor((f.length - lag) / Tb) - span), start = (k) => Math.round(k * Tb);
+  const S1 = new Float64Array(f.length + 1), S2 = new Float64Array(f.length + 1), d = new Float64Array(nb).fill(NaN), cs = new Float64Array(2 * lag + 1);
+  for (let i = 0; i < f.length; i++) { S1[i + 1] = S1[i] + f[i]; S2[i + 1] = S2[i] + f[i] * f[i]; }
+  for (let k = 4; k < nb; k++) {
+    const a = start(k - 4), b = start(k);
+    if (b - lag < 0 || b + W + lag > f.length) continue;
+    const ma = (S1[a + W] - S1[a]) / W, va = S2[a + W] - S2[a] - W * ma * ma;
+    if (!(va > 1e-12)) continue;
+    const c = (i) => { // the match at lag i - lag, worked out once
+      if (!isNaN(cs[i])) return cs[i];
+      const o = b + i - lag, mb = (S1[o + W] - S1[o]) / W, vb = S2[o + W] - S2[o] - W * mb * mb;
+      let ab = 0;
+      for (let j = 0; j < W; j++) ab += f[a + j] * f[o + j];
+      return (cs[i] = vb > 1e-12 ? (ab - W * ma * mb) / Math.sqrt(va * vb) : 0);
+    };
+    cs.fill(NaN);
+    let best = 0; // every other lag, then the two beside the best (a match is wider than a hop)
+    for (let i = 2; i < cs.length; i += 2) if (c(i) > c(best)) best = i;
+    for (const i of [best - 1, best + 1]) if (i >= 0 && i < cs.length && c(i) > c(best)) best = i;
+    if (c(best) < 0.5) continue;
+    let off = 0;
+    if (best > 0 && best < cs.length - 1) { const p = c(best - 1), q = c(best), r = c(best + 1), den = p - 2 * q + r; if (den < 0) off = (0.5 * (p - r)) / den; }
+    d[k] = best - lag + off;
+  }
+  const base = new Float64Array(nb).fill(NaN);
+  for (let k = 0; k < nb; k++) {
+    const w = [];
+    for (let j = Math.max(0, k - 16); j <= Math.min(nb - 1, k + 16); j++) if (!isNaN(d[j])) w.push(d[j]);
+    if (w.length >= 8) base[k] = medianOf(w);
+  }
+  return { f, d, base, nb, start, Tb, span };
+}
+
+/** A recording's readings at beat T (s): both envelopes, in windows of one beat and of two. */
+function skipReadings(pcm, T, hop) {
+  const sr = pcm.sampleRate, lag = Math.round((SKIP_LAG * sr) / hop), out = [];
+  for (const [i, f] of skipEnvelopes(pcm, hop).entries()) for (const span of [1, 2]) out.push({ i, ...barShifts(f, (T * sr) / hop, span, lag) });
+  return out;
+}
+
+/**
+ * The steps in one reading: a run of windows off their bar by one amount S, with the beat as it was either side of
+ * it (past the windows that straddle the step, which may read anything), where the bars about it (two bars either
+ * side) sit together.
+ * -> [{S (hops), mlo, mhi, first, last}]: the first window wholly after the step is one of mlo..mhi.
+ */
+function readSteps(r, hop, sr) {
+  const { d, base, nb, span } = r, tol = (SKIP_TOL * sr) / hop, min = (SKIP_MIN * sr) / hop, max = (SKIP_MAX * sr) / hop;
+  const dev = (k) => (k >= 4 && k < nb && !isNaN(d[k]) && !isNaN(base[k]) ? d[k] - base[k] : NaN);
+  const out = [], near = new Uint8Array(nb);
+  const side = (from, dir) => { // twice where there is room
+    let quiet = 0, have = 0;
+    for (let i = 0; i < span + 3; i++) {
+      const j = from + dir * i, x = dev(j);
+      if (j < 4) continue;
+      have++;
+      if (isNaN(x)) continue;
+      if (Math.abs(x) <= tol) quiet++; else if (i > span) return false;
+    }
+    return quiet >= Math.min(2, have);
+  };
+  for (let k = 4; k < nb; k++) {
+    const v = dev(k);
+    if (isNaN(v) || Math.abs(v) < min) continue;
+    let last = k;
+    while (last + 1 < nb && Math.abs(dev(last + 1) - v) <= tol) last++;
+    const first = k, run = [];
+    for (let j = first; j <= last; j++) run.push(dev(j));
+    const S = medianOf(run);
+    k = last;
+    if (run.length < 3 || run.length > 4 + span || Math.abs(S) > max || run.some((x) => Math.abs(x - S) > tol)) continue;
+    const mark = () => { for (let j = Math.max(0, first - span); j <= Math.min(nb - 1, last + span); j++) near[j] = 1; };
+    if (last + 2 >= nb) { mark(); continue; } // the track ends: no telling
+    if (!side(first - 1, -1) || !side(last + 1, 1)) continue;
+    mark();
+    const mlo = Math.max(1, first, last - 3);
+    out.push({ S, mlo, mhi: Math.max(mlo, Math.min(first + span, last - 3 + span)), first, last });
+  }
+  return out.filter((s) => {
+    const rest = [];
+    let stray = 0;
+    for (let k = Math.max(4, s.first - 8); k <= Math.min(nb - 1, s.last + 8); k++) {
+      const x = dev(k);
+      if (near[k] || isNaN(x)) continue;
+      rest.push(Math.abs(x));
+      if (Math.abs(x) >= min) stray++;
+    }
+    rest.sort((p, q) => p - q);
+    return rest.length >= 4 && (rest[Math.floor(0.9 * (rest.length - 1))] * hop) / sr <= SKIP_NOISE && stray <= 1;
+  });
+}
+
+/**
+ * Where about step s (hops) the music leaves its bar-before self at the old place and meets it moved by S, on the
+ * rises of both envelopes: {lo, hi}, the split that fits best (a stretch, where nothing rises).
+ */
+function whereStep(fs, r, s) {
+  const { Tb, start, base } = r, A = Math.max(1, Math.round(start(s.mlo - 1) - 0.25 * Tb)), B = Math.min(fs[0].length - 1, Math.round(start(s.mhi) + 0.25 * Tb));
+  const b = base[Math.min(base.length - 1, s.mhi)] || 0, n = B - A, E = new Float64Array(n + 1), SM = 4;
+  if (n <= 0 || A - 4 * Tb - b - Math.abs(s.S) - SM - 2 < 0) return { lo: A, hi: B };
+  for (const f of fs) {
+    const sm = (x) => { const i = Math.floor(x), t = x - i; let acc = 0; for (let j = 0; j < SM; j++) acc += f[i - j] * (1 - t) + f[i - j + 1] * t; return acc / SM; };
+    const rise = (x) => Math.max(0, sm(x) - sm(x - 1));
+    let norm = 1e-12;
+    for (let x = A; x < B; x++) norm += rise(x) ** 2;
+    const P0 = new Float64Array(n + 1), PS = new Float64Array(n + 1);
+    for (let i = 0; i < n; i++) {
+      const x = A + i, back = x - 4 * Tb - b, v = rise(x);
+      P0[i + 1] = P0[i] + (v - rise(back)) ** 2 / norm;
+      PS[i + 1] = PS[i] + (v - rise(back - s.S)) ** 2 / norm;
+    }
+    for (let i = 0; i <= n; i++) E[i] += P0[i] + PS[n] - PS[i];
+  }
+  let lo = 0, top = -Infinity;
+  for (let i = 0; i <= n; i++) { if (E[i] < E[lo]) lo = i; top = Math.max(top, E[i]); }
+  const eps = E[lo] + 0.05 * (top - E[lo]);
+  let hi = lo;
+  while (lo > 0 && E[lo - 1] <= eps) lo--;
+  while (hi < n && E[hi + 1] <= eps) hi++;
+  return { lo: A + lo, hi: A + hi };
+}
+
+/** A recording with edits [at, frames cut (> 0) or silence put in (< 0)], in order. */
+function edited({ L, R, sampleRate }, edits) {
+  const size = edits.reduce((s, [, len]) => s - len, L.length), oL = new Float32Array(size), oR = new Float32Array(size);
+  let src = 0, dst = 0;
+  for (const [at, len] of edits) {
+    oL.set(L.subarray(src, at), dst); oR.set(R.subarray(src, at), dst); dst += at - src;
+    if (len > 0) src = at + len; else { dst -= len; src = at; } // a cut skips audio; a loss gets silence
+  }
+  oL.set(L.subarray(src), dst); oR.set(R.subarray(src), dst);
+  return { L: oL, R: oR, sampleRate };
+}
+
+/**
+ * A recording's skips mended, so every beat is in its place: silence the capture put in is cut (the run of zeros a
+ * step long, or the step's worth of a longer one), and audio it lost is given back as silence in the quietest 10 ms
+ * where the step is. A loss must show in two readings; an edit stays only where the mended recording reads as one
+ * beat there. T: the beat period (s). -> {pcm, steps: [{at: s, ms}]}; pcm is the same object when nothing was mended.
+ */
+export function mendSteps(pcm, T) {
+  const { L, R, sampleRate: sr } = pcm, hop = Math.max(1, Math.round(0.0005 * sr));
+  if (!(T > 0) || L.length < 12 * T * sr) return { pcm, steps: [] };
+  const rs = skipReadings(pcm, T, hop), fs = rs.filter((r) => r.span === 1).map((r) => r.f), found = [];
+  for (const r of rs) for (const s of readSteps(r, hop, sr)) {
+    const lo = r.start(s.mlo - 1) - r.Tb, hi = r.start(s.mhi) + r.Tb, same = found.find((x) => x.lo < hi && lo < x.hi);
+    if (!same) found.push({ r, s, lo, hi, seen: 1 });
+    else if (Math.abs(same.s.S - s.S) <= (SKIP_TOL * sr) / hop) same.seen++;
+  }
+  found.sort((p, q) => p.lo - q.lo);
+  const BUF = Math.round(0.01 * sr), tol = Math.round(SKIP_TOL * sr), edits = [];
+  for (const { r, s, seen } of found) {
+    let D = Math.round(s.S * hop), at = -1, len;
+    const k = Math.round(D / BUF);
+    if (k !== 0 && Math.abs(D - k * BUF) <= tol) D = k * BUF; // whole capture buffers
+    len = D;
+    if (D > 0) {
+      // The capture's silence: a run of zeros as long as the step; or, where the track is near silent there too, a
+      // near-silent run the step longer than the same place a bar away (silence it fell into).
+      const lo = Math.max(0, Math.round(r.start(s.mlo - 1) - 0.25 * r.Tb) * hop), hi = Math.min(L.length, Math.round(r.start(s.mhi) + 0.25 * r.Tb) * hop);
+      const bar = Math.round((4 * r.Tb + (r.base[s.mhi] || 0)) * hop);
+      const runs = (still) => {
+        const runAt = (i) => { if (!still(i)) return 0; let a = i, j = i; while (still(a - 1)) a--; while (still(j)) j++; return j - a; };
+        const out = [];
+        for (let i = lo; i < hi; i++) {
+          if (!still(i)) continue;
+          let a = i, j = i;
+          while (still(a - 1)) a--;
+          while (still(j)) j++;
+          i = j;
+          const mid = (a + j) >> 1;
+          out.push({ a, run: j - a, more: j - a - (mid - bar >= 0 ? runAt(mid - bar) : runAt(mid + bar + D)) });
+        }
+        return out;
+      };
+      const zero = (i) => i >= 0 && i < L.length && L[i] === 0 && R[i] === 0;
+      const hush = (i) => i >= 0 && i < L.length && Math.abs(L[i]) <= 1e-4 && Math.abs(R[i]) <= 1e-4;
+      const near = (xs, key) => xs.filter((x) => Math.abs(x[key] - D) <= tol).sort((p, q) => Math.abs(p[key] - D) - Math.abs(q[key] - D))[0];
+      const best = near(runs(zero), 'run') || near(runs(hush), 'more');
+      if (!best) continue; // audio put in is the capture's silence, or no skip
+      if (Math.abs(best.run - D) <= tol && zero(best.a)) { at = best.a; len = best.run; } else at = best.a + ((best.run - D) >> 1);
+    } else {
+      if (seen < 2) continue; // a loss leaves nothing behind: two readings must see it
+      const sp = whereStep(fs, r, s), w = Math.min(-D, BUF), a0 = Math.max(0, sp.lo * hop - (w >> 1)), b0 = Math.min(L.length, (sp.hi + 1) * hop + (w >> 1));
+      const sum = new Float64Array(Math.max(0, b0 - a0) + 1);
+      for (let i = a0; i < b0; i++) sum[i - a0 + 1] = sum[i - a0] + Math.max(Math.abs(L[i]), Math.abs(R[i]));
+      let low = Infinity;
+      for (let i = a0; i + w <= b0; i++) if (sum[i + w - a0] - sum[i - a0] < low) { low = sum[i + w - a0] - sum[i - a0]; at = i; }
+      if (at < 0) continue;
+    }
+    const prev = edits[edits.length - 1];
+    if (prev && at < prev[0] + Math.max(0, prev[1])) continue;
+    edits.push([at, len, r]);
+  }
+  if (!edits.length) return { pcm, steps: [] };
+  // Read again about each edit (12 beats either side): an edit after which its reading still finds a step there was
+  // no skip, or not that one.
+  let out = edited(pcm, edits), moved = 0;
+  const keep = edits.filter(([at, len, r]) => {
+    const mid = at - moved, from = Math.max(0, Math.round(mid - 12 * T * sr)), to = Math.min(out.L.length, Math.round(mid + 12 * T * sr));
+    moved += len;
+    const part = { L: out.L.subarray(from, to), R: out.R.subarray(from, to), sampleRate: sr }, k = (mid - from) / hop / r.Tb;
+    const y = skipReadings(part, T, hop).find((x) => x.i === r.i && x.span === r.span);
+    return !readSteps(y, hop, sr).some((s) => s.mlo - 3 <= k && k <= s.mhi + 3);
+  });
+  if (!keep.length) return { pcm, steps: [] };
+  if (keep.length < edits.length) out = edited(pcm, keep);
+  return { pcm: out, steps: keep.map(([at, len]) => ({ at: at / sr, ms: (len / sr) * 1000 })) };
+}
+
 export class Recording extends Job {
   /** live: the live tab deck whose page is recorded; deck: the loading deck the recording becomes. */
   constructor({ engine, live, deck, signal }) {
@@ -1032,15 +1276,30 @@ export class Recording extends Job {
       this.send({ t: 'drive', mode: 'stop' });
       this.send({ t: 'tap', on: false, forget: true });
       this.say(0.8, 'slowing the recording back');
-      const pcm = await resample({ L: L.slice(start, start + need), R: R.slice(start, start + need), sampleRate: sr / REC_RATE }, sr);
+      const take = { L: L.slice(start, start + need), R: R.slice(start, start + need), sampleRate: sr / REC_RATE };
+      let pcm = await resample(take, sr);
       this.check();
       this.say(0.85, SAY.beat);
-      let analysis = null;
-      try { analysis = await e.analyse(pcm, this.signal); } catch (err) {
-        this.check();
-        e.event('warn', `Deck ${d.slot}: no beat grid from the whole track (${err.message}). TAP the beat.`, d.id);
-      }
+      const analyse = async () => {
+        try { return await e.analyse(pcm, this.signal); } catch (err) {
+          this.check();
+          e.event('warn', `Deck ${d.slot}: no beat grid from the whole track (${err.message}). TAP the beat.`, d.id);
+          return null;
+        }
+      };
+      let analysis = await analyse(), mended = [];
       this.check();
+      // The capture's skips, mended against its own bars (a bar apart everywhere else), and the beat found again.
+      if (analysis && analysis.bpm > 0) {
+        const m = mendSteps({ L: take.L, R: take.R, sampleRate: sr }, 60 / analysis.bpm / REC_RATE);
+        if (m.steps.length) {
+          mended = m.steps;
+          pcm = await resample({ ...m.pcm, sampleRate: sr / REC_RATE }, sr);
+          this.check();
+          analysis = await analyse();
+          this.check();
+        }
+      }
       const res = await e.serial(() => e.startResidentDeck({ deckId: d.id, pcm, analysis }));
       if (!res.ok) { this.check(); throw new Stop('live', res.error); }
       this.end();
@@ -1048,7 +1307,10 @@ export class Recording extends Job {
       d.setLoad({ report: [
         'JD Samps load report', `Page: ${host}`, `Result: resident, ${got.toFixed(3)} s, recorded from the page at ${REC_RATE}× (reduced highs)`,
         `Track length: ${D.toFixed(3)} s (the page's player)`, ...(T < D ? [`Limit: the deck holds the first ${minutes(T / 60)}`] : []),
-        `Recorded: ${(need / sr).toFixed(3)} s of the tab's sound from deck ${live.slot}'s capture, slowed back by ${REC_RATE}`, `Total: ${secs(now() - t0)}`,
+        `Recorded: ${(need / sr).toFixed(3)} s of the tab's sound from deck ${live.slot}'s capture, slowed back by ${REC_RATE}`,
+        ...(mended.length ? [`Mended: ${mended.length} skip${mended.length === 1 ? '' : 's'} in the capture (the computer was busy): ${mended.map((x) =>
+          `${Math.round(Math.abs(x.ms) * REC_RATE)} ms ${x.ms > 0 ? 'put in' : 'lost'} at ${(x.at * REC_RATE).toFixed(1)} s`).join(', ')}`] : []),
+        `Total: ${secs(now() - t0)}`,
       ].join('\n') });
       e.event('info', `Deck ${d.slot}: the whole track was recorded from the page (reduced highs). Deck ${live.slot} is let go.`, d.id);
       e.eject(live.id); // the page paused, its capture released

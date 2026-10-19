@@ -16,15 +16,41 @@ const deckPageErrors = [];
 const deckBy = (s, slot) => s.decks.find((d) => d.slot === slot);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// JDS_DIAG=<dir>: each recording record() makes is kept there, named by the engine's clock at its start and stop,
+// and the engine's state at every tick goes to <dir>/ticks.json (one row per tick, as TICK_PROBE builds it).
+const DIAG = process.env.JDS_DIAG;
+let diagN = 0;
 async function record(target, seconds) {
   const known = await downloadIds(h);
+  const c0 = DIAG ? (await state(deck)).ctxTime : 0;
   const start = target === 'mix' ? await act(deck, null, 'mixRecStart') : await act(deck, target, 'recStart');
   assert.equal(start.ok, true, JSON.stringify(start));
   await sleep(seconds * 1000);
   if (target === 'mix') await act(deck, null, 'mixRecStop'); else await act(deck, target, 'recStop');
+  const c1 = DIAG ? (await state(deck)).ctxTime : 0;
   const dl = await waitForDownload(h, known);
+  if (DIAG) fs.copyFileSync(dl.filename, path.join(DIAG, `rec${String(++diagN).padStart(2, '0')}-${target}-${c0.toFixed(3)}-${c1.toFixed(3)}.wav`));
   return { dl, wav: parseWav(fs.readFileSync(dl.filename)) };
 }
+// Row: [time, clock mode, clock bpm, frame, ...decks: [slot, playhead, rate, pitch, sync, phaseMs, starved, edge age,
+//   reserve, source rate, assist rate sent, grid T, grid t0, tempo state, tracker bpm, dropout runs, playing, live edge,
+//   native BPM at the playhead, source rate of the audio there]].
+const TICK_PROBE = `(() => {
+  const e = globalThis.__jdsEngine, log = window.__ticks = [], orig = e.tick.bind(e);
+  e.tick = (m) => {
+    orig(m);
+    const now = e.ctx.currentTime, c = e.clock.state(), row = [now, c.mode, c.bpm, m.frame];
+    for (const d of e.decks.values()) {
+      if (!d.ts || d.kind === 'loading') continue;
+      const p = d.ts.posAt(now), g = d.grids.at(p), ti = d.tempo ? d.tempo.get() : null;
+      row.push([d.slot, p, d.ts.rateAt(now), d.params.pitch, d.syncOn, d.phaseMs, d.starved, d.edgeAt == null ? null : now - d.edgeAt,
+        d.ts.reserveAt(now), d.assist.sourceRate, d.assist.sent, g ? g.T : null, g ? g.t0 : null, ti && ti.state, ti && ti.inBpm, d.dropouts.runs, d.wantPlay, d.ts.liveEdge,
+        d.tempoInfo(p).native, d.src.rateAt(p)]);
+    }
+    log.push(row);
+  };
+  return true;
+})()`;
 
 const median = (xs) => [...xs].sort((a, b) => a - b)[Math.floor(xs.length / 2)];
 /** Each deck's stretcher latency (s), by slot. */
@@ -84,8 +110,12 @@ before(async () => {
     assert.equal(r.ok, true, JSON.stringify(r));
   }
   await installClient(deck);
+  if (DIAG) { fs.mkdirSync(DIAG, { recursive: true }); await offscreenEval(h, TICK_PROBE); }
 });
-after(async () => { await h?.close(); await server?.close(); });
+after(async () => {
+  if (DIAG) await offscreenEval(h, 'JSON.stringify(window.__ticks)').then((s) => fs.writeFileSync(path.join(DIAG, 'ticks.json'), s)).catch((e) => console.log(`DIAG ticks: ${e}`));
+  await h?.close(); await server?.close();
+});
 
 test('two tabs load as cued decks and start buffering', async () => {
   const s = await state(deck);
@@ -317,10 +347,16 @@ test('60 s deck recordings: with assist off the reserve drained at rate − 1, t
   assert.ok(Math.abs(slope + x) < 0.1 * x, `reserve slope ${slope} s/s, expected ${-x}`);
 });
 
-test('the mix recording has both decks at 128 BPM with aligned beats', async () => {
+test('the mix recording has both decks at 128 BPM with aligned beats', async (t) => {
+  // What each deck was doing as the recording started and stopped: said with the beats, for a failure to explain.
+  const was = (s) => s.decks.map((d) => `deck ${d.slot}: rate ${d.engineRate.toFixed(4)}, pitch ${d.params.pitch.toFixed(4)}, native ${d.bpm.native?.toFixed(3)}, out ${d.bpm.out?.toFixed(3)}, phase ${d.sync.phaseMs?.toFixed(1)} ms, starved ${d.starved}, reserve ${d.reserve.toFixed(2)} s`).join('; ');
+  const s0 = await state(deck);
   const { wav } = await record('mix', 8);
+  const s1 = await state(deck);
   assert.ok(wav.seconds > 7 && wav.sr > 0);
   const lo = bandOnsets(wav.mono, wav.sr, 'low'), hi = bandOnsets(wav.mono, wav.sr, 'high');
+  const iv = (on) => on.slice(1).map((x, i) => Math.round((x - on[i]) * 1000)).join(' ');
+  t.diagnostic(`beat to beat (ms): low ${iv(lo)}; high ${iv(hi)}. At the start ${was(s0)}. At the end ${was(s1)}.`);
   assert.ok(Math.abs(medianBpm(lo) - 128) < 1, `low ${medianBpm(lo)}`);
   assert.ok(Math.abs(medianBpm(hi) - 128) < 1, `high ${medianBpm(hi)}`);
   const offs = lo.map((t) => Math.min(...hi.map((u) => Math.abs(u - t)))).sort((x, y) => x - y);
@@ -330,16 +366,24 @@ test('the mix recording has both decks at 128 BPM with aligned beats', async () 
 
 test('crossfader extremes isolate the A and B sides', async (t) => {
   // Deck 1 (A) is the low kick, deck 2 (B) the high click: each side is measured in its own band.
-  set(deck, 1, 'xf', 'A'); set(deck, 2, 'xf', 'B'); set(deck, null, 'xfader.pos', 0.5);
-  await sleep(300);
-  const both = await record('mix', 3);
-  set(deck, null, 'xfader.pos', 1);
-  await sleep(300);
-  const onlyB = await record('mix', 3);
-  set(deck, null, 'xfader.pos', 0);
-  await sleep(300);
-  const onlyA = await record('mix', 3);
-  await Promise.all([set(deck, null, 'xfader.pos', 0.5), set(deck, 1, 'xf', 'THRU'), set(deck, 2, 'xf', 'THRU')]);
+  // The side cut is silent: its gain is 0 (under -120 dB), not merely small.
+  const gains = () => offscreenEval(h, 'Object.fromEntries([...globalThis.__jdsEngine.decks.values()].map((d) => [d.slot, d.xfGain.gain.value]))');
+  let both, onlyB, onlyA;
+  try {
+    set(deck, 1, 'xf', 'A'); set(deck, 2, 'xf', 'B'); set(deck, null, 'xfader.pos', 0.5);
+    await sleep(300);
+    both = await record('mix', 3);
+    set(deck, null, 'xfader.pos', 1);
+    await sleep(300);
+    const gB = await gains();
+    assert.ok(gB[1] < 1e-6, `A's gain at the B end: ${gB[1]}`);
+    onlyB = await record('mix', 3);
+    set(deck, null, 'xfader.pos', 0);
+    await sleep(300);
+    const gA = await gains();
+    assert.ok(gA[2] < 1e-6, `B's gain at the A end: ${gA[2]}`);
+    onlyA = await record('mix', 3);
+  } finally { await Promise.all([set(deck, null, 'xfader.pos', 0.5), set(deck, 1, 'xf', 'THRU'), set(deck, 2, 'xf', 'THRU')]); }
   const db = (x, y, band) => 20 * Math.log10(bandRms(x.wav.mono, x.wav.sr, band) / bandRms(y.wav.mono, y.wav.sr, band));
   const aDrop = db(onlyB, both, 'low'), bDrop = db(onlyA, both, 'high');
   t.diagnostic(`at B: A (low band) ${aDrop.toFixed(1)} dB; at A: B (high band) ${bDrop.toFixed(1)} dB`);

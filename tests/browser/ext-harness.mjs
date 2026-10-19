@@ -603,10 +603,11 @@ function bandFilter(x, sr, band) {
   return y;
 }
 
+/** RMS in one band, from 10 ms in: a recording starts wherever the music is, and the filter would hear that start as a click. */
 export function bandRms(mono, sr, band) {
-  const y = bandFilter(mono, sr, band);
-  let s = 0; for (let i = 0; i < y.length; i++) s += y[i] * y[i];
-  return Math.sqrt(s / Math.max(1, y.length));
+  const y = bandFilter(mono, sr, band), from = Math.min(y.length, Math.round(0.01 * sr));
+  let s = 0; for (let i = from; i < y.length; i++) s += y[i] * y[i];
+  return Math.sqrt(s / Math.max(1, y.length - from));
 }
 
 /** Onset times (s) in one band: 2 ms envelope, rising through 35% of max, 150 ms refractory. */
@@ -642,6 +643,102 @@ export function steadyBeats(onsets, { tol = 0.008, minLen = 8 } = {}) {
     n += r.length;
   }
   return { T: sxy / sxx, n, runs };
+}
+
+const median = (xs) => [...xs].sort((a, b) => a - b)[xs.length >> 1];
+
+/** How late bandOnsets() reports a beat of a makeTrackWav sound itself (s): taken off before two decks are compared. */
+export function onsetBias(bpm, kind, band) {
+  const w = parseWav(makeTrackWav({ bpm, kind, seconds: 8 })), T = 60 / bpm;
+  return median(bandOnsets(w.mono, w.sr, band).map((x) => x - Math.round(x / T) * T));
+}
+
+/**
+ * Two beat-matched decks in a master recording, one heard in each band (a low kick and a high click): each one's
+ * onsets, steady tempo (steadyBeats) and median BPM, and each kick's distance (ms) to the nearest click less `bias`
+ * (s: the detector's own lateness on the kick less on the click).
+ */
+export function beatMatch(wav, bias = 0) {
+  const lo = bandOnsets(wav.mono, wav.sr, 'low'), hi = bandOnsets(wav.mono, wav.sr, 'high');
+  const off = lo.map((x) => ({ t: x, ms: (x - hi.reduce((b, y) => (Math.abs(x - y) < Math.abs(x - b) ? y : b), Infinity) - bias) * 1000 }));
+  const abs = off.map((o) => Math.abs(o.ms)).sort((a, b) => a - b), windows = [];
+  for (let w = 0; w < wav.seconds - 1; w += 5) { // every 5 s, and what is left at the end
+    const to = Math.min(w + 5, wav.seconds), xs = off.filter((o) => o.t >= w && o.t < to).map((o) => Math.abs(o.ms));
+    windows.push({ from: w, to, n: xs.length, med: xs.length ? median(xs) : Infinity });
+  }
+  const A = steadyBeats(lo), B = steadyBeats(hi);
+  return { seconds: wav.seconds, lo, hi, off, A, B, tempoErr: A.T / B.T - 1, bpm: [medianBpm(lo), medianBpm(hi)], med: median(abs), p90: abs[Math.floor(abs.length * 0.9)], max: abs.at(-1), windows };
+}
+
+/**
+ * What a beat match (beatMatch) falls short of, as plain sentences ([] when it holds), over `seconds` at `bpm`: the
+ * recording that long, the kicks and clicks there at that tempo, the same tempo within 0.2 %, and every kick within
+ * `tol` ms of a click, to the end of the recording (a kick cut by its start or end aside). steady: each deck's beats one steady run (no jump, no gap, none
+ * missing). excuse: the beats this many after each break in the master's own steady run (master: 'lo', the kick, or
+ * 'hi') may be further off, a tenth of the beats at most: a live master's capture can skip, and the other deck takes
+ * a few beats to follow it.
+ */
+export function matchFaults(m, { seconds, bpm = 124, tol = 20, steady = false, excuse = 0, master = 'lo' } = {}) {
+  const out = [], beats = (seconds * bpm) / 60, T = 60 / bpm;
+  if (m.seconds < seconds - 0.2) out.push(`${m.seconds.toFixed(3)} s recorded of ${seconds} s`);
+  if (!(m.lo.length >= beats - 2 && m.hi.length >= beats - 2)) out.push(`${m.lo.length} kicks, ${m.hi.length} clicks in ${seconds} s`);
+  if (!(Math.abs(m.bpm[0] - bpm) < 1 && Math.abs(m.bpm[1] - bpm) < 1)) out.push(`median BPM ${m.bpm}`);
+  if (!(Math.abs(m.tempoErr) < 0.002)) out.push(`tempo error ${(m.tempoErr * 100).toFixed(4)} %`);
+  const breaks = excuse ? (master === 'lo' ? m.A : m.B).runs.slice(1).map((r) => r[0]) : [];
+  const excused = (t) => breaks.some((b) => t >= b - T / 2 && t < b + (excuse - 0.5) * T);
+  // A recording starts and stops wherever the music is: a kick cut there is no beat.
+  const off = m.off.filter((o) => Math.abs(o.ms) > tol && o.t > 0.15 && o.t < m.seconds - 0.15), own = off.filter((o) => !excused(o.t));
+  if (own.length) out.push(`kicks more than ${tol} ms from a click: ${own.map((o) => `${o.t.toFixed(2)} s: ${o.ms.toFixed(1)} ms`).join(', ')}`);
+  if (off.length - own.length > 0.1 * beats) out.push(`${off.length - own.length} beats off after the master's own breaks`);
+  for (const w of m.windows) {
+    const want = ((w.to - w.from) * bpm) / 60 - 2;
+    if (!(w.n >= want && w.med <= tol)) out.push(`${w.from}-${w.to.toFixed(1)} s: median ${w.med.toFixed(1)} ms over ${w.n} beats`);
+  }
+  if (steady) {
+    for (const [name, on, fit] of [['kicks', m.lo, m.A], ['clicks', m.hi, m.B]]) {
+      const runs = fit.runs.filter((r) => r.length > 1);
+      if (!(runs.length === 1 && runs[0].length >= on.length - 2)) out.push(`${name}: steady runs ${fit.runs.map((r) => r.length)}`);
+    }
+  }
+  return out;
+}
+
+/**
+ * Where a master recording's level leaves its own beat, as plain sentences ([] when it doesn't): its RMS in each
+ * 1/48 of a beat of the kicks' steady tempo (beatMatch), over the whole band and above 1.5 kHz, against the same
+ * 48th in the 8 beats either side (median), more than `db` below (a dropout, a dip) or above (a click, a jump), all
+ * under -60 dBFS (-40 above 1.5 kHz, where a click's tail can sit a few ms on) taken as silence. The first and last
+ * `edge` s are left out.
+ */
+export function levelFaults(wav, m, { db = 10, edge = 0.5 } = {}) {
+  const T = m.A.T, B = 48, sr = wav.sr, t0 = median(m.lo.map((t) => t - Math.round((t - m.lo[0]) / T) * T));
+  const k0 = Math.ceil((edge - t0) / T), k1 = Math.floor((wav.seconds - edge - t0) / T) - 1, out = [];
+  for (const [band, x, floor] of [['', wav.mono, -60], ['above 1.5 kHz ', bandFilter(wav.mono, sr, 'high'), -40]]) {
+    const lv = [];
+    for (let k = k0; k <= k1; k++) {
+      const row = new Float64Array(B);
+      for (let j = 0; j < B; j++) {
+        const a = Math.round((t0 + (k + j / B) * T) * sr), b = Math.round((t0 + (k + (j + 1) / B) * T) * sr);
+        let s = 0;
+        for (let i = a; i < b; i++) s += x[i] * x[i];
+        row[j] = Math.max(floor, 10 * Math.log10(s / Math.max(1, b - a) + 1e-12)); // silence is silence, however quiet
+      }
+      lv.push(row);
+    }
+    const found = [];
+    for (let k = 0; k < lv.length; k++) {
+      for (let j = 0; j < B; j++) {
+        const near = [];
+        for (let q = Math.max(0, k - 8); q <= Math.min(lv.length - 1, k + 8); q++) if (q !== k) near.push(lv[q][j]);
+        const dev = lv[k][j] - median(near);
+        if (Math.abs(dev) <= db) continue;
+        const t = t0 + (k0 + k + j / B) * T, last = found[found.length - 1];
+        if (last && t - last.to < T / B + 1e-6 && Math.sign(dev) === Math.sign(last.dev)) { last.to = t + T / B; if (Math.abs(dev) > Math.abs(last.dev)) last.dev = dev; } else found.push({ from: t, to: t + T / B, dev });
+      }
+    }
+    for (const f of found) out.push(`${f.from.toFixed(2)} s: ${Math.round((f.to - f.from) * 1000)} ms ${band}${f.dev < 0 ? 'below' : 'above'} its beat by up to ${Math.abs(f.dev).toFixed(0)} dB`);
+  }
+  return out;
 }
 
 /** The RIFF/WAVE header fields, as written, plus the file length. */
