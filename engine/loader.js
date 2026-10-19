@@ -35,6 +35,8 @@ export const TIMES = Object.freeze({
   grace: 2000,       // after the hub has asked the tab's frames to connect: their agents' ports follow at once
   settle: 700,       // after the player's length is known: the tap's errors, links and kept inits are on their way
   duration: 8000,    // the most to wait for the player to say how long the track is (a stream says it has no end after 3 s)
+  idle: 2000,        // a player that holds nothing this long after the tap is on was not started (play not pressed)
+  start: 30000,      // the most to wait for the DJ to start such a player on the tab
   file: 65000,       // the page's track link (the agent gives it 60 s)
   fetchEach: 15000,  // per eight links fetched by the page (the agent gives each 15 s)
   stall: 5000,       // a seek-hop that brings no new audio this long is given up for accelerate
@@ -42,11 +44,12 @@ export const TIMES = Object.freeze({
   drivePerSec: 250,
   check: 400,        // between gap checks while driving (each one places every piece)
   away: 1500,        // after the page went away: the most to wait for word of what became of the tab (closed, another page)
+  report: 1000,      // between refreshes of the load report while nothing else moves the deck's progress
 });
 
 /** Plain words for the deck's loading state. */
 const SAY = {
-  wait: 'waiting for the page', look: "looking at the page's player", file: "reading the page's track link",
+  wait: 'waiting for the page', look: "looking at the page's player", start: 'start the track on the tab', file: "reading the page's track link",
   media: 'fetching the track', pieces: "fetching the track's pieces", hop: 'running the player through the track',
   fast: (r) => `running the player through the track (${r}×)`, decode: 'decoding', beat: 'finding the beat',
 };
@@ -59,6 +62,7 @@ const LIVE = {
   webaudio: 'this page makes its sound without a media player the deck can read, so it plays live from the tab.',
   unreachable: "the deck cannot reach this page's player, so it plays live from the tab.",
   length: "the page's player does not say how long the track is, so it plays live from the tab.",
+  unstarted: "the page's player had not started, so it plays live from the tab. For the whole track, press play on the tab, eject this deck and load the tab again.",
   gone: 'the page changed while the track was loading, so it plays live from the tab.',
   big: 'the track is too large to hold, so it plays live from the tab.',
   failed: (why) => `the whole track could not be read from this page (${why}), so it plays live from the tab.`,
@@ -72,18 +76,20 @@ const UNFLUSHED = {
   sticky: 'it would not fetch again what was taken from behind its place',
 };
 const DECISIVE = ['drm', 'worker', 'preview', 'live'];
+const UNREADABLE = ['drm', 'worker']; // decisive, and the page's bytes cannot be had: only its sound can be recorded
 const NO_LENGTH = "the page's player has not said how long the track is";
 const TAB_CAP = 600 * 2 ** 20;       // bytes from one tab: each frame's tap holds at most this, and so does the whole tab
 const NO_STAMPS = /^audio\/(mpeg|mp3|aac|x-aac)\b/i; // placed in append order only: never seek-hopped
-const DRIVE_RATE = 8;
+const DRIVE_RATE = 16;               // accelerate: the most a media element takes; capturing bytes is lossless at any rate
 const FETCHED = 1e6;                 // placement keys of fetched batches, clear of the tap's SourceBuffers (frame * 1000 + sb)
 
 class Stop extends Error {
   /**
    * kind: 'cancel' (the deck was ejected or the load cancelled), 'live' (play the tab live, saying why) or 'away' (the
-   * page went away before the track was in: what follows depends on what became of the tab).
+   * page went away before the track was in: what follows depends on what became of the tab). noBytes (live): the page's
+   * bytes cannot be had, so only its sound can be recorded (the setting "Record whole track at 2× when bytes are unavailable").
    */
-  constructor(kind, message) { super(message); this.kind = kind; }
+  constructor(kind, message, noBytes = false) { super(message); this.kind = kind; this.noBytes = noBytes; }
 }
 const now = () => performance.now();
 const secs = (ms) => `${(ms / 1000).toFixed(1)} s`;
@@ -187,8 +193,10 @@ class Job {
   say(p, strategy) {
     if (this.done) return;
     this.progress = Math.max(this.progress, Math.min(0.99, p));
-    this.deck.setLoad(strategy === undefined ? { progress: this.progress } : { progress: this.progress, strategy });
+    this.deck.setLoad({ ...(strategy === undefined ? { progress: this.progress } : { progress: this.progress, strategy }), ...this.also(strategy) });
   }
+  /** What else the deck's load shows with its progress (a Loader: its report as it stands). */
+  also() { return {}; }
   /** A rung's own 0..1 mapped onto what is left of the bar before decoding. */
   band(hi = 0.8) { const lo = Math.min(this.progress, hi); return (x) => lo + Math.max(0, Math.min(1, x)) * (hi - lo); }
 }
@@ -222,6 +230,19 @@ export class Loader extends Job {
     this.bytes = 0;            // read from the tab, all frames
     this.host = hostOf(deck.meta && deck.meta.url);
     this.rep = { steps: [], mimes: new Set(), refetched: 0, placed: null, limit: null, result: null, notes: [], t0: now() };
+    this.doing = '';           // what the load is doing now, in plain words (its report says so until it ends)
+    this.reportedAt = -Infinity;
+  }
+
+  /**
+   * The load report as it stands goes with the progress (§11: it can be copied while the deck loads): at once when what
+   * the load does changes, else at most every 250 ms.
+   */
+  also(strategy) {
+    if (strategy !== undefined) this.doing = strategy;
+    if (strategy === undefined && now() - this.reportedAt < 250) return {};
+    this.reportedAt = now();
+    return { report: this.report() };
   }
 
   // ---------------------------------------------------------------- the deck's agents
@@ -320,6 +341,14 @@ export class Loader extends Job {
   own(f) { return f.own ? f.parts.filter((p) => f.own.has(p.sb - f.n * 1000)) : f.parts; }
   /** The track's frame, or once the page has been looked at, its pinned frame even after it left (what it gave stays good). */
   held() { return this.pinned || this.track(); }
+  /**
+   * The track's player holds nothing yet: no length, no source, nothing appended or asked for. A page whose play button
+   * was not pressed (a track page that does not autoplay): the hub's start finds no source to play.
+   */
+  idle() {
+    const f = this.track(), p = f && f.prog;
+    return !!p && p.duration == null && !p.src && !p.mimes.length && !f.own && !f.parts.length && !f.reqs.some((r) => r.media);
+  }
   /** How long the track's player says the track is. */
   duration() { const f = this.held(); return f && f.prog ? f.prog.duration : null; }
   limitSec() { return (this.engine.params['resident.limitMin'] || 15) * 60; }
@@ -349,7 +378,7 @@ export class Loader extends Job {
   check() {
     if (this.signal.aborted || this.engine.decks.get(this.deck.id) !== this.deck) throw new Stop('cancel', 'Loading was cancelled.');
     const why = this.looked && this.decisive();
-    if (why) throw new Stop('live', LIVE[why]);
+    if (why) throw new Stop('live', LIVE[why], UNREADABLE.includes(why));
     if (!this.gone && !this.have && this.moved()) { this.gone = 'the page moved on'; this.inPlace = true; }
     if (this.gone && !this.have) throw new Stop('away', this.gone);
     if (this.big) throw new Stop('live', LIVE.big);
@@ -381,6 +410,8 @@ export class Loader extends Job {
   /** -> {ok:true, kind:'resident'|'live', deckId, slot} or {ok:false, error}. Never rejects. */
   async run() {
     let out;
+    // While a step waits long (a look, a fetch, a page's answer), its report still keeps up with how long it has taken.
+    const tick = setInterval(() => { if (!this.done) this.deck.setLoad({ report: this.report() }); }, this.t.report);
     try {
       this.say(0, SAY.wait);
       await this.connect();
@@ -393,6 +424,7 @@ export class Loader extends Job {
     } catch (err) {
       out = await this.fail(err);
     } finally {
+      clearInterval(tick);
       this.end();
     }
     return out;
@@ -408,23 +440,41 @@ export class Loader extends Job {
     this.check();
     const n = this.attached().length;
     this.rep.steps.push({ name: 'connect', outcome: n ? 'ok' : 'none', why: `${n} frame${n === 1 ? '' : 's'} with a player`, ms: now() - t0 });
-    if (!n) throw new Stop('live', r && r.ok === false ? LIVE.unreachable : LIVE.webaudio);
+    if (!n) throw new Stop('live', r && r.ok === false ? LIVE.unreachable : LIVE.webaudio, true);
     this.tapping = true;
     for (const f of this.attached()) this.tapOn(f);
   }
 
   /** What the tap first says: the player's length, and anything that sends the deck live at once. */
   async look() {
-    const t0 = now();
+    const t0 = now(), known = () => !!this.decisive() || this.duration() != null;
     this.say(0.02, SAY.look);
-    await this.until(() => !!this.decisive() || this.duration() != null, this.t.duration);
+    await this.until(known, Math.min(this.t.idle, this.t.duration));
+    this.check();
+    let wait = this.t.duration - this.t.idle;
+    if (!known() && this.idle()) {
+      // Not started: the DJ is asked to start it on the tab, and the load goes on once it plays. It has a player, so it
+      // is never said to make its sound without one.
+      this.say(this.progress, SAY.start);
+      this.engine.event('info', `Deck ${this.deck.slot}: start the track on the tab. The deck loads it once it plays.`, this.deck.id);
+      await this.until(() => known() || !this.idle(), this.t.start);
+      this.check();
+      if (!known() && this.idle()) {
+        this.rep.steps.push({ name: 'look', outcome: 'not started', why: "the page's player had nothing to play", ms: now() - t0 });
+        throw new Stop('live', LIVE.unstarted);
+      }
+      this.rep.notes.push(`the track was started on the tab ${secs(now() - t0)} into the load`);
+      this.say(this.progress, SAY.look);
+      wait = this.t.duration;
+    }
+    await this.until(known, wait);
     this.check();
     await this.until(() => !!this.decisive(), this.t.settle); // errors and links still on their way
     this.check();
     this.pinned = this.track();
     const why = this.decisive(), D = this.duration();
     this.rep.steps.push({ name: 'look', outcome: why || 'ok', why: D != null ? `the player says ${D.toFixed(3)} s` : "the player's length is not known", ms: now() - t0 });
-    if (why) throw new Stop('live', LIVE[why]);
+    if (why) throw new Stop('live', LIVE[why], UNREADABLE.includes(why));
     this.looked = true;
   }
 
@@ -442,13 +492,16 @@ export class Loader extends Job {
       if (got) return got;
     }
     const tried = this.rep.steps.filter((s) => RUNGS.includes(s.name) && s.outcome !== 'skipped');
-    if (!tried.length) throw new Stop('live', this.rep.steps.some((s) => s.why === NO_LENGTH) ? LIVE.length : LIVE.webaudio);
-    throw new Stop('live', LIVE.failed(tried.find((s) => s.outcome === 'failed').why));
+    if (!tried.length) {
+      const length = this.rep.steps.some((s) => s.why === NO_LENGTH);
+      throw new Stop('live', length ? LIVE.length : LIVE.webaudio, !length);
+    }
+    throw new Stop('live', LIVE.failed(tried.find((s) => s.outcome === 'failed').why), true);
   }
 
   /** Run one rung, noting how it went: its result is {done: {pcm, notice}} or {outcome, why}. */
   async step(name, fn) {
-    const e = { name, how: '', outcome: '', why: '', ms: 0 }, t0 = now();
+    const t0 = now(), e = { name, how: '', outcome: '', why: '', ms: 0, at: t0 };
     this.rep.steps.push(e);
     try {
       const r = await fn(e);
@@ -887,17 +940,17 @@ export class Loader extends Job {
     const lines = [
       'JD Samps load report',
       `Page: ${this.host || 'unknown'} (${site ? `site table: ${site} starts at ${SITES[site]}` : 'generic site: file, refetch, drive, then live'})`,
-      `Result: ${r.result}`,
+      `Result: ${r.result || `still loading: ${this.doing || 'starting'}`}`,
       `Track length: ${D != null ? `${D.toFixed(3)} s (the page's player)` : 'not known'}`,
       ...(r.limit ? [`Limit: ${r.limit}`] : []),
       'Steps:',
-      ...r.steps.map((s) => `  ${s.name}${s.how ? ` (${s.how})` : ''}: ${s.outcome} in ${secs(s.ms)}${s.why ? ` — ${s.why}` : ''}`),
+      ...r.steps.map((s) => `  ${s.name}${s.how ? ` (${s.how})` : ''}: ${s.outcome ? `${s.outcome} in ${secs(s.ms)}` : `running for ${secs(now() - s.at)}`}${s.why ? ` — ${s.why}` : ''}`),
       ...r.notes.map((n) => `  note: ${n}`),
       `Media types: ${r.mimes.size ? [...r.mimes].join(', ') : 'none seen'}`,
       `Runs: ${p ? p.runs.length : 0}, segments: ${p ? p.runs.reduce((n, x) => n + x.segs.length, 0) : 0}, gaps: ${gaps.length ? gaps.map(span).join(', ') : 'none'}`,
       `Requests seen: ${media} media, ${lists} playlist${lists === 1 ? '' : 's'}`,
       `Bytes: ${kb(captured)} captured from the player, ${kb(r.refetched)} fetched again`,
-      `First failure: ${failed ? `${failed.name}: ${failed.why}` : r.result.startsWith('live: ') ? r.result.slice(6) : 'none'}`,
+      `First failure: ${failed ? `${failed.name}: ${failed.why}` : (r.result || '').startsWith('live: ') ? r.result.slice(6) : 'none'}`,
       `Total: ${secs(now() - r.t0)}`,
     ];
     return lines.join('\n');
@@ -981,14 +1034,46 @@ export class Loader extends Job {
       if (e.decks.get(d.id) === d) e.eject(d.id);
       return r;
     }
-    return { ok: true, kind: 'live', deckId: d.id, slot: d.slot };
+    return { ok: true, kind: 'live', deckId: d.id, slot: d.slot, ...(err instanceof Stop && err.noBytes ? { noBytes: true } : {}) };
+  }
+}
+
+/**
+ * The load report of a file or a link loaded straight onto a deck (engine.loadDirect), for "Copy load report": what it
+ * is, each step with how it ended, why and how long it took, and the result. Shown while the deck loads, and kept on
+ * the deck it leaves, resident or failed.
+ */
+export class DirectReport {
+  /** file: its name; else url: the link. */
+  constructor({ file, url }) {
+    this.source = file != null ? `a file, “${file}”` : `a link, ${short(url)}`;
+    this.steps = [];
+    this.t0 = this.at = now();
+    this.result = null;
+    this.limit = null;
+  }
+  /** The step that ran since the last one ended: how it ended, and why. */
+  step(name, outcome, why = '') { const t = now(); this.steps.push({ name, outcome, why, ms: t - this.at }); this.at = t; }
+  /** The fetch step done: n bytes. */
+  fetched(n) { this.step('fetch', 'ok', kb(n)); }
+  /** The report; doing: what the load is doing now (until it has a result). */
+  text(doing) {
+    const failed = this.steps.find((s) => s.outcome === 'failed');
+    return [
+      'JD Samps load report', `Source: ${this.source}`, `Result: ${this.result || `still loading: ${doing || 'starting'}`}`,
+      ...(this.limit ? [`Limit: ${this.limit}`] : []), 'Steps:',
+      ...this.steps.map((s) => `  ${s.name}: ${s.outcome} in ${secs(s.ms)}${s.why ? ` — ${s.why}` : ''}`),
+      ...(this.result ? [] : [`  ${doing || 'starting'}: running for ${secs(now() - this.at)}`]),
+      `First failure: ${failed ? `${failed.name}: ${failed.why}` : 'none'}`, `Total: ${secs(now() - this.t0)}`,
+    ].join('\n');
   }
 }
 
 // ---------------------------------------------------------------- recording a whole track (§4.4)
-// Opt-in, never automatic: for a page whose bytes cannot be had, the live deck's own capture records the tab's
-// sound while its player runs the track at 2× from the start (pitch unlocked), and the recording is slowed back
-// by 2. Whatever lay above a quarter of the media's rate (12 kHz at 48 kHz) is gone, and the deck says so.
+// Opt-in (the ⓘ action, or the setting that does it without asking): for a page whose bytes cannot be had, the live
+// deck's own capture records the tab's sound while its player runs the track at 2× from the start (pitch unlocked),
+// and the recording is slowed back by 2. Whatever lay above a quarter of the media's rate (12 kHz at 48 kHz) is gone,
+// and the deck says so.
 const REC_RATE = 2;
 const AUDIBLE = 0.003; // about -50 dBFS, as a deck's first audible sample
 const HOLD_MS = 700;   // the player held silent at the start: longer than a recorder batch and the capture's delay

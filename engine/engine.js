@@ -12,7 +12,7 @@ import { MasterClock } from './sync.js';
 import { Deck } from './deck.js';
 import { fetchArrayBuffer, decodeTo, resample, limitPcm } from './decode.js';
 import { analyseTrack, applyAnalysis } from './analysis.js';
-import { Loader, Recording, framesOf } from './loader.js';
+import { Loader, Recording, DirectReport, framesOf } from './loader.js';
 
 const STRETCH_URL = new URL('../vendor/signalsmith-stretch/SignalsmithStretch.js', import.meta.url).href;
 SignalsmithStretch.moduleUrl = STRETCH_URL;
@@ -322,8 +322,20 @@ class Engine {
     return loader.run().then((r) => {
       if (this.loads.get(deck.id) === load) this.loads.delete(deck.id);
       if (deck.loader === loader) deck.loader = null;
+      if (r.ok && r.kind === 'live' && r.noBytes && this.params['resident.recordWhole']) this.recordUnread(deck);
       return r;
     });
+  }
+
+  /**
+   * Settings → Record whole track at 2× when bytes are unavailable (§11): a tab deck that went live because its page's
+   * bytes cannot be had is recorded without asking, or says why it cannot be.
+   */
+  async recordUnread(live) {
+    const r = await this.recordWhole(live.id);
+    if (this.decks.get(live.id) !== live) return;
+    if (r.ok) this.event('info', `Deck ${live.slot}: recording its whole track from the page at 2× (reduced highs), as the settings ask.`, live.id);
+    else this.event('info', `Deck ${live.slot}: its whole track is not recorded at 2×. ${r.error}`, live.id);
   }
 
   /**
@@ -498,7 +510,7 @@ class Engine {
   /** A local file, as the deck page's blob: URL for it. */
   loadFile({ name, blobUrl, token }) {
     const title = trackTitle(name) || 'track';
-    return this.loadDirect(blobUrl, { title }, { strategy: 'reading the file', failed: `Could not read “${title}”`, token });
+    return this.loadDirect(blobUrl, { title }, { strategy: 'reading the file', failed: `Could not read “${title}”`, token, file: name });
   }
 
   /** A link to an audio file, fetched here. */
@@ -510,30 +522,38 @@ class Engine {
   }
 
   /**
-   * Fetch and decode a whole track onto a new deck, which shows as loading meanwhile. Settles when the
-   * deck is resident ({ok:true}), or with the reason it is not (the deck is gone again).
+   * Fetch and decode a whole track onto a new deck, which shows as loading meanwhile, with its load report. Settles
+   * when the deck is resident ({ok:true}), or with the reason it is not: the deck stays, failed, saying why and offering
+   * its report until the DJ dismisses it (a cancel: it is gone).
    */
-  async loadDirect(src, meta, { strategy, failed, token }) {
+  async loadDirect(src, meta, { strategy, failed, token, file }) {
     const r = await this.serial(() => this.startLoadingDeck({ meta, token }));
     if (!r.ok) return r;
     const deck = this.decks.get(r.deckId), ac = new AbortController(), load = { abort: () => ac.abort() };
     this.loads.set(deck.id, load);
     const gone = () => ac.signal.aborted || this.decks.get(deck.id) !== deck || this.leaving.has(deck);
+    const rep = new DirectReport(file != null ? { file } : { url: src });
+    const say = (o) => deck.setLoad({ ...o, report: rep.text(o.strategy) });
+    const tick = setInterval(() => { if (gone() || rep.result) clearInterval(tick); else deck.setLoad({ report: rep.text(deck.load.strategy) }); }, 1000);
     const refuse = async (error) => {
       const cancelled = gone();
       if (this.loads.get(deck.id) === load) this.loads.delete(deck.id);
-      if (!cancelled) await this.eject(deck.id);
-      return { ok: false, error: cancelled ? 'Loading was cancelled.' : error };
+      if (cancelled) return { ok: false, error: 'Loading was cancelled.' };
+      rep.result = `failed: ${error}`;
+      deck.setLoad({ state: 'error', error, strategy: null, report: rep.text() });
+      return { ok: false, error };
     };
-    deck.setLoad({ strategy });
+    say({ strategy });
     let buf, pcm;
     try {
       buf = await fetchArrayBuffer(src, { signal: ac.signal });
     } catch (err) {
+      rep.step('fetch', 'failed', err.message);
       return refuse(`${failed}: ${err.message}`);
     }
     if (gone()) return refuse();
-    deck.setLoad({ progress: 0.5, strategy: 'decoding' });
+    rep.fetched(buf.byteLength);
+    say({ progress: 0.5, strategy: 'decoding' });
     // Longer than the resident limit, an MP3 or ADTS file is cut at the frame a second past it and only that part
     // is decoded, as a tab's file is (a file in any other format is decoded whole).
     const limitMin = this.params['resident.limitMin'], w = framesOf(buf, limitMin * 60 + 1);
@@ -542,25 +562,33 @@ class Engine {
     try {
       pcm = await decodeTo(this.ctx, buf);
     } catch (_) {
-      return refuse(`“${meta.title}” is not audio this browser can play.`);
+      const error = `“${meta.title}” is not audio this browser can play.`;
+      rep.step('decode', 'failed', error);
+      return refuse(error);
     }
     buf = null;
     if (gone()) return refuse();
+    rep.step('decode', 'ok', `${(pcm.L.length / pcm.sampleRate).toFixed(3)} s${cut ? `, the first part of ${own.toFixed(1)} s` : ''}`);
     const lim = limitPcm(pcm, limitMin, cut ? own : undefined);
     pcm = null;
+    rep.limit = lim.notice;
     // Found here rather than in startResidentDeck, so other decks' starts and ejects never queue behind it.
-    deck.setLoad({ progress: 0.8, strategy: 'finding the beat' });
-    let analysis = null;
+    say({ progress: 0.8, strategy: 'finding the beat' });
+    let analysis = null, why = '';
     try {
       analysis = await this.analyse(lim.pcm, ac.signal);
     } catch (err) {
       if (gone()) return refuse();
+      why = err.message;
       this.event('warn', `Deck ${deck.slot}: no beat grid from the whole track (${err.message}). TAP the beat.`, deck.id);
     }
     if (gone()) return refuse();
+    rep.step('beat', analysis ? 'ok' : 'none', analysis ? (analysis.bpm > 0 ? `${analysis.bpm.toFixed(2)} BPM` : 'no steady beat') : why);
     this.loads.delete(deck.id);
+    rep.result = `resident, ${(lim.pcm.L.length / lim.pcm.sampleRate).toFixed(3)} s`;
+    deck.setLoad({ report: rep.text() }); // with the promotion: the resident deck never shows without its report
     const res = await this.serial(() => this.startResidentDeck({ deckId: deck.id, pcm: lim.pcm, analysis }));
-    if (!res.ok) return refuse(res.error);
+    if (!res.ok) { rep.result = null; rep.step('deck', 'failed', res.error); return refuse(res.error); }
     if (lim.notice) this.notify('warn', `Deck ${deck.slot}: ${lim.notice}`); // waits for a deck page, if none is open
     return res;
   }
