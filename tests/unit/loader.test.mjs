@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SITES, TIMES, firstRung, parseHls, findStart } from '../../engine/loader.js';
 import { defaults, MASTER_PARAMS, PERSISTED_MASTER_KEYS, validateUiMessage } from '../../shared/protocol.js';
-import { FETCH_STALL } from '../../engine/decode.js';
+import { FETCH_STALL, FetchRefused } from '../../engine/decode.js';
 import { placeParts } from '../../engine/assemble.js';
 import { load, rendition, file, mp3, code, DUR, SR, OPUS, makeTab, makeEngine, loaderFor, fetcher, settle, turn, decoders, FAST } from './fixtures/loader-harness.mjs';
 
@@ -151,6 +151,33 @@ test('an MSE page whose links can be fetched again: the playlist is read and onl
   const [s] = called(engine, 'startResidentDeck');
   assert.ok(near(s.frames / SR, 120, 0.02), `${s.frames / SR} s`);
   assert.ok(!tab.kinds().some((k) => /drive (seekhop|accelerate)/.test(k)));
+});
+
+test('an MSE page whose server types its playlist audio/mpegurl or audio/x-mpegurl (HLS types): the playlist the page hands over is read, and the track loads', async () => {
+  for (const type of ['audio/mpegurl', 'audio/x-mpegurl']) {
+    const r = hi();
+    const { result, tab, deck } = await load({ kind: 'mse', rendition: r, preTap: 6, playing: 3, list: true, segUrls: true, types: { [r.list]: type } });
+    assert.equal(result.kind, 'resident', `${type}: ${deck.load.report}`);
+    assert.deepEqual(asked(tab), ['tap on', 'readTralbum', 'fetch', 'fetch'], type);
+    assert.match(deck.load.report, /refetch \(fetching the track's pieces\): ok in \d+\.\d s — 29 pieces fetched/, type);
+  }
+});
+
+test('a piece the page handed over that the engine refuses to read is not the page going away: the load goes on without it', async () => {
+  const r = hi(), tab = makeTab({ kind: 'mse', rendition: r, preTap: 6, playing: 3, list: true, segUrls: true }), engine = makeEngine({ tabs: [tab] });
+  const read = fetcher([tab]), refused = [];
+  const fetchBytes = async (u, o) => {
+    if (tab.blobs.has(u) && new TextDecoder().decode(tab.blobs.get(u).slice(0, 7)) === '#EXTM3U') { refused.push(u); throw new FetchRefused('stream', 'this link is a stream with no end, so there is no whole track to load'); }
+    return read(u, o);
+  };
+  const { deck, loader } = loaderFor(tab, engine, { fetchBytes });
+  const result = await loader.run();
+  await settle();
+  assert.equal(refused.length, 1, 'the playlist the page handed over was refused');
+  assert.equal(result.kind, 'resident', deck.load.report);
+  assert.deepEqual(called(engine, 'failLoadingToLive'), []);
+  assert.doesNotMatch(deck.load.report, /the page changed|could not be read/);
+  assert.match(deck.load.report, /refetch \(fetching the track's pieces\): ok in \d+\.\d s — 29 pieces fetched/);
 });
 
 test('an MSE page with nothing to fetch again is driven: seek-hop, then drive stop', async () => {

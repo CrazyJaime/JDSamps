@@ -573,7 +573,7 @@ class Engine {
       buf = await fetchArrayBuffer(src, { signal: ac.signal, ...(file != null ? { cap: Infinity } : {}) });
     } catch (err) {
       rep.step('fetch', 'failed', err.message);
-      if (err instanceof FetchRefused && err.kind === 'page') return refuse(file != null ? `“${meta.title}” is not audio this browser can play.` : err.message);
+      if (err instanceof FetchRefused && err.kind === 'page') return refuse(err.message);
       return refuse(`${failed}: ${err.message}`);
     }
     if (gone()) return refuse();

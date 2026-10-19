@@ -316,7 +316,13 @@ export class Loader extends Job {
       this.bytes += bytes.byteLength;
       if (this.bytes > this.cap) this.big = true;
       return sink(bytes);
-    }, () => {
+    }, (err) => {
+      // Refused for what it holds (past the cap): the page is still there, and the piece is missing.
+      if (err instanceof FetchRefused) {
+        if (err.kind === 'big') this.big = true;
+        else this.rep.notes.push(`a piece the page handed over was not read: ${err.message}`);
+        return null;
+      }
       // A blob: URL the page minted dies with the page (or its tap was switched off): the page has gone.
       if (!this.signal.aborted && !this.done) this.gone = this.gone || 'a piece the page handed over could not be read';
       return null;

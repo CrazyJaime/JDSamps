@@ -12,14 +12,15 @@ export class FetchRefused extends Error {
   constructor(kind, message) { super(message); this.name = 'FetchRefused'; this.kind = kind; }
 }
 const PAGE_TYPE = /^(text\/html|application\/xhtml\+xml)$/i;
-const STREAM_TYPE = /^audio\/(x-scpls|x-mpegurl|mpegurl)$/i; // a radio station's playlist (.pls, .m3u)
+const STREAM_TYPE = /^audio\/x-scpls$/i; // a radio station's playlist (.pls); an .m3u may be an HLS playlist (RFC 8216), with an end
 const mb = (n) => `${+(n / 2 ** 20).toFixed(1)} MB`;
 
 /**
  * The bytes at a URL. Throws with a plain reason when the fetch fails or the server refuses, and refuses (FetchRefused)
  * a link that sends nothing for `stall` ms, one whose body passes `cap` bytes (or what is left of `budget.left`, shared
  * by several fetches and taken from as bytes come), a stream with no end (no length and past the cap, an Icecast
- * station, a radio playlist) and a web page.
+ * station, a radio playlist) and a web page. A blob: URL holds what was read whole already (a part a page handed over,
+ * typed by its server's answer, or a local file): only the stall and the cap apply to it.
  */
 export async function fetchArrayBuffer(url, { signal, stall = FETCH_STALL, cap = FETCH_CAP, budget = null } = {}) {
   const ac = new AbortController(), abort = () => ac.abort();
@@ -33,8 +34,9 @@ export async function fetchArrayBuffer(url, { signal, stall = FETCH_STALL, cap =
     if (!res.ok) { ac.abort(); throw new Error(`it answered ${res.status}${res.statusText ? ` ${res.statusText}` : ''}`); }
     const type = (res.headers.get('content-type') || '').split(';')[0].trim(), told = res.headers.get('content-length');
     const size = told != null && /^\d+$/.test(told) ? Number(told) : null, limit = Math.min(cap, budget ? budget.left : Infinity);
-    if (PAGE_TYPE.test(type)) throw refuse('page', 'That link is a web page, not an audio file: open it in a tab and add the tab to a deck.');
-    if (STREAM_TYPE.test(type) || [...res.headers.keys()].some((k) => k.toLowerCase().startsWith('icy-'))) throw refuse('stream', 'this link is a stream with no end, so there is no whole track to load');
+    const link = /^https?:/i.test(url);
+    if (link && PAGE_TYPE.test(type)) throw refuse('page', 'That link is a web page, not an audio file: open it in a tab and add the tab to a deck.');
+    if (link && (STREAM_TYPE.test(type) || [...res.headers.keys()].some((k) => k.toLowerCase().startsWith('icy-')))) throw refuse('stream', 'this link is a stream with no end, so there is no whole track to load');
     if (size != null && size > limit) throw refuse('big', `it holds ${(size / 2 ** 20).toFixed(1)} MB, more than the ${mb(limit)} a deck takes`);
     // Read as it comes, into one buffer when its length is known: a body that passes the cap is refused as it does.
     const reader = res.body.getReader(), parts = [];

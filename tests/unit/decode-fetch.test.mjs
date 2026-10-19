@@ -7,6 +7,7 @@ import { fetchArrayBuffer, FetchRefused, FETCH_CAP, FETCH_STALL } from '../../en
 
 let server, origin, served = 0;
 const KB = 1024, chunk = Buffer.alloc(64 * KB, 7);
+const HLS = '#EXTM3U\n#EXT-X-VERSION:7\n#EXT-X-TARGETDURATION:4\n#EXT-X-PLAYLIST-TYPE:VOD\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:4.0,\nseg-00001.m4s\n#EXT-X-ENDLIST\n';
 const routes = {
   // A file with its length.
   '/file.mp3': (req, res) => { const b = Buffer.alloc(300 * KB, 3); res.writeHead(200, { 'content-type': 'audio/mpeg', 'content-length': b.length }); res.end(b); },
@@ -37,6 +38,9 @@ const routes = {
   '/radio.pls': (req, res) => { res.writeHead(200, { 'content-type': 'audio/x-scpls' }); res.end('[playlist]\nFile1=http://radio.example/stream\n'); },
   // A file that says it is larger than the cap.
   '/huge.wav': (req, res) => { res.writeHead(200, { 'content-type': 'audio/wav', 'content-length': String(4 * 2 ** 30) }); res.write(chunk); },
+  // An HLS media playlist with its end, as servers type it: one of the two types RFC 8216 names, and Apache's for .m3u.
+  '/list-mpegurl.m3u8': (req, res) => { res.writeHead(200, { 'content-type': 'audio/mpegurl' }); res.end(HLS); },
+  '/list-x-mpegurl.m3u8': (req, res) => { res.writeHead(200, { 'content-type': 'audio/x-mpegurl' }); res.end(HLS); },
   // A web page (a track's page on a site, pasted instead of its audio).
   '/track-page': (req, res) => { res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' }); res.end('<!doctype html><title>A track</title>'); },
   '/missing.mp3': (req, res) => { res.writeHead(404); res.end(); },
@@ -115,4 +119,19 @@ test('a budget shared by several fetches is a cap on them all', async () => {
 
 test('a web page is refused as one: open it in a tab', async () => {
   await refused(fetchArrayBuffer(`${origin}/track-page`), 'page', /^That link is a web page, not an audio file: open it in a tab and add the tab to a deck\.$/);
+});
+
+test('an HLS playlist typed audio/mpegurl or audio/x-mpegurl is a playlist with an end, not a stream: read whole', async () => {
+  for (const path of ['/list-mpegurl.m3u8', '/list-x-mpegurl.m3u8']) {
+    assert.equal(new TextDecoder().decode(await fetchArrayBuffer(`${origin}${path}`)), HLS, path);
+  }
+});
+
+test('a blob: URL (a part a page handed over, typed by its server\'s answer, or a local file) is read whole whatever its type: the link checks are for links', async () => {
+  for (const type of ['audio/mpegurl', 'audio/x-mpegurl', 'audio/x-scpls', 'text/html', 'application/xhtml+xml', 'text/html; charset=utf-8']) {
+    const url = URL.createObjectURL(new Blob([HLS], { type }));
+    try {
+      assert.equal(new TextDecoder().decode(await fetchArrayBuffer(url)), HLS, type);
+    } finally { URL.revokeObjectURL(url); }
+  }
 });

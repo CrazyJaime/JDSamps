@@ -264,10 +264,10 @@ async function mseOn(a, mime, duration, { prepare, ...opts }) {
   tick();
 }
 function msePage({ list, mime }) {
-  const a = document.getElementById('a');
+  const a = document.getElementById('a'), type = qs.get('listType'); // ?listType=: its playlist served as that Content-Type
   let ready;
   return async () => {
-    ready ||= playlist(list).then(({ init, segs }) => mseOn(a, mime, segs.at(-1).t1, {
+    ready ||= playlist(type ? `${list}?type=${encodeURIComponent(type)}` : list).then(({ init, segs }) => mseOn(a, mime, segs.at(-1).t1, {
       times: segs.map((s) => [s.t0, s.t1]), fetchInit: () => getBytes(init), fetchSeg: (n) => getBytes(segs[n].url),
     }));
     await ready;
@@ -506,7 +506,7 @@ ${audio('/m/media/track.mp3')}`,
       if (p === '/m/data/track') return send(res, 'application/octet-stream', fs.readFileSync(path.join(SITES, 'track.webm')).map((b) => b ^ XOR));
       if (p === '/m/media/opus.m3u8') return send(res, 'application/vnd.apple.mpegurl', master());
       const pl = /^\/m\/media\/([\w-]+)\.m3u8$/.exec(p);
-      if (pl && index().reps[pl[1]]) return send(res, 'application/vnd.apple.mpegurl', m3u8(pl[1], u.searchParams.get('live') === '1'));
+      if (pl && index().reps[pl[1]]) return send(res, u.searchParams.get('type') || 'application/vnd.apple.mpegurl', m3u8(pl[1], u.searchParams.get('live') === '1'));
       if (p.startsWith('/m/media/')) return file(req, res, decodeURIComponent(p.slice('/m/media/'.length)));
       if (Object.hasOwn(pages, name)) return send(res, 'text/html; charset=utf-8', modelPage({ name, ...pages[name](index().signal.seconds) }));
       res.writeHead(404); res.end();

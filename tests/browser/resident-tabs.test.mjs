@@ -307,6 +307,18 @@ test('an MSE page whose segments can be fetched again ends resident: the start i
   await assertReleased(d, site);
 });
 
+test('an MSE page whose server types its playlist audio/mpegurl or audio/x-mpegurl (HLS types) ends resident: the playlist the page fetches again is read', async () => {
+  for (const type of ['audio/mpegurl', 'audio/x-mpegurl']) {
+    const site = await openSite('mse', `autoplay=1&listType=${encodeURIComponent(type)}`);
+    await playing(site.tab);
+    const d = await loadTab(site.tabId);
+    assert.equal(d.kind, 'resident', `${type}: ${JSON.stringify(d.load)}`);
+    assert.match(d.load.report, /\n {2}refetch \(fetching the track's pieces\): ok in \d+\.\d s — \d+ pieces fetched/, type);
+    assert.ok(Math.abs(d.duration - OPUS_END) < 0.015, `${type}: duration ${d.duration}`);
+    await assertReleased(d, site);
+  }
+});
+
 test('an ABR page captured across its quality switch (lo, then hi from 12 s) ends resident from both renditions, with no doubled or missing audio at the switch', async (t) => {
   const site = await openSite('abr', '');
   const d = await loadTab(site.tabId, {

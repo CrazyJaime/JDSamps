@@ -14,7 +14,7 @@ import { validateAgentMessage } from '../../../shared/protocol.js';
 import { gapsFor, AssemblyError } from '../../../engine/assemble.js';
 import { mp3Frames } from '../../../engine/bmff.js';
 import { Loader } from '../../../engine/loader.js';
-import { FetchRefused, FETCH_STALL } from '../../../engine/decode.js';
+import { FetchRefused, FETCH_STALL, fetchArrayBuffer } from '../../../engine/decode.js';
 import { VirtualClock } from './virtual-clock.mjs';
 
 const SITES = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../fixtures/sites');
@@ -67,6 +67,8 @@ export const code = (s) => Math.fround([...String(s)].reduce((n, c) => (n * 31 +
  *   list (the HLS playlist was requested), segUrls (segment requests seen), pageFetch (false: every page fetch fails),
  *   src (a progressive element source URL), tralbum ({url, duration}), files ({url: bytes}, served to the page and the engine),
  *   hang ([url]: links the engine's own fetch of never answers),
+ *   types ({url: Content-Type}: what its server types a link as; the blob the page hands over for it is typed so, as the
+ *   agent makes it from the response, and the engine reads a typed blob through the real fetchArrayBuffer),
  *   errors (reasons reported at tap on), seekhop ('ok' | 'stall' | 'refuse' | 'slow': a piece every 10 ms | 'trickle': stalled where it hops, while the player
  *   appends on elsewhere, so bytes keep coming but never what is missing), accelerate ('ok' | 'refuse' | 'dead': it runs, and
  *   nothing more comes, as from a page whose connection dropped | 'late': it appends the rest after 200 ms), 'dead' for
@@ -86,13 +88,13 @@ export const code = (s) => Math.fround([...String(s)].reduce((n, c) => (n * 31 +
  * }
  */
 export function makeTab({ tabId = 7, url = 'https://site.example/track', frames = 1, ...page } = {}) {
-  const blobs = new Map(), log = [], net = new Map(Object.entries(page.files || {}));
+  const blobs = new Map(), types = new Map(), log = [], net = new Map(Object.entries(page.files || {}));
   for (const r of [page, ...(page.framePages || [])].flatMap((p) => [p.rendition, p.other && p.other.rendition])) {
     if (r) { net.set(r.list, enc(playlist(r, { ts: page.ts }))); net.set(r.init.url, r.init.bytes); for (const s of r.segs) net.set(page.ts ? tsUrl(s.url) : s.url, s.bytes); }
   }
   // Its delays run on a virtual clock: the engine's (makeEngine shares its own with the tabs it is given).
-  const tab = { tabId, url, page, blobs, log, net, frames: [], deck: null, hooks: [], clock: new VirtualClock() };
-  const mint = (bytes) => { const u = `blob:${new URL(url).origin}/${crypto.randomUUID()}`; blobs.set(u, bytes); return u; };
+  const tab = { tabId, url, page, blobs, types, log, net, frames: [], deck: null, hooks: [], clock: new VirtualClock() };
+  const mint = (bytes, type) => { const u = `blob:${new URL(url).origin}/${crypto.randomUUID()}`; blobs.set(u, bytes); if (type) types.set(u, type); return u; };
   for (let i = 0; i < frames; i++) {
     const pg = { ...page, ...((page.framePages || [])[i] || {}) }, r = pg.rendition;
     // The pieces appended before the tap are in the player's buffer: a drive never makes it append them again.
@@ -177,7 +179,7 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
         else emit({ t: 'tap-ready', parts: [{ blobUrl: mint(net.get(t.url)), mime: 'audio/mpeg', kind: 'file', sb: -1, seq: 0 }], duration: t.duration ?? null });
       } else if (m.t === 'fetch') {
         m.urls.forEach((u, seq) => setImmediate(() => {
-          if (pg.pageFetch !== false && net.has(u)) emit({ t: 'tap-ready', parts: [{ blobUrl: mint(net.get(u)), mime: '', kind: 'media', sb: -1, seq }], duration: null });
+          if (pg.pageFetch !== false && net.has(u)) emit({ t: 'tap-ready', parts: [{ blobUrl: mint(net.get(u), (pg.types || {})[u]), mime: '', kind: 'media', sb: -1, seq }], duration: null });
           else emit({ t: 'tap-error', reason: 'fetch', detail: `#${seq}: network error`, seq });
         }));
       } else if (m.t === 'drive' && m.mode !== 'stop') drive(m.mode, m);
@@ -379,15 +381,21 @@ export const decoders = {
 };
 
 /**
- * fetchBytes as the offscreen engine has it (decode.js fetchArrayBuffer): page blob: URLs (dead once the page goes), and
- * the open web with its limits: a link in page.hang never answers and is given up after the stall (on the tabs' clock),
- * and one larger than the budget it is given is refused.
+ * fetchBytes as the offscreen engine has it (decode.js fetchArrayBuffer): page blob: URLs (dead once the page goes; one
+ * typed by page.types read by the real fetchArrayBuffer, from a real blob of that type), and the open web with its
+ * limits: a link in page.hang never answers and is given up after the stall (on the tabs' clock), and one larger than
+ * the budget it is given is refused.
  */
 export function fetcher(tabs) {
   return async (u, { signal, stall = FETCH_STALL, budget = null } = {}) => {
     await turn();
     if (signal && signal.aborted) throw new Error('The operation was aborted.');
-    for (const t of tabs) if (t.blobs.has(u)) return t.blobs.get(u).slice(0);
+    for (const t of tabs) {
+      if (!t.blobs.has(u)) continue;
+      if (!t.types.has(u)) return t.blobs.get(u).slice(0);
+      const real = URL.createObjectURL(new Blob([t.blobs.get(u)], { type: t.types.get(u) }));
+      try { return await fetchArrayBuffer(real, { signal }); } finally { URL.revokeObjectURL(real); }
+    }
     if (!u.startsWith('blob:')) {
       const hung = tabs.find((t) => (t.page.hang || []).includes(u));
       if (hung) {
