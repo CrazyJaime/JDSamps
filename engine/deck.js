@@ -341,7 +341,7 @@ export class Deck {
    */
   tempoInfo(p = this.ts ? this.ts.posAt(this.now()) : 0) {
     const g = this.tempo ? this.tempo.get() : null;
-    const grid = this.grids.at(p);
+    const grid = this.gridAt(p);
     let native = null;
     if (grid) native = 60 / grid.T / this.src.rateAt(p);
     else if (g && g.inBpm) native = g.inBpm / this.assist.sourceRate;
@@ -1217,7 +1217,7 @@ export class Deck {
     const starved = this.starved;
     const T = this.ts.soon(now) + 0.02;
     const mb = this.engine.clock.beat(T);
-    const p = this.ts.posAt(T), g = this.grids.at(p), rate = this.ts.rateAt(T);
+    const p = this.ts.posAt(T), g = this.gridAt(p), rate = this.ts.rateAt(T);
     if (!mb || !g || !(rate > 0)) return;
     const e = phaseError(lastBeatOut(g, p, rate, T), g.T / rate, mb.lastBeat, mb.period);
     this.phaseMs = e * 1000;
@@ -1245,9 +1245,24 @@ export class Deck {
     else if (plan.kind === 'jump') { this.sched(T, { input: this.ts.clampInput(p + plan.seconds * rate) }); this.settleUntil = T + 0.3; }
   }
 
+  /**
+   * The grid of the audio at input position p, for its beat and tempo as heard: in a grid map segment of the track the
+   * tracker follows, its clock as the live edge passed p, when that was in the segment. The segment's own grid is one
+   * for all of it: until a later gap is found, the live clock, which follows the beats at the live edge, seconds on,
+   * and takes in a gap there before it is found (a master's clock published from it moved 10 ms off its audio's beat,
+   * a gap found 6 s late, and its followers bent after it); once frozen, the beats just before that gap, off those
+   * before a step in it the tracker never found.
+   */
+  gridAt(p) {
+    const s = this.grids.seg(p), t = this.tempo;
+    if (!s || !s.grid || !t || t.seeded || t.tapped || !t.heardGrid || s.track !== t.track.n) return s ? s.grid : null;
+    const h = t.heardGrid(Math.round(p * t.sr), s.from * t.sr);
+    return h ? { ...s.grid, t0: h.t0, T: h.T } : s.grid;
+  }
+
   masterInfo(now) {
     if (!this.ts) return null;
-    const p = this.ts.posAt(now), g = this.grids.at(p), rate = this.ts.rateAt(now), out = this.tempoInfo(p).out;
+    const p = this.ts.posAt(now), g = this.gridAt(p), rate = this.ts.rateAt(now), out = this.tempoInfo(p).out;
     if (!out) return null;
     const playing = this.wantPlay && !this.previewing && this.ts.playingAt(now);
     // One clock: the tempo of the beat actually being played — nudge, bend and starve clamp

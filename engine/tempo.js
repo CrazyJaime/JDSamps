@@ -683,6 +683,16 @@ export class DeckTempo {
   }
 
   /**
+   * The beat clock {t0, T} (input s) as the live edge passed input frame `at`, when that was at frame `from` or later,
+   * else null: the grid of the audio there before any later capture gap pulled the clock.
+   */
+  heardGrid(at, from) {
+    let h = null;
+    for (const e of this.hist) { if (e.t <= at) h = e; else break; }
+    return h && h.t >= from ? { t0: h.t0 / this.sr, T: h.T / this.sr } : null;
+  }
+
+  /**
    * Lock to a whole-track analysis (engine/analysis.js) instead of tracking the live edge: a resident
    * deck holds its whole track, so its grid is known everywhere from the start. The clock is the grid
    * of the analysis's last segment (the deck writes the clock into its grid map's last segment, as for

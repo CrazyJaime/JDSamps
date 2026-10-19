@@ -464,3 +464,87 @@ test('a follower through two gaps, the first found 4 ms off: at the second it ju
   assert.ok(Math.abs(after - before) < 1, `${(after - before).toFixed(1)} ms off its beat after the second gap; jumped ${got}`);
   assert.ok(w.bend < 0.002, `bent ${(w.bend * 100).toFixed(2)} %`);
 });
+
+// The grid at a playhead seconds behind the live edge is the tracker's live clock until a later gap is found, and the
+// live clock follows the beats at the live edge: through a later gap not found yet, which it takes in. A master
+// publishes its clock from the grid at its playhead, so its clock moved off its own audio's beat by that much, and its
+// followers bent after it (seen in the live-sync acceptance; here a master's capture whose gap was found 6 s late).
+
+/** Onsets (input s) in a capture fixture's tracker input: peaks of one band, as the live-sync judge reads them. */
+function captureOnsets(c, band, T) {
+  const v = c[band], spf = c.spf / c.sr, on = [], vals = [], peaks = [];
+  for (let i = 1; i + 1 < v.length; i++) if (v[i] > v[i - 1] && v[i] >= v[i + 1]) peaks.push(i);
+  const hi = peaks.map((i) => v[i]).sort((a, b) => a - b), ref = hi[Math.floor(hi.length * 0.9)];
+  for (const i of peaks) {
+    if (v[i] < 0.3 * ref) continue;
+    const a = v[i - 1], b = v[i], q = v[i + 1], qq = a - 2 * b + q, x = (c.t0 + i * c.spf) / c.sr + (qq < 0 ? (0.5 * (a - q)) / qq : 0) * spf;
+    if (on.length && x - on[on.length - 1] < 0.6 * T) { if (b > vals[vals.length - 1]) { on[on.length - 1] = x; vals[vals.length - 1] = b; } continue; }
+    on.push(x); vals.push(b);
+  }
+  return on;
+}
+
+test('a master whose live clock takes in a gap not found yet (one run\'s capture): its clock stays on its audio\'s beat, and its follower never bends', async () => {
+  const c = JSON.parse(fs.readFileSync(new URL('./fixtures/live-late-gap-capture.json', import.meta.url), 'utf8'));
+  const clock = { t: 100 }, engine = makeEngine(clock), T = 60 / 128, on = captureOnsets(c, 'full', T);
+  engine.params['assist.on'] = false;
+  const m = makeDeck(engine, clock, { id: 1, slot: 1, bpm: 128, liveEdge: 600, capSec: 1e7 });
+  const d = makeDeck(engine, clock, { id: 2, slot: 2, bpm: 124, t0: 0.11, liveEdge: 600, capSec: 1e7 });
+  const feed = replays(m, c);
+  run(engine, clock, 8, feed); // the playhead 8 s behind its live edge: the 49.9 s gap is found as it reaches 48 s
+  await m.act('play');
+  engine.clock.follow(1);
+  run(engine, clock, 2, feed);
+  assert.deepEqual(await d.act('syncPlay'), { ok: true });
+  // The master's audio beat (its last onset played since its last change of segment) against its published clock, and
+  // the follower's bends, up to 47 s (its capture's own -7 ms step at 47.13 s was never found: its audio is off every
+  // grid after it, and the follower follows it there by the phase loop).
+  const offs = [];
+  let bend = 0;
+  watch(engine, clock, d, 50, { onTick: (t) => {
+    feed(t);
+    const p = m.node.posAt(t), seg = m.node.segAt(t), mb = engine.clock.beat(t);
+    if (p < 47) bend = Math.max(bend, bendOf(d, t));
+    if (!seg.active || !(seg.rate > 0) || !mb) return;
+    let b = 0;
+    while (b + 1 < on.length && on[b + 1] <= p) b++;
+    if (on[b] >= seg.input) offs.push({ p, e: phaseError(t - (p - on[b]) / seg.rate, T / seg.rate, mb.lastBeat, mb.period) * 1000 });
+  } });
+  assert.ok(m.ts.posAt(clock.t) > 51, `played to input ${m.ts.posAt(clock.t).toFixed(1)} s, past the gap found late`);
+  const es = offs.map((o) => o.e).sort((a, b) => a - b), base = es[es.length >> 1];
+  const off = offs.filter((o) => o.p > 10 && o.p < 47 && Math.abs(o.e - base) > 3).map((o) => `${(o.e - base).toFixed(1)} ms at ${o.p.toFixed(2)} s`);
+  assert.deepEqual(off.filter((x, i) => i % 10 === 0), [], `the master's clock off its audio's beat by over 3 ms ${off.length} times`);
+  assert.ok(bend < 0.002, `the follower bent ${(bend * 100).toFixed(2)} %`);
+});
+
+test('a follower whose live grid takes in a gap of its own not found yet (the same capture): it stays on the master\'s beat, unbent', async () => {
+  // The follower's phase loop measured its beat on that grid too: an error that was not in its audio, bent away 1.4 %.
+  const c = JSON.parse(fs.readFileSync(new URL('./fixtures/live-late-gap-capture.json', import.meta.url), 'utf8'));
+  const clock = { t: 100 }, engine = makeEngine(clock), T = 60 / 128, on = captureOnsets(c, 'full', T);
+  engine.params['assist.on'] = false;
+  const m = makeDeck(engine, clock, { id: 1, slot: 1, bpm: 124, liveEdge: 600, capSec: 1e7 });
+  const d = makeDeck(engine, clock, { id: 2, slot: 2, bpm: 128, liveEdge: 600, capSec: 1e7 });
+  const feed = replays(d, c);
+  await m.act('play');
+  engine.clock.follow(1);
+  run(engine, clock, 8, feed); // the follower's playhead will be 8 s behind its live edge
+  assert.deepEqual(await d.act('syncPlay'), { ok: true });
+  // The follower's audio beat (its last onset played since its last change of segment) against the master's clock, and
+  // its bends, up to 47 s (its capture's own -7 ms step at 47.13 s was never found).
+  const offs = [];
+  let bend = 0;
+  run(engine, clock, 50, (t) => {
+    feed(t);
+    const p = d.node.posAt(t), seg = d.node.segAt(t), mb = engine.clock.beat(t);
+    if (p < 47) bend = Math.max(bend, bendOf(d, t));
+    if (!seg.active || !(seg.rate > 0) || !mb) return;
+    let b = 0;
+    while (b + 1 < on.length && on[b + 1] <= p) b++;
+    if (on[b] >= seg.input) offs.push({ p, e: phaseError(t - (p - on[b]) / seg.rate, T / seg.rate, mb.lastBeat, mb.period) * 1000 });
+  });
+  assert.ok(d.ts.posAt(clock.t) > 47, `played to input ${d.ts.posAt(clock.t).toFixed(1)} s`);
+  const es = offs.filter((o) => o.p > 10).map((o) => o.e).sort((a, b) => a - b), base = es[es.length >> 1];
+  const off = offs.filter((o) => o.p > 10 && o.p < 47 && Math.abs(o.e - base) > 4).map((o) => `${(o.e - base).toFixed(1)} ms at ${o.p.toFixed(2)} s`);
+  assert.deepEqual(off.filter((x, i) => i % 10 === 0), [], `the follower's audio off the master's beat by over 4 ms ${off.length} times`);
+  assert.ok(bend < 0.002, `the follower bent ${(bend * 100).toFixed(2)} %`);
+});
