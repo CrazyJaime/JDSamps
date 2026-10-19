@@ -149,3 +149,72 @@ test('a live deck TAPped 15 ms after its onsets, then a capture gap found: the g
   const off = [(beatOf(segs[k - 1].grid, before) - click(before)) * 1000, (beatOf(segs[k].grid, after) - click(after, 0.012)) * 1000];
   assert.ok(off.every((x) => Math.abs(x - 15) < 2), `the grids before and after the gap at ${segs[k].from.toFixed(2)} s are ${off.map((x) => x.toFixed(1)).join(' and ')} ms off the clicks`);
 });
+
+// Where no onsets are, the tracker's measured beats are onset-function noise: the strongest peak within T/6 of each
+// clock beat, wherever it falls. A master's clock published from their median swung by up to 190 ms in a breakdown, and
+// its followers bent after it again and again. There, its beat is its clock's as the live edge passed.
+
+/** A house track of `a` bars, a breakdown of `b` bars (`pad`: no drums), house again for `c` bars, at `bpm`. */
+function withBreakdown(bpm, a, b, c, pad) {
+  const parts = [synth({ ...PATTERNS.house, bpm, bars: a, tail: 0, seed: 3 }), synth({ ...pad, bpm, bars: b, tail: 0, seed: 4 }), synth({ ...PATTERNS.house, bpm, bars: c, tail: 0, seed: 5 })];
+  const x = new Float32Array(parts.reduce((n, p) => n + p.x.length, 0)), T = 60 / bpm;
+  let at = 0;
+  for (const p of parts) { x.set(p.x, at); at += p.x.length; }
+  return { x, T, from: a * 4 * T, to: (a + b) * 4 * T };
+}
+
+/** Run `s` seconds: master m's audio beat (input s, on its grid of period T from 0) against its published clock at each tick, ms. */
+function published(engine, clock, m, T, s, feed) {
+  const offs = [];
+  run(engine, clock, s, (t) => {
+    feed(t);
+    const p = m.node.posAt(t), seg = m.node.segAt(t), mb = engine.clock.beat(t);
+    if (!seg.active || !(seg.rate > 0) || !mb) return;
+    const e = (t - (p - Math.floor(p / T) * T) / seg.rate - mb.lastBeat) * 1000, P = Math.min(T / seg.rate, mb.period) * 1000;
+    offs.push({ p, e: e - Math.round(e / P) * P });
+  });
+  return offs;
+}
+
+for (const [name, pad] of [['a chord pad', { pat: [['chord', [0, 2], 0.15]], padDb: -12 }], ['a held pad', { pat: [], padDb: -10 }], ['silence', { pat: [], padDb: -Infinity, noiseDb: -Infinity }]]) {
+  test(`a live master through an 8-bar breakdown of ${name}: its published clock never follows onset noise`, async () => {
+    const clock = { t: 100 }, engine = makeEngine(clock), bpm = 124;
+    engine.params['assist.on'] = false;
+    const m = makeDeck(engine, clock, { id: 1, slot: 1, bpm, liveEdge: 600, capSec: 1e7 });
+    const { x, T, from, to } = withBreakdown(bpm, 12, 8, 12, pad), feed = tracks(m, x);
+    run(engine, clock, 6, feed); // the playhead 6 s behind its live edge
+    await m.act('play');
+    engine.clock.follow(1);
+    run(engine, clock, 8, feed);
+    const offs = published(engine, clock, m, T, to + 4 - m.ts.posAt(clock.t), feed), es = offs.filter((o) => o.p < from).map((o) => o.e).sort((a, b) => a - b);
+    const b0 = es[es.length >> 1], inBd = offs.filter((o) => o.p > from && o.p < to);
+    assert.ok(m.ts.posAt(clock.t) > to + 1, `played to input ${m.ts.posAt(clock.t).toFixed(1)} s, past the breakdown`);
+    let step = 0, at = null, worst = 0;
+    for (let i = 1; i < inBd.length; i++) if (Math.abs(inBd[i].e - inBd[i - 1].e) > step) { step = Math.abs(inBd[i].e - inBd[i - 1].e); at = inBd[i].p; }
+    for (const o of inBd) worst = Math.max(worst, Math.abs(o.e - b0));
+    // (Its clock as the live edge passed drifts off the grid in the breakdown, smoothly: up to 35 ms.)
+    assert.ok(step < 20, `its clock stepped ${step.toFixed(1)} ms in a tick at input ${at && at.toFixed(2)} s (worst ${worst.toFixed(1)} ms off its grid)`);
+    assert.ok(worst < 40, `its clock ${worst.toFixed(1)} ms off its grid in the breakdown`);
+    const after = offs.filter((o) => o.p > to + 1.5).map((o) => Math.abs(o.e - b0));
+    assert.ok(Math.max(...after) < 3, `${Math.max(...after).toFixed(1)} ms off its grid after the breakdown`);
+  });
+}
+
+for (const [name, audio, beats] of [['a kick-only loop', () => clicks(70, 124), 0], ['a house loop', () => synth({ ...PATTERNS.house, bars: 36, tail: 0 }).x, 32]]) {
+  test(`2× on a live master playing ${name}: its published clock stays on its audio's beats`, async () => {
+    const clock = { t: 100 }, engine = makeEngine(clock), T = 60 / 124;
+    engine.params['assist.on'] = false;
+    const m = makeDeck(engine, clock, { id: 1, slot: 1, bpm: 124, liveEdge: 600, capSec: 1e7 });
+    const feed = tracks(m, audio());
+    run(engine, clock, 8, feed);
+    await m.act('play');
+    engine.clock.follow(1);
+    run(engine, clock, 4, feed);
+    const was = published(engine, clock, m, T, 4, feed).map((o) => o.e).sort((a, b) => a - b), b0 = was[was.length >> 1];
+    assert.deepEqual(await m.act('mult', { factor: 2 }), { ok: true });
+    run(engine, clock, 3, feed);
+    const offs = published(engine, clock, m, T, 15, feed), over = offs.filter((o) => Math.abs(o.e - b0) > 5);
+    // (Base: 0 and 32 of 469 ticks; where the house loop's hats and bass between its kicks pull the tracker's grid.)
+    assert.ok(over.length <= beats, `${over.length} of ${offs.length} ticks over 5 ms off its beat: ${over.filter((o, i) => i % 20 === 0).map((o) => `${(o.e - b0).toFixed(1)} ms at ${o.p.toFixed(2)} s`).join(', ')}`);
+  });
+}

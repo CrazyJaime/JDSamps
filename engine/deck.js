@@ -1248,11 +1248,12 @@ export class Deck {
   /**
    * The grid of the audio at input position p, for its beat and tempo as heard: in a grid map segment of the track the
    * tracker follows, at the period its clock had as the live edge passed p, through the beats the tracker measured
-   * there (in the segment, within 1.5 s); without three of them, its clock then, when that was in the segment. The
-   * segment's own grid is one for all of it: until a later gap is found, the live clock, which follows the beats at the
-   * live edge, seconds on, and takes in a gap there before it is found (a master's clock published from it moved 10 ms
-   * off its audio's beat, a gap found 6 s late, and its followers bent after it); once frozen, the beats just before
-   * that gap. The clock as the live edge passed p can still be settling after a burst of gaps (7-8 ms off its beats).
+   * there (in the segment, within 1.5 s); unless they agree (DeckTempo.beatNear), its clock then, when that was in the
+   * segment. The segment's own grid is one for all of it: until a later gap is found, the live clock, which follows the
+   * beats at the live edge, seconds on, and takes in a gap there before it is found (a master's clock published from it
+   * moved 10 ms off its audio's beat, a gap found 6 s late, and its followers bent after it); once frozen, the beats
+   * just before that gap. The clock as the live edge passed p can still be settling after a burst of gaps (7-8 ms off
+   * its beats).
    */
   gridAt(p) {
     const segs = this.grids.segs, s = this.grids.seg(p), t = this.tempo;

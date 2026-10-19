@@ -696,21 +696,33 @@ export class DeckTempo {
    * Where the beats measured at the live edge (this.heard: each beat's onset in the window, the last 16 s) put a beat
    * near input frame `at`: the median of those between frames `from` and `to` within 1.5 s of it, each carried there
    * at period T, moved by the DJ's GRID nudge (gridOffset: the grid is theirs, the onsets only the tracker's); null
-   * with fewer than 3.
+   * with fewer than 3, or unless three in four of them are within 4 ms of it. Where no onsets are (a breakdown, the
+   * beats between a kick-only track's at 2×), the strongest peak near a beat is noise, anywhere within T/6 of it.
    */
   beatNear(at, T, from = -Infinity, to = Infinity) {
     const w = 1.5 * this.sr, xs = [];
-    for (const x of this.heard) if (x >= from && x < to && Math.abs(x - at) <= w) xs.push(x + Math.round((at - x) / T) * T);
+    let ref = null; // (each carried to the beat of the first nearest `at`: midway, the beats nearest it are two)
+    for (const x of this.heard) {
+      if (x < from || x >= to || Math.abs(x - at) > w) continue;
+      if (ref == null) ref = x + Math.round((at - x) / T) * T;
+      xs.push(x + Math.round((ref - x) / T) * T);
+    }
     if (xs.length < 3) return null;
     xs.sort((x, y) => x - y);
-    return xs[xs.length >> 1] + this.gridOffset;
+    const m = xs[xs.length >> 1], tol = 0.004 * this.sr;
+    let n = 0;
+    for (const x of xs) if (Math.abs(x - m) <= tol) n++;
+    return n >= 3 && 4 * n >= 3 * xs.length ? m + this.gridOffset : null;
   }
 
-  /** Keep where the window's beats rs ({beat, r}, oldest first) are, each its onset, over what was kept for that span. */
+  /**
+   * Keep where the window's beats rs ({beat, r, edge}, oldest first) are, each its onset, over what was kept for that
+   * span; not those with no onset peak near them (silence: every value the same, which put them all T/6 early).
+   */
   noteBeats(rs) {
     if (!rs.length) return;
     const T = this.clock.T, lo = rs[0].beat - T / 2, h = this.heard.filter((x) => x < lo && x > this.tracker.lastT - 16 * this.sr);
-    for (const x of rs) h.push(x.beat + x.r);
+    for (const x of rs) if (!x.edge) h.push(x.beat + x.r);
     this.heard = h;
   }
 
@@ -842,7 +854,8 @@ export class DeckTempo {
 
   /**
    * Each beat of the clock grid, moved back by `shift` (input frames), since input frame `from` (at most the last 8 s),
-   * with the offset r (input frames) of the strongest onset within T/6 of it: {beat, r}, oldest first.
+   * with the offset r (input frames) of the strongest onset within T/6 of it: {beat, r, edge}, oldest first; edge when
+   * that is at either end (the onset function only rises or falls there, or is flat).
    */
   beatOffsets(from, shift = 0) {
     const tr = this.tracker, { T } = this.clock, t0 = this.clock.t0 - shift, spf = tr.spf;
@@ -861,7 +874,7 @@ export class DeckTempo {
       if (ci - half < 1) continue;
       let bi = ci - half; for (let i = bi + 1; i <= ci + half; i++) if (s[i] > s[bi]) bi = i;
       const a = s[bi - 1], b = s[bi], d = s[bi + 1], q = a - 2 * b + d;
-      out.push({ beat, r: (bi + (q < 0 ? (0.5 * (a - d)) / q : 0) - c) * spf });
+      out.push({ beat, r: (bi + (q < 0 ? (0.5 * (a - d)) / q : 0) - c) * spf, edge: bi === ci - half || bi === ci + half });
     }
     return out;
   }
