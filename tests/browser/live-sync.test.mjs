@@ -197,7 +197,9 @@ test('two synced live decks: a minute of master recording at one tempo and on on
   }
   // In the engine: how far each deck's scheduled rate left the rate it is synced to, its playhead jumps, and the box's
   // own capture trouble: a jump nowhere near a spliced gap is one of its capture skips, a dropout its stretcher
-  // running dry. Those stretches (from 1 s before to 2 s after) are reported, and left out of the bounds below.
+  // running dry. Those stretches (from 1 s before to 2 s after; to 8 s after a skip over 25 ms, which leaves both decks'
+  // captures lagging and catching up for seconds, so their grids settle and the follower follows) are reported, and
+  // left out of the bounds below.
   const eng = {}, rough = [];
   for (const slot of [1, 2]) {
     const xs = ticks.filter((x) => x[1] === slot), jumps = [];
@@ -208,11 +210,11 @@ test('two synced live decks: a minute of master recording at one tempo and on on
       const d = p1 - (p0 + ((r0 + r1) / 2) * (t1 - t0)), jump = Math.abs(d) > 0.004;
       const spliced = heard.some((g) => g.slot === slot && Math.abs(g.p - p0) < 2 && Math.abs(d + g.ms / 1000) < 0.006); // a drop is jumped back
       if (jump) jumps.push(`${(d * 1000).toFixed(1)} ms at ${p0.toFixed(2)} s${spliced ? '' : ' (its own)'}`);
-      if ((jump && !spliced) || dry1 > dry0) rough.push({ slot, t: t1 - recFrom, what: jump && !spliced ? `a ${(d * 1000).toFixed(0)} ms capture skip` : 'a dropout' });
+      if ((jump && !spliced) || dry1 > dry0) rough.push({ slot, t: t1 - recFrom, until: jump && !spliced && Math.abs(d) > 0.025 ? 8 : 2, what: jump && !spliced ? `a ${(d * 1000).toFixed(0)} ms capture skip` : 'a dropout' });
     }
     eng[slot] = { bend, jumps, at: at ? `at ${at[2].toFixed(2)} s (phase ${at[6] == null ? '-' : at[6].toFixed(1)} ms just before)` : '' };
   }
-  const smooth = (x) => !rough.some((r) => x > r.t - 1 && x < r.t + 2);
+  const smooth = (x) => !rough.some((r) => x > r.t - 1 && x < r.t + r.until);
   const m = beatMatch(rec, onsetBias(124, 'low', 'low') - onsetBias(128, 'high', 'high'));
   const all = m.off.filter((o) => o.t > 0.15 && o.t < m.seconds - 0.15), off = all.filter((o) => smooth(o.t)).map((o) => Math.abs(o.ms)).sort((x, y) => x - y);
   const med = off[off.length >> 1], max = off.at(-1);
