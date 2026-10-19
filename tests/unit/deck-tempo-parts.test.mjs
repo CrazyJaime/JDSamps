@@ -1,7 +1,7 @@
 // A file holding tracks at unrelated tempi (an album or a mix in one file, spec §8.5): a correction (½× / 2×,
 // GRID, a typed tempo, a TAP, the BPM range) acts on the analysed segment the DJ hears and on any segment at a
-// related tempo, never on an unrelated tempo elsewhere in the file. One song whose tempo drifts is still corrected
-// piece by piece as a whole (deck-piecewise-retime).
+// related tempo, never on an unrelated tempo elsewhere in the file. One song whose tempo drifts, even far enough
+// that the analysis cuts it into tempo segments, is one part: corrected piece by piece as a whole (19a1f8a).
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { makeEngine, makeDeck } from './fixtures/deck-harness.mjs';
@@ -17,9 +17,26 @@ function album(tracks) {
   return { x, spans };
 }
 
+/** One song whose tempo moves bar by bar from `a` to `b` BPM over `bars` bars: the file and its true beats (s), one span. */
+function drifting(a, b, bars) {
+  const pieces = [], truth = [];
+  let t = 0;
+  for (let k = 0; k < bars; k++) {
+    const s = synth({ ...PATTERNS.house, bpm: a + ((b - a) * k) / (bars - 1), bars: 1, tail: 0.7, seed: 5 + k, padDb: -60 });
+    pieces.push({ at: t, x: s.x });
+    for (const tb of s.truth) truth.push(t + tb);
+    t += 4 * s.beatSec;
+  }
+  const x = new Float32Array(Math.ceil((t + 0.7) * FS));
+  for (const p of pieces) { const s = Math.round(p.at * FS); for (let i = 0; i < p.x.length && s + i < x.length; i++) x[s + i] += p.x[i]; }
+  return { x, spans: [{ from: 0, to: t, truth }] };
+}
+
 const FILES = {
   two: () => album([{ pattern: 'house', bpm: 100, bars: 30, seed: 11 }, { pattern: 'techno', bpm: 128, bars: 36, seed: 23 }]),
   back: () => album([{ pattern: 'house', bpm: 100, bars: 24, seed: 11 }, { pattern: 'techno', bpm: 128, bars: 30, seed: 23 }, { pattern: 'house', bpm: 100, bars: 24, seed: 31 }]),
+  drift: () => drifting(108, 120, 96), // 5 % a minute, over 3 min
+  fast: () => drifting(116, 128, 48), // 7 % a minute, over 1.5 min
 };
 const made = new Map();
 function file(name) {
@@ -149,4 +166,52 @@ test('a correction made in one track applies to a track at a related tempo later
   assertIntact(d, a1, 100, '2× in the related track puts the first back');
   assertIntact(d, a2, 100, '2× where it was made');
   assertIntact(d, b, 128, 'the unrelated track between');
+});
+
+test('one song whose tempo drifts far enough to be cut into tempo segments is one part', () => {
+  const bad = [];
+  for (const name of ['drift', 'fast']) {
+    const a = file(name).analysis, tag = a.segments.map((s) => `${s.from.toFixed(0)}s:${(60 / s.grid.T).toFixed(1)}:${s.part}`).join(' ');
+    // Blocks more than 2 % from the first of their tempo segment start another: this one is cut at least twice.
+    assert.ok(a.segments[0].grid.T / a.segments[a.segments.length - 1].grid.T > 1.04, `${name}: drifts too little to be cut: ${tag}`);
+    if (new Set(a.segments.map((s) => s.part)).size !== 1) bad.push(`${name}: ${tag}`);
+  }
+  assert.deepEqual(bad, []);
+});
+
+// Each correction made at 10 s into one song drifting from 108 to 120 BPM: it reaches the end of the song, each piece
+// scaled or moved as the one heard is (19a1f8a). want(the grid at 10 s) checks each probe's grid g0 -> g1 (null: right).
+const along = (s) => { const ps = []; for (let p = 10; p < s.to - 5; p += 15) ps.push(p); return ps; };
+const scaled = (k) => (g0, g1) => Math.abs(g0.T / g1.T / k - 1) < 1e-9 ? null : `${(60 / g0.T).toFixed(2)} -> ${(60 / g1.T).toFixed(2)} BPM, not ×${k}`;
+const moved = (by) => (g0, g1) => Math.abs(g1.t0 - g0.t0 - by(g0)) < 1e-9 && g1.T === g0.T ? null : `moved ${((g1.t0 - g0.t0) * 1000).toFixed(1)} ms, not ${(by(g0) * 1000).toFixed(1)}`;
+const DRIFT = [
+  { name: '½×', act: (d) => d.act('mult', { factor: 0.5 }), want: () => scaled(0.5) },
+  { name: '2×', act: (d) => d.act('mult', { factor: 2 }), want: () => scaled(2) },
+  { name: 'a typed 110 BPM', act: (d) => d.act('setNativeBpm', { bpm: 110 }), want: (first) => scaled(110 / (60 / first.T)) },
+  { name: 'GRID +½', act: (d) => d.act('gridShift', { beats: 0.5 }), want: () => moved((g) => g.T / 2) },
+  { name: 'GRID +10 ms', act: (d) => d.act('gridShift', { ms: 10 }), want: () => moved(() => 0.01) },
+  { name: 'the BPM range 55-115', act: (d, engine) => { engine.params['bpm.range'] = '55-115'; d.setRange(55, 115); return { ok: true }; }, want: () => scaled(0.5) },
+];
+
+for (const c of DRIFT) {
+  test(`${c.name} made at the start of one song whose tempo drifts reaches its end`, async () => {
+    const { d, clock, engine, spans: [s] } = await resident('drift');
+    const probes = along(s), before = probes.map((p) => ({ ...d.grids.at(p) }));
+    parkAt(d, clock, 10);
+    assert.deepEqual(await c.act(d, engine), { ok: true });
+    const want = c.want(before[0]), bad = probes.map((p, i) => [p, want(before[i], d.grids.at(p))]).filter(([, e]) => e);
+    assert.ok(!bad.length, `after ${c.name} at 10 s: ${bad.map(([p, e]) => `${p} s ${e}`).join('; ')}`);
+  });
+}
+
+test('a TAP and TAP 1 at the start of one song whose tempo drifts reach its end', async () => {
+  const { d, clock, spans: [s] } = await resident('drift');
+  const probes = along(s), before = probes.map((p) => ({ ...d.grids.at(p) }));
+  await tapBeats(d, clock, s, 10);
+  assert.equal(d.tempo.get().tapped, true, 'the tracker follows the song, so it holds the TAP');
+  const k = probes.map((p, i) => before[i].T / d.grids.at(p).T);
+  assert.ok(k.every((v) => Math.abs(v / k[0] - 1) < 1e-9), `each piece scaled alike: ${k.map((v) => v.toFixed(5)).join(', ')}`);
+  assert.deepEqual(await d.act('tap1', { t: 10 }), { ok: true });
+  const bar1 = probes.map((p) => d.grids.at(p).bar1);
+  assert.ok(bar1[0] != null && bar1.every((b) => b === bar1[0]), `bar 1 along the song: ${bar1.join(', ')}`);
 });
