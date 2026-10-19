@@ -35,9 +35,9 @@ export const TIMES = Object.freeze({
   grace: 2000,       // after the hub has asked the tab's frames to connect: their agents' ports follow at once
   settle: 700,       // after the player's length is known: the tap's errors, links and kept inits are on their way
   duration: 8000,    // the most to wait for the player to say how long the track is (a stream says it has no end after 3 s)
-  idle: 2000,        // a player that still holds nothing this long after the tap is on has not been started (its play button not pressed)
+  idle: 2000,        // a player that holds nothing this long after the tap is on was not started (play not pressed)
   start: 30000,      // the most to wait for the DJ to start such a player on the tab
-  file: 65000,      // the page's track link (the agent gives it 60 s)
+  file: 65000,       // the page's track link (the agent gives it 60 s)
   fetchEach: 15000,  // per eight links fetched by the page (the agent gives each 15 s)
   stall: 5000,       // a seek-hop that brings no new audio this long is given up for accelerate
   drive: 30000,      // a drive's budget: this, plus drivePerSec for each second of the track
@@ -80,7 +80,7 @@ const UNREADABLE = ['drm', 'worker']; // decisive, and the page's bytes cannot b
 const NO_LENGTH = "the page's player has not said how long the track is";
 const TAB_CAP = 600 * 2 ** 20;       // bytes from one tab: each frame's tap holds at most this, and so does the whole tab
 const NO_STAMPS = /^audio\/(mpeg|mp3|aac|x-aac)\b/i; // placed in append order only: never seek-hopped
-const DRIVE_RATE = 16;             // accelerate: the most a media element takes (the agent's limit too); byte capture is lossless at any rate
+const DRIVE_RATE = 16;               // accelerate: the most a media element takes; capturing bytes is lossless at any rate
 const FETCHED = 1e6;                 // placement keys of fetched batches, clear of the tap's SourceBuffers (frame * 1000 + sb)
 
 class Stop extends Error {
@@ -1071,7 +1071,8 @@ export class DirectReport {
 // ---------------------------------------------------------------- recording a whole track (§4.4)
 // Opt-in (the ⓘ action, or the setting that does it without asking): for a page whose bytes cannot be had, the live
 // deck's own capture records the tab's sound while its player runs the track at 2× from the start (pitch unlocked),
-// and the recording is slowed back by 2. Whatever lay above a quarter of the media's rate (12 kHz at 48 kHz) is gone, and the deck says so.
+// and the recording is slowed back by 2. Whatever lay above a quarter of the media's rate (12 kHz at 48 kHz) is gone,
+// and the deck says so.
 const REC_RATE = 2;
 const AUDIBLE = 0.003; // about -50 dBFS, as a deck's first audible sample
 const HOLD_MS = 700;   // the player held silent at the start: longer than a recorder batch and the capture's delay

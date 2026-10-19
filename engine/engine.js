@@ -532,7 +532,8 @@ class Engine {
     const deck = this.decks.get(r.deckId), ac = new AbortController(), load = { abort: () => ac.abort() };
     this.loads.set(deck.id, load);
     const gone = () => ac.signal.aborted || this.decks.get(deck.id) !== deck || this.leaving.has(deck);
-    const rep = new DirectReport(file != null ? { file } : { url: src }), say = (o) => deck.setLoad({ ...o, report: rep.text(o.strategy) });
+    const rep = new DirectReport(file != null ? { file } : { url: src });
+    const say = (o) => deck.setLoad({ ...o, report: rep.text(o.strategy) });
     const tick = setInterval(() => { if (gone() || rep.result) clearInterval(tick); else deck.setLoad({ report: rep.text(deck.load.strategy) }); }, 1000);
     const refuse = async (error) => {
       const cancelled = gone();
