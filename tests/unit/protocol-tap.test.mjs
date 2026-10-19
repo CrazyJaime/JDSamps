@@ -35,6 +35,15 @@ test('tap-progress may say how a drive of the player is going', () => {
   }
 });
 
+test('tap-progress may name the web source its player plays (src): an http(s) link only', () => {
+  const m = { t: 'tap-progress', bytes: 1, buffered: [], duration: 180, mimes: [] };
+  const src = 'https://cdn.example.com/track.mp3?sig=abc';
+  assert.deepEqual(validateAgentMessage({ ...m, src }), { ...m, src });
+  for (const bad of ['blob:https://example.com/0f8e7d6c-5b4a-4392-8170-6f5e4d3c2b1a', 'javascript:alert(1)', 'data:audio/mp3,x', `https://e.com/${'a'.repeat(9000)}`, 5, null]) {
+    assert.deepEqual(validateAgentMessage({ ...m, src: bad }), m, String(bad).slice(0, 60));
+  }
+});
+
 test('tap-urls: media requests with method, Range and size; only http(s) links', () => {
   const r = { url: 'https://cdn.example.com/a/seg-00004.m4s?sig=abc', method: 'GET', range: 'bytes=0-999', size: 1000, media: true };
   assert.deepEqual(validateAgentMessage({ t: 'tap-urls', reqs: [r] }), { t: 'tap-urls', reqs: [r] });

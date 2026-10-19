@@ -563,7 +563,9 @@ test('the Sources drawer loads a link to an audio file; anything but a web link 
   await field.fill('  https://example.com/a.mp3  ');
   await field.press('Enter');
   await wait(50);
-  assert.deepEqual((await loadActs('loadUrl')).map((m) => [m.deck, m.arg]), [[null, { url: 'https://example.com/a.mp3' }]]);
+  const [sentLink, more] = await loadActs('loadUrl');
+  assert.deepEqual([sentLink.deck, sentLink.arg.url, more], [null, 'https://example.com/a.mp3', undefined]);
+  assert.match(sentLink.arg.token, /^[0-9a-f-]{36}$/, 'with a token its deck will show');
   assert.equal(await field.inputValue(), '', 'cleared once sent');
   await page.locator('#sources [data-close]').click();
 });
@@ -577,8 +579,8 @@ async function loadLink(url) {
   await wait(30);
   return (await loadActs('loadUrl')).find((m) => m.arg.url === url);
 }
-/** kinds() with more decks after the first three, each loading the way loadFile/loadUrl's deck does (no tab). Engine
- *  deck ids only ever rise, so theirs are above any an earlier test showed. */
+/** kinds() with more decks after the first three, each loading the way loadFile/loadUrl's deck does (no tab; its load's
+ *  token in its snapshot). Engine deck ids only ever rise, so theirs are above any an earlier test showed. */
 const withLoading = (...more) => kinds((s) => { s.decks.push(...more.map((o) => loadingDeck({ title: 'long', url: '', ...o }))); });
 const lastAct = async (a, deckId) => (await sent('act', (m) => m.a === a && m.deck === deckId)).at(-1);
 
@@ -591,7 +593,7 @@ test('a cancel the DJ asked for is not an error: no warning after ✕, a held ej
   try {
     // ✕, twice in quick succession: one loadCancel, and the link's "Loading was cancelled." says nothing.
     const link = await loadLink('https://example.com/long.mp3');
-    await show(withLoading({ id: 91, slot: 4, url: 'https://example.com/long.mp3' }));
+    await show(withLoading({ id: 91, slot: 4, url: 'https://example.com/long.mp3', load: { token: link.arg.token } }));
     await deckEl(4).locator('[data-act="loadCancel"]').dblclick();
     await wait(50);
     const cancels = await sent('act', (m) => m.a === 'loadCancel');
@@ -605,7 +607,7 @@ test('a cancel the DJ asked for is not an error: no warning after ✕, a held ej
     await drop('.board', [{ name: 'b.mp3', type: 'audio/mpeg' }]);
     await wait(30);
     const file = (await loadActs('loadFile')).at(-1);
-    await show(withLoading({ id: 92, slot: 4 }));
+    await show(withLoading({ id: 92, slot: 4, load: { token: file.arg.token } }));
     const b = await deckEl(4).locator('[data-act="eject"]').boundingBox();
     await page.mouse.move(b.x + b.width / 2, b.y + b.height / 2);
     await page.mouse.down();
@@ -619,7 +621,7 @@ test('a cancel the DJ asked for is not an error: no warning after ✕, a held ej
     assert.deepEqual(await revoked(), [file.arg.blobUrl]);
     // STOP ALL, confirmed.
     const all = await loadLink('https://example.com/all.mp3');
-    await show(withLoading({ id: 93, slot: 4, url: 'https://example.com/all.mp3' }));
+    await show(withLoading({ id: 93, slot: 4, url: 'https://example.com/all.mp3', load: { token: all.arg.token } }));
     page.once('dialog', (d) => d.accept());
     await page.locator('#stopAllBtn').click();
     await wait(50);
@@ -630,7 +632,7 @@ test('a cancel the DJ asked for is not an error: no warning after ✕, a held ej
     assert.deepEqual(await toasts(), []);
     // A load nobody cancelled still says why it failed.
     const bad = await loadLink('https://example.com/missing.mp3');
-    await show(withLoading({ id: 94, slot: 4, url: 'https://example.com/missing.mp3' }));
+    await show(withLoading({ id: 94, slot: 4, url: 'https://example.com/missing.mp3', load: { token: bad.arg.token } }));
     await show(kinds());
     await reply(bad.id, false, ERROR);
     await wait(50);
@@ -657,7 +659,7 @@ test('a load still loading after the engine\'s answer time keeps waiting, and se
   try {
     // A link whose deck loads past the answer time, then turns into a whole track: never a warning.
     const link = await loadLink('https://example.com/slow-link.mp3');
-    await show(withLoading({ id: 101, slot: 4, url: 'https://example.com/slow-link.mp3' }));
+    await show(withLoading({ id: 101, slot: 4, url: 'https://example.com/slow-link.mp3', load: { token: link.arg.token } }));
     await wait(late);
     assert.deepEqual(await toasts(), [], 'no time-out while its deck loads');
     await show(resident({ id: 101, slot: 4 }));
@@ -668,7 +670,7 @@ test('a load still loading after the engine\'s answer time keeps waiting, and se
     await drop('.board', [{ name: 'long.mp3', type: 'audio/mpeg' }]);
     await wait(30);
     const file = (await loadActs('loadFile')).at(-1);
-    await show(withLoading({ id: 102, slot: 5 }));
+    await show(withLoading({ id: 102, slot: 5, load: { token: file.arg.token } }));
     await wait(late);
     assert.deepEqual(await revoked(), [], 'still loading');
     await show(resident({ id: 102, slot: 5 }));
@@ -679,14 +681,14 @@ test('a load still loading after the engine\'s answer time keeps waiting, and se
     await drop('.board', [{ name: 'gone.mp3', type: 'audio/mpeg' }]);
     await wait(30);
     const gone = (await loadActs('loadFile')).at(-1);
-    await show(withLoading({ id: 103, slot: 4 }));
+    await show(withLoading({ id: 103, slot: 4, load: { token: gone.arg.token } }));
     await wait(late);
     await show(kinds());
     await wait(2200);
     assert.deepEqual((await revoked()).at(-1), gone.arg.blobUrl, 'gone: settled');
     // A deck gone with its answer close behind: the answer says why.
     const bad = await loadLink('https://example.com/bad.mp3');
-    await show(withLoading({ id: 104, slot: 4, url: 'https://example.com/bad.mp3' }));
+    await show(withLoading({ id: 104, slot: 4, url: 'https://example.com/bad.mp3', load: { token: bad.arg.token } }));
     await wait(late);
     await show(kinds());
     await reply(bad.id, false, '“bad” is not audio this browser can play.');
@@ -702,6 +704,148 @@ test('a load still loading after the engine\'s answer time keeps waiting, and se
     assert.deepEqual((await revoked()).at(-1), lost.arg.blobUrl);
   } finally {
     await answerMs(was);
+    await manual(false);
+  }
+});
+
+test('a tab load that turns tabless (released) between two file loads never takes a file load\'s place: each follows its own deck, by its token', async () => {
+  const answerMs = (v) => page.evaluate(async (x) => { const { ACT_MS } = await import('/ui/connection.js'); const old = ACT_MS.loadFile; ACT_MS.loadFile = ACT_MS.loadUrl = x; return old; }, v);
+  await show(kinds());
+  await spyRevoke();
+  await manual(true);
+  await ui.clearSent();
+  await clearToasts();
+  const was = await answerMs(300);
+  const fileDeck = (id, slot, act, make = loadingDeck) => make({ id, slot, title: act.arg.name.replace(/\.mp3$/, ''), url: '', load: { token: act.arg.token } });
+  try {
+    await drop('.board', [{ name: 'first.mp3', type: 'audio/mpeg' }]);
+    await wait(30);
+    const a = (await loadActs('loadFile')).at(-1);
+    // A tab's deck comes before either file's, loading; the second file is dropped meanwhile.
+    await show(kinds((s) => { s.decks.push(loadingDeck({ id: 501, slot: 4, tabId: 77, title: 'A tab', url: 'https://a.example/x' })); }));
+    await drop('.board', [{ name: 'second.mp3', type: 'audio/mpeg' }]);
+    await wait(30);
+    const b = (await loadActs('loadFile')).at(-1);
+    assert.notEqual(a.arg.token, b.arg.token);
+    // The tab's deck holds its track and lets its tab go (no tab now), ahead of the two files' decks.
+    const tab = residentDeck({ id: 501, slot: 4, title: 'A tab' });
+    await show(kinds((s) => { s.decks.push(tab, fileDeck(502, 5, a), fileDeck(503, 6, b)); }));
+    await wait(700); // past both answer times: each load follows its deck now
+    assert.deepEqual(await revoked(), [], 'no file let go while its own deck still loads');
+    await show(kinds((s) => { s.decks.push(tab, fileDeck(502, 5, a), fileDeck(503, 6, b, residentDeck)); }));
+    await wait(50);
+    assert.deepEqual(await revoked(), [b.arg.blobUrl], 'the second file is done once its own deck holds the track');
+    // ✕ on the first file's deck: that load, and no other, ends without a word.
+    await deckEl(5).locator('[data-act="loadCancel"]').click();
+    await wait(50);
+    await reply((await lastAct('loadCancel', 502)).id, true);
+    await show(kinds((s) => { s.decks.push(tab, fileDeck(503, 6, b, residentDeck)); }));
+    await reply(a.id, false, 'Loading was cancelled.');
+    await wait(50);
+    assert.deepEqual(await toasts(), []);
+    assert.deepEqual((await revoked()).sort(), [a.arg.blobUrl, b.arg.blobUrl].sort());
+  } finally {
+    await answerMs(was);
+    await manual(false);
+  }
+});
+
+test('a file load follows the deck showing its token, past tabless loading decks made before it and never seen with a tab: a recording, another deck page\'s link', async () => {
+  const answerMs = (v) => page.evaluate(async (x) => { const { ACT_MS } = await import('/ui/connection.js'); const old = ACT_MS.loadFile; ACT_MS.loadFile = ACT_MS.loadUrl = x; return old; }, v);
+  await show(kinds());
+  await spyRevoke();
+  await manual(true);
+  await ui.clearSent();
+  await clearToasts();
+  const was = await answerMs(300);
+  try {
+    await drop('.board', [{ name: 'mine.mp3', type: 'audio/mpeg' }]);
+    await wait(30);
+    const a = (await loadActs('loadFile')).at(-1);
+    // Ahead of the file's deck: a whole track recorded from a live deck's page (no tab, no token) and a link loaded on
+    // another deck page (its own token). Matched by deck order, the file's load would take the first of them.
+    const rec = (make = loadingDeck) => make({ id: 504, slot: 4, title: 'A tab (recorded from the page — reduced highs)', url: 'https://a.example/x' });
+    const other = (make = loadingDeck) => make({ id: 505, slot: 5, title: 'other', url: 'https://example.com/other.mp3', load: { token: 'other-page-token' } });
+    const mine = (make = loadingDeck) => make({ id: 506, slot: 6, title: 'mine', url: '', load: { token: a.arg.token } });
+    await show(kinds((s) => { s.decks.push(rec(), other(), mine()); }));
+    await wait(700); // past the answer time: the load follows its deck now
+    await show(kinds((s) => { s.decks.push(rec(residentDeck), other(residentDeck), mine()); }));
+    await wait(50);
+    assert.deepEqual(await revoked(), [], 'the file was let go while its own deck still loads');
+    // ✕ on its own deck: the load ends without a word, and lets go of the file.
+    await deckEl(6).locator('[data-act="loadCancel"]').click();
+    await wait(50);
+    await reply((await lastAct('loadCancel', 506)).id, true);
+    await show(kinds((s) => { s.decks.push(rec(residentDeck), other(residentDeck)); }));
+    await reply(a.id, false, 'Loading was cancelled.');
+    await wait(50);
+    assert.deepEqual(await toasts(), []);
+    assert.deepEqual(await revoked(), [a.arg.blobUrl]);
+  } finally {
+    await answerMs(was);
+    await manual(false);
+  }
+});
+
+test('a tab loaded from the Sources drawer is followed to its whole track: said once when it holds it, and not at all after a cancel the DJ asked for', async () => {
+  const TAB = { id: 55, title: 'A tab', url: 'https://a.example/x', favIconUrl: '', audible: true, granted: true, deckSlot: null };
+  await show(kinds());
+  await manual(true);
+  await ui.clearSent();
+  await clearToasts();
+  // LOAD_TAB answers when the test says (window.__tabReply).
+  await page.evaluate((t) => {
+    window.__fake.hubReplies.LIST_SOURCES = { ok: true, tabs: [t] };
+    window.__fake.hubReplies.LOAD_TAB = () => new Promise((r) => { window.__tabReply = r; });
+  }, TAB);
+  const loadTab = async () => {
+    await page.locator('#sourcesBtn').click();
+    await page.locator('#sourceList [data-load]').first().click();
+    await page.locator('#sources [data-close]').click();
+    await wait(30);
+  };
+  const answer = (r) => page.evaluate((x) => window.__tabReply(x), r);
+  const tabDeck = (id, make = loadingDeck) => make({ id, slot: 4, tabId: make === loadingDeck ? 55 : null, title: 'A tab', url: TAB.url, load: make === loadingDeck ? { strategy: 'running the player through the track' } : {} });
+  const cancel = async (id) => {
+    await deckEl(4).locator('[data-act="loadCancel"]').click();
+    await wait(50);
+    await reply((await lastAct('loadCancel', id)).id, true);
+    await show(kinds());
+  };
+  try {
+    // A hub that answers once the whole track is in: ✕ on the loading deck, and its "Loading was cancelled." says nothing.
+    await loadTab();
+    await show(kinds((s) => { s.decks.push(tabDeck(511)); }));
+    await cancel(511);
+    await answer({ ok: false, error: 'Loading was cancelled.' });
+    await wait(50);
+    assert.deepEqual(await toasts(), []);
+    // A hub that answers once the deck is made: nothing is said while it loads, nor after the DJ cancels it.
+    await loadTab();
+    await answer({ ok: true, deckId: 512, slot: 4 });
+    await show(kinds((s) => { s.decks.push(tabDeck(512)); }));
+    await wait(50);
+    assert.deepEqual(await toasts(), [], 'nothing said while the track loads');
+    await cancel(512);
+    await wait(50);
+    assert.deepEqual(await toasts(), []);
+    // One that loads: said once, when its deck holds the track (and has let its tab go).
+    await loadTab();
+    await answer({ ok: true, deckId: 513, slot: 4 });
+    await show(kinds((s) => { s.decks.push(tabDeck(513)); }));
+    await wait(50);
+    assert.deepEqual(await toasts(), []);
+    await show(kinds((s) => { s.decks.push(tabDeck(513, residentDeck)); }));
+    await wait(50);
+    assert.deepEqual(await toasts(), ['Loaded onto a deck. It is cued: press PLAY when ready.']);
+    // A load the hub refuses still says why.
+    await clearToasts();
+    await loadTab();
+    await answer({ ok: false, error: 'That tab is already on deck 2.' });
+    await wait(50);
+    assert.deepEqual(await toasts(), ['That tab is already on deck 2.']);
+  } finally {
+    await page.evaluate(() => { window.__fake.hubReplies.LIST_SOURCES = { ok: true, tabs: [] }; delete window.__fake.hubReplies.LOAD_TAB; });
     await manual(false);
   }
 });
@@ -732,7 +876,7 @@ test('a link pasted on the board is offered for loading; a paste into a text fie
   assert.deepEqual(await loadActs('loadUrl'), [], 'nothing loads until asked');
   await offer.getByRole('button', { name: 'Load' }).click();
   await wait(50);
-  assert.deepEqual((await loadActs('loadUrl')).map((m) => m.arg), [{ url: 'https://example.com/b.mp3' }]);
+  assert.deepEqual((await loadActs('loadUrl')).map((m) => m.arg.url), ['https://example.com/b.mp3']);
   assert.equal(await offer.count(), 0, 'the offer goes once taken');
 });
 

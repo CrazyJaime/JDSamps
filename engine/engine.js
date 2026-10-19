@@ -47,6 +47,7 @@ class Engine {
     this.decks = new Map();
     this.loads = new Map(); // deck id → its load in progress ({abort()}): loadCancel and eject stop it
     this.tabStops = new WeakMap(); // deck → its STOP_TAB (sent once)
+    this.leaving = new WeakSet(); // decks an eject has been asked for: it takes them in their turn on serial()
     this.nextId = 1;
     this.clock = new MasterClock();
     this.ui = new Set();
@@ -221,8 +222,19 @@ class Engine {
     await this.ready;
     switch (msg.type) {
       case ENGINE.START: return this.startTab(msg);
-      case ENGINE.EJECT: { const d = this.deckByTab(msg.tabId); if (d) await this.eject(d.id, msg.reason); return { ok: true }; }
-      case ENGINE.META: { const d = this.deckByTab(msg.tabId); if (d) Object.assign(d.meta, msg.meta || {}); return { ok: true }; }
+      case ENGINE.EJECT: {
+        const d = this.deckByTab(msg.tabId);
+        if (!d) return { ok: true };
+        // The tab was closed: a deck still loading from it goes, said once here (its load ends cancelled, quietly).
+        if (d.kind === 'loading' && this.loads.has(d.id)) this.event('error', `Deck ${d.slot}: the tab was closed before the track was in.`, d.id);
+        await this.eject(d.id, msg.reason);
+        return { ok: true };
+      }
+      case ENGINE.META: {
+        const d = this.deckByTab(msg.tabId);
+        if (d) { Object.assign(d.meta, msg.meta || {}); if (d.loader) d.loader.poke(); } // a load waits on no page that moved on
+        return { ok: true };
+      }
       case ENGINE.PING: return { ok: true, decks: [...this.decks.values()].map((d) => ({ tabId: d.tabId, slot: d.slot })) };
       case ENGINE.DOWNLOAD_DONE: {
         if (this.downloadsSettled.has(msg.url)) return { ok: true };
@@ -382,7 +394,7 @@ class Engine {
    * A deck that shows as loading while its track is on the way: its chain is built, nothing plays. It
    * holds a tab's capture (streamId), if given, for a fall-back to live.
    */
-  async startLoadingDeck({ tabId = null, streamId = null, meta = {} } = {}) {
+  async startLoadingDeck({ tabId = null, streamId = null, meta = {}, token = null } = {}) {
     const no = await this.readyForDeck(tabId);
     if (no) return { ok: false, error: no };
     let stream = null;
@@ -390,6 +402,7 @@ class Engine {
       try { stream = await this.tabStream(streamId); } catch (err) { return { ok: false, error: `Chrome would not share that tab's audio: ${err.message}` }; }
     }
     const deck = this.newDeck({ tabId, stream, meta, kind: 'loading' });
+    if (token) deck.setLoad({ token }); // in its first snapshot: the deck page knows its load's deck by it
     try {
       await deck.build();
     } catch (err) {
@@ -411,7 +424,7 @@ class Engine {
     let deck = null;
     if (deckId != null) {
       deck = this.decks.get(deckId);
-      if (!deck) return { ok: false, error: 'That deck is gone.' };
+      if (!deck || this.leaving.has(deck)) return { ok: false, error: 'That deck is gone.' };
       if (deck.kind !== 'loading' || deck.ts.liveEdge > 0) return { ok: false, error: `Deck ${deck.slot} is not waiting for a track.` };
     } else {
       const no = await this.readyForDeck(tabId);
@@ -436,7 +449,7 @@ class Engine {
       this.event('warn', `Deck ${deck.slot}: no beat grid from the whole track (${err.message}). TAP the beat.`, deck.id);
     }
     if (deckId == null) this.addDeck(deck);
-    else if (this.decks.get(deck.id) !== deck) return { ok: false, error: 'That deck is gone.' };
+    else if (this.decks.get(deck.id) !== deck || this.leaving.has(deck)) return { ok: false, error: 'That deck is gone.' }; // ejected meanwhile: not loaded
     this.event('info', `Loaded “${deck.meta.title || 'track'}” on deck ${deck.slot}. It is cued: press PLAY when you're ready.`, deck.id);
     return { ok: true, deckId: deck.id, slot: deck.slot };
   }
@@ -464,7 +477,8 @@ class Engine {
   /** A loading deck holding a tab's capture plays it live after all; the reason is said once. */
   async failLoadingToLive(deckId, reason) {
     const d = this.decks.get(deckId);
-    if (!d || d.kind !== 'loading') return { ok: false, error: d ? `Deck ${d.slot} is not loading.` : 'That deck is gone.' };
+    if (!d || this.leaving.has(d)) return { ok: false, error: 'That deck is gone.' };
+    if (d.kind !== 'loading') return { ok: false, error: `Deck ${d.slot} is not loading.` };
     if (!d.stream) return { ok: false, error: `Deck ${d.slot} has no tab audio to play live.` };
     this.abortLoad(deckId);
     try {
@@ -479,29 +493,29 @@ class Engine {
   }
 
   /** A local file, as the deck page's blob: URL for it. */
-  loadFile({ name, blobUrl }) {
+  loadFile({ name, blobUrl, token }) {
     const title = trackTitle(name) || 'track';
-    return this.loadDirect(blobUrl, { title }, { strategy: 'reading the file', failed: `Could not read “${title}”` });
+    return this.loadDirect(blobUrl, { title }, { strategy: 'reading the file', failed: `Could not read “${title}”`, token });
   }
 
   /** A link to an audio file, fetched here. */
-  loadUrl({ url }) {
+  loadUrl({ url, token }) {
     const u = new URL(url);
     let name = u.pathname;
     try { name = decodeURIComponent(name); } catch (_) {}
-    return this.loadDirect(url, { title: trackTitle(name) || u.hostname, url }, { strategy: 'fetching the link', failed: 'Could not fetch that link' });
+    return this.loadDirect(url, { title: trackTitle(name) || u.hostname, url }, { strategy: 'fetching the link', failed: 'Could not fetch that link', token });
   }
 
   /**
    * Fetch and decode a whole track onto a new deck, which shows as loading meanwhile. Settles when the
    * deck is resident ({ok:true}), or with the reason it is not (the deck is gone again).
    */
-  async loadDirect(src, meta, { strategy, failed }) {
-    const r = await this.serial(() => this.startLoadingDeck({ meta }));
+  async loadDirect(src, meta, { strategy, failed, token }) {
+    const r = await this.serial(() => this.startLoadingDeck({ meta, token }));
     if (!r.ok) return r;
     const deck = this.decks.get(r.deckId), ac = new AbortController(), load = { abort: () => ac.abort() };
     this.loads.set(deck.id, load);
-    const gone = () => ac.signal.aborted || this.decks.get(deck.id) !== deck;
+    const gone = () => ac.signal.aborted || this.decks.get(deck.id) !== deck || this.leaving.has(deck);
     const refuse = async (error) => {
       const cancelled = gone();
       if (this.loads.get(deck.id) === load) this.loads.delete(deck.id);
@@ -582,7 +596,7 @@ class Engine {
     this.abortLoad(id);
     // Stopping the tab starts now, ahead of the queue, so STOP ALL stops every tab in parallel.
     const d0 = this.decks.get(id);
-    if (d0) this.stopTab(d0);
+    if (d0) { this.leaving.add(d0); this.stopTab(d0); }
     return this.serial(async () => {
       const d = this.decks.get(id);
       if (!d) return;

@@ -47,6 +47,16 @@ test('loadFile / loadUrl / loadCancel / recordWhole are valid UI actions; junk i
   bad({ t: 'act', deck: null, a: 'loadCancel', arg: {} }); // a deck action
 });
 
+test('loadFile / loadUrl may carry a token of up to 64 characters, which the deck page matches its load by', () => {
+  const tok = 'a'.repeat(64), file = { name: 'a.mp3', blobUrl: 'blob:chrome-extension://x/y' }, link = { url: 'https://example.com/a.mp3' };
+  assert.deepEqual(validateUiMessage({ t: 'act', deck: null, a: 'loadFile', arg: { ...file, token: tok } }).arg, { ...file, token: tok });
+  assert.deepEqual(validateUiMessage({ t: 'act', deck: null, a: 'loadUrl', arg: { ...link, token: 'f81d4fae-7dec-11d0-a765-00a0c91e6bf6' } }).arg, { ...link, token: 'f81d4fae-7dec-11d0-a765-00a0c91e6bf6' });
+  assert.deepEqual(validateUiMessage({ t: 'act', deck: null, a: 'loadUrl', arg: link }).arg, link, 'none given: none passed on');
+  for (const token of ['', 'a'.repeat(65), 7, {}, ['x']]) {
+    for (const [a, arg] of [['loadFile', file], ['loadUrl', link]]) assert.equal(validateUiMessage({ t: 'act', deck: null, a, arg: { ...arg, token } }).ok, false, `${a} ${JSON.stringify(token)}`);
+  }
+});
+
 test('the resident track limit (1..60 min, default 15) and whole-track recording (default off) are persisted settings', () => {
   const d = defaults(MASTER_PARAMS);
   assert.equal(d['resident.limitMin'], 15);

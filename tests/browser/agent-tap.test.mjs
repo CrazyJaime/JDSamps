@@ -713,6 +713,25 @@ describe('the URL and element layers', { concurrency: 2 }, () => {
     await checkPosted(p);
     await p.close();
   });
+
+  test('tap-progress names the web source the player plays (src), and none for a Media Source player', async () => {
+    const p = await tapPage('', { page: '/blank.html' });
+    await connect(p);
+    await p.run(`(() => { const a = document.getElementById('a'); a.src = '/fx/mp3/track.mp3'; return new Promise((r) => { a.onloadedmetadata = r; }); })()`);
+    await send(p, { t: 'tap', on: true });
+    await waitFor(async () => !!(await lastProgress(p)), 5000);
+    assert.equal((await lastProgress(p)).src, `${server.origin}/fx/mp3/track.mp3`);
+    await checkPosted(p);
+    await p.close();
+    const m = await tapPage('set=short&n=4&dur=16&manual');
+    await connect(m);
+    await send(m, { t: 'tap', on: true });
+    await m.run('window.__go()');
+    await waitFor(async () => { const x = await lastProgress(m); return !!x && x.mimes.length > 0; }, 10000);
+    assert.equal((await lastProgress(m)).src, undefined, 'a blob: source is no link to fetch');
+    await checkPosted(m);
+    await m.close();
+  });
 });
 
 // ---------------------------------------------------------------- disguise

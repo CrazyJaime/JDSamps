@@ -644,6 +644,9 @@
     const msg = { t: 'tap-progress', bytes: tap.bytes, buffered: rangesOf(el), duration: durOf(el), mimes: [...tap.mimes].slice(0, 16) };
     const own = sbsOf(el);
     if (own) msg.sbs = own;
+    let src = '';
+    try { src = el ? el.currentSrc : ''; } catch (_) {}
+    if (/^https?:/i.test(src)) { const u = absUrl(src); if (u) msg.src = u; } // the file it plays: the loader fetches it again first
     if (drv.mode) msg.drive = { mode: drv.mode, state: drv.state, at: Math.max(0, drv.mode === 'seekhop' ? drv.cursor : el.currentTime) };
     const s = JSON.stringify(msg);
     if (s === tp.last) return;

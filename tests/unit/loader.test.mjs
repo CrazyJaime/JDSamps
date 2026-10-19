@@ -4,7 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SITES, firstRung, parseHls, findStart } from '../../engine/loader.js';
 import { defaults, MASTER_PARAMS, PERSISTED_MASTER_KEYS, validateUiMessage } from '../../shared/protocol.js';
-import { load, rendition, file, mp3, code, DUR, SR, OPUS, makeTab, makeEngine, loaderFor, fetcher, settle, turn, decoders } from './fixtures/loader-harness.mjs';
+import { load, rendition, file, mp3, code, DUR, SR, OPUS, makeTab, makeEngine, loaderFor, fetcher, settle, turn, decoders, FAST } from './fixtures/loader-harness.mjs';
 
 const hi = () => rendition('opus-hi');
 const called = (engine, fn) => engine.calls.filter((c) => c.fn === fn);
@@ -43,6 +43,26 @@ test('an HLS playlist is read: a master names its variants, a media playlist its
   assert.equal(parseHls('#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI="k"\n#EXTINF:4,\ns0.ts\n', 'https://c.example/x.m3u8'), null, 'encrypted segments cannot be decoded');
 });
 
+test('an HLS playlist of MPEG-TS pieces is told apart: no init, and .ts pieces or an mp2t hint', () => {
+  const at = 'https://c.example/m/a.m3u8', list = (lines) => parseHls(['#EXTM3U', ...lines, '#EXT-X-ENDLIST', ''].join('\n'), at);
+  assert.equal(list(['#EXTINF:4,', 's0.ts', '#EXTINF:4,', 's1.ts?tok=1']).ts, true);
+  assert.equal(list(['#EXTINF:4,', 'seg?n=0&mime=video%2Fmp2t']).ts, true);
+  assert.equal(list(['#EXTINF:4,', 'seg?n=0', '#EXT-X-MEDIA-TYPE:video/mp2t']).ts, true);
+  assert.equal(list(['#EXT-X-MAP:URI="init.mp4"', '#EXTINF:4,', 's0.m4s']).ts, undefined, 'fMP4 pieces with their init');
+  assert.equal(list(['#EXTINF:4,', 's0.aac', '#EXTINF:4,', 's1.aac']).ts, undefined, 'packed audio (ADTS) decodes as it is');
+  assert.equal(list(['#EXTINF:4,', 's0.mp3']).ts, undefined);
+});
+
+test('an MSE page whose playlist is MPEG-TS skips fetching its pieces again (they cannot be decoded), says so, and drives the player', async () => {
+  const r = hi();
+  const { result, tab, deck, engine } = await load({ kind: 'mse', rendition: r, preTap: 0, playing: 1, list: true, ts: true });
+  assert.equal(result.kind, 'resident', JSON.stringify(called(engine, 'failLoadingToLive')));
+  assert.deepEqual(asked(tab), ['tap on', 'readTralbum', 'fetch', 'drive seekhop']);
+  assert.deepEqual(tab.sent().find((m) => m.t === 'fetch').urls, [r.list], 'the playlist only: no piece is fetched');
+  assert.match(deck.load.report, /refetch \(fetching the track's pieces\): skipped in \d+\.\d s — the playlist's pieces are MPEG-TS, which cannot be decoded directly/);
+  assert.equal(deck.load.report.match(/^ +refetch/gm).length, 1, 'not tried again after the drive');
+});
+
 // ---------------------------------------------------------------- the ladder
 test('a Bandcamp-like page loads from its own track link: readTralbum, and nothing else', async () => {
   const link = 'https://site.example/stream/track.mp3';
@@ -65,6 +85,19 @@ test('a progressive page re-fetches its player\'s media link from the page, chec
   assert.deepEqual(tab.sent().find((m) => m.t === 'fetch').urls, [link]);
   assert.equal(called(engine, 'startResidentDeck')[0].code, code('ratefight'));
   assert.ok(!tab.kinds().includes('drive seekhop') && !tab.kinds().includes('drive accelerate'), 'never driven');
+});
+
+test('a progressive page re-fetches its heard player\'s own source first, ahead of media the page fetched before it', async () => {
+  const link = 'https://site.example/media/track.mp3', ads = [1, 2, 3].map((k) => `https://ads.example/jingle-${k}.mp3`);
+  const files = { [link]: file('track', 120), ...Object.fromEntries(ads.map((u) => [u, file('jingle', 30)])) };
+  const { result, tab, engine } = await load({ kind: 'progressive', src: link, fetched: ads, files });
+  assert.equal(result.kind, 'resident', JSON.stringify(called(engine, 'failLoadingToLive')));
+  assert.deepEqual(tab.sent().filter((m) => m.t === 'fetch').map((m) => m.urls), [[link]], 'its own source, first and only');
+  assert.equal(called(engine, 'startResidentDeck')[0].code, code('track'));
+  // When the tap does not say which source the player plays, the links go in the order the page asked for them.
+  const blind = await load({ kind: 'progressive', src: link, fetched: ads.slice(0, 1), files, elSrc: false });
+  assert.deepEqual(blind.tab.sent().filter((m) => m.t === 'fetch').map((m) => m.urls), [[ads[0]], [link]]);
+  assert.equal(blind.result.kind, 'resident');
 });
 
 test('a media link the page cannot fetch (no CORS) is fetched by the engine itself', async () => {
@@ -164,6 +197,36 @@ for (const [reason, re] of [['drm', /protected/], ['worker', /worker/], ['previe
   });
 }
 
+/** load() options: the page reports `reason` as the loader does `when` (a command it sends, or 'beat': the analysis). */
+const lateError = (reason, when) => ({
+  before: ({ tab, engine }) => {
+    let fired = false;
+    const fire = () => { if (!fired) { fired = true; setImmediate(() => tab.frames[0].emit({ t: 'tap-error', reason, detail: `late ${reason}` })); } };
+    if (when !== 'beat') { tab.hooks.push((m) => { if (when(m)) fire(); }); return; }
+    const f = engine.analyse.bind(engine);
+    engine.analyse = async (pcm, s) => { fire(); await settle(10); return f(pcm, s); };
+  },
+});
+for (const [reason, re] of [['drm', /protected/], ['worker', /worker/], ['preview', /30-second preview/], ['live', /live stream/]]) {
+  for (const [stage, page, when, before] of [
+    ['while the pieces are fetched', { kind: 'mse', rendition: hi(), preTap: 6, playing: 2, list: true, segUrls: true }, (m) => m.t === 'fetch', ['tap on', 'readTralbum', 'fetch']],
+    ['while the player is driven', { kind: 'mse', rendition: hi(), preTap: 0, playing: 1 }, (m) => m.t === 'drive' && m.mode === 'seekhop', ['tap on', 'readTralbum', 'drive seekhop']],
+    ['while the beat is found', { kind: 'progressive', src: 'https://site.example/t.mp3', files: { 'https://site.example/t.mp3': file('t', 120.0065) } }, 'beat', ['tap on', 'readTralbum', 'fetch']],
+  ]) {
+    test(`${reason} said after the first look, ${stage}: live at once with its one message, nothing more asked of the page, nothing promoted`, async () => {
+      const { result, engine, tab } = await load(page, lateError(reason, when));
+      assert.equal(result.kind, 'live', JSON.stringify(result));
+      assert.deepEqual(called(engine, 'startResidentDeck'), []);
+      const f = called(engine, 'failLoadingToLive');
+      assert.equal(f.length, 1);
+      assert.match(f[0].reason, re);
+      assert.equal(engine.events.filter((e) => /^Deck 1: /.test(e.text)).length, 1, 'said once');
+      assert.deepEqual(asked(tab), before, 'nothing fetched again, driven or run faster after it');
+      if (stage.includes('driven')) assert.ok(tab.kinds().includes('drive stop'));
+    });
+  }
+}
+
 test('a stream with no end goes live without trying the slower rungs', async () => {
   const { result, engine, tab } = await load({ kind: 'mse', rendition: hi(), preTap: 6, list: true, segUrls: true, duration: Infinity, liveAfter: 60 });
   assert.equal(result.kind, 'live');
@@ -213,14 +276,22 @@ test('progress only goes up, and says in plain words what the loader is doing', 
   assert.equal(deck.load.progress, 1);
 });
 
-test('a resident load releases the tab: STOP_TAB, the capture stopped, the agents tapped off and let go, then the tab forgotten', async () => {
+test('a resident load releases the tab in order: STOP_TAB answered, then the capture stopped, the agents tapped off and let go, then the tab forgotten', async () => {
   const link = 'https://site.example/media/track.mp3';
-  const { tab, engine, deck } = await load({ kind: 'progressive', src: link, files: { [link]: file('a', 120) } });
-  const stop = engine.order.indexOf('STOP_TAB'), changed = engine.order.lastIndexOf('DECKS_CHANGED');
-  assert.ok(stop >= 0 && changed > stop, engine.order.join());
-  assert.equal(engine.hubLog[stop].tabId, 7, 'STOP_TAB for the source tab');
-  assert.equal(engine.hubLog[stop].release, true, 'a release: the tab is paused, never left muted');
-  assert.deepEqual(engine.hubLog[changed].decks, [], 'the hub forgets the tab');
+  const { tab, engine, deck } = await load({ kind: 'progressive', src: link, files: { [link]: file('a', 120) } }, {
+    before: ({ engine: e, deck: d, tab: t }) => {
+      const tr = d.tracks[0], stop = tr.stop;
+      tr.stop = function () { e.order.push('capture stopped'); return stop.call(this); };
+      const disc = t.frames[0].port.disconnect;
+      t.frames[0].port.disconnect = () => { e.order.push('agent let go'); disc(); };
+    },
+  });
+  // The tab is silenced (its STOP_TAB answered) before its capture goes, so the track never comes out of the speakers.
+  assert.deepEqual(engine.order.filter((x) => x !== 'AGENT_CONNECT'), ['STOP_TAB', 'STOP_TAB done', 'capture stopped', 'agent let go', 'DECKS_CHANGED']);
+  const stop = engine.hubLog.find((m) => m.type === 'STOP_TAB'), changed = engine.hubLog.findLast((m) => m.type === 'DECKS_CHANGED');
+  assert.equal(stop.tabId, 7, 'STOP_TAB for the source tab');
+  assert.equal(stop.release, true, 'a release: the tab is paused, never left muted');
+  assert.deepEqual(changed.decks, [], 'the hub forgets the tab');
   assert.equal(deck.tracks[0].stopped, true, 'the held capture is stopped');
   assert.equal(deck.stream, null);
   assert.equal(deck.tabId, null);
@@ -379,11 +450,16 @@ test('two loads racing on two tabs: each deck gets its own track, and no tab hea
 async function ejectAt(k, page) {
   const tab = makeTab(page), engine = makeEngine({ tabs: [tab] });
   let n = 0, at = null;
-  const { deck, loader } = loaderFor(tab, engine, { fetchBytes: (u, o) => { tick(`read ${u.slice(0, 12)}`); return fetcher([tab])(u, o); } });
+  const { deck, loader, ac } = loaderFor(tab, engine, { fetchBytes: (u, o) => { tick(`read ${u.slice(0, 12)}`); return fetcher([tab])(u, o); } });
   const order = [];
   function tick(what) {
     order.push(what);
-    if (n++ === k && at == null) { at = { what, sent: tab.log.length }; engine.eject(deck.id); }
+    if (n++ === k && at == null) {
+      at = { what, sent: tab.log.length };
+      // Another deck starting holds serial() for a moment, so the eject's turn (and its deck's going) comes later.
+      engine.serial(() => new Promise((r) => setTimeout(r, 25)));
+      engine.eject(deck.id);
+    }
   }
   tab.hooks.push((m) => tick(`send ${m.t}${m.mode ? ` ${m.mode}` : ''}`));
   for (const fn of ['hub', 'stopTab', 'analyse', 'startResidentDeck', 'failLoadingToLive']) {
@@ -391,8 +467,9 @@ async function ejectAt(k, page) {
     engine[fn] = (...a) => { tick(fn); return f(...a); };
   }
   const result = await loader.run();
+  await engine.serial(() => {}); // the eject has had its turn
   await settle(30);
-  return { result, at, tab, engine, deck, order };
+  return { result, at, tab, engine, deck, order, signal: ac.signal };
 }
 
 for (const [name, page] of [
@@ -403,9 +480,12 @@ for (const [name, page] of [
   test(`ejected at every step of a load ${name}: cancelled, nothing promoted or sent live, the page given back, then silence`, async () => {
     let k = 0;
     for (;; k++) {
-      const { result, at, tab, engine, deck, order } = await ejectAt(k, page);
+      const { result, at, tab, engine, deck, order, signal } = await ejectAt(k, page);
       if (!at) { assert.ok(k > 5, `only ${k} steps`); break; }
       const where = `ejected at step ${k} (${at.what}) of ${order.join(', ')}`;
+      // The eject stops the load at once (its deck goes later, in its turn), as the real one does.
+      assert.equal(signal.aborted, true, `${where}: the load's abort signal fired`);
+      assert.equal(engine.decks.has(deck.id), false, `${where}: the deck is gone`);
       if (order.slice(0, k).includes('startResidentDeck')) {
         // Ejected while the tab was being released: the load had finished, and the eject takes the resident deck.
         assert.equal(result.kind, 'resident', where);
@@ -414,11 +494,14 @@ for (const [name, page] of [
       }
       assert.deepEqual(result, { ok: false, error: 'Loading was cancelled.' }, where);
       const after = engine.calls.slice(engine.calls.findIndex((c) => c.fn === 'eject') + 1);
-      // A promotion already on its way finds the deck gone; none is started after the eject.
+      // A promotion already on its way finds the deck on its way out; none is started after the eject.
       assert.notEqual(deck.kind, 'resident', where);
+      assert.deepEqual(engine.events.filter((e) => /^Loaded /.test(e.text)), [], `${where}: said to be loaded`);
       assert.ok(after.filter((c) => c.fn === 'startResidentDeck').length <= (at.what === 'startResidentDeck' ? 1 : 0), where);
       assert.ok(after.filter((c) => c.fn === 'failLoadingToLive').length <= (at.what === 'failLoadingToLive' ? 1 : 0), where);
-      assert.equal(engine.hubLog.filter((m) => m.type === 'DECKS_CHANGED' || m.type === 'STOP_TAB').length, 0, `${where}: no release of an ejected deck`);
+      // No release of an ejected deck: the eject's own STOP_TAB and DECKS_CHANGED only, and the deck keeps its tab.
+      assert.deepEqual(engine.hubLog.filter((m) => (m.type === 'STOP_TAB' && m.release) || (m.type === 'DECKS_CHANGED' && !m.eject)), [], `${where}: released`);
+      assert.equal(deck.tabId, tab.tabId, `${where}: released`);
       const late = tab.log.slice(at.sent).map((x) => x.m).filter((m) => !(m.t === 'drive' && m.mode === 'stop') && !(m.t === 'tap' && m.on === false));
       // The command that was being sent when the eject came is the only other one.
       assert.ok(late.length <= (at.what.startsWith('send') ? 1 : 0), `${where}: sent after the eject: ${JSON.stringify(late)}`);
@@ -438,14 +521,17 @@ test('the analysis is told to stop when the deck is ejected while the beat is be
   assert.equal(signal && signal.aborted, true, 'the Worker\'s signal is aborted (analyseTrack terminates it)');
 });
 
-test('the page navigating away mid-load goes live with one message: no half-built deck, nothing unhandled', async () => {
+/** load() options: at the n-th fetch the loader sends, fn({tab, engine, deck}) runs. */
+const atFetch = (n, fn) => ({ before: (x) => { let k = 0; x.tab.hooks.push((m) => { if (m.t === 'fetch' && ++k === n) setImmediate(() => fn(x)); }); } });
+const MOVED = 'Deck 1: the page moved on to something else before the track was in. Add the tab again.';
+const OTHER = 'https://site.example/another-track';
+
+test('the page reloading mid-load (the same page again) goes live with one message: no half-built deck, nothing unhandled', async () => {
   const unhandled = [];
   const on = (e) => unhandled.push(e);
   process.on('unhandledRejection', on);
   try {
-    const { result, engine, tab } = await load({ kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true }, {
-      before: ({ tab: t }) => { let n = 0; t.hooks.push((m) => { if (m.t === 'fetch' && ++n === 2) setImmediate(() => t.navigate()); }); },
-    });
+    const { result, engine, tab, deck } = await load({ kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true }, atFetch(2, ({ tab: t }) => t.navigate()));
     await settle(30);
     assert.equal(result.kind, 'live');
     assert.deepEqual(called(engine, 'startResidentDeck'), []);
@@ -454,8 +540,108 @@ test('the page navigating away mid-load goes live with one message: no half-buil
     assert.match(f[0].reason, /the page changed while the track was loading/);
     assert.equal(engine.events.filter((e) => /^Deck 1: /.test(e.text)).length, 1);
     assert.ok(tab.frames[0].left);
+    assert.match(deck.load.report, /page: reload in \d+\.\d s — the same page again/);
   } finally { process.off('unhandledRejection', on); }
   assert.deepEqual(unhandled, []);
+});
+
+test('the page moving on to another page mid-load ejects the deck with one error: never a live deck on that page\'s audio', async () => {
+  // The hub's word of the new page (META) comes a little after the page's agents have gone, as it does in Chrome.
+  const { result, engine } = await load({ kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true },
+    atFetch(2, ({ tab: t }) => t.navigate({ to: OTHER, metaAfter: 30 })));
+  await settle(30);
+  assert.deepEqual(result, { ok: false, error: MOVED });
+  assert.deepEqual(called(engine, 'failLoadingToLive'), []);
+  assert.deepEqual(called(engine, 'startResidentDeck'), []);
+  assert.equal(called(engine, 'eject').length, 1);
+  assert.equal(engine.decks.size, 0);
+  assert.deepEqual(engine.events.filter((e) => /^Deck 1: /.test(e.text)), [{ level: 'error', text: MOVED }]);
+});
+
+test('a page that moves on while a link it gave decodes badly is ejected, never played live', async () => {
+  const link = 'https://site.example/t.mp3';
+  const { result, engine } = await load({ kind: 'progressive', src: link, files: { [link]: file('t', 120.0065) } }, {
+    before: ({ tab, loader }) => { loader.d.decodeFile = async () => { tab.navigate({ to: OTHER }); await settle(5); throw new Error('Unable to decode audio data'); }; },
+  });
+  assert.deepEqual(result, { ok: false, error: MOVED });
+  assert.deepEqual(called(engine, 'failLoadingToLive'), []);
+  assert.deepEqual(engine.events.filter((e) => /^Deck 1: /.test(e.text)), [{ level: 'error', text: MOVED }]);
+});
+
+// A single-page site (YouTube, SoundCloud, Mixcloud) moves on to another track in place: the address changes, the page
+// and its agents stay, and the same player plays the other track.
+test('a single-page site moving on to another track while a link it gave decodes badly is ejected, never played live', async () => {
+  const link = 'https://site.example/t.mp3';
+  const { result, engine } = await load({ kind: 'progressive', src: link, files: { [link]: file('t', 120.0065) } }, {
+    before: ({ tab, loader }) => { loader.d.decodeFile = async () => { tab.moveInPlace({ to: OTHER }); await new Promise((r) => setTimeout(r, 5)); throw new Error('Unable to decode audio data'); }; },
+  });
+  assert.deepEqual(result, { ok: false, error: MOVED }, JSON.stringify(engine.events));
+  assert.deepEqual(called(engine, 'failLoadingToLive'), []);
+  assert.deepEqual(called(engine, 'startResidentDeck'), []);
+  assert.deepEqual(engine.events.filter((e) => /^Deck 1: /.test(e.text)), [{ level: 'error', text: MOVED }]);
+});
+
+test('a single-page site moving on to another track while its player is driven is ejected: the other track never becomes the deck', async () => {
+  // The other track (80 s, the low rendition's pieces) is appended whole a moment after the address changed.
+  const { result, engine, tab } = await load({ kind: 'mse', rendition: hi(), preTap: 0, playing: 1 }, {
+    before: ({ tab: t }) => { t.hooks.push((m) => { if (m.t === 'drive' && m.mode === 'seekhop') t.moveInPlace({ to: OTHER, rendition: rendition('opus-lo'), duration: 80 }); }); },
+  });
+  await settle(30);
+  assert.deepEqual(result, { ok: false, error: MOVED }, JSON.stringify([engine.calls, engine.events]));
+  assert.deepEqual(called(engine, 'startResidentDeck'), []);
+  assert.deepEqual(called(engine, 'failLoadingToLive'), []);
+  assert.equal(called(engine, 'eject').length, 1);
+  assert.deepEqual(engine.events.filter((e) => /^Deck 1: /.test(e.text)), [{ level: 'error', text: MOVED }]);
+  assert.ok(tab.kinds().includes('drive stop'), 'the page has its player back');
+});
+
+test('a single-page site moving on to another track while its pieces are fetched again is ejected, never played live or resident', async () => {
+  const { result, engine } = await load({ kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true },
+    atFetch(2, ({ tab: t }) => t.moveInPlace({ to: OTHER, rendition: rendition('opus-lo'), duration: 80 })));
+  await settle(30);
+  assert.deepEqual(result, { ok: false, error: MOVED }, JSON.stringify([engine.calls, engine.events]));
+  assert.deepEqual(called(engine, 'startResidentDeck'), []);
+  assert.deepEqual(called(engine, 'failLoadingToLive'), []);
+  assert.deepEqual(engine.events.filter((e) => /^Deck 1: /.test(e.text)), [{ level: 'error', text: MOVED }]);
+});
+for (const [what, page, opts] of [
+  ['its pieces fetched, while the beat is found', { kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true },
+    { before: ({ tab, engine }) => { const f = engine.analyse.bind(engine); engine.analyse = async (p, s) => { tab.navigate({ to: OTHER }); await settle(5); return f(p, s); }; } }],
+  ['its link read, while it is decoded', { kind: 'progressive', src: 'https://site.example/t.mp3', files: { 'https://site.example/t.mp3': file('t', 120.0065) } },
+    { before: ({ tab, loader }) => { loader.d.decodeFile = async (ctx, buf) => { tab.navigate({ to: OTHER }); await settle(5); return decoders.decodeFile(ctx, buf); }; } }],
+  // Checked only when the drive says it is done, so the page goes before the loader has looked at what it holds.
+  ['all its pieces captured from the player, before the loader looked', { kind: 'mse', rendition: hi(), preTap: 0, playing: 1 },
+    { times: { ...FAST, check: 1000 }, before: ({ tab }) => { tab.hooks.push((m) => { if (m.t === 'drive' && m.mode === 'seekhop') setTimeout(() => tab.navigate({ to: OTHER }), 2); }); } }],
+  // The hub's word of the new page (META) can come before the old page's agents have gone.
+  ['all its pieces captured from the player, before the loader looked, word of the new page coming before its agents go', { kind: 'mse', rendition: hi(), preTap: 0, playing: 1 },
+    { times: { ...FAST, check: 1000 }, before: ({ tab }) => { tab.hooks.push((m) => { if (m.t === 'drive' && m.mode === 'seekhop') setTimeout(() => { tab.deck.meta.url = OTHER; setTimeout(() => tab.navigate(), 20); }, 2); }); } }],
+  // A single-page site moving on in place: its agents stay, and its player goes on to another track.
+  ['its pieces fetched, while the beat is found, on a single-page site that moves on in place', { kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true },
+    { before: ({ tab, engine }) => { const f = engine.analyse.bind(engine); engine.analyse = async (p, s) => { tab.moveInPlace({ to: OTHER }); await new Promise((r) => setTimeout(r, 5)); return f(p, s); }; } }],
+  ['its link read, while it is decoded, on a single-page site that moves on in place', { kind: 'progressive', src: 'https://site.example/t.mp3', files: { 'https://site.example/t.mp3': file('t', 120.0065) } },
+    { before: ({ tab, loader }) => { loader.d.decodeFile = async (ctx, buf) => { tab.moveInPlace({ to: OTHER }); await new Promise((r) => setTimeout(r, 5)); return decoders.decodeFile(ctx, buf); }; } }],
+]) {
+  test(`a page that moves on once every byte of its track is in, ${what}: the deck goes resident and lets go of the tab`, async () => {
+    const { result, engine, deck } = await load(page, opts);
+    assert.equal(result.kind, 'resident', JSON.stringify([result, engine.events]));
+    assert.ok(near(called(engine, 'startResidentDeck')[0].frames / SR, 120, 0.02));
+    assert.deepEqual(called(engine, 'failLoadingToLive'), []);
+    assert.deepEqual(called(engine, 'eject'), []);
+    assert.equal(deck.tabId, null, 'released');
+    assert.deepEqual(engine.events.filter((e) => e.level === 'error'), []);
+  });
+}
+
+test('the tab closed mid-load ejects the deck with one error: no live deck on its dying capture', async () => {
+  // The page's agents go first; the capture ends 10 ms later and the hub's EJECT for the closed tab comes after that.
+  const { result, engine } = await load({ kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true },
+    atFetch(2, ({ tab: t, engine: e }) => t.close(e, { endAfter: 10, ejectAfter: 30 })));
+  await settle(30);
+  assert.equal(result.ok, false);
+  assert.deepEqual(called(engine, 'failLoadingToLive'), []);
+  assert.deepEqual(called(engine, 'startResidentDeck'), []);
+  assert.equal(engine.decks.size, 0);
+  assert.deepEqual(engine.events.filter((e) => /^Deck 1: /.test(e.text)), [{ level: 'error', text: 'Deck 1: the tab was closed before the track was in.' }]);
 });
 
 test('the page going away with the tab\'s audio gone too ejects the deck with one error, never a silent live deck', async () => {

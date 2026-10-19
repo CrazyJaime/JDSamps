@@ -181,10 +181,11 @@ test('a link that is not audio, or not there, is refused with a reason and leave
   await waitFor(async () => (await decks()).length === n);
 });
 
-test('a deck shows that it is loading, refuses to play meanwhile, and loadCancel stops the fetch and ejects it', async () => {
-  const pending = act(deck, null, 'loadUrl', { url: `${origin}/slow.wav` });
+test('a deck shows that it is loading, with its load\'s token, refuses to play meanwhile, and loadCancel stops the fetch and ejects it', async () => {
+  const pending = act(deck, null, 'loadUrl', { url: `${origin}/slow.wav`, token: 'tok-slow-1' });
   const d = await deckWhere((x) => x.kind === 'loading');
   assert.equal(d.title, 'slow');
+  assert.equal(d.load.token, 'tok-slow-1', 'the deck page knows the deck by its load\'s token');
   assert.equal(d.load.state, 'loading');
   assert.match(d.load.strategy, /fetching/);
   assert.match((await act(deck, d.id, 'play')).error, /still loading/);
@@ -194,6 +195,21 @@ test('a deck shows that it is loading, refuses to play meanwhile, and loadCancel
   assert.match(r.error, /cancel/i);
   await waitFor(() => slowClosed, 5000);
   await waitFor(async () => !(await decks()).some((x) => x.id === d.id));
+});
+
+test('an eject that lands while a track is being promoted takes the deck, and no "Loaded" is said of it', async () => {
+  // The eject queues behind the promotion (both run in turn), as one the DJ makes at that moment does.
+  await engine(`const s = e.startResidentDeck.bind(e); e.__srd = s;
+    e.startResidentDeck = (o) => { const p = s(o); if (o && o.deckId != null) e.eject(o.deckId); return p; }; return true;`);
+  try {
+    const had = new Set((await decks()).map((x) => x.id)), seen = (await events(deck)).length;
+    const r = await act(deck, null, 'loadUrl', { url: `${origin}/linked-kick.wav?promoted` });
+    await waitFor(async () => !(await decks()).some((x) => !had.has(x.id)), 8000);
+    await sleep(300);
+    const said = (await events(deck)).slice(seen);
+    assert.deepEqual(said.filter((e) => /^Loaded /.test(e.text)).map((e) => e.text), []);
+    assert.deepEqual(r, { ok: false, error: 'Loading was cancelled.' });
+  } finally { await engine('e.startResidentDeck = e.__srd; delete e.__srd; return true;'); }
 });
 
 test('a track longer than the resident limit is cut to it, and the deck says so once', async () => {

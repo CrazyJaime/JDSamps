@@ -68,7 +68,8 @@ async function startRecServer() {
  * Pages with two players, on another origin. The track (A) is an MSE player of the model track (opus-hi), fed from
  * its HLS playlist 16 s ahead. The other player (B) is a 24 s 440 Hz tone (Opus fMP4, made here): a muted, looping
  * one in the top frame with the track in an iframe of /m/mse (/dur), or one that starts appending when the page's
- * window.__startB() is called: paused beside the track (/two-same) or playing muted in an iframe (/two-sub).
+ * window.__startB() is called: paused beside the track (/two-same) or playing muted in an iframe (/two-sub). /spa
+ * has the track alone, for a single-page site that moves on to the tone in place (nextTrack).
  */
 async function startMultiServer() {
   const tone = path.join(tmp, 'tone.mp4');
@@ -80,12 +81,13 @@ async function startMultiServer() {
   const mse = `async function mse(el, list) {
   const text = await (await fetch(list)).text(), base = new URL(list, location.href), segs = []; let init = null, n = 0, played = false;
   for (const l of text.split('\\n')) { const m = /URI="([^"]+)"/.exec(l); if (m) init = new URL(m[1], base).href; else if (l && l[0] !== '#') segs.push(new URL(l, base).href); }
-  const ms = new MediaSource(); el.src = URL.createObjectURL(ms);
+  const ms = new MediaSource(), src = el.src = URL.createObjectURL(ms);
   await new Promise((r) => ms.addEventListener('sourceopen', r, { once: true }));
   const sb = ms.addSourceBuffer('audio/mp4; codecs="opus"'), app = (b) => new Promise((r) => { sb.addEventListener('updateend', r, { once: true }); sb.appendBuffer(b); });
   ms.duration = ${rep.segs.at(-1).t1};
   await app(await (await fetch(init)).arrayBuffer());
   for (;;) {
+    if (el.src !== src) return; // the player plays something else now
     const end = sb.buffered.length ? sb.buffered.end(sb.buffered.length - 1) : 0;
     if (n < segs.length && end < el.currentTime + 16) { await app(await (await fetch(segs[n++])).arrayBuffer()); if (!played) { played = true; el.play().catch(() => {}); } continue; }
     if (n >= segs.length) { try { ms.endOfStream(); } catch (_) {} return; }
@@ -107,6 +109,7 @@ window.__media = () => { const a = document.querySelector('audio'); return { t: 
     '/two-same': html('Two players', '<audio id="a"></audio><audio id="b"></audio>', `mse(document.getElementById('a'), '/media/opus-hi.m3u8'); window.__startB = () => tone(document.getElementById('b'));`),
     '/two-sub': html('Two frames', '<audio id="a"></audio><iframe src="/bframe" allow="autoplay"></iframe>', `mse(document.getElementById('a'), '/media/opus-hi.m3u8');`),
     '/bframe': html('Another player', '<audio id="b" muted></audio>', `window.__startB = async () => { const b = document.getElementById('b'); await tone(b); await b.play(); };`),
+    '/spa': html('Track A', '<audio id="a"></audio>', `mse(document.getElementById('a'), '/media/opus-hi.m3u8');`),
   };
   const srv = http.createServer((req, res) => {
     const u = new URL(req.url, 'http://x');
@@ -114,7 +117,8 @@ window.__media = () => { const a = document.querySelector('audio'); return { t: 
     if (u.pathname === '/media/opus-hi.m3u8') { res.writeHead(200, { 'content-type': 'application/vnd.apple.mpegurl' }); res.end(m3u8); return; }
     const f = u.pathname === '/tone.mp4' ? tone : /^\/media\/(opus-hi\/[\w.-]+)$/.test(u.pathname) ? path.join(SITES, u.pathname.slice(7)) : null;
     if (!f || !fs.existsSync(f)) { res.writeHead(404); res.end(); return; }
-    res.writeHead(200, { 'content-type': 'audio/mp4', 'cache-control': 'no-store' });
+    // The tone is fetched by pages on other origins too, as a single-page site's next track (nextTrack).
+    res.writeHead(200, { 'content-type': 'audio/mp4', 'cache-control': 'no-store', ...(f === tone ? { 'access-control-allow-origin': '*' } : {}) });
     res.end(fs.readFileSync(f));
   });
   await new Promise((r) => srv.listen(0, '127.0.0.1', r));
@@ -250,14 +254,60 @@ test('an MSE page whose segments can be fetched again ends resident: the start i
   await assertReleased(d, site);
 });
 
-test('an ABR page ends resident with no doubled or missing audio at its quality switch', async () => {
-  const site = await openSite('abr');
-  await playing(site.tab);
-  const d = await loadTab(site.tabId);
+test('an ABR page captured across its quality switch (lo, then hi from 12 s) ends resident from both renditions, with no doubled or missing audio at the switch', async (t) => {
+  const site = await openSite('abr', '');
+  const d = await loadTab(site.tabId, {
+    // Its player starts once the deck is reading the page, so the tap captures the switch itself. What the deck is
+    // decoded from is kept: each piece's SHA-256, to tell which rendition it is.
+    during: async (r) => {
+      await waitFor(() => engine(`const l = e.loads.get(${r.deckId}); return !!l && l.loader.tapping;`), 15000);
+      await engine(`const l = e.loads.get(${r.deckId}).loader, dp = l.d.decodePlaced;
+        const hex = async (b) => [...new Uint8Array(await crypto.subtle.digest('SHA-256', b))].map((x) => x.toString(16).padStart(2, '0')).join('');
+        l.d.decodePlaced = async (ctx, placed, o) => {
+          window.__runs = await Promise.all(placed.runs.map(async (run) => Promise.all(run.segs.map(async (s) => ({ t0: s.t0, t1: s.t1, sha: await hex(s.bytes) })))));
+          return dp(ctx, placed, o);
+        };
+        return true;`);
+      await site.tab.click('#play');
+    },
+  });
   assert.equal(d.kind, 'resident', JSON.stringify(d.load));
   assert.ok(Math.abs(d.duration - OPUS_END) < 0.015, `duration ${d.duration}`);
-  const c = await compare(d.id, opusUrls('opus-hi'));
-  assert.ok(c.corr > 0.999, JSON.stringify(c));
+  // Both renditions are in what the deck was decoded from, each piece byte-true, lo up to the switch and hi after it.
+  const repOf = new Map(['opus-lo', 'opus-hi'].flatMap((rep) => index.reps[rep].segs.map((s) => [s.sha256, { rep, t0: s.t0 }])));
+  const segs = (await engine('return window.__runs;')).flat();
+  for (const s of segs) assert.ok(repOf.has(s.sha) && Math.abs(repOf.get(s.sha).t0 - s.t0) < 1e-6, `the piece at ${s.t0} s is no rendition's piece for that time`);
+  const at = (t) => repOf.get(segs.find((s) => s.t0 <= t && t < s.t1).sha).rep;
+  assert.deepEqual([at(10), at(14)], ['opus-lo', 'opus-hi'], 'the switch at 12 s is in the deck');
+  assert.ok(new Set(segs.map((s) => repOf.get(s.sha).rep)).size === 2);
+  // Continuous at the switch: either side lines up with its rendition decoded whole at lag 0 (a doubled or missing
+  // piece would shift it by whole seconds), and the span across the switch matches the two stitched there.
+  const c = await engine(`
+    const pcm = e.__pcm.get(${d.id}), a = pcm.L, sr = pcm.sampleRate;
+    const dec = async (rep) => {
+      const bufs = await Promise.all(${JSON.stringify(Object.fromEntries(['opus-lo', 'opus-hi'].map((rep) => [rep, opusUrls(rep)])))}[rep].map((u) => fetch(u).then((r) => r.arrayBuffer())));
+      const cat = new Uint8Array(bufs.reduce((n, b) => n + b.byteLength, 0)); let k = 0;
+      for (const b of bufs) { cat.set(new Uint8Array(b), k); k += b.byteLength; }
+      return (await e.ctx.decodeAudioData(cat.buffer)).getChannelData(0);
+    };
+    const lo = await dec('opus-lo'), hi = await dec('opus-hi'), cut = Math.round(12 * sr);
+    const both = new Float32Array(hi.length); both.set(lo.subarray(0, cut)); both.set(hi.subarray(cut), cut);
+    const corr = (ref, i0, n, lag) => { let ab = 0, aa = 0, bb = 0; for (let i = 0; i < n; i++) { const x = a[i0 + i], y = ref[i0 + i + lag]; ab += x * y; aa += x * x; bb += y * y; } return ab / Math.sqrt(aa * bb); };
+    const best = (ref, from, to) => {
+      const i0 = Math.round(from * sr), n = Math.round((to - from) * sr), W = Math.round(0.04 * sr);
+      let lag = 0, top = -2;
+      for (let l = -W; l <= W; l += 2) { const x = corr(ref, i0, n, l); if (x > top) { top = x; lag = l; } }
+      for (let l = lag - 2; l <= lag + 2; l++) { const x = corr(ref, i0, n, l); if (x > top) { top = x; lag = l; } }
+      return { lagMs: (lag / sr) * 1000, corr: top, atZero: corr(ref, i0, n, 0) };
+    };
+    e.__pcm.delete(${d.id});
+    return { before: best(lo, 10.5, 11.95), after: best(hi, 12.05, 13.5), across: best(both, 11.5, 12.5) };
+  `);
+  t.diagnostic(`runs: ${segs.map((s) => `${s.t0}:${repOf.get(s.sha).rep}`).join(' ')}; at the switch: ${JSON.stringify(c)}`);
+  for (const [k, x] of Object.entries(c)) {
+    assert.equal(x.lagMs, 0, `${k} the switch: lined up ${x.lagMs.toFixed(3)} ms off (${JSON.stringify(c)})`);
+    assert.ok(x.atZero > 0.99, `${k} the switch: ${JSON.stringify(c)}`);
+  }
   await assertReleased(d, site);
 });
 
@@ -563,7 +613,7 @@ async function drivenLoad() {
   await site.tab.click('#play');
   await deckWhere((x) => x.id === r.deckId && /running the player/.test(x.load.strategy || ''), 15000);
   await waitFor(async () => (await player(site.tab)).muted, 5000); // muted while driven
-  return { site, deckId: r.deckId };
+  return { site, deckId: r.deckId, cdp };
 }
 
 test('ejected mid-drive: within 1 s the page has its player back, the capture is released, the blob URLs revoked, and no command follows', async () => {
@@ -583,10 +633,14 @@ test('ejected mid-drive: within 1 s the page has its player back, the capture is
   await site.tab.close();
 });
 
-test('ejected while the beat is being found: the analysis Worker is terminated and no deck is left', async () => {
-  await engine(`if (!window.__W) { const W = window.__W = globalThis.Worker; window.__workers = { made: 0, ended: 0 };
-    globalThis.Worker = class extends W { constructor(...a) { super(...a); window.__workers.made++; } terminate() { window.__workers.ended++; return super.terminate(); } }; }
-    window.__workers = { made: 0, ended: 0 };
+test('ejected while the beat is being found: the analysis Worker is terminated before it finishes, and no deck is left', async () => {
+  // Every Worker counted: made, terminated, and each result it sent back (one that finished its analysis sends one).
+  await engine(`if (!window.__W) { const W = window.__W = globalThis.Worker;
+    globalThis.Worker = class extends W {
+      constructor(...a) { super(...a); window.__workers.made++; this.addEventListener('message', () => { window.__workers.results++; }); }
+      terminate() { window.__workers.ended++; return super.terminate(); }
+    }; }
+    window.__workers = { made: 0, ended: 0, results: 0 };
     const f = e.analyse.bind(e); e.__analyse = f;
     e.analyse = (pcm, signal) => { const p = f(pcm, signal); const id = [...e.loads.keys()][0]; e.eject(id); return p; };
     return true;`);
@@ -598,24 +652,144 @@ test('ejected while the beat is being found: the analysis Worker is terminated a
     await waitFor(async () => !(await decks()).some((x) => x.id === r.deckId), 30000);
     await waitFor(() => engine('return window.__workers.made > 0 && window.__workers.made === window.__workers.ended;'), 3000)
       .catch(async () => assert.fail(JSON.stringify(await engine('return window.__workers;'))));
+    // analyseTrack terminates its Worker once it has answered too: only one stopped by the eject never answers.
+    await sleep(1000);
+    assert.equal(await engine('return window.__workers.results;'), 0, 'the Worker finished its analysis: the eject did not stop it');
     assert.deepEqual(await engine('return [...e.__pcm.keys()];'), [], 'nothing was promoted');
     await site.tab.close();
   } finally { await engine('e.analyse = e.__analyse; delete e.__analyse; return true;'); }
 });
 
-test('the page navigating away mid-load: the deck plays the tab live, saying so once, with no error', async () => {
-  const { site, deckId } = await drivenLoad();
-  const seen = (await events(deck)).length;
-  await site.tab.goto(`${server.origin}/m/progressive?autoplay=1`);
-  const d = await deckWhere((x) => x.id === deckId && x.kind === 'live', 15000);
-  assert.equal(d.tabId, site.tabId);
+/** The deck's kinds from now until it is gone (or ms pass), polled from the engine. */
+async function kindsUntilGone(deckId, ms = 8000) {
+  const seen = [], t0 = Date.now();
+  for (;;) {
+    const d = await engine(`const d = e.decks.get(${deckId}); return d ? d.kind : null;`);
+    if (d == null || Date.now() - t0 > ms) return seen;
+    if (seen.at(-1) !== d) seen.push(d);
+    await sleep(20);
+  }
+}
+
+/** After a test, whatever it left: every deck ejected, every model page closed (so a failure does not carry on). */
+async function tidy() {
+  for (const id of await engine('return [...e.decks.keys()];')) await engine(`await e.eject(${id}); return true;`);
+  for (const p of h.context.pages()) if (p !== deck && !p.isClosed() && p.url().startsWith(server.origin)) await p.close();
+}
+
+test('the page reloading mid-load (the same page again): the deck plays the tab live, saying so once, with no error', async () => {
+  try {
+    const { site, deckId } = await drivenLoad();
+    const seen = (await events(deck)).length;
+    await site.tab.reload();
+    const d = await deckWhere((x) => x.id === deckId && x.kind === 'live', 15000);
+    assert.equal(d.tabId, site.tabId);
+    const said = (await events(deck)).slice(seen);
+    assert.equal(said.filter((e) => /^Deck \d: the page changed while the track was loading/.test(e.text)).length, 1, JSON.stringify(said));
+    assert.deepEqual(said.filter((e) => e.level === 'error'), []);
+    assert.match(d.load.report, /First failure: (drive: )?.*(page went away|page changed)/);
+    assert.match(d.load.report, /page: reload in \d+\.\d s — the same page again/);
+  } finally { await tidy(); }
+});
+
+test('the page moving on to another page mid-load: the deck goes with one error, and never plays that page live', async () => {
+  try {
+    const { site, deckId } = await drivenLoad();
+    const seen = (await events(deck)).length;
+    const kinds = kindsUntilGone(deckId, 15000);
+    await site.tab.goto(`${server.origin}/m/progressive?autoplay=1`);
+    assert.ok(!(await kinds).includes('live'), 'it was never a live deck');
+    await sleep(500);
+    const said = (await events(deck)).slice(seen).filter((e) => e.text.startsWith('Deck '));
+    assert.deepEqual(said.map((e) => [e.level, e.text.replace(/^Deck \d/, 'Deck N')]),
+      [['error', 'Deck N: the page moved on to something else before the track was in. Add the tab again.']]);
+    assert.equal(await h.sw.evaluate(() => chrome.action.getBadgeText({})), '', 'the hub forgot the tab');
+  } finally { await tidy(); }
+});
+
+/**
+ * A single-page site moving on to its next track, as YouTube, SoundCloud and Mixcloud do: the address changes with no
+ * page load (the page and its agents stay), then the same <audio> plays the next track (the 24 s tone, fetched over the
+ * network) on a MediaSource of its own. Answers once the engine has the new address for the deck (the hub's META, in
+ * milliseconds, where a real page's pieces take seconds).
+ */
+const nextTrack = async (tab, to, deckId) => {
+  await tab.evaluate(({ to: path, tone }) => {
+    history.pushState(null, '', path);
+    document.title = 'Track B';
+    (async () => {
+      const a = document.querySelector('audio'), b = await (await fetch(tone)).arrayBuffer(), ms = new MediaSource();
+      a.src = URL.createObjectURL(ms);
+      await new Promise((r) => ms.addEventListener('sourceopen', r, { once: true }));
+      const sb = ms.addSourceBuffer('audio/mp4; codecs="opus"');
+      await new Promise((r) => { sb.addEventListener('updateend', r, { once: true }); sb.appendBuffer(b); });
+      try { ms.endOfStream(); } catch (_) {}
+      a.play().catch(() => {});
+    })();
+  }, { to, tone: `${multi.origin}/tone.mp4` });
+  await waitFor(() => engine(`const d = e.decks.get(${deckId}); return !d || new URL(d.meta.url).pathname === ${JSON.stringify(to)};`), 5000);
+};
+/** The deck's end: 'gone', or the kind it took instead ('live', 'resident'). */
+const endOf = (deckId, ms = 30000) => waitFor(async () => {
+  const k = await engine(`const d = e.decks.get(${deckId}); return d ? d.kind : 'gone';`);
+  return k === 'loading' ? null : k;
+}, ms, 20);
+/**
+ * What a deck that went because its page moved on leaves: one error, never a word of playing live or of a loaded track,
+ * nothing promoted, the hub's tab forgotten. (Its eject stops the tab as every eject does: a player caught between two
+ * tracks has nothing to pause, so the tab is muted, and that is said.)
+ */
+async function assertMovedOn(deckId, seen) {
+  await sleep(500);
   const said = (await events(deck)).slice(seen);
-  assert.equal(said.filter((e) => /^Deck \d: the page changed while the track was loading/.test(e.text)).length, 1, JSON.stringify(said));
-  assert.deepEqual(said.filter((e) => e.level === 'error'), []);
-  assert.match(d.load.report, /First failure: (drive: )?.*(page went away|page changed)/);
-  assert.equal((await act(deck, deckId, 'eject')).ok, true);
-  await waitFor(async () => !(await decks()).length, 8000);
-  await site.tab.close();
+  assert.deepEqual(said.filter((e) => e.level !== 'info').map((e) => [e.level, e.text.replace(/^Deck \d/, 'Deck N')]),
+    [['error', 'Deck N: the page moved on to something else before the track was in. Add the tab again.']]);
+  assert.deepEqual(said.filter((e) => /plays live|^Loaded/.test(e.text)), []);
+  assert.equal(await engine(`return e.__pcm.has(${deckId});`), false, 'nothing was promoted');
+  assert.equal(await h.sw.evaluate(() => chrome.action.getBadgeText({})), '', 'the hub forgot the tab');
+}
+
+test('a single-page site moving on to another track while its pieces are fetched again: the deck goes with one error, and never plays it live', async () => {
+  const url = `${multi.origin}/spa`, tab = await h.context.newPage();
+  try {
+    await tab.goto(url);
+    const tabId = await tabIdFor(h, url);
+    await playing(tab);
+    const cdp = await h.context.newCDPSession(tab);
+    await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 100, downloadThroughput: 40 * 1024, uploadThroughput: -1 });
+    const seen = (await events(deck)).length;
+    const r = await hubCall(deck, { type: 'LOAD_TAB', tabId });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    await deckWhere((x) => x.id === r.deckId && /fetching the track's pieces/.test(x.load.strategy || ''), 20000);
+    await nextTrack(tab, '/spa/b', r.deckId);
+    await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
+    assert.equal(await endOf(r.deckId), 'gone');
+    await assertMovedOn(r.deckId, seen);
+  } finally { await tidy(); await tab.close(); }
+});
+
+test('a single-page site moving on to another track while its player is driven: the deck goes with one error, and the other track never becomes the deck', async () => {
+  try {
+    const { site, deckId, cdp } = await drivenLoad();
+    const seen = (await events(deck)).length;
+    await nextTrack(site.tab, '/m/opaque/b', deckId);
+    await cdp.send('Network.emulateNetworkConditions', { offline: false, latency: 0, downloadThroughput: -1, uploadThroughput: -1 });
+    assert.equal(await endOf(deckId), 'gone');
+    await assertMovedOn(deckId, seen);
+  } finally { await tidy(); }
+});
+
+test('the tab closed mid-load: the deck goes with one error, and no live deck is built on its dying capture', async () => {
+  try {
+    const { site, deckId } = await drivenLoad();
+    const seen = (await events(deck)).length;
+    const kinds = kindsUntilGone(deckId, 15000);
+    await site.tab.close();
+    assert.ok(!(await kinds).includes('live'), 'it was never a live deck');
+    await sleep(500);
+    const said = (await events(deck)).slice(seen).filter((e) => e.text.startsWith('Deck '));
+    assert.deepEqual(said.map((e) => [e.level, e.text.replace(/^Deck \d/, 'Deck N')]), [['error', 'Deck N: the tab was closed before the track was in.']]);
+  } finally { await tidy(); }
 });
 
 test('the deck page showed every load without errors', () => { assert.deepEqual(pageErrors, []); });

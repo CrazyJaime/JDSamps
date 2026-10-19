@@ -30,12 +30,19 @@ export function rendition(rep = 'opus-hi', origin = 'https://cdn.example') {
     segs: r.segs.map((s) => ({ url: `${origin}/media/${s.path}`, t0: s.t0, t1: s.t1, bytes: read(s.path) })),
   };
 }
-/** The rendition's HLS media playlist, its links relative to it (as the model sites write them). */
-export function playlist(r) {
+/**
+ * The rendition's HLS media playlist, its links relative to it (as the model sites write them). ts: the playlist an
+ * MPEG-TS stream has instead (no init, .ts pieces), whose player transmuxes each piece before it appends it.
+ */
+export function playlist(r, { ts = false } = {}) {
   const rel = (u) => u.slice(r.list.lastIndexOf('/') + 1);
+  if (ts) return ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-TARGETDURATION:4', '#EXT-X-PLAYLIST-TYPE:VOD',
+    ...r.segs.flatMap((s) => [`#EXTINF:${(s.t1 - s.t0).toFixed(6)},`, rel(tsUrl(s.url))]), '#EXT-X-ENDLIST', ''].join('\n');
   return ['#EXTM3U', '#EXT-X-VERSION:7', '#EXT-X-TARGETDURATION:4', '#EXT-X-PLAYLIST-TYPE:VOD', `#EXT-X-MAP:URI="${rel(r.init.url)}"`,
     ...r.segs.flatMap((s) => [`#EXTINF:${(s.t1 - s.t0).toFixed(6)},`, rel(s.url)]), '#EXT-X-ENDLIST', ''].join('\n');
 }
+/** A piece's link in an MPEG-TS playlist. */
+export const tsUrl = (u) => u.replace(/\.m4s$/, '.ts');
 const enc = (s) => { const b = Buffer.from(s); return b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength); };
 /** A whole "file" the stand-in decoder reads: `seconds` of audio coded `audio`. */
 export const file = (audio, seconds) => enc(JSON.stringify({ audio, seconds }));
@@ -60,13 +67,15 @@ export const code = (s) => Math.fround([...String(s)].reduce((n, c) => (n * 31 +
  *   status (the frame agent's status, over a heard playing player's), framePages ([{...}]: frame i's page, over this one),
  *   other ({rendition, sb, n}: another player's SourceBuffer in the frame, appending its init and first n segments at tap on),
  *   sbs (the SourceBuffers the tap says feed the heard player: default [0] for 'mse', [] for 'progressive'; null: not said),
- *   evicts (the player lets go of what it held from before the tap while it is driven: a later drive appends that again)
+ *   evicts (the player lets go of what it held from before the tap while it is driven: a later drive appends that again),
+ *   ts (the playlist is MPEG-TS: no init, .ts pieces), fetched ([url]: media the page fetched before its player's own
+ *   source, seen first), elSrc (false: the tap does not say which source the heard player plays)
  * }
  */
 export function makeTab({ tabId = 7, url = 'https://site.example/track', frames = 1, ...page } = {}) {
   const blobs = new Map(), log = [], net = new Map(Object.entries(page.files || {}));
   for (const r of [page, ...(page.framePages || [])].flatMap((p) => [p.rendition, p.other && p.other.rendition])) {
-    if (r) { net.set(r.list, enc(playlist(r))); net.set(r.init.url, r.init.bytes); for (const s of r.segs) net.set(s.url, s.bytes); }
+    if (r) { net.set(r.list, enc(playlist(r, { ts: page.ts }))); net.set(r.init.url, r.init.bytes); for (const s of r.segs) net.set(page.ts ? tsUrl(s.url) : s.url, s.bytes); }
   }
   const tab = { tabId, url, page, blobs, log, net, frames: [], deck: null, hooks: [] };
   const mint = (bytes) => { const u = `blob:${new URL(url).origin}/${crypto.randomUUID()}`; blobs.set(u, bytes); return u; };
@@ -81,7 +90,7 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
     };
     const sbs = pg.sbs !== undefined ? pg.sbs : pg.kind === 'mse' ? [0] : pg.kind === 'progressive' ? [] : null;
     const progress = (extra = {}) => emit({ t: 'tap-progress', bytes: 0, buffered: [], duration: Number.isFinite(fr.duration) ? fr.duration : null,
-      mimes: pg.mimes || (pg.kind === 'mse' ? [r ? r.mime : OPUS] : []), ...(sbs ? { sbs } : {}), ...extra });
+      mimes: pg.mimes || (pg.kind === 'mse' ? [r ? r.mime : OPUS] : []), ...(sbs ? { sbs } : {}), ...(pg.src && pg.elSrc !== false ? { src: pg.src } : {}), ...extra });
     const append = (ks) => {
       const parts = [];
       for (const k of ks) if (!fr.appended.has(k) && r.segs[k]) { fr.appended.add(k); parts.push({ blobUrl: mint(r.segs[k].bytes), mime: r.mime, kind: 'media', sb: 0, seq: fr.seq++ }); }
@@ -106,6 +115,7 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
         const reqs = [];
         if (pg.list) reqs.push({ url: r.list, method: 'GET', range: null, size: null, media: false, past: true });
         if (pg.segUrls) { reqs.push({ url: r.init.url, method: 'GET', range: null, size: null, media: true, past: true }); for (let k = 0; k < (pg.preTap || 0); k++) reqs.push({ url: r.segs[k].url, method: 'GET', range: null, size: null, media: true, past: true }); }
+        for (const u of pg.fetched || []) reqs.push({ url: u, method: 'GET', range: null, size: null, media: true, past: true });
         if (pg.src) reqs.push({ url: pg.src, method: 'GET', range: null, size: null, media: true, past: true });
         for (let k = 0; k < reqs.length; k += 16) emit({ t: 'tap-urls', reqs: reqs.slice(k, k + 16) });
         progress();
@@ -147,14 +157,48 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
       if (deck.loader) deck.loader.onAttach(fr.id, fr.a);
     }
   };
-  /** The page navigates away: its agents' ports drop and the blob URLs it minted die. */
-  tab.navigate = () => {
+  /**
+   * The page navigates away: its agents' ports drop and the blob URLs it minted die. to: the page the tab shows now,
+   * which the hub tells the engine (META) metaAfter ms later; a reload stays on the same page.
+   */
+  tab.navigate = ({ to = null, metaAfter = 0 } = {}) => {
     blobs.clear();
     for (const fr of tab.frames) {
       fr.left = true;
       const d = tab.deck;
       if (d && d.agents.get(fr.id) === fr.a) { d.agents.delete(fr.id); if (d.loader) d.loader.onDetach(fr.id, fr.a); }
     }
+    if (to) setTimeout(() => { if (tab.deck) Object.assign(tab.deck.meta, { url: to }); }, metaAfter);
+  };
+  /**
+   * A single-page site moves on to another track in place (history.pushState): the address changes, which the hub
+   * tells the engine (META) at once (a real page's pieces take far longer than that word), but the page and its agents
+   * stay. Its player plays the other track from then on: its length is `duration` (when given), a drive appends
+   * nothing more of the first, and appendAfter ms later it appends `rendition` (init and every piece) on a SourceBuffer
+   * of its own, which the tap says feeds it now.
+   */
+  tab.moveInPlace = ({ to, rendition: r2 = null, duration, appendAfter = 10 } = {}) => {
+    if (tab.deck) Object.assign(tab.deck.meta, { url: to });
+    for (const fr of tab.frames) {
+      if (fr.left) continue;
+      if (fr.pg.rendition) fr.pg.rendition.segs.forEach((_, k) => fr.appended.add(k));
+      if (duration !== undefined) fr.duration = duration;
+      if (r2) {
+        setTimeout(() => {
+          fr.progress({ sbs: [1], mimes: [r2.mime] });
+          fr.emit({ t: 'tap-ready', parts: [r2.init, ...r2.segs].map((x, k) => ({ blobUrl: mint(x.bytes), mime: r2.mime, kind: k ? 'media' : 'init', sb: 1, seq: fr.seq++ })), duration: fr.duration });
+        }, appendAfter);
+      }
+    }
+  };
+  /**
+   * The tab is closed: its page goes as on a navigation, its capture ends endAfter ms later (null: not yet), and the
+   * hub's EJECT for it reaches the engine ejectAfter ms later (null: never).
+   */
+  tab.close = (engine, { endAfter = 0, ejectAfter = 20 } = {}) => {
+    tab.navigate();
+    if (endAfter != null) setTimeout(() => { if (tab.deck) for (const t of tab.deck.tracks) t.stop(); }, endAfter);
+    if (ejectAfter != null) setTimeout(() => engine.hubEject(tab.tabId), ejectAfter);
   };
   tab.sent = (frame = 0) => log.filter((x) => x.frame === frame).map((x) => x.m);
   tab.kinds = () => log.map((x) => (x.m.t === 'drive' ? `drive ${x.m.mode}` : x.m.t === 'tap' ? `tap ${x.m.on ? 'on' : 'off'}` : x.m.t));
@@ -176,12 +220,16 @@ export function makeDeck(tab, { id = 1, slot = 1, title = 'Model track' } = {}) 
   return deck;
 }
 
-/** A fake engine: the I1 entry points, the hub (AGENT_CONNECT connects the tab), events. */
+/**
+ * A fake engine: the I1 entry points, the hub (AGENT_CONNECT connects the tab), events. Its eject has the real one's
+ * shape: the load is stopped and the tab's STOP_TAB started at once, and the deck goes in its turn on serial().
+ */
 export function makeEngine({ tabs = [], limitMin = 15, hubOk = true } = {}) {
   let q = Promise.resolve();
+  const stops = new WeakMap(); // deck -> its STOP_TAB, sent once (the real engine's tabStops)
   const e = {
     ctx: { sampleRate: SR }, params: { 'resident.limitMin': limitMin, 'bpm.range': 'AUTO' }, decks: new Map(), loads: new Map(),
-    hubLog: [], events: [], notes: [], calls: [], order: [],
+    hubLog: [], events: [], notes: [], calls: [], order: [], leaving: new WeakSet(),
     serial(fn) { const run = q.then(fn, fn); q = run.catch(() => {}); return run; },
     hub(m) {
       e.hubLog.push(structuredClone(m)); e.order.push(m.type);
@@ -192,7 +240,14 @@ export function makeEngine({ tabs = [], limitMin = 15, hubOk = true } = {}) {
       }
       return Promise.resolve({ ok: true });
     },
-    stopTab(d, o = {}) { e.hubLog.push({ type: 'STOP_TAB', tabId: d.tabId, ...o }); e.order.push('STOP_TAB'); return turn(); },
+    stopTab(d, o = {}) {
+      if (d.tabId == null) return Promise.resolve();
+      if (!stops.has(d)) {
+        e.hubLog.push({ type: 'STOP_TAB', tabId: d.tabId, ...o }); e.order.push('STOP_TAB');
+        stops.set(d, turn().then(() => { e.order.push('STOP_TAB done'); }));
+      }
+      return stops.get(d);
+    },
     tabDecks() { return [...e.decks.values()].filter((d) => d.tabId != null).map((d) => ({ tabId: d.tabId, slot: d.slot })); },
     async analyse(pcm, signal) {
       e.calls.push({ fn: 'analyse', frames: pcm.L.length });
@@ -202,31 +257,52 @@ export function makeEngine({ tabs = [], limitMin = 15, hubOk = true } = {}) {
     },
     async startResidentDeck({ deckId, pcm, analysis, ...rest }) {
       e.calls.push({ fn: 'startResidentDeck', deckId, frames: pcm.L.length, code: pcm.L[0], analysis: !!analysis, rest });
-      await turn();
       const d = e.decks.get(deckId);
-      if (!d) return { ok: false, error: 'That deck is gone.' };
+      if (!d || e.leaving.has(d)) return { ok: false, error: 'That deck is gone.' };
+      await turn();
       d.kind = 'resident'; d.duration = pcm.L.length / pcm.sampleRate;
       d.setLoad({ state: 'ready', progress: 1, strategy: null, error: null });
+      if (e.decks.get(deckId) !== d || e.leaving.has(d)) return { ok: false, error: 'That deck is gone.' }; // ejected meanwhile
+      e.events.push({ level: 'info', text: `Loaded “${d.meta.title}” on deck ${d.slot}.` });
       return { ok: true, deckId, slot: d.slot };
     },
     async failLoadingToLive(deckId, reason) {
       e.calls.push({ fn: 'failLoadingToLive', deckId, reason });
       const d = e.decks.get(deckId);
-      if (!d) return { ok: false, error: 'That deck is gone.' };
+      if (!d || e.leaving.has(d)) return { ok: false, error: 'That deck is gone.' };
       const l = e.loads.get(deckId); if (l) { e.loads.delete(deckId); l.abort(); }
       d.kind = 'live';
       d.setLoad({ state: 'ready', progress: 1, strategy: null, error: null });
       if (reason) e.events.push({ level: 'warn', text: `Deck ${d.slot}: ${reason}` });
       return { ok: true, deckId, slot: d.slot };
     },
-    eject(id) { e.calls.push({ fn: 'eject', deckId: id }); const l = e.loads.get(id); if (l) { e.loads.delete(id); l.abort(); } e.decks.delete(id); return Promise.resolve(); },
+    eject(id) {
+      e.calls.push({ fn: 'eject', deckId: id });
+      const l = e.loads.get(id); if (l) { e.loads.delete(id); l.abort(); }
+      const d0 = e.decks.get(id);
+      if (d0) { e.leaving.add(d0); e.stopTab(d0); }
+      return e.serial(async () => {
+        const d = e.decks.get(id);
+        if (!d) return;
+        e.decks.delete(id);
+        e.hubLog.push({ type: 'DECKS_CHANGED', decks: e.tabDecks(), eject: true }); e.order.push('DECKS_CHANGED');
+        await e.stopTab(d);
+      });
+    },
+    /** The hub's EJECT for a closed tab, as the real engine takes it: a deck still loading from it says so, once. */
+    hubEject(tabId) {
+      const d = [...e.decks.values()].find((x) => x.tabId === tabId);
+      if (!d) return Promise.resolve();
+      if (d.kind === 'loading' && e.loads.has(d.id)) e.events.push({ level: 'error', text: `Deck ${d.slot}: the tab was closed before the track was in.` });
+      return e.eject(d.id);
+    },
     event(level, text) { e.events.push({ level, text }); },
     notify(level, text) { e.notes.push({ level, text }); },
   };
   return e;
 }
 
-export const FAST = { grace: 40, settle: 15, duration: 400, file: 400, fetchEach: 200, stall: 60, drive: 1500, drivePerSec: 0, check: 5 };
+export const FAST = { grace: 40, settle: 15, duration: 400, file: 400, fetchEach: 200, stall: 60, drive: 1500, drivePerSec: 0, check: 5, away: 80 };
 
 /** Stand-ins for the browser-only decoders. */
 export const decoders = {

@@ -41,6 +41,7 @@ export const TIMES = Object.freeze({
   drive: 30000,      // a drive's budget: this, plus drivePerSec for each second of the track
   drivePerSec: 250,
   check: 400,        // between gap checks while driving (each one places every piece)
+  away: 1500,        // after the page went away: the most to wait for word of what became of the tab (closed, another page)
 });
 
 /** Plain words for the deck's loading state. */
@@ -70,7 +71,10 @@ const DRIVE_RATE = 8;
 const FETCHED = 1e6;                 // placement keys of fetched batches, clear of the tap's SourceBuffers (frame * 1000 + sb)
 
 class Stop extends Error {
-  /** kind: 'cancel' (the deck was ejected or the load cancelled) or 'live' (play the tab live, saying why). */
+  /**
+   * kind: 'cancel' (the deck was ejected or the load cancelled), 'live' (play the tab live, saying why) or 'away' (the
+   * page went away before the track was in: what follows depends on what became of the tab).
+   */
   constructor(kind, message) { super(message); this.kind = kind; }
 }
 const now = () => performance.now();
@@ -82,8 +86,9 @@ const short = (u) => { try { const x = new URL(u); return `${x.host}${x.pathname
 const uniq = (xs) => [...new Set(xs)];
 
 /**
- * An HLS playlist: {variants: [{bw, url}]} for a master playlist, {init, segs: [{url, t0, t1}]} for a media
- * playlist, or null (not HLS, encrypted segments, or byte ranges of one file, none of which are read here).
+ * An HLS playlist: {variants: [{bw, url}]} for a master playlist, {init, segs: [{url, t0, t1}], ts?} for a media
+ * playlist, or null (not HLS, encrypted segments, or byte ranges of one file, none of which are read here). ts:
+ * its pieces are MPEG-TS (no init, and .ts pieces or an mp2t hint), which decodeAudioData cannot read (§4.2).
  */
 export function parseHls(text, base) {
   const s = String(text);
@@ -104,7 +109,9 @@ export function parseHls(text, base) {
     }
   } catch (_) { return null; }
   if (variants.length) return { variants };
-  return segs.length ? { init, segs } : null;
+  if (!segs.length) return null;
+  const ts = !init && (segs.some((x) => /\.ts$/i.test(new URL(x.url).pathname)) || /mp2t/i.test(s));
+  return ts ? { init, segs, ts } : { init, segs };
 }
 
 /**
@@ -138,11 +145,14 @@ class Job {
     signal.addEventListener('abort', () => this.poke(), { once: true });
   }
 
-  /** Resolves true once cond() holds (checked whenever the page says something), false after ms; rejects when cancelled. */
+  /**
+   * Resolves true once cond() holds, or something every wait gives way to (urgent(): the caller's check() says what),
+   * checked whenever the page says something; false after ms; rejects when cancelled.
+   */
   until(cond, ms) {
     return new Promise((resolve, reject) => {
       if (this.signal.aborted) { reject(new Stop('cancel', 'Loading was cancelled.')); return; }
-      if (cond()) { resolve(true); return; }
+      if (cond() || this.urgent()) { resolve(true); return; }
       const w = { cond, resolve, reject, timer: 0 };
       w.timer = setTimeout(() => { this.waiters.delete(w); resolve(false); }, Math.max(0, ms));
       this.waiters.add(w);
@@ -153,10 +163,11 @@ class Job {
     for (const w of [...this.waiters]) {
       let go = false;
       if (this.signal.aborted) { clearTimeout(w.timer); this.waiters.delete(w); w.reject(new Stop('cancel', 'Loading was cancelled.')); continue; }
-      try { go = w.cond(); } catch (_) {}
+      try { go = w.cond() || this.urgent(); } catch (_) {}
       if (go) { clearTimeout(w.timer); this.waiters.delete(w); w.resolve(true); }
     }
   }
+  urgent() { return false; }
   /** No more waiting: every timer cleared. */
   end() {
     this.done = true;
@@ -193,7 +204,11 @@ export class Loader extends Job {
     this.batch = 0;
     this.tapping = false;
     this.gone = null;          // the page went away mid-load
+    this.inPlace = false;      // it moved on with the track's frame still there (a single-page site's next track, until that frame goes)
     this.pinned = null;        // the frame whose player is the track, once the page has been looked at
+    this.looked = false;       // past the first look: a decisive tap error ends the load wherever it is
+    this.have = false;         // every byte of the track is in hand: the page going away no longer matters
+    this.url0 = (deck.meta && deck.meta.url) || '';
     this.big = false;
     this.bytes = 0;            // read from the tab, all frames
     this.host = hostOf(deck.meta && deck.meta.url);
@@ -294,8 +309,10 @@ export class Loader extends Job {
   mseFrame() { const f = this.track(); return f && (f.own ? f.own.size > 0 : (f.prog && f.prog.mimes.length) || f.parts.length) ? f : null; }
   /** A frame's captured appends: only those of the SourceBuffers feeding its player, when the tap says which. */
   own(f) { return f.own ? f.parts.filter((p) => f.own.has(p.sb - f.n * 1000)) : f.parts; }
+  /** The track's frame, or once the page has been looked at, its pinned frame even after it left (what it gave stays good). */
+  held() { return this.pinned || this.track(); }
   /** How long the track's player says the track is. */
-  duration() { const f = this.track(); return f && f.prog ? f.prog.duration : null; }
+  duration() { const f = this.held(); return f && f.prog ? f.prog.duration : null; }
   limitSec() { return (this.engine.params['resident.limitMin'] || 15) * 60; }
   /**
    * What must be covered: the track, or its first part when it is longer than the resident limit (a second
@@ -308,11 +325,32 @@ export class Loader extends Job {
   }
 
   // ---------------------------------------------------------------- waiting
-  /** After every await: stop if the load was cancelled, the deck is gone, or the page went away. */
+  /**
+   * The tab shows another page than the one this load began on (the hub's META; a hash is the same page): a navigation,
+   * or a single-page site's move to its next track, which leaves the page and its agents in place.
+   */
+  moved() { const page = (u) => String(u || '').split('#')[0]; return page(this.deck.meta && this.deck.meta.url) !== page(this.url0); }
+  /** Waits give way to a decisive tap error once the page has been looked at, and to the page going away or moving on. */
+  urgent() { return (this.looked && !!this.decisive()) || ((!!this.gone || this.moved()) && !this.have); }
+  /**
+   * After every await: stop if the load was cancelled or the deck is gone; go live, with its one message, on a decisive
+   * tap error (protected, in a worker, a preview, a stream) whenever the page reports it; stop if the page went away or
+   * moved on, unless every byte of the track is in hand already.
+   */
   check() {
     if (this.signal.aborted || this.engine.decks.get(this.deck.id) !== this.deck) throw new Stop('cancel', 'Loading was cancelled.');
-    if (this.gone) throw new Stop('live', LIVE.gone);
+    const why = this.looked && this.decisive();
+    if (why) throw new Stop('live', LIVE[why]);
+    if (!this.gone && !this.have && this.moved()) { this.gone = 'the page moved on'; this.inPlace = true; }
+    if (this.gone && !this.have) throw new Stop('away', this.gone);
     if (this.big) throw new Stop('live', LIVE.big);
+  }
+  /** Work on a whole track's bytes, all in hand: meanwhile (and after, when it gives the track) the page going away does not matter. */
+  async holding(fn) {
+    this.have = true;
+    let r = null;
+    try { r = await fn(); } finally { if (!(r && r.done)) this.have = false; }
+    return r;
   }
   async drain() {
     while (this.inflight.size) await Promise.all([...this.inflight]);
@@ -327,7 +365,11 @@ export class Loader extends Job {
       this.say(0, SAY.wait);
       await this.connect();
       await this.look();
-      out = await this.finish(await this.climb());
+      let got;
+      try { got = await this.climb(); } catch (err) {
+        if (!(err instanceof Stop && err.kind === 'away') || !(got = await this.inHand())) throw err;
+      }
+      out = await this.finish(got);
     } catch (err) {
       out = await this.fail(err);
     } finally {
@@ -363,6 +405,7 @@ export class Loader extends Job {
     const why = this.decisive(), D = this.duration();
     this.rep.steps.push({ name: 'look', outcome: why || 'ok', why: D != null ? `the player says ${D.toFixed(3)} s` : "the player's length is not known", ms: now() - t0 });
     if (why) throw new Stop('live', LIVE[why]);
+    this.looked = true;
   }
 
   /** The rungs, from the site's first. -> {pcm, notice} for a whole track; throws Stop('live') when none gives one. */
@@ -374,7 +417,7 @@ export class Loader extends Job {
       if (got) return got;
     }
     // Links the player asked for while it was driven: one more pass at them.
-    if (order.includes('refetch') && this.mseFrame() && this.wanted(this.plan).urls.length) {
+    if (order.includes('refetch') && this.mseFrame() && !(this.plan && this.plan.ts) && this.wanted(this.plan).urls.length) {
       const got = await this.step('refetch', (e) => this.refetch(e));
       if (got) return got;
     }
@@ -424,9 +467,10 @@ export class Loader extends Job {
   /**
    * A whole media file, decoded and checked against the length the page gives (`expect`, s). Longer than the resident
    * limit, an MP3 or ADTS file is cut at the frame a second past it, and only that part is decoded; a file in any other
-   * format is decoded whole, so only up to twice the limit.
+   * format is decoded whole, so only up to twice the limit. Its bytes are all in: the page may go meanwhile.
    */
-  async wholeFile(bytes, expect, what) {
+  wholeFile(bytes, expect, what) { return this.holding(() => this.decodeWhole(bytes, expect, what)); }
+  async decodeWhole(bytes, expect, what) {
     const L = this.limitSec(), w = framesOf(bytes, L + 1), own = w ? w.samples / w.sampleRate : null;
     const off = (got, want) => Math.abs(got - want) > Math.max(0.5, 0.01 * want);
     if (own && expect && off(own, expect)) return { outcome: 'failed', why: `${what} holds ${own.toFixed(1)} s, but the page's player says ${expect.toFixed(1)} s` };
@@ -457,11 +501,14 @@ export class Loader extends Job {
   // ---------------------------------------------------------------- rung: what the page requested, again (§4.2)
   refetch(e) { return this.mseFrame() ? this.refetchPieces(e) : this.refetchFile(e); }
 
-  /** A progressive player's media file (an <audio src> the URL layer saw), from the page, else from here. */
+  /**
+   * A progressive player's media file (an <audio src> the URL layer saw), from the page, else from here: the heard
+   * player's own source first (the tap names it), then the media links the page asked for, in order.
+   */
   async refetchFile(e) {
     e.how = SAY.media;
-    const D = this.duration();
-    const urls = uniq(this.reqs().filter((r) => r.media && r.method === 'GET' && (!r.range || /^bytes=0-$/i.test(r.range))).map((r) => r.url));
+    const D = this.duration(), f = this.held(), src = f && f.prog && f.prog.src;
+    const urls = uniq([...(src ? [src] : []), ...this.reqs().filter((r) => r.media && r.method === 'GET' && (!r.range || /^bytes=0-$/i.test(r.range))).map((r) => r.url)]);
     if (!urls.length) return { outcome: 'skipped', why: 'the page has asked for no media file' };
     if (D == null) return { outcome: 'skipped', why: NO_LENGTH };
     const why = [];
@@ -490,6 +537,8 @@ export class Loader extends Job {
       this.plan = null;
       for (const url of lists.slice(0, 4)) { this.plan = await this.readList(url); if (this.plan) break; }
     }
+    // A player of MPEG-TS transmuxes each piece before it appends it: fetched as they are, the pieces would not decode.
+    if (this.plan && this.plan.ts) return { outcome: 'skipped', why: "the playlist's pieces are MPEG-TS, which cannot be decoded directly" };
     let fetched = 0, failed = 0;
     const counts = () => `${fetched} pieces fetched${failed ? `, ${failed} failed` : ''}`;
     for (let round = 0; round < 3; round++) {
@@ -648,7 +697,7 @@ export class Loader extends Job {
   }
 
   // ---------------------------------------------------------------- assembly
-  parts() { const f = this.track(); return [...(f ? this.own(f) : []), ...this.fetched]; }
+  parts() { const f = this.held(); return [...(f ? this.own(f) : []), ...this.fetched]; }
 
   /** The placement of everything captured and fetched when it covers the track (re-checked against the latest length), else null. */
   async complete() {
@@ -669,9 +718,31 @@ export class Loader extends Job {
     if (!T || !this.rep.placed) return 0;
     return 1 - this.gapsNow().reduce((n, [a, b]) => n + (b - a), 0) / T;
   }
+  /**
+   * After the page went away: the track, when what is already in covers it ({pcm, notice}: the page going away does
+   * not matter then), else null. Pieces still being read are waited for; one the page took with it fails to read.
+   */
+  async inHand() {
+    // A page that moved on in place (a single-page site: its frame and agent stay) may have handed over its next track's
+    // pieces as the track's: what is in is kept only if the track's frame goes too (another document).
+    if (this.inPlace && !(await this.frameGone())) return null;
+    while (this.inflight.size) await Promise.all([...this.inflight]);
+    const T = this.target(), parts = this.parts();
+    if (T == null || !parts.length) return null;
+    const placed = this.d.placeParts(parts);
+    if (this.d.gapsFor(placed, T).length) return null;
+    this.rep.placed = placed;
+    this.rep.notes.push('the page went away once every piece was in: the track was kept');
+    const r = await this.decodeOr(placed);
+    return r.done || null;
+  }
 
-  /** {done: {pcm, notice}}, {again: true} when the length changed while decoding, or {outcome:'failed', why}. */
-  async decodeOr(placed) {
+  /**
+   * {done: {pcm, notice}}, {again: true} when the length changed while decoding, or {outcome:'failed', why}. The
+   * placement covers the track: every byte is in, so the page may go meanwhile.
+   */
+  decodeOr(placed) { return this.holding(() => this.decodeRuns(placed)); }
+  async decodeRuns(placed) {
     const D = this.duration(), T = this.target(), cut = T < D - placed.tol, t0 = now();
     this.say(0.8, SAY.decode);
     let pcm;
@@ -767,24 +838,69 @@ export class Loader extends Job {
     }
   }
 
+  /** The track's frame has gone, or goes within a moment (word of a page's new address can come before its agent goes). */
+  async frameGone() {
+    for (const t0 = now(); ;) {
+      const f = this.held();
+      if (!f || f.left) return true;
+      if (this.signal.aborted || now() - t0 >= this.t.away) return false;
+      await new Promise((r) => setTimeout(r, Math.min(50, this.t.away / 4)));
+    }
+  }
+
+  /** The tab's capture has ended: the tab closed, or its audio went away otherwise. */
+  ended() { const s = this.deck.stream; return !s || s.getAudioTracks().every((t) => t.readyState === 'ended'); }
+
+  /**
+   * The page went away before the track was in: what became of the tab. Word of it comes by other ways a moment
+   * later (the hub's META for the page the tab shows now, its EJECT of a closed tab), so it is waited for: 'moved'
+   * (another page), 'ended' (the capture ended, and no EJECT came) or 'reload' (the same page again). An EJECT
+   * meanwhile cancels the load, and says why itself.
+   */
+  async fate() {
+    const t0 = now();
+    for (;;) {
+      if (this.signal.aborted || this.engine.decks.get(this.deck.id) !== this.deck) throw new Stop('cancel', 'Loading was cancelled.');
+      if (this.moved()) {
+        this.rep.steps.push({ name: 'page', outcome: 'moved', why: `the tab shows ${short(this.deck.meta.url)} now`, ms: now() - t0 });
+        return 'moved';
+      }
+      if (now() - t0 >= this.t.away) break;
+      await new Promise((r) => setTimeout(r, Math.min(50, this.t.away / 4)));
+    }
+    const ended = this.ended();
+    this.rep.steps.push({ name: 'page', outcome: ended ? 'ended' : 'reload', why: ended ? "the tab's capture ended" : 'the same page again', ms: now() - t0 });
+    return ended ? 'ended' : 'reload';
+  }
+
   async fail(err) {
     const d = this.deck, e = this.engine;
-    const cancelled = (err instanceof Stop && err.kind === 'cancel') || this.signal.aborted || e.decks.get(d.id) !== d;
     this.quiet();
+    let away = null;
+    // A page that moved on in place says so only by its address: looked at here too, whatever ended the load.
+    if ((this.gone || this.moved()) && !this.signal.aborted && e.decks.get(d.id) === d) {
+      try { away = await this.fate(); } catch (x) { err = x; }
+    }
+    const cancelled = (err instanceof Stop && err.kind === 'cancel') || this.signal.aborted || e.decks.get(d.id) !== d;
     this.done = true;
     if (cancelled) { this.rep.result = 'cancelled'; return { ok: false, error: 'Loading was cancelled.' }; }
-    const reason = err instanceof Stop ? err.message : LIVE.failed((err && err.message) || String(err));
-    this.rep.result = `live: ${reason}`;
-    d.setLoad({ report: this.report() });
     const own = e.loads.get(d.id);
     if (own && own.loader === this) e.loads.delete(d.id); // failLoadingToLive aborts the load it finds
-    // A tab whose audio has gone too (closed, or its capture ended) would make a silent live deck: the deck goes.
-    if (!d.stream || d.stream.getAudioTracks().every((t) => t.readyState === 'ended')) {
-      const error = `Deck ${d.slot}: the tab's audio went away while the track was loading.`;
+    // The deck goes, with one error, rather than play live: a tab showing another page plays something else, and a
+    // tab whose capture ended (closed, or its audio gone) would make a silent live deck.
+    const gone = away === 'moved' ? 'the page moved on to something else before the track was in. Add the tab again.'
+      : this.ended() ? "the tab's audio went away while the track was loading." : null;
+    if (gone) {
+      const error = `Deck ${d.slot}: ${gone}`;
+      this.rep.result = `ejected: ${gone}`;
+      d.setLoad({ report: this.report() });
       e.event('error', error, d.id);
       e.eject(d.id);
       return { ok: false, error };
     }
+    const reason = !(err instanceof Stop) ? LIVE.failed((err && err.message) || String(err)) : err.kind === 'away' ? LIVE.gone : err.message;
+    this.rep.result = `live: ${reason}`;
+    d.setLoad({ report: this.report() });
     const r = await e.failLoadingToLive(d.id, reason);
     if (!r.ok) {
       if (e.decks.get(d.id) === d) e.eject(d.id);
