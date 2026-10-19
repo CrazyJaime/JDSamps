@@ -481,11 +481,12 @@ export class DeckStrip {
   }
 
   renderJogHint() {
-    const mode = this.jogMode(), r = this.refs;
+    const mode = this.inert ? 'none' : this.jogMode(), r = this.refs; // a loading deck takes no drag: no hint, no drag cursor
     setAttr(r.wave, 'data-jog', mode);
-    setAttr(r.wave, 'title', mode === 'bend' ? 'Drag to bend the tempo (jog)' : 'Drag to move the playhead');
+    setAttr(r.wave, 'title', mode === 'bend' ? 'Drag to bend the tempo (jog)' : mode === 'seek' ? 'Drag to move the playhead' : '');
+    setHidden(r.jogHint, this.inert);
     const k = this.jog ? this.jog.k : 0;
-    setText(r.jogHint, mode === 'bend' ? (k ? `BEND ${fmtPct(k * JOG_STEP)}` : 'DRAG: BEND TEMPO') : 'DRAG: MOVE PLAYHEAD');
+    setText(r.jogHint, mode === 'bend' ? (k ? `BEND ${fmtPct(k * JOG_STEP)}` : 'DRAG: BEND TEMPO') : mode === 'seek' ? 'DRAG: MOVE PLAYHEAD' : '');
   }
 
   /** Keyboard entry points (Task 13 keys.js). */
@@ -541,7 +542,8 @@ export class DeckStrip {
     setStyle(r.reserveFill, 'width', `${(resFrac * 100).toFixed(1)}%`);
     setText(r.reserveText, `${d.reserve.toFixed(1)}s`);
     r.reserve.classList.toggle('low', d.reserve < 4);
-    setHidden(r.assist, !(d.assist.active || (!d.assist.available && d.sync.on && d.engineRate > 1)));
+    // Only a live deck has a tab player to assist: a whole track never needs it, so never says it is n/a.
+    setHidden(r.assist, !(d.kind === 'live' && (d.assist.active || (!d.assist.available && d.sync.on && d.engineRate > 1))));
     setText(r.assist, d.assist.active ? `ASSIST ${d.assist.sourceRate.toFixed(3)}×` : 'ASSIST n/a');
     setClass(r.assist, `badge ${d.assist.active ? 'info' : 'warn'}`);
     setHidden(r.starved, !d.starved);

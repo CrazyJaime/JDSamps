@@ -219,12 +219,16 @@ export class Deck {
     if (this.cueAuto && !this.hasPlayed) this.setCue(this.firstAudible ?? 0);
   }
 
-  /** The automatic cue moves, once, to the first beat of grid g at the track's first sound. */
+  /**
+   * The automatic cue moves, once, to the first beat of grid g at the track's first sound. A whole track whose first
+   * beat is within one onset frame of its start (the grid is read to about a frame) is cued at the start itself, so
+   * its first attack is whole.
+   */
   snapAutoCue(g) {
     if (!g || !this.cueAuto || this.cueSnapped || this.hasPlayed || this.firstAudible == null) return;
     this.cueSnapped = true;
-    const k = Math.ceil((this.firstAudible - 0.05 - g.t0) / g.T);
-    this.setCue(g.t0 + k * g.T);
+    const k = Math.ceil((this.firstAudible - 0.05 - g.t0) / g.T), b = g.t0 + k * g.T;
+    this.setCue(this.ts.whole && b < 1 / this.tempo.fps ? 0 : b);
   }
 
   noteFirstAudible(L, R, at) {
@@ -414,7 +418,8 @@ export class Deck {
     const input = this.ts.clampInput(p);
     this.ts.change(this.now(), T, { active: true, input, rate: this.effRate(input), semitones: this.semis(input) });
     this.wantPlay = true;
-    this.search = null; // a search is a paused deck's: playing, the held nudge is a nudge again
+    // A search is a paused deck's: PLAY ends it, and the button still held does nothing (phase lock runs) until let go.
+    if (this.search) { this.search = null; this.nudge = 0; this.nudgeFactor = 1; }
     this.hasPlayed = true;
     this.playingSince = T;
     this.settleUntil = T + 0.5;
@@ -493,9 +498,13 @@ export class Deck {
         let target = this.ts.clampInput(this.ts.liveEdge - this.ts.lat - LIVE_RESERVE);
         if (this.wantPlay) {
           // Playing on its beat grid, the deck jumps whole beats (landing up to a beat further back), so it keeps its
-          // phase: a synced deck has nothing to bend back into line out of the small reserve LIVE leaves it.
-          const p = this.ts.posAt(T), g = this.grids.at(p);
-          if (g && g.T > 0 && this.canBeat(p)) target = this.ts.clampInput(p + Math.floor((target - p) / g.T) * g.T);
+          // phase: a synced deck has nothing to bend back into line out of the small reserve LIVE leaves it. The beats
+          // are counted on the grid where it lands (audio captured at an assist rate has them closer together).
+          const p = this.ts.posAt(T), g = this.grids.at(p), to = this.grids.at(target);
+          if (g && g.T > 0 && to && to.T > 0 && this.canBeat(p)) {
+            const ph = frac((p - g.t0) / g.T);
+            target = this.ts.clampInput(to.t0 + (Math.floor((target - to.t0) / to.T - ph) + ph) * to.T);
+          }
           this.sched(T, { input: target });
         } else this.ts.change(now, T, { active: false, input: target });
         return OK;
@@ -506,6 +515,7 @@ export class Deck {
         else { this.engine.clock.follow(this.id); this.syncOn = false; this.phaseMs = null; }
         return OK;
       case 'nudge':
+        if (!arg.dir && !this.nudge) return OK; // nothing held (PLAY ended its search): letting go changes nothing
         // Paused, the nudge buttons search instead: the playhead moves while held (searchTick).
         this.search = !this.wantPlay && arg.dir ? { dir: arg.dir, fine: arg.fine, from: this.ts.posAt(this.landAt(now)), at: now } : null;
         if (this.search) this.cueAuto = false;
@@ -597,7 +607,10 @@ export class Deck {
 
   rollEnd(now, T) {
     if (!this.rollFrom) return OK;
-    this.sched(T, { input: this.ts.clampInput(this.slipAt(T)), loopStart: 0, loopEnd: 0 });
+    const slip = this.slipAt(T);
+    // A whole track that carried on past its end beneath the roll has ended: it lands stopped there.
+    if (this.kind === 'resident' && slip >= this.duration) this.sched(T, { active: false, input: this.duration, loopStart: 0, loopEnd: 0 });
+    else this.sched(T, { input: this.ts.clampInput(slip), loopStart: 0, loopEnd: 0 });
     this.roll = null; this.loop = null; this.rollFrom = null;
     this.settleUntil = T + 0.3;
     return OK;
@@ -956,10 +969,12 @@ export class Deck {
    * A resident deck stops at the end of its track (input = duration). The stop is planned once the end is
    * near, after any change still pending; a later change drops it, and the next tick plans it again. Parked
    * at the end with a start still to come (CUE, then PLAY at once), it is not stopped: that start would play unseen.
+   * A CUE preview held into the end goes back to the cue there, as letting go of it would.
    */
   planEnd(now) {
     const ts = this.ts, end = this.duration;
     if (this.parkedAtEnd(now) && !ts.planned(now, true)) {
+      if (this.previewing) ts.change(now, now, { active: false, input: this.cue });
       this.wantPlay = false; this.previewing = false; this.playingSince = Infinity;
       return;
     }
@@ -967,8 +982,8 @@ export class Deck {
     if (!last.active || !(last.rate > 0) || last.loopEnd > last.loopStart) return; // stop planned already, or looping
     const from = Math.max(last.output, now), tEnd = from + (end - ts.posAt(from)) / last.rate;
     if (tEnd - now > END_PLAN) return;
-    if (last.output > now) ts.then(now, Math.max(tEnd, last.output + 1e-6), { active: false, input: end });
-    else ts.change(now, Math.max(tEnd, ts.soon(now)), { active: false, input: end });
+    if (last.output > now) ts.then(now, Math.max(tEnd, last.output + 1e-6), { active: false, input: end, end: true });
+    else ts.change(now, Math.max(tEnd, ts.soon(now)), { active: false, input: end, end: true });
   }
 
   /**

@@ -17,6 +17,7 @@ import { TempoTracker, DeckTempo, DEFAULTS, RELATED } from './tempo.js';
 const WIN = 10, HOP = 5;  // s: phase-comb windows, and how far apart they start
 const BLOCK = 20;         // s: blocks a coarse tempo is read from, to find tempo changes
 const SAME = 0.02;        // blocks whose tempi are related within this are one tempo segment
+const CARRY = 0.04;       // a tempo segment starting within this of the tempo the one before ended at carries on its song
 const CUT = 25;           // s: history either side of a block boundary searched for the change point
 const EDGE = 4;           // s: a refined change point stays this far inside the blocks it splits
 const MIN_SEG = 8;        // s: shortest tempo segment kept
@@ -67,7 +68,7 @@ function onsets(fr, from, to) {
 }
 
 const median = (xs) => { const a = [...xs].sort((p, q) => p - q); return a.length ? a[a.length >> 1] : 0; };
-const related = (a, b) => RELATED.some((m) => Math.abs(a / (b * m) - 1) < SAME);
+const related = (a, b, tol = SAME) => RELATED.some((m) => Math.abs(a / (b * m) - 1) < tol);
 const inputAt = (fr, i) => fr.t0 + i * fr.spf; // input frame at the centre of onset frame i
 
 /** A live tempo tracker holding exactly frames [from, to). */
@@ -282,12 +283,17 @@ function fit(fr, sr, { lo = DEFAULTS.lo, hi = DEFAULTS.hi } = {}) {
   const wave = { tStart: fr.t0 / sr, hop: fr.spf / sr, data: fr.bands };
   const out = { bpm: 0, conf: 0, octConf: 0, segments: [], bar1: null, residuals: { median: 0, max: 0 }, wave };
   if (fr.full.length < 4 * fr.fps) return out;
-  const segs = tempoSegments(fr, { lo, hi }), resid = [];
+  const segs = tempoSegments(fr, { lo, hi }), resid = [], parts = [];
   let main = null;
   for (const s of segs) {
     const g = s.est ? segmentGrid(fr, s.from, s.to, s.est.bpm, sr) : null;
     if (!g) continue;
-    for (const p of g.pieces) out.segments.push({ ...p, conf: s.est.conf });
+    // Its part: the previous segment's when it carries on at the tempo that one ended at (one song whose tempo drifts,
+    // which tempoSegments cuts every 2 %), else the first part at a related tempo (tracks at the same beat), else its own.
+    const prev = out.segments[out.segments.length - 1];
+    let part = prev && related(prev.grid.T, g.pieces[0].grid.T, CARRY) ? prev.part : parts.findIndex((bpm) => related(s.est.bpm, bpm));
+    if (part < 0) part = parts.push(s.est.bpm) - 1;
+    for (const p of g.pieces) out.segments.push({ ...p, conf: s.est.conf, part });
     resid.push(...g.resid);
     if (!main || s.to - s.from > main.to - main.from) main = { ...s, T: g.T };
   }
@@ -351,7 +357,10 @@ export function analyseTrackSync(pcm, { lo, hi } = {}) {
  * what was there), its tempo seeded from the analysis (made first, at the analysis rate and the deck's
  * BPM range, if the deck has none: no input worklet ever announced one), and the whole waveform into
  * its wave store and out to the pages, as the live input path stores and sends each batch. Bar 1 is
- * left for the DJ: the analysis only suggests it.
+ * left for the DJ: the analysis only suggests it. Each part (one song, its tempo drifting or not, and
+ * segments at related tempi) is a track of the grid map, so a correction made in one leaves an unrelated
+ * tempo elsewhere in the file alone; the tempo holds the last segment's grid, so that segment's part is
+ * the track it follows.
  */
 export function applyAnalysis(deck, a) {
   const w = a.wave;
@@ -359,7 +368,11 @@ export function applyAnalysis(deck, a) {
     const [lo, hi] = BPM_RANGES[deck.engine.params['bpm.range']] || BPM_RANGES.AUTO;
     deck.tempo = new DeckTempo({ sampleRate: deck.sr, fps: deck.sr / Math.round(w.hop * deck.sr), lo, hi });
   }
-  a.segments.forEach((s, i) => deck.grids.split(i ? s.from : -Infinity, { t0: s.grid.t0, T: s.grid.T, bar1: null }));
+  const n = deck.tempo.track.n, segs = a.segments, last = segs.length ? segs[segs.length - 1].part ?? 0 : 0;
+  segs.forEach((s, i) => {
+    const part = s.part ?? 0;
+    deck.grids.split(i ? s.from : -Infinity, { t0: s.grid.t0, T: s.grid.T, bar1: null }, part === last ? n : n + 1 + part);
+  });
   deck.tempo.seed(a);
   if (w.data.length) {
     deck.appendWave(w.tStart, w.hop, w.data);

@@ -80,10 +80,11 @@ export class Timeshift {
   rateAt(t) { return this.segAt(t).rate; }
   reserveAt(t) { return Math.max(0, this.liveEdge - this.lat - this.posAt(t)); }
 
-  /** A playable input position: behind a live edge by the latency and a margin, or up to a whole track's last frame. */
+  /** A playable input position: behind a live edge by the latency and a margin, or anywhere from a whole track's first frame to its last. */
   clampInput(x) {
+    const lo = this.whole ? this.historyStart : this.historyStart + 0.01;
     const end = this.whole ? this.liveEdge - 1 / this.sr : this.liveEdge - this.lat - 0.3;
-    return Math.min(Math.max(x, this.historyStart + 0.01), Math.max(this.historyStart + 0.01, end));
+    return Math.min(Math.max(x, lo), Math.max(lo, end));
   }
 
   /** Output time of the last planned change (pending or queued), or -Infinity. */
@@ -100,7 +101,8 @@ export class Timeshift {
     const seg = { output: T };
     for (const k of FIELDS) seg[k] = fields[k] !== undefined ? fields[k] : base[k];
     if (fields.input === undefined) seg.input = this.posAt(T);
-    seg.transport = TRANSPORT.some((k) => fields[k] !== undefined);
+    seg.transport = !fields.end && TRANSPORT.some((k) => fields[k] !== undefined);
+    if (fields.end) seg.end = true;
     return seg;
   }
 
@@ -109,9 +111,18 @@ export class Timeshift {
    * (start, pause, jump, loop) that has not happened yet is folded in rather than lost: the new
    * change keeps every field it does not restate and lands at the planned time (or at T, if it
    * jumps and T is later). So a rate update never cancels a pending PLAY or SYNC-PLAY. Only a
-   * change that reverses its play state (PAUSE during a pending start) cancels it.
+   * change that reverses its play state (PAUSE during a pending start) cancels it. A whole track's stop at its
+   * end (fields.end, planned by the deck) is not the DJ's: nothing folds into it. A change landing before it
+   * replaces it (the deck plans it again after the change); one landing after it follows it, so the track is
+   * never played past its end.
    */
   change(now, T, fields) {
+    const stop = this.segs.find((s) => s.output > now && s.end);
+    if (stop && stop.output <= T) {
+      this.segs = this.segs.filter((s) => s.output <= stop.output);
+      this.queue = this.queue.filter((s) => s.output <= stop.output);
+      return this.then(now, T, fields);
+    }
     const planned = this.segs.find((s) => s.output > now && s.transport && (fields.active === undefined || fields.active === s.active));
     this.cut(now);
     this.queue = [];
@@ -256,9 +267,9 @@ export class GridMap {
       }
     }
   }
-  split(inPos, grid) {
+  /** A new grid from inPos on (an assist step; a whole-track analysis's segment, with its own track). */
+  split(inPos, grid, track = this.segs.length ? this.segs[this.segs.length - 1].track : 0) {
     if (!grid) return;
-    const track = this.segs.length ? this.segs[this.segs.length - 1].track : 0;
     this.segs = this.segs.filter((s) => s.from < inPos);
     this.segs.push({ from: this.segs.length ? inPos : -Infinity, grid: { ...grid }, track });
   }
