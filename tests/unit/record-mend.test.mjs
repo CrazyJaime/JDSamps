@@ -3,7 +3,7 @@
 // mendSteps finds those steps between steady beats and puts the audio back on the beat.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mendSteps } from '../../engine/loader.js';
+import { mendSteps, keepsTime } from '../../engine/loader.js';
 
 const SR = 48000, BPM = 124, T = 60 / BPM;
 
@@ -184,4 +184,44 @@ test('a burst of skips (10 ms lost, then 24 ms and 10 ms of silence put in) is m
     assert.equal(r.pcm.L.length, x.length, `${name} at ${sr}: ${JSON.stringify(r.steps)}`);
     assert.ok(d && d[0] >= at && d[1] < at + T * sr, `${name} at ${sr}: differs ${d && d.map((v) => (v / sr).toFixed(3))} s`);
   }
+});
+
+// ---------------------------------------------------------------- the recording checked after it is mended (keepsTime)
+// A capture that went wrong in a way mendSteps cannot mend (the speed wandering, a stream of losses too small to see
+// one by one) must never become a deck at the wrong speed: every bar must sit where the bar before it puts it, the
+// premise mendSteps mends by, all through the track.
+
+/** Kicks whose beat goes from T0 to T1 (s) over the recording: a capture at the wrong, changing speed. */
+function drifting(T0, T1, seconds = 16) {
+  const n = Math.round(seconds * SR), L = new Float32Array(n), beats = [];
+  for (let t = 0; t < seconds; t += T0 + (T1 - T0) * (t / seconds)) beats.push(t);
+  for (const b of beats) for (let i = 0; i < 0.2 * SR; i++) { const k = Math.round(b * SR) + i, t = i / SR; if (k < n) L[k] += 0.8 * Math.sin(2 * Math.PI * (45 + 70 * Math.exp(-t * 35)) * t) * Math.exp(-t * 18); }
+  return { pcm: { L, R: L.slice(), sampleRate: SR }, T: (T0 + T1) / 2 };
+}
+/** n frames lost every `every` s from `from` s on (each too small to be a skip mendSteps mends). */
+const leaky = (x, n, every, from) => { let y = x; for (let at = Math.round(from * SR); at < y.length - n; at += Math.round(every * SR) - n) y = cut(y, at, n); return y; };
+
+test('a recording that keeps time passes the check: clean or mended, kicks or a loop with a bed, played by hand, or with no beat to tell by', () => {
+  assert.equal(keepsTime(kicks(), T).steady, true, 'clean kicks');
+  const skippedKicks = both(kicks(), (x) => cut(ins(x, Math.round((4 * T + 0.3) * SR), 960), Math.round((15 * T + 0.1) * SR), 960));
+  const m = mendSteps(skippedKicks, T);
+  assert.equal(m.steps.length, 2);
+  assert.equal(keepsTime(m.pcm, T).steady, true, 'mended kicks');
+  // A loop as the 2x capture it is checked as: the bars' own time, halved.
+  for (const name of Object.keys(PATTERNS)) { const { pcm, T: Tl } = loop(name, 48000); assert.equal(keepsTime(pcm, Tl, { tol: 0.0015 }).steady, true, name); }
+  const n = 10 * SR, L = new Float32Array(n);
+  for (let i = 0; i < n; i++) L[i] = 0.3 * Math.sin(2 * Math.PI * 220 * (i / SR)) * (0.5 + 0.5 * Math.sin(i / SR));
+  assert.equal(keepsTime({ L, R: L.slice(), sampleRate: SR }, T).steady, true, 'no beat: nothing to tell by');
+});
+
+test('a recording at a wandering speed, or that starts losing a little all the time, fails the check (mendSteps leaves it as it is)', () => {
+  const d = drifting(0.493, 0.423);                   // beat to beat 493 ms down to 423 ms: "bpm 125.65"
+  assert.deepEqual(mendSteps(d.pcm, d.T).steps, [], 'nothing mendSteps can mend');
+  const r = keepsTime(d.pcm, d.T);
+  assert.equal(r.steady, false, JSON.stringify(r));
+  assert.equal(keepsTime(drifting(0.489, 0.477).pcm, 0.483).steady, false, 'a beat 2.5 % faster at the end than at the start');
+  const lossy = both(kicks(), (x) => leaky(x, Math.round(0.003 * SR), 0.31, 8)); // from 8 s on, 3 ms lost every 310 ms
+  assert.equal(keepsTime(mendSteps(lossy, T).pcm, T).steady, false);
+  const { x, T: Tl } = loop('techno', 48000), y = leaky(x, Math.round(0.002 * 48000), 0.2, 4);
+  assert.equal(keepsTime({ L: y, R: y, sampleRate: 48000 }, Tl, { tol: 0.0015 }).steady, false, 'a loop with a bed losing 2 ms every 200 ms from 4 s on');
 });

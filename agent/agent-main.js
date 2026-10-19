@@ -133,7 +133,11 @@
   const EVENTS = ['play', 'playing', 'pause', 'emptied', 'loadedmetadata', 'volumechange', 'timeupdate'];
   function onMedia(e) {
     watchdog();
-    if (e.type === 'timeupdate') { pump(); return; } // about 4 a second while playing, timers or not
+    if (e.type === 'timeupdate') { // about 4 a second while playing, timers or not
+      pump();
+      if (drv.mode === 'accelerate' && e.currentTarget === drv.el) tapDirty(); // its place as it runs (a recording reads it against its capture)
+      return;
+    }
     if (st.enforcing && (e.type === 'playing' || e.type === 'loadedmetadata')) apply(e.currentTarget);
     report();
   }
