@@ -338,6 +338,17 @@ test('a capture step that comes over two beats, as one run captured it: found, a
   assert.deepEqual(late, [], `locked at ${lock.t.toFixed(1)} s on ${lock.bpm.toFixed(3)}`);
 });
 
+test('two capture steps two beats apart (as one run captured them): each is found with its own step, not as one over two beats', () => {
+  // The two beats between the steps sit on one level, part of the way: a step over two beats moves them part of the way
+  // each, the second further than the first. Taken as one, the -48.7 ms of both was found between those two beats, and
+  // the deck jumped it there: its audio 28 ms off for the beat until the second step.
+  const { gaps } = captureGaps('live-two-steps-capture.json'), say = gaps.say;
+  const near = (at) => gaps.filter((g) => Math.abs(g.from - at) < 0.6);
+  assert.ok(near(47.68).some((g) => Math.abs(g.D + 18.6) <= 3), `the capture stepped -18.6 ms at 47.68 s; ${say}`);
+  assert.ok(near(48.62).some((g) => g.from > 48.15 && Math.abs(g.D + 30.1) <= 4), `and -30.1 ms at 48.62 s; ${say}`);
+  assert.ok(!gaps.some((g) => Math.abs(g.D + 48.7) <= 6), `no gap of both: ${say}`);
+});
+
 test('capture gaps while the clock\'s period is off (a burst the fine fit took in, as one run captured it): each is found', () => {
   // A spliced gap and three of the box's own capture skips over three seconds were never found: the fine fit took them in
   // and read 0.4-0.6 % fast, so the beats drifted 2-3 ms a beat off the clock. The window's step fit allows for a drift,

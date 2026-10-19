@@ -459,8 +459,8 @@ function phaseStep(r, skip = -1, K = r.length, w = 1) {
 
 /**
  * A step that came over two beats (the capture moved two beats in a row part of the way each): phaseStep leaving out
- * the two beats p, p + 1 around split j, which then sit between the levels on either side, in order. Returns the best
- * such step, with skip p, or null.
+ * the two beats p, p + 1 around split j, which then sit between the levels on either side, in order, the second further
+ * on (on one level, they lie between two steps: each its own gap). Returns the best such step, with skip p, or null.
  */
 function phaseRamp(r, j, K) {
   let best = null;
@@ -468,7 +468,7 @@ function phaseRamp(r, j, K) {
     const s = phaseStep(r, p, K, 2);
     if (!s || !s.clear || s.j < p || s.j > p + 2) continue;
     const f0 = (r[p] - s.a - s.b * p) / s.D, f1 = (r[p + 1] - s.a - s.b * (p + 1)) / s.D;
-    if (!(f0 > 0.1 && f1 < 0.9 && f0 <= f1)) continue;
+    if (!(f0 > 0.1 && f1 < 0.9 && f1 - f0 >= 0.1)) continue;
     if (!best || s.sse < best.sse) best = { ...s, skip: p };
   }
   return best;
