@@ -11,7 +11,7 @@
 // then live. A rung whose precondition is absent is not tried, and says why. Protected media, MSE in a worker,
 // a stream with no end, a page with no player the tap can read and a preview go live at once (§4.5).
 import { HUB } from '../shared/protocol.js';
-import { placeParts, gapsFor, decodePlaced, AssemblyError } from './assemble.js';
+import { placeParts, gapsFor, decodePlaced, AssemblyError, PlaceIndex } from './assemble.js';
 import { decodeTo, limitPcm, fetchArrayBuffer, resample, FetchRefused } from './decode.js';
 import { mp3Frames, adtsFrames } from './bmff.js';
 
@@ -42,7 +42,7 @@ export const TIMES = Object.freeze({
   stall: 5000,       // a seek-hop that brings no new audio this long is given up for accelerate; then, accelerate too
   drive: 30000,      // a drive's budget: this, plus drivePerSec for each second of the track
   drivePerSec: 250,
-  check: 400,        // between gap checks while driving (each one places every piece)
+  check: 400,        // between gap checks while driving (each one reads only the pieces that came since)
   away: 1500,        // after the page went away: the most to wait for word of what became of the tab (closed, another page)
   report: 1000,      // between refreshes of the load report while nothing else moves the deck's progress
 });
@@ -226,6 +226,7 @@ export class Loader extends Job {
     this.frames = new Map();   // frameId -> what its agent said, and what it handed over
     this.inflight = new Set(); // blob: URLs being read
     this.fetched = [];         // pieces fetched again, keyed for placement
+    this.index = new PlaceIndex(); // where the pieces so far place, each read once as it comes (the gaps while driving)
     this.tried = new Set();    // links already fetched again
     this.unfetched = new Map(); // link -> why the engine's own fetch of it failed
     this.batch = 0;
@@ -660,7 +661,7 @@ export class Loader extends Job {
       const n = await this.fetchPieces(want);
       fetched += n.ok; failed += n.failed;
     }
-    const placed = await this.complete();
+    const placed = await this.complete({ exact: true });
     if (placed) return { why: counts(), ...(await this.decodeOr(placed)) };
     return { outcome: 'failed', why: `${counts()}, still missing ${this.gapsNow().map(span).join(', ') || 'the track length'}` };
   }
@@ -840,14 +841,14 @@ export class Loader extends Job {
         if (d && d.unflushed && !unflushed) { unflushed = d.unflushed; this.rep.notes.push(`the player was not flushed: ${UNFLUSHED[d.unflushed]}`); }
         if (st === 'done' || this.now() - checked >= this.t.check) {
           checked = this.now();
-          placed = await this.complete();
+          placed = await this.complete({ exact: st === 'done' });
           if (placed) break;
           this.say(band(this.covered()));
         }
         if (st === 'done') {
           await this.sleep(2 * this.t.check); // a last piece may still be on its way
           this.check();
-          placed = await this.complete();
+          placed = await this.complete({ exact: true });
           if (placed) break;
           const gaps = this.gapsNow();
           if (!gaps.length) { out = { outcome: 'failed', why: NO_LENGTH }; break; } // the player no longer gives a length
@@ -883,11 +884,19 @@ export class Loader extends Job {
   // ---------------------------------------------------------------- assembly
   parts() { const f = this.held(); return [...(f ? this.own(f) : []), ...this.fetched]; }
 
-  /** The placement of everything captured and fetched when it covers the track (re-checked against the latest length), else null. */
-  async complete() {
+  /**
+   * The placement of everything captured and fetched when it covers the track (re-checked against the latest length),
+   * else null. The gaps come from the index, which reads each piece once as it comes; the whole placement a decode needs
+   * is made only once the index finds none, or when `exact` (a decision that rests on it alone).
+   */
+  async complete({ exact = false } = {}) {
     await this.drain();
     const T = this.target(), parts = this.parts();
     if (T == null || !parts.length) return null;
+    if (!exact) {
+      const ix = this.index.update(parts);
+      if (ix) { this.rep.placed = ix; if (this.d.gapsFor(ix, T).length) return null; }
+    }
     const placed = this.d.placeParts(parts);
     this.rep.placed = placed;
     return this.d.gapsFor(placed, T).length ? null : placed;

@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { SITES, TIMES, firstRung, parseHls, findStart } from '../../engine/loader.js';
 import { defaults, MASTER_PARAMS, PERSISTED_MASTER_KEYS, validateUiMessage } from '../../shared/protocol.js';
 import { FETCH_STALL } from '../../engine/decode.js';
+import { placeParts } from '../../engine/assemble.js';
 import { load, rendition, file, mp3, code, DUR, SR, OPUS, makeTab, makeEngine, loaderFor, fetcher, settle, turn, decoders, FAST } from './fixtures/loader-harness.mjs';
 
 const hi = () => rendition('opus-hi');
@@ -157,6 +158,19 @@ test('an MSE page with nothing to fetch again is driven: seek-hop, then drive st
   assert.equal(result.kind, 'resident', JSON.stringify(engine.calls));
   assert.deepEqual(tab.kinds(), ['tap on', 'readTralbum', 'drive seekhop', 'drive stop', 'tap off']);
   assert.ok(near(called(engine, 'startResidentDeck')[0].frames / SR, 120, 0.02));
+});
+
+test('while a player is driven, its pieces are read once each as they come: the whole placement is made once, when they cover the track', async () => {
+  let full = 0;
+  const { result, engine, deck } = await load({ kind: 'mse', rendition: hi(), preTap: 0, playing: 1, seekhop: 'slow' }, {
+    deps: { placeParts: (parts) => { full++; return placeParts(parts); } },
+  });
+  assert.equal(result.kind, 'resident', deck.load.report);
+  assert.ok(near(called(engine, 'startResidentDeck')[0].frames / SR, 120, 0.02));
+  assert.equal(full, 1, `placed from scratch ${full} times`);
+  // The deck's progress still follows the pieces as they come.
+  const ps = deck.loads.map((l) => l.progress);
+  assert.ok(new Set(ps.filter((p) => p > 0.05 && p < 0.8)).size >= 10, `progress: ${[...new Set(ps)].map((p) => p.toFixed(2)).join(' ')}`);
 });
 
 test('a seek-hop that stalls goes on to accelerate, with the pitch unlocked through the drive', async () => {

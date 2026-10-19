@@ -119,6 +119,124 @@ export function placeParts(parts) {
   return choose([...reps.values()], skipped);
 }
 
+const MAX_TAIL = 16 * 2 ** 20; // bytes a stream may hold unread (nothing in them placed) before the index gives up on it
+
+/**
+ * placeParts kept up to date as parts come in, for a drive that looks for gaps every few hundred ms: each new part is
+ * read once (an item cut across appends waits for the rest), what it places goes into an index, and the coverage comes
+ * from the same choose(). The last item read in a stream is read again with what follows it (a WebM cluster of unknown
+ * size may still grow). Its segments carry no bytes: the placement a decode needs is placeParts', made once this finds
+ * no gap. update(parts) takes the list placeParts would take, and returns null when a stream defeats it (bytes it cannot
+ * get past): placeParts has the say then.
+ */
+export class PlaceIndex {
+  constructor() { this.reset(); }
+  reset() { this.seen = new Set(); this.streams = new Map(); this.reps = new Map(); this.files = 0; this.lost = false; }
+
+  update(parts) {
+    let kept = 0;
+    for (const p of parts) if (this.seen.has(p)) kept++;
+    if (kept < this.seen.size) this.reset(); // a part left the list (another player feeds the track now): from the start
+    const touched = new Set();
+    for (const p of parts) {
+      if (this.seen.has(p)) continue;
+      this.seen.add(p);
+      const key = p.kind === 'file' ? `file:${this.files++}` : `sb:${p.sb ?? 0}`;
+      let s = this.streams.get(key);
+      if (!s) this.streams.set(key, (s = { key, mime: p.mime, fmt: null, fresh: [], tail: [], size: 0, last: -Infinity, init: null, rep: null, prov: [], mp3: null }));
+      s.fresh.push(p);
+      touched.add(s);
+    }
+    for (const s of touched) {
+      s.fresh.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+      // A part that comes after a later one of its stream was read: everything is read again, in order.
+      if ((s.fresh[0].seq ?? 0) < s.last) { const all = parts; this.reset(); return this.update(all); }
+    }
+    for (const s of touched) this.read(s);
+    return this.lost ? null : this.placement();
+  }
+
+  rep(id, props) { if (!this.reps.has(id)) this.reps.set(id, { id, segs: [], bytes: 0, secs: 0, ...props }); return this.reps.get(id); }
+  add(r, seg) {
+    if (r.segs.some((s) => Math.abs(s.t0 - seg.t0) < EXACT)) return;
+    r.segs.push(seg); r.bytes += seg.size; r.secs += seg.t1 - seg.t0;
+  }
+
+  read(s) {
+    for (const p of s.fresh) { s.tail.push(bytesOf(p.bytes)); s.size += p.bytes.byteLength; s.last = Math.max(s.last, p.seq ?? 0); }
+    s.fresh = [];
+    if (!s.fmt) { const { buf } = join(s.tail); s.fmt = buf.length ? sniff(s.mime, buf) : null; }
+    if (s.fmt === 'mp4' || s.fmt === 'webm') this.readItems(s);
+    else if (s.fmt === 'mp3' || s.fmt === 'adts') this.readFrames(s);
+    if (s.tail.reduce((n, b) => n + b.byteLength, 0) > MAX_TAIL) this.lost = true;
+  }
+
+  /** fMP4 or WebM: the unread bytes behind the init they follow, walked as placeParts walks them. */
+  readItems(s) {
+    const pre = s.init ? [s.init] : [], { buf, cuts } = join([...pre, ...s.tail]), base = pre.length ? s.init.byteLength : 0;
+    const items = (s.fmt === 'mp4' ? mp4Items : webmItems)(buf, { resync: cuts }).filter((it) => it.start >= base);
+    let done = base, cur = s.rep;
+    s.prov = [];
+    items.forEach((it, i) => {
+      const last = i === items.length - 1;
+      if (it.kind === 'init') {
+        const info = it.info;
+        if (s.fmt === 'mp4' && !info.fragmented) {                                       // a whole progressive file
+          cur = null;
+          if (info.duration && info.timescale) {
+            const r = this.rep(`${s.key}:whole`, { fmt: s.fmt, mime: s.mime, key: info.key, init: null, rate: info.rate, delay: info.delay / info.timescale });
+            const seg = { t0: 0, t1: info.duration / info.timescale, frame: FRAME, size: s.size, bytes: null };
+            if (last) s.prov.push({ r, seg }); else this.add(r, seg);
+          }
+          if (!last) { s.init = null; s.rep = null; }
+        } else {
+          const init = buf.slice(it.start, it.end);
+          cur = this.rep(`${s.fmt}:${latin1(init)}`, { fmt: s.fmt, mime: s.mime, key: info.key, init: init.buffer, rate: info.rate || 48000,
+            delay: s.fmt === 'mp4' ? info.delay / info.timescale : info.delay });
+          if (!last) { s.init = init; s.rep = cur; }
+        }
+      } else if (cur) {
+        const seg = { t0: it.t0, t1: it.t1, frame: it.frame, size: it.end - it.start, bytes: null };
+        if (last) s.prov.push({ r: cur, seg }); else this.add(cur, seg);
+      }
+      if (!last) done = it.end;
+    });
+    // What is left unread: from the end of the last item read for good, still cut where the appends were.
+    const tail = [];
+    cuts.forEach((c, i) => { const e = cuts[i + 1] ?? buf.length; if (e > done && e > base) tail.push(buf.subarray(Math.max(c, done, base), e)); });
+    s.tail = tail;
+  }
+
+  /** MP3 or ADTS: the frame walk goes on from the last whole frame; the stream is one segment from 0, as placeParts has it. */
+  readFrames(s) {
+    const m = s.mp3 || (s.mp3 = { frames: 0, samples: 0, sampleRate: 0, spf: 0, at: 0, midJunk: false });
+    const { buf } = join(s.tail), walk = s.fmt === 'mp3' ? mp3Frames : adtsFrames;
+    const w = walk(buf, m.frames ? { resume: { frames: m.frames, sampleRate: m.sampleRate } } : {});
+    if (w.frames) {
+      m.frames += w.frames; m.samples += w.samples; m.sampleRate = w.sampleRate; m.spf = Math.max(m.spf, w.spf); m.at += w.end;
+      m.midJunk = m.midJunk || w.midJunk;
+      s.tail = w.end < buf.length ? [buf.subarray(w.end)] : [];
+    }
+    s.prov = [];
+    if (!m.frames || m.midJunk) { this.reps.delete(`${s.key}:${s.fmt}`); return; }         // lost sync: bytes may be missing, so place nothing
+    const r = this.rep(`${s.key}:${s.fmt}`, { fmt: s.fmt, mime: s.mime, key: `${s.fmt}/${m.sampleRate}`, init: null, rate: m.sampleRate, delay: 0 });
+    r.segs = [{ t0: 0, t1: m.samples / m.sampleRate, frame: m.spf / m.sampleRate, size: m.at, bytes: null }];
+    r.bytes = m.at; r.secs = r.segs[0].t1;
+  }
+
+  /** The placement as placeParts gives it for the parts read so far (with each stream's last item as read now). */
+  placement() {
+    const prov = new Map();
+    for (const s of this.streams.values()) for (const { r, seg } of s.prov) { if (!prov.has(r)) prov.set(r, []); prov.get(r).push(seg); }
+    const reps = [...this.reps.values()].map((r) => {
+      const more = (prov.get(r) || []).filter((seg) => !r.segs.some((x) => Math.abs(x.t0 - seg.t0) < EXACT));
+      return more.length ? { ...r, segs: [...r.segs, ...more], bytes: r.bytes + more.reduce((n, x) => n + x.size, 0), secs: r.secs + more.reduce((n, x) => n + x.t1 - x.t0, 0) } : r;
+    });
+    for (const [r, segs] of prov) if (!this.reps.has(r.id)) reps.push({ ...r, segs }); // a rep only a last item has made so far
+    return choose(reps, 0);
+  }
+}
+
 /** One segment per span: the highest bitrate starting at each boundary, a switch only where a warm-up exists. */
 function choose(reps, skipped) {
   const all = reps.flatMap((r) => r.segs.map((s) => ({ ...s, rep: r }))).sort((a, b) => a.t0 - b.t0 || a.t1 - b.t1);

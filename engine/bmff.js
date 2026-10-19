@@ -323,9 +323,9 @@ function xing(b, p, h) {
   return { delay: (b[lame + 21] << 4) | (b[lame + 22] >> 4), padding: ((b[lame + 22] & 15) << 8) | b[lame + 23] };
 }
 
-function walk(buf, header, lameTag, until = Infinity) {
-  const b = bytesOf(buf);
-  let p = 0, frames = 0, samples = 0, junk = 0, sampleRate = 0, spf = 0, end = 0, synced = false, delay = 0, padding = 0, midJunk = false, lost = false, cut = null;
+function walk(buf, header, lameTag, until = Infinity, resume = null) {
+  const b = bytesOf(buf), prior = resume ? resume.frames : 0;
+  let p = 0, frames = 0, samples = 0, junk = 0, sampleRate = resume ? resume.sampleRate : 0, spf = 0, end = 0, synced = !!resume, delay = 0, padding = 0, midJunk = false, lost = false, cut = null;
   while (p + 4 <= b.length) {
     if (b[p] === 0x49 && b[p + 1] === 0x44 && b[p + 2] === 0x33 && p + 10 <= b.length) {            // ID3v2 tag
       p += 10 + ((b[p + 6] & 127) << 21 | (b[p + 7] & 127) << 14 | (b[p + 8] & 127) << 7 | (b[p + 9] & 127)) + (b[p + 5] & 0x10 ? 10 : 0);
@@ -336,7 +336,7 @@ function walk(buf, header, lameTag, until = Infinity) {
     const next = fits && p + h.len;
     if (fits && next > b.length) break;                                                             // a frame cut short at the end
     if (fits && (synced || next === b.length || header(b, next))) {
-      const x = lameTag && frames === 0 && !end ? lameTag(b, p, h) : null;
+      const x = lameTag && frames === 0 && !end && !prior ? lameTag(b, p, h) : null;
       if (x) { delay = x.delay; padding = x.padding; }
       else { frames++; samples += h.spf; if (h.spf > spf) spf = h.spf; }
       if (lost) midJunk = true;
@@ -344,7 +344,7 @@ function walk(buf, header, lameTag, until = Infinity) {
       if (!cut && samples - delay >= until * sampleRate) cut = { end, samples: samples - delay };
       continue;
     }
-    junk++; p++; synced = false; lost = frames > 0;
+    junk++; p++; synced = false; lost = frames + prior > 0;
   }
   return { sampleRate, frames, samples: Math.max(0, samples - delay - padding), junk, midJunk, end, spf, delay, padding, cut };
 }
@@ -352,7 +352,9 @@ function walk(buf, header, lameTag, until = Infinity) {
 /**
  * MP3 (Layer III) frame walk: {sampleRate, frames, samples, junk, midJunk, end, spf, delay, padding, cut}. midJunk: sync
  * was lost between frames. until (s): cut is {end, samples} at the first frame boundary at or past it (null if none).
+ * resume ({frames, sampleRate}): buf goes on from the end of the last whole frame of an earlier walk of the same stream,
+ * which had found that many frames (it is in sync there, and its first frame is no encoder tag).
  */
-export const mp3Frames = (buf, { until } = {}) => walk(buf, mp3Header, xing, until);
-/** ADTS (AAC) header walk: {sampleRate, frames, samples, junk, midJunk, end, spf, cut}. */
-export const adtsFrames = (buf, { until } = {}) => walk(buf, adtsHeader, null, until);
+export const mp3Frames = (buf, { until, resume } = {}) => walk(buf, mp3Header, xing, until, resume);
+/** ADTS (AAC) header walk: {sampleRate, frames, samples, junk, midJunk, end, spf, cut}. resume: as mp3Frames. */
+export const adtsFrames = (buf, { until, resume } = {}) => walk(buf, adtsHeader, null, until, resume);

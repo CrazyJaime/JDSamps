@@ -67,7 +67,7 @@ export const code = (s) => Math.fround([...String(s)].reduce((n, c) => (n * 31 +
  *   list (the HLS playlist was requested), segUrls (segment requests seen), pageFetch (false: every page fetch fails),
  *   src (a progressive element source URL), tralbum ({url, duration}), files ({url: bytes}, served to the page and the engine),
  *   hang ([url]: links the engine's own fetch of never answers),
- *   errors (reasons reported at tap on), seekhop ('ok' | 'stall' | 'refuse' | 'trickle': stalled where it hops, while the player
+ *   errors (reasons reported at tap on), seekhop ('ok' | 'stall' | 'refuse' | 'slow': a piece every 10 ms | 'trickle': stalled where it hops, while the player
  *   appends on elsewhere, so bytes keep coming but never what is missing), accelerate ('ok' | 'refuse' | 'dead': it runs, and
  *   nothing more comes, as from a page whose connection dropped), mimes (override),
  *   appends (MSE parts as {bytes} the player appends on a drive, in order, for a stream with no timestamps),
@@ -115,6 +115,11 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
       if (how === 'refuse' || (mode === 'seekhop' && (pg.mimes || []).some((m) => /mpeg|aac/.test(m)))) { progress({ drive: { mode, state: 'refused', at: 0 } }); return; }
       if (how === 'stall') { progress({ drive: { mode, state: 'stalled', at: 24 } }); return; }
       if (how === 'dead') { progress({ drive: { mode, state: 'running', at: 24 } }); return; }
+      if (how === 'slow') {
+        const ks = r.segs.map((_, k) => k).filter((k) => !fr.appended.has(k));
+        ks.forEach((k, i) => tab.clock.setTimeout(() => { append([k]); if (i === ks.length - 1) tab.clock.setTimeout(() => progress({ drive: { mode, state: 'done', at: fr.duration } }), 5); }, 10 * (i + 1)));
+        return;
+      }
       if (how === 'trickle') {
         progress({ drive: { mode, state: 'stalled', at: 0 } });
         const k = pg.preTap || 0;
