@@ -4,6 +4,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { SITES, TIMES, firstRung, parseHls, findStart } from '../../engine/loader.js';
 import { defaults, MASTER_PARAMS, PERSISTED_MASTER_KEYS, validateUiMessage } from '../../shared/protocol.js';
+import { FETCH_STALL } from '../../engine/decode.js';
 import { load, rendition, file, mp3, code, DUR, SR, OPUS, makeTab, makeEngine, loaderFor, fetcher, settle, turn, decoders, FAST } from './fixtures/loader-harness.mjs';
 
 const hi = () => rendition('opus-hi');
@@ -105,6 +106,23 @@ test('a media link the page cannot fetch (no CORS) is fetched by the engine itse
   const { result, engine } = await load({ kind: 'progressive', src: link, pageFetch: false, files: { [link]: file('cdn', 120) } });
   assert.equal(result.kind, 'resident');
   assert.equal(called(engine, 'startResidentDeck')[0].code, code('cdn'));
+});
+
+test('a media link the engine fetches itself that never answers is given up after the stall: the load ends, and says why', async () => {
+  const link = 'https://cdn.example/stalls.mp3';
+  const { result, engine, deck } = await load({ kind: 'progressive', src: link, pageFetch: false, hang: [link] });
+  assert.equal(result.kind, 'live');
+  assert.ok(engine.clock.now() < FETCH_STALL + 5000, `the load ended ${engine.clock.now()} ms in`);
+  assert.match(called(engine, 'failLoadingToLive')[0].reason, /cdn\.example\/stalls\.mp3 could not be fetched \(nothing came from the link for 15 s\)/);
+  assert.match(deck.load.report, /refetch \(fetching the track\): failed in 15\.\d s/);
+});
+
+test('the engine fetches a link itself only within what is left of the tab\'s byte budget: a larger one makes the deck say the track is too large', async () => {
+  const link = 'https://cdn.example/big.mp3';
+  const { result, engine } = await load({ kind: 'progressive', src: link, pageFetch: false, files: { [link]: file('big', 120) } }, { deps: { cap: 20 } });
+  assert.equal(result.kind, 'live');
+  assert.deepEqual(called(engine, 'startResidentDeck'), []);
+  assert.match(called(engine, 'failLoadingToLive')[0].reason, /^the track is too large to hold, so it plays live from the tab\.$/);
 });
 
 test('a media link whose length is not the player\'s is not taken: the deck goes live and says why', async () => {

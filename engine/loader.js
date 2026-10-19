@@ -12,7 +12,7 @@
 // a stream with no end, a page with no player the tap can read and a preview go live at once (§4.5).
 import { HUB } from '../shared/protocol.js';
 import { placeParts, gapsFor, decodePlaced, AssemblyError } from './assemble.js';
-import { decodeTo, limitPcm, fetchArrayBuffer, resample } from './decode.js';
+import { decodeTo, limitPcm, fetchArrayBuffer, resample, FetchRefused } from './decode.js';
 import { mp3Frames, adtsFrames } from './bmff.js';
 
 /** Site table (§4.6): host suffix -> first rung. The only per-site knowledge there is. */
@@ -213,11 +213,12 @@ export class Loader extends Job {
   /**
    * engine: the Engine (or a stand-in with the same methods); deck: the loading deck, holding the tab's capture;
    * signal: aborted when the deck is ejected or the load cancelled. deps: fetchBytes, decodeFile, decodePlaced,
-   * placeParts, gapsFor, times and clock ({now, setTimeout, clearTimeout}), for tests.
+   * placeParts, gapsFor, times, clock ({now, setTimeout, clearTimeout}) and cap (the tab's byte budget), for tests.
    */
   constructor({ engine, deck, tabId, signal, deps = {} }) {
-    const { times, clock, ...d } = deps;
+    const { times, clock, cap = TAB_CAP, ...d } = deps;
     super(engine, deck, signal, clock);
+    this.cap = cap;
     this.tabId = tabId;
     this.d = { fetchBytes: fetchArrayBuffer, decodeFile: decodeTo, decodePlaced, placeParts, gapsFor, ...d };
     this.t = { ...TIMES, ...times };
@@ -225,6 +226,7 @@ export class Loader extends Job {
     this.inflight = new Set(); // blob: URLs being read
     this.fetched = [];         // pieces fetched again, keyed for placement
     this.tried = new Set();    // links already fetched again
+    this.unfetched = new Map(); // link -> why the engine's own fetch of it failed
     this.batch = 0;
     this.tapping = false;
     this.gone = null;          // the page went away mid-load
@@ -310,7 +312,7 @@ export class Loader extends Job {
   grab(url, sink) {
     const job = this.d.fetchBytes(url, { signal: this.signal }).then((bytes) => {
       this.bytes += bytes.byteLength;
-      if (this.bytes > TAB_CAP) this.big = true;
+      if (this.bytes > this.cap) this.big = true;
       return sink(bytes);
     }, () => {
       // A blob: URL the page minted dies with the page (or its tap was switched off): the page has gone.
@@ -622,7 +624,7 @@ export class Loader extends Job {
     for (const url of urls.slice(0, 3)) {
       this.say(this.progress, SAY.media);
       const [bytes] = await this.fetchUrls(this.frameOf(url), [url]);
-      if (!bytes) { why.push(`${short(url)} could not be fetched`); continue; }
+      if (!bytes) { why.push(`${short(url)} could not be fetched${this.unfetched.has(url) ? ` (${this.unfetched.get(url)})` : ''}`); continue; }
       this.rep.refetched += bytes.byteLength;
       const r = await this.wholeFile(bytes, D, 'the media file');
       if (r.done) return r;
@@ -745,15 +747,26 @@ export class Loader extends Job {
 
   frameOf(url) { const r = this.reqs().find((x) => x.url === url); return r ? r.frame : this.track() || this.top(); }
 
-  /** Fetch links from the page (it holds the session signed links are bound to), and from here what it could not. */
+  /**
+   * Fetch links from the page (it holds the session signed links are bound to), and from here what it could not: within
+   * what is left of the tab's byte budget, shared by the eight at a time (a link past it: the track is too large to hold).
+   * The engine's fetch has its own stall deadline, and refuses a stream with no end.
+   */
   async fetchUrls(f, urls, onCount) {
     const out = await this.pageFetch(f, urls, onCount);
-    const miss = urls.map((_, i) => i).filter((i) => !out[i]);
+    const miss = urls.map((_, i) => i).filter((i) => !out[i]), budget = { left: Math.max(0, this.cap - this.bytes) };
     let k = 0;
     const worker = async () => {
       while (k < miss.length && !this.signal.aborted) {
         const i = miss[k++];
-        try { out[i] = await this.d.fetchBytes(urls[i], { signal: this.signal }); } catch (_) { out[i] = null; }
+        try {
+          out[i] = await this.d.fetchBytes(urls[i], { signal: this.signal, budget });
+          this.bytes += out[i].byteLength;
+        } catch (err) {
+          out[i] = null;
+          this.unfetched.set(urls[i], err.message);
+          if (err instanceof FetchRefused && err.kind === 'big') this.big = true;
+        }
       }
     };
     await Promise.all(Array.from({ length: Math.min(8, miss.length) }, worker));

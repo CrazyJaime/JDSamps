@@ -10,7 +10,7 @@ import { createMaster } from './master.js';
 import { Recorder } from './recorder.js';
 import { MasterClock } from './sync.js';
 import { Deck } from './deck.js';
-import { fetchArrayBuffer, decodeTo, resample, limitPcm, wavFrames, mediaDuration, minutes } from './decode.js';
+import { fetchArrayBuffer, decodeTo, resample, limitPcm, wavFrames, mediaDuration, minutes, FetchRefused } from './decode.js';
 import { analyseTrack, applyAnalysis } from './analysis.js';
 import { decodePlaced } from './assemble.js';
 import { Loader, Recording, DirectReport, framesOf } from './loader.js';
@@ -569,9 +569,11 @@ class Engine {
     say({ strategy });
     let buf;
     try {
-      buf = await fetchArrayBuffer(src, { signal: ac.signal });
+      // A link has a stall deadline and a byte cap, and a stream with no end is refused; a local file is read whole.
+      buf = await fetchArrayBuffer(src, { signal: ac.signal, ...(file != null ? { cap: Infinity } : {}) });
     } catch (err) {
       rep.step('fetch', 'failed', err.message);
+      if (err instanceof FetchRefused && err.kind === 'page') return refuse(file != null ? `“${meta.title}” is not audio this browser can play.` : err.message);
       return refuse(`${failed}: ${err.message}`);
     }
     if (gone()) return refuse();

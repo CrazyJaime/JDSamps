@@ -14,6 +14,7 @@ import { validateAgentMessage } from '../../../shared/protocol.js';
 import { gapsFor, AssemblyError } from '../../../engine/assemble.js';
 import { mp3Frames } from '../../../engine/bmff.js';
 import { Loader } from '../../../engine/loader.js';
+import { FetchRefused, FETCH_STALL } from '../../../engine/decode.js';
 import { VirtualClock } from './virtual-clock.mjs';
 
 const SITES = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../../fixtures/sites');
@@ -65,6 +66,7 @@ export const code = (s) => Math.fround([...String(s)].reduce((n, c) => (n * 31 +
  *   rendition, preTap (segments appended before the tap was on: lost but for the init), playing (segments appended right after tap on),
  *   list (the HLS playlist was requested), segUrls (segment requests seen), pageFetch (false: every page fetch fails),
  *   src (a progressive element source URL), tralbum ({url, duration}), files ({url: bytes}, served to the page and the engine),
+ *   hang ([url]: links the engine's own fetch of never answers),
  *   errors (reasons reported at tap on), seekhop ('ok' | 'stall' | 'refuse' | 'trickle': stalled where it hops, while the player
  *   appends on elsewhere, so bytes keep coming but never what is missing), accelerate ('ok' | 'refuse'), mimes (override),
  *   appends (MSE parts as {bytes} the player appends on a drive, in order, for a stream with no timestamps),
@@ -367,13 +369,32 @@ export const decoders = {
   },
 };
 
-/** fetchBytes as the offscreen engine has it: page blob: URLs (dead once the page goes), and the open web. */
+/**
+ * fetchBytes as the offscreen engine has it (decode.js fetchArrayBuffer): page blob: URLs (dead once the page goes), and
+ * the open web with its limits: a link in page.hang never answers and is given up after the stall (on the tabs' clock),
+ * and one larger than the budget it is given is refused.
+ */
 export function fetcher(tabs) {
-  return async (u, { signal } = {}) => {
+  return async (u, { signal, stall = FETCH_STALL, budget = null } = {}) => {
     await turn();
     if (signal && signal.aborted) throw new Error('The operation was aborted.');
     for (const t of tabs) if (t.blobs.has(u)) return t.blobs.get(u).slice(0);
-    if (!u.startsWith('blob:')) for (const t of tabs) if (t.page.extensionFetch !== false && t.net.has(u)) return t.net.get(u).slice(0);
+    if (!u.startsWith('blob:')) {
+      const hung = tabs.find((t) => (t.page.hang || []).includes(u));
+      if (hung) {
+        return new Promise((resolve, reject) => {
+          const timer = hung.clock.setTimeout(() => reject(new FetchRefused('stall', `nothing came from the link for ${+(stall / 1000).toFixed(1)} s`)), stall);
+          if (signal) signal.addEventListener('abort', () => { hung.clock.clearTimeout(timer); reject(new Error('The operation was aborted.')); }, { once: true });
+        });
+      }
+      for (const t of tabs) {
+        if (t.page.extensionFetch === false || !t.net.has(u)) continue;
+        const b = t.net.get(u);
+        if (budget && b.byteLength > budget.left) throw new FetchRefused('big', `it holds ${(b.byteLength / 2 ** 20).toFixed(1)} MB, more than the ${+(budget.left / 2 ** 20).toFixed(1)} MB a deck takes`);
+        if (budget) budget.left -= b.byteLength;
+        return b.slice(0);
+      }
+    }
     throw new Error(u.startsWith('blob:') ? 'Failed to fetch' : 'it answered 404');
   };
 }
