@@ -237,12 +237,13 @@ test('a gap found just before the playhead gets there, after a phase look past i
   assert.ok(w.bend < 0.002, `bent ${(w.bend * 100).toFixed(2)} %`);
 });
 
-// The tracker refines the grid after a gap for as long as it is the live one; by the time the playhead reaches the gap
-// the step between the two grids is no longer quite the one found (seen in the browser: 15 ms found, 13 ms a few
-// seconds later). A jump of the old step would leave the deck that far off the beat its grid shows, and the phase loop
-// bends it back. It jumps the step the grids give where the playhead reaches the gap.
+// The grid after a gap is the tracker's live clock until a later gap is found, and it moves on after the gap was found:
+// it follows the beats at the live edge, seconds past the gap. Its move is no better a step than the one found (over 57
+// jumps in six live-sync runs, the step found was a median 0.4 ms off the step in the deck's own capture, the live
+// grid's 0.5 ms, and up to 8.4 ms off where it had taken in part of a later gap). The deck jumps the step found; a move
+// inside the phase loop's deadband leaves it that far off its grid's beat, and nothing bends.
 for (const [who, moved] of [['follower', 3], ['follower', -2.5], ['master', 3]]) {
-  test(`the grid after a gap moved ${moved} ms since the gap was found: the ${who} jumps the step the grids give now and stays on the beat`, async () => {
+  test(`the grid after a gap moved ${moved} ms since the gap was found: the ${who} jumps the step found there, and nothing bends`, async () => {
     const { clock, engine, m, d } = await rig();
     const x = who === 'master' ? m : d, X = gap(x, clock, 2, 12), live = x.grids.segs.at(-1);
     x.grids.update({ ...live.grid, t0: live.grid.t0 + moved / 1000 }, { n: 0, from: -Infinity, prev: null, jump: x.grids.jump });
@@ -254,9 +255,12 @@ for (const [who, moved] of [['follower', 3], ['follower', -2.5], ['master', 3]])
       dBend = Math.max(dBend, bendOf(d, t));
     } });
     assert.equal(w.jumps.length, 1, JSON.stringify(w.jumps));
-    assert.ok(Math.abs(w.jumps[0].by - (12 + moved) / 1000) < 2e-4, `jumped ${(w.jumps[0].by * 1000).toFixed(2)} ms, the grids step ${12 + moved} ms`);
-    if (who === 'follower') assert.ok(Math.abs(clockErrMs(engine, d, clock.t)) < 1, `${clockErrMs(engine, d, clock.t).toFixed(2)} ms off after the gap`);
-    assert.ok(pair < 1, `follower and master ${pair.toFixed(1)} ms apart across the gap`);
+    assert.ok(Math.abs(w.jumps[0].by - 0.012) < 2e-4, `jumped ${(w.jumps[0].by * 1000).toFixed(2)} ms, the step found is 12 ms`);
+    if (who === 'follower') {
+      const off = clockErrMs(engine, d, clock.t);
+      assert.ok(Math.abs(Math.abs(off) - Math.abs(moved)) < 1, `${off.toFixed(2)} ms off its grid's beat after the gap, the grid moved ${moved} ms`);
+    }
+    assert.ok(pair < Math.abs(moved) + 1, `follower and master ${pair.toFixed(1)} ms apart across the gap, by their grids`);
     assert.ok(w.bend < 0.002 && dBend < 0.002, `bent: ${(w.bend * 100).toFixed(2)} %, follower ${(dBend * 100).toFixed(2)} %`);
   });
 }
@@ -331,3 +335,48 @@ for (const [who, b0, b1, ramp] of [['follower', 124, 125, 0], ['follower', 120, 
     assert.deepEqual(tj, [], 'the other deck\'s playhead jumps');
   });
 }
+
+// The newer grid of a gap is the tracker's live clock until a later gap is found, and the live clock follows the beats
+// at the live edge, seconds past the gap: through a later gap it has not found yet, which it then partly takes in. Seen
+// in the browser (live-sync acceptance): a master 5.6 s behind its live edge jumped -19.5 ms for a gap found -11.5 ms
+// (its capture stepped -11.1 ms there), its live clock already 8 ms into the next gap, found 0.2 s after the jump.
+
+/** A 128 BPM click track at 48 kHz (a 3 kHz blip a beat) with `drops` ({ms, at}: ms of audio dropped at track second at). */
+function clicks(seconds, drops, sr = 48000) {
+  const T = 60 / 128;
+  let x = new Float32Array(seconds * sr);
+  for (let i = 0; i < x.length; i++) { const u = (i / sr) % T; if (u < 0.04) x[i] = 0.6 * Math.sin(2 * Math.PI * 3000 * u) * Math.exp(-u * 90); }
+  for (const { ms, at } of [...drops].sort((a, b) => b.at - a.at)) {
+    const i = Math.round(at * sr), n = Math.round((ms / 1000) * sr), y = new Float32Array(x.length - n);
+    y.set(x.subarray(0, i)); y.set(x.subarray(i + n), i); x = y;
+  }
+  return x;
+}
+
+test('two capture gaps 2.4 s apart, the second taken in by the live grid but not found yet when the playhead reaches the first: each jump is its own gap\'s step', async () => {
+  const clock = { t: 100 }, engine = makeEngine(clock);
+  engine.params['assist.on'] = false;
+  const m = makeDeck(engine, clock, { id: 1, slot: 1, bpm: 128, liveEdge: 600, capSec: 1e7 });
+  const d = makeDeck(engine, clock, { id: 2, slot: 2, bpm: 124, t0: 0.11, liveEdge: 600, capSec: 1e7 });
+  const feed = tracks(m, clicks(40, [{ ms: 12, at: 24.15 }, { ms: 18, at: 26.55 }]));
+  run(engine, clock, 4, feed); // the playhead 4 s behind its live edge
+  await m.act('play');
+  engine.clock.follow(1);
+  run(engine, clock, 2, feed);
+  assert.deepEqual(await d.act('syncPlay'), { ok: true });
+  run(engine, clock, 3, feed);
+  let late = null; // the second gap is found after the jump over the first is planned
+  const plan = m.scheduleSkip.bind(m);
+  m.scheduleSkip = (now, p) => { plan(now, p); if (late == null && m.skipPlan) late = !m.grids.segs.some((s) => s.shift && s.from > 26); };
+  const w = watch(engine, clock, m, 25, { onTick: feed });
+  assert.ok(m.ts.posAt(clock.t) > 28, `played to input ${m.ts.posAt(clock.t).toFixed(1)} s, past both gaps`);
+  assert.equal(late, true, 'the second gap was found before the playhead reached the first');
+  const got = w.jumps.map((j) => `${(j.by * 1000).toFixed(1)} ms at input ${j.at.toFixed(2)} s`);
+  assert.equal(w.jumps.length, 2, JSON.stringify(got));
+  for (const [j, ms, at] of [[w.jumps[0], -12, 24.15], [w.jumps[1], -18, 26.538]]) {
+    assert.ok(Math.abs(j.at - at) < 0.5 && Math.abs(j.by * 1000 - ms) <= 1.5, `jumped ${got.join(', ')}: the gaps are ${ms} ms at ${at} s`);
+  }
+  let bend = 0;
+  for (const s of d.node.map) if (s.active && s.output > clock.t - 25) bend = Math.max(bend, Math.abs(s.rate / ((1 + d.params.pitch) * d.nudgeFactor) - 1));
+  assert.ok(bend < 0.002, `the follower bent ${(bend * 100).toFixed(2)} %`);
+});
