@@ -414,17 +414,18 @@ export class BeatClock {
   }
 }
 
-// Capture gaps: smallest phase jump (s) acted on, largest (beats), and how far it must stand out of
-// the per-beat jitter (standard deviations).
-const JUMP = { min: 0.005, max: 1 / 8, z: 6 };
+// Capture gaps: smallest phase jump (s) acted on, largest (beats), how far it must stand out of
+// the per-beat jitter (standard deviations), and how many times better than a bend (a real tempo
+// change) its step must fit the beats.
+const JUMP = { min: 0.005, max: 1 / 8, z: 6, bend: 3 };
 
 /**
  * Where per-beat onset offsets r (oldest first; the first K of them) step: the least-squares fit
  * r_i = a + b·i + D·[i ≥ j] (a level, a drift from a slightly wrong period, and a step) over every
  * split j with at least 4 beats before it and 3 after, leaving out beat `skip`. Returns the best
- * {j, D, clear, worst} or null; clear when the step stands out of the jitter, outweighs the drift
+ * {j, D, clear, worst, sse} or null; clear when the step stands out of the jitter, outweighs the drift
  * across the window and every beat sits nearer its own side of the step; worst is the beat farthest
- * off the fit.
+ * off the fit, sse its squared error.
  */
 const det3 = (a, b, c, d, e, f, g, h, i) => a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
 function phaseStep(r, skip = -1, K = r.length) {
@@ -451,13 +452,37 @@ function phaseStep(r, skip = -1, K = r.length) {
     if (e > we) { we = e; worst = i; }
   }
   const clear = Math.abs(D) >= JUMP.z * Math.sqrt(Math.max(0, sse) / (n - 3)) && Math.max(we, Math.abs(b) * (K - 1)) < Math.abs(D) / 2;
-  return { j, D, worst, clear };
+  return { j, D, worst, clear, sse };
+}
+
+/**
+ * The least squared error of a bend in per-beat onset offsets r (the first K, leaving out beat `skip`): r_i = a + b·i +
+ * c·max(0, i − m), the beats on one slope and from m on another, the best m in quarter beats. A real tempo change bends
+ * the offsets so (a cut exactly, a ramp over a few beats near enough); a capture gap steps them, which no bend fits.
+ */
+function bendSse(r, K, skip = -1) {
+  let best = Infinity;
+  for (let m = 1; m <= K - 2; m += 0.25) {
+    let n = 0, Si = 0, Sii = 0, Su = 0, Suu = 0, Siu = 0, Sr = 0, Sir = 0, Sur = 0, Srr = 0;
+    for (let i = 0; i < K; i++) {
+      if (i === skip) continue;
+      const u = Math.max(0, i - m), v = r[i];
+      n++; Si += i; Sii += i * i; Su += u; Suu += u * u; Siu += i * u; Sr += v; Sir += i * v; Sur += u * v; Srr += v * v;
+    }
+    const det = det3(n, Si, Su, Si, Sii, Siu, Su, Siu, Suu);
+    if (!det) continue;
+    const a = det3(Sr, Si, Su, Sir, Sii, Siu, Sur, Siu, Suu) / det;
+    const b = det3(n, Sr, Su, Si, Sir, Siu, Su, Sur, Suu) / det;
+    const c = det3(n, Si, Sr, Si, Sii, Sir, Su, Siu, Sur) / det;
+    best = Math.min(best, Srr - a * Sr - b * Sir - c * Sur);
+  }
+  return best;
 }
 
 /**
  * Two steps close together in per-beat onset offsets r (the first K): r_i = level_k + b·i over three runs, at least
  * 4 beats before the first step, 2 between and 3 after the second (a burst of capture gaps a single step cannot
- * explain). Returns the best {j1, D1, j2, D2, clear} or null; clear as for phaseStep, for both steps.
+ * explain). Returns the best {j1, D1, j2, D2, clear, sse} or null; clear as for phaseStep, for both steps.
  */
 const PS2 = { cap: 0 };
 function phaseSteps2(r, K) {
@@ -484,7 +509,7 @@ function phaseSteps2(r, K) {
   for (let i = 0; i < K; i++) we = Math.max(we, Math.abs(r[i] - b * i - (i < j1 ? l0 : i < j2 ? l1 : l2)));
   const D = Math.min(Math.abs(D1), Math.abs(D2));
   const clear = D >= JUMP.z * Math.sqrt(Math.max(0, sse) / (K - 4)) && Math.max(we, Math.abs(b) * (K - 1)) < D / 2;
-  return { j1, D1, j2, D2, clear };
+  return { j1, D1, j2, D2, clear, sse };
 }
 
 /**
@@ -791,7 +816,9 @@ export class DeckTempo {
    * fine tempo fit keeps its beats, those before it moved by the step. Under a load spike the capture skips
    * in bursts, a few beats apart: the gaps already found are taken out of the beats before them, and
    * the oldest step that stands out in the beats up to the next one is the one found, so each gap of
-   * a burst is found with its own step.
+   * a burst is found with its own step. A real tempo change is no gap: it bends the beats onto a new slope that keeps
+   * drifting off the grid, and a step fitted to its first few beats can look clear. A step is taken only when it fits
+   * the beats clearly better (JUMP.bend times) than any bend does.
    */
   detectJump() {
     const tr = this.tracker, clock = this.clock, sr = this.sr;
@@ -807,11 +834,11 @@ export class DeckTempo {
       let s = phaseStep(r, -1, k), sk = -1;
       if (k === r.length) big = !!s && Math.abs(s.D) >= JUMP.min * sr;
       if (s && !s.clear) { sk = s.worst; s = phaseStep(r, sk, k); if (s && sk !== s.j - 1 && sk !== s.j) s = null; }
-      if (s && s.clear && (!st || s.j < st.j - 1)) { st = s; skip = sk; }
+      if (s && s.clear && (!st || s.j < st.j - 1) && bendSse(r, k, sk) > JUMP.bend * s.sse) { st = s; skip = sk; }
     }
     if (!st && big) { // two gaps too close for a step on its own: the first of them
       const s2 = phaseSteps2(r, r.length);
-      if (s2 && s2.clear) { st = { j: s2.j1, D: s2.D1 }; skip = -1; }
+      if (s2 && s2.clear && bendSse(r, r.length) > JUMP.bend * s2.sse) { st = { j: s2.j1, D: s2.D1 }; skip = -1; }
     }
     if (!st || Math.abs(st.D) < JUMP.min * sr || Math.abs(st.D) > JUMP.max * clock.T) { this.jumpCand = null; return; }
     const D = st.D, before = rs[st.j - 1 === skip ? st.j - 2 : st.j - 1], after = rs[st.j === skip ? st.j + 1 : st.j];

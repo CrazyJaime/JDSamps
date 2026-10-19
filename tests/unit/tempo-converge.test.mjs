@@ -156,6 +156,38 @@ test('capture gaps a few beats apart are each found, each with its own step', ()
   }
 });
 
+/** The e2e pages' sounds at a tempo that goes from b0 to b1 BPM at second `at`, at once or over `ramp` s, its beats unbroken. */
+function tempoChange({ kind, b0, b1, at = 20, ramp = 0, seconds = 30, sr = 44100, lead = 0.0052 }) {
+  const x = new Float32Array(Math.round(seconds * sr));
+  let ph = 0, onset = lead;
+  for (let i = Math.round(lead * sr); i < x.length; i++) {
+    const t = i / sr, f = t < at ? 0 : ramp > 0 ? Math.min(1, (t - at) / ramp) : 1, was = ph;
+    ph += (b0 + (b1 - b0) * f) / 60 / sr;
+    if (Math.floor(ph) !== Math.floor(was)) onset = t;
+    const u = t - onset;
+    if (kind === 'low' && u < 0.2) x[i] = 0.8 * Math.sin(2 * Math.PI * (45 + 70 * Math.exp(-u * 35)) * u) * Math.exp(-u * 18);
+    else if (kind === 'high' && u < 0.04) x[i] = 0.6 * Math.sin(2 * Math.PI * 3000 * u) * Math.exp(-u * 90);
+    else if (kind === 'mid' && u < 0.08) x[i] = 0.6 * Math.sin(2 * Math.PI * 800 * u) * Math.exp(-u * 50);
+  }
+  return x;
+}
+
+test('a real tempo change of 1-3 % in a live source, at once or over 2 s, is no capture gap', () => {
+  // A DJ stream moving its pitch bends the beats onto a new slope that keeps drifting off the grid. A step fitted to the
+  // first few beats of that drift looked like a capture gap, and a beat-locked deck (the master too) jumped 12-47 ms
+  // where nothing was dropped. A tempo change goes through the tempo and phase paths.
+  const bad = [];
+  for (const kind of ['low', 'high', 'mid']) {
+    for (const [b0, b1] of [[124, 125], [124, 126], [124, 127.5], [128, 126.5], [120, 118], [130, 128.7]]) {
+      for (const ramp of [0, 2]) {
+        const f = found(tempoChange({ kind, b0, b1, ramp }), 44100);
+        if (f.length) bad.push(`${kind} ${b0} -> ${b1} BPM${ramp ? ` over ${ramp} s` : ''}: ${f.map((g) => `${g.D.toFixed(1)} ms at ${g.from.toFixed(2)} s`).join(', ')}`);
+      }
+    }
+  }
+  assert.deepEqual(bad, []);
+});
+
 test('a capture gap found soon after the lock: the grid before it has the tempo the fine fit found, not the lock\'s', () => {
   // The grid the audio before a gap keeps is the one the clock had when the live edge passed it, seconds after the
   // lock: at the tempo the lock read (0.15-0.4 % off), not the fine fit's that came later. A deck playing that audio

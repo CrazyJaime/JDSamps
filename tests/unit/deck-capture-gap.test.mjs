@@ -7,6 +7,9 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { makeEngine, makeDeck, run, clockErrMs, pairErrMs } from './fixtures/deck-harness.mjs';
+import { OdfCore } from '../../worklets/odf-core.js';
+import { DeckTempo } from '../../engine/tempo.js';
+import { GridMap } from '../../engine/timeshift.js';
 
 const TICK = 1536 / 48000;
 
@@ -267,3 +270,64 @@ test('a gap found after the playhead went through it: the phase loop jumps the s
   assert.ok(Math.abs(w.jumps[0].by - 0.012) < 0.002, `jumped ${(w.jumps[0].by * 1000).toFixed(2)} ms`);
   assert.ok(w.bend < 0.002, `bent ${(w.bend * 100).toFixed(2)} %`);
 });
+
+// A real tempo change in a live source (a DJ stream moving its pitch) is no capture gap: the tracker used to fit a step
+// to the first beats of the new slope, and the deck jumped 12-47 ms where nothing was dropped; a master with BEAT
+// followers jumped its own audio. With the deck's real tracker fed from its capture, it goes through the tempo and
+// phase paths: no jump.
+
+/** A kick track at 48 kHz going from b0 to b1 BPM at input second 20, at once or over `ramp` s, its beats unbroken. */
+function kicks(b0, b1, ramp, seconds = 50, sr = 48000) {
+  const x = new Float32Array(seconds * sr);
+  let ph = 0, onset = 0;
+  for (let i = 0; i < x.length; i++) {
+    const t = i / sr, f = t < 20 ? 0 : ramp > 0 ? Math.min(1, (t - 20) / ramp) : 1, was = ph;
+    ph += (b0 + (b1 - b0) * f) / 60 / sr;
+    if (Math.floor(ph) !== Math.floor(was)) onset = t;
+    const u = t - onset;
+    if (u < 0.2) x[i] = 0.8 * Math.sin(2 * Math.PI * (45 + 70 * Math.exp(-u * 35)) * u) * Math.exp(-u * 18);
+  }
+  return x;
+}
+
+/** Deck x follows its capture `audio` with a real tracker and grid map; the returned function feeds it up to its live edge. */
+function tracks(x, audio) {
+  const sr = 48000, odf = new OdfCore(sr, (f, l, t) => x.tempo.pushFrame(f, l, t));
+  let fed = 0;
+  x.tempo = new DeckTempo({ sampleRate: sr, fps: odf.fps });
+  x.grids = new GridMap();
+  x.ts.liveEdge = 0.05;
+  return () => {
+    for (const upto = Math.min(audio.length, Math.floor((x.ts.liveEdge * sr) / 128) * 128); fed + 128 <= upto; fed += 128) odf.push(audio.subarray(fed, fed + 128), fed);
+    x.followTempo();
+  };
+}
+
+for (const [who, b0, b1, ramp] of [['follower', 124, 125, 0], ['follower', 120, 118, 2], ['master', 124, 125, 0], ['master', 128, 126.5, 2]]) {
+  test(`a real tempo change of ${b0} to ${b1} BPM${ramp ? ` over ${ramp} s` : ''} in a ${who}'s live source: no playhead jump on it or its ${who === 'master' ? 'follower' : 'master'}`, async () => {
+    const clock = { t: 100 }, engine = makeEngine(clock);
+    engine.params['assist.on'] = false;
+    const m = makeDeck(engine, clock, { id: 1, slot: 1, bpm: 128, liveEdge: 600, capSec: 1e7 });
+    const d = makeDeck(engine, clock, { id: 2, slot: 2, bpm: 124, t0: 0.11, liveEdge: 600, capSec: 1e7 });
+    const x = who === 'master' ? m : d, feed = tracks(x, kicks(b0, b1, ramp));
+    run(engine, clock, 9, feed); // the playhead plays from the start of the capture, seconds behind its live edge
+    assert.equal(x.tempo.get().state, 'LOCKED');
+    await m.act('play');
+    engine.clock.follow(1);
+    run(engine, clock, 1, feed);
+    assert.deepEqual(await d.act('syncPlay'), { ok: true });
+    run(engine, clock, 3, feed);
+    const other = x === m ? d : m, theirs = other.node.map.length;
+    const w = watch(engine, clock, x, 32, { onTick: feed });
+    assert.ok(x.ts.posAt(clock.t) > 24 + ramp, `played to input ${x.ts.posAt(clock.t).toFixed(1)} s, past the change`);
+    assert.deepEqual(w.jumps.map((j) => `${(j.by * 1000).toFixed(1)} ms at input ${j.at.toFixed(2)} s`), [], `${who} playhead jumps`);
+    const gaps = x.grids.segs.filter((s) => s.shift).map((s) => `${(s.shift * 1000).toFixed(1)} ms at ${s.from.toFixed(2)} s`);
+    assert.deepEqual(gaps, [], 'capture gaps on its grid');
+    const tj = [];
+    for (let i = Math.max(1, theirs); i < other.node.map.length; i++) {
+      const a = other.node.map[i - 1], b = other.node.map[i], at = a.input + a.rate * (b.output - a.output);
+      if (a.active && b.active !== false && Math.abs(b.input - at) > 1e-4) tj.push(b);
+    }
+    assert.deepEqual(tj, [], 'the other deck\'s playhead jumps');
+  });
+}
