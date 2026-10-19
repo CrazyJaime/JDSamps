@@ -112,7 +112,7 @@ function gaps(x, sr, list) {
   return { y, at };
 }
 
-/** Every capture gap the tracker records: {from (s), D (ms)}. */
+/** Every capture gap the tracker records: {from (s), D (ms)}; the DeckTempo as `deck`. */
 function found(x, sr) {
   let deck;
   const odf = new OdfCore(sr, (f, l, t) => deck.pushFrame(f, l, t));
@@ -127,8 +127,16 @@ function found(x, sr) {
     out.push({ from: j.from, D: (t0 + Math.round((b - t0) / T) * T - b) * 1000 });
   };
   for (let s = 0; s + 128 <= x.length; s += 128) odf.push(x.subarray(s, s + 128), s);
+  out.deck = deck;
   return out;
 }
+
+test('a gap every ten seconds of a long capture: each is found, and the deck keeps only those its window still holds', () => {
+  const list = [15, 25, 35, 45, 55, 65, 75].map((at, i) => ({ ms: i % 2 ? -12 : 12, at: at + 0.13 }));
+  const f = found(gaps(blips({ kind: 'low', bpm: 124, seconds: 85, lead: 0.003 }), 44100, list).y, 44100);
+  assert.equal(f.length, list.length, `found ${f.map((g) => `${g.D.toFixed(1)} ms at ${g.from.toFixed(2)} s`).join(', ')}`);
+  assert.ok(f.deck.gaps.length <= 1, `${f.deck.gaps.length} gaps kept`);
+});
 
 test('capture gaps a few beats apart are each found, each with its own step', () => {
   for (const [kind, bpm] of [['high', 128], ['low', 124]]) {

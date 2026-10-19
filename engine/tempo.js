@@ -777,10 +777,12 @@ export class DeckTempo {
    * a burst is found with its own step.
    */
   detectJump() {
-    const tr = this.tracker, clock = this.clock, sr = this.sr, gaps = this.gaps;
+    const tr = this.tracker, clock = this.clock, sr = this.sr;
     if (clock.t0 == null || !(clock.T > 0) || tr.cand) { this.jumpCand = null; return; }
     // The comb's own start (tr.phaseFrom) cuts the window only for a rate step: a gap's is in gaps.
-    const rs = this.beatOffsets(Math.max(this.jumpFrom, gaps.length ? -Infinity : tr.phaseFrom, this.track.from * sr));
+    const rs = this.beatOffsets(Math.max(this.jumpFrom, this.gaps.length ? -Infinity : tr.phaseFrom, this.track.from * sr));
+    if (rs.length && this.gaps.some((g) => g.at <= rs[0].beat)) this.gaps = this.gaps.filter((g) => g.at > rs[0].beat); // no beat before them left
+    const gaps = this.gaps;
     const r = rs.map((x) => { let v = x.r; for (const g of gaps) if (x.beat < g.at) v += g.D; return v; });
     let st = null, skip = -1, big = false;
     for (let k = r.length; k >= 7 && !(st && k === r.length - 1); k--) { // a clear step in the whole window is the only one
@@ -807,6 +809,7 @@ export class DeckTempo {
     gaps.push({ at, D });
     tr.phaseFrom = at;
     tr.cuts.push(at); // the fine fit's beats step there, by however much their own onsets say
+    tr.cuts.sort((x, y) => x - y);
     tr.fit = null;
     clock.t0 = t0 + Math.round((clock.t0 - t0) / T) * T + D;
     clock.miss = 0;
