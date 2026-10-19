@@ -493,9 +493,13 @@ export class Deck {
         let target = this.ts.clampInput(this.ts.liveEdge - this.ts.lat - LIVE_RESERVE);
         if (this.wantPlay) {
           // Playing on its beat grid, the deck jumps whole beats (landing up to a beat further back), so it keeps its
-          // phase: a synced deck has nothing to bend back into line out of the small reserve LIVE leaves it.
-          const p = this.ts.posAt(T), g = this.grids.at(p);
-          if (g && g.T > 0 && this.canBeat(p)) target = this.ts.clampInput(p + Math.floor((target - p) / g.T) * g.T);
+          // phase: a synced deck has nothing to bend back into line out of the small reserve LIVE leaves it. The beats
+          // are counted on the grid where it lands (audio captured at an assist rate has them closer together).
+          const p = this.ts.posAt(T), g = this.grids.at(p), to = this.grids.at(target);
+          if (g && g.T > 0 && to && to.T > 0 && this.canBeat(p)) {
+            const ph = frac((p - g.t0) / g.T);
+            target = this.ts.clampInput(to.t0 + (Math.floor((target - to.t0) / to.T - ph) + ph) * to.T);
+          }
           this.sched(T, { input: target });
         } else this.ts.change(now, T, { active: false, input: target });
         return OK;
