@@ -8,6 +8,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { makeEngine, makeDeck, run, clockErrMs, pairErrMs } from './fixtures/deck-harness.mjs';
+import { phaseError } from '../../engine/sync.js';
 import { OdfCore } from '../../worklets/odf-core.js';
 import { DeckTempo } from '../../engine/tempo.js';
 import { GridMap } from '../../engine/timeshift.js';
@@ -421,4 +422,45 @@ test('a capture gap found 6 s late, the clock\'s period then 0.2 % short (one ru
     assert.ok(j && Math.abs(j.by * 1000 - ms) <= 2, `the capture stepped ${ms} ms at ${at} s; jumped ${got}`);
   }
   assert.equal(w.jumps.length, 5, got);
+});
+
+// A follower's jump over a gap takes off the few ms it sat off the beat, measured against the grid kept before the gap
+// (offBefore). That grid was the clock as the live edge passed the gap: soon after the gap before it was found, that
+// gap's re-phase by the step found there. A step found 4 ms off left the follower 4 ms off its audio's beat with its grid
+// saying 0, and it jumped the next gap by the step alone: 4 ms off for good, with nothing to bend it back inside the
+// phase loop's deadband. Measured here against the audio's own beats, not the deck's grids.
+test('a follower through two gaps, the first found 4 ms off: at the second it jumps back onto its audio\'s beat', async () => {
+  const clock = { t: 100 }, engine = makeEngine(clock), T = 60 / 128;
+  engine.params['assist.on'] = false;
+  const m = makeDeck(engine, clock, { id: 1, slot: 1, bpm: 124, liveEdge: 600, capSec: 1e7 });
+  const d = makeDeck(engine, clock, { id: 2, slot: 2, bpm: 128, liveEdge: 600, capSec: 1e7 });
+  const drops = [{ ms: 12, at: 15.1 }, { ms: 15, at: 17.4 }], feed = tracks(d, clicks(40, drops));
+  // the gap search reads the beats after the first gap 4 ms later than they are, until it is found
+  const offsets = d.tempo.beatOffsets.bind(d.tempo);
+  d.tempo.beatOffsets = (from) => offsets(from).map((b) => (!d.tempo.track.jump && b.beat > 15.1 * 48000 ? { beat: b.beat, r: b.r + 0.004 * 48000 } : b));
+  // where the audio's beats are in the capture (input s), and the follower's heard beat against the master's clock (ms)
+  const beats = [];
+  for (let k = 0; k * T < 40; k++) beats.push(k * T - drops.filter((g) => g.at < k * T).reduce((s, g) => s + g.ms / 1000, 0));
+  const heardErr = (t) => {
+    const p = d.node.posAt(t), seg = d.node.segAt(t), mb = engine.clock.beat(t);
+    if (!seg.active || !(seg.rate > 0) || !mb) return null;
+    let b = 0;
+    while (b + 1 < beats.length && beats[b + 1] <= p) b++;
+    return phaseError(t - (p - beats[b]) / seg.rate, T / seg.rate, mb.lastBeat, mb.period) * 1000;
+  };
+  await m.act('play');
+  engine.clock.follow(1);
+  run(engine, clock, 8, feed); // the follower's playhead will be 8 s behind its live edge: each gap is found before it gets there
+  assert.deepEqual(await d.act('syncPlay'), { ok: true });
+  const errs = [];
+  const w = watch(engine, clock, d, 22, { onTick: (t) => { feed(t); const p = d.node.posAt(t), e = heardErr(t); if (e != null) errs.push({ p, e }); } });
+  assert.ok(d.ts.posAt(clock.t) > 19, `played to input ${d.ts.posAt(clock.t).toFixed(1)} s, past both gaps`);
+  const got = w.jumps.map((j) => `${(j.by * 1000).toFixed(1)} ms at input ${j.at.toFixed(2)} s`).join(', ');
+  assert.equal(w.jumps.length, 2, got);
+  const med = (xs) => xs.map((x) => x.e).sort((a, b) => a - b)[xs.length >> 1];
+  const before = med(errs.filter((x) => x.p > 11 && x.p < 14.5)), between = med(errs.filter((x) => x.p > 15.6 && x.p < 16.9));
+  const after = med(errs.filter((x) => x.p > 18 && x.p < 19));
+  assert.ok(Math.abs(Math.abs(between - before) - 3.5) < 1.5, `${(between - before).toFixed(1)} ms off its beat between the gaps (the first jumped 4 ms short); jumped ${got}`);
+  assert.ok(Math.abs(after - before) < 1, `${(after - before).toFixed(1)} ms off its beat after the second gap; jumped ${got}`);
+  assert.ok(w.bend < 0.002, `bent ${(w.bend * 100).toFixed(2)} %`);
 });

@@ -349,3 +349,36 @@ test('capture gaps while the clock\'s period is off (a burst the fine fit took i
     assert.ok(gaps.some((g) => Math.abs(g.from - at) < 0.6 && Math.abs(g.D - ms) <= 3), `the capture stepped ${ms} ms at ${at} s; ${gaps.say}`);
   }
 });
+
+test('a gap found a few ms off, and a second gap after it: the grid kept before the second is where the beats are', () => {
+  // The grid kept before a gap is the clock as the live edge passed it. When that was soon after the gap before it was
+  // found, it is that gap's re-phase (the grid before it moved by the step found), which the clock then still had: a
+  // step found 4 ms off left the beats before the second gap 4 ms off their grid. A follower jumping the second gap
+  // takes its offset against that grid (deck.js offBefore), and a beat-locked deck plays the audio before it against it.
+  for (const [kind, bpm, lead] of [['high', 128, 0.2], ['low', 124, 0.0052], ['mid', 120, 0.2]]) {
+    for (const [at1, ms1, dt, ms2, bias] of [[10.1, 12, 2.3, -10, 4], [10.1, -15, 2.0, 12, -4], [10.1, 20, 2.6, 15, 4]]) {
+      const sr = 44100, at2 = at1 + dt, x = gap(gap(blips({ kind, bpm, seconds: 30, lead }), sr, at1, ms1), sr, at2 - ms1 / 1000, ms2);
+      let deck;
+      const odf = new OdfCore(sr, (f, l, t) => deck.pushFrame(f, l, t));
+      deck = new DeckTempo({ sampleRate: sr, fps: odf.fps });
+      // the gap search reads the beats after the first gap `bias` ms later than they are, until it is found
+      const offsets = deck.beatOffsets.bind(deck), detect = deck.detectJump.bind(deck), found = [];
+      deck.beatOffsets = (from) => offsets(from).map((b) => (!found.length && b.beat > at1 * sr ? { beat: b.beat, r: b.r + (bias / 1000) * sr } : b));
+      deck.detectJump = () => {
+        const was = deck.track.jump;
+        detect();
+        const j = deck.track.jump;
+        if (j && j !== was) found.push({ from: j.from, D: (deck.gaps.at(-1).D / sr) * 1000, prev: { ...j.prev } });
+      };
+      for (let s = 0; s + 128 <= x.length; s += 128) odf.push(x.subarray(s, s + 128), s);
+      const say = `${kind} ${bpm} BPM, gaps of ${ms1} ms at ${at1} s and ${ms2} ms at ${at2.toFixed(2)} s: found ${found.map((f) => `${f.D.toFixed(1)} ms at ${f.from.toFixed(2)} s`).join(', ')}`;
+      assert.equal(found.length, 2, say);
+      assert.ok(Math.abs(found[0].D + ms1 - bias) < 1.5, `${say}: the first is found ${bias} ms off`);
+      // the beats before the second gap: the first gap's grid's beat there, on at the track's period, moved by the step
+      // the audio made at the first; against them, the grid kept before the second
+      const beat = (g, x) => g.t0 + Math.round((x - g.t0) / g.T) * g.T, T = 60 / bpm, b1 = beat(found[0].prev, at1);
+      const truth = b1 + Math.round((at2 - b1) / T) * T - ms1 / 1000, off = (beat(found[1].prev, truth) - truth) * 1000;
+      assert.ok(Math.abs(off) < 1, `${say}: the grid kept before the second gap is ${off.toFixed(2)} ms off the beats`);
+    }
+  }
+});
