@@ -9,6 +9,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { makeEngine, makeDeck, run, clockErrMs, pairErrMs } from './fixtures/deck-harness.mjs';
 import { phaseError } from '../../engine/sync.js';
+import { captureOnsets } from './fixtures/capture-onsets.mjs';
 import { OdfCore } from '../../worklets/odf-core.js';
 import { DeckTempo } from '../../engine/tempo.js';
 import { GridMap } from '../../engine/timeshift.js';
@@ -469,20 +470,6 @@ test('a follower through two gaps, the first found 4 ms off: at the second it ju
 // live clock follows the beats at the live edge: through a later gap not found yet, which it takes in. A master
 // publishes its clock from the grid at its playhead, so its clock moved off its own audio's beat by that much, and its
 // followers bent after it (seen in the live-sync acceptance; here a master's capture whose gap was found 6 s late).
-
-/** Onsets (input s) in a capture fixture's tracker input: peaks of one band, as the live-sync judge reads them. */
-function captureOnsets(c, band, T) {
-  const v = c[band], spf = c.spf / c.sr, on = [], vals = [], peaks = [];
-  for (let i = 1; i + 1 < v.length; i++) if (v[i] > v[i - 1] && v[i] >= v[i + 1]) peaks.push(i);
-  const hi = peaks.map((i) => v[i]).sort((a, b) => a - b), ref = hi[Math.floor(hi.length * 0.9)];
-  for (const i of peaks) {
-    if (v[i] < 0.3 * ref) continue;
-    const a = v[i - 1], b = v[i], q = v[i + 1], qq = a - 2 * b + q, x = (c.t0 + i * c.spf) / c.sr + (qq < 0 ? (0.5 * (a - q)) / qq : 0) * spf;
-    if (on.length && x - on[on.length - 1] < 0.6 * T) { if (b > vals[vals.length - 1]) { on[on.length - 1] = x; vals[vals.length - 1] = b; } continue; }
-    on.push(x); vals.push(b);
-  }
-  return on;
-}
 
 test('a master whose live clock takes in a gap not found yet (one run\'s capture): its clock stays on its audio\'s beat, and its follower never bends', async () => {
   const c = JSON.parse(fs.readFileSync(new URL('./fixtures/live-late-gap-capture.json', import.meta.url), 'utf8'));

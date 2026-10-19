@@ -10,6 +10,7 @@ import { OdfCore } from '../../worklets/odf-core.js';
 import { DeckTempo } from '../../engine/tempo.js';
 import { GridMap } from '../../engine/timeshift.js';
 import { synth, PATTERNS, FS } from './fixtures/synth.mjs';
+import { captureOnsets } from './fixtures/capture-onsets.mjs';
 
 /** The e2e test pages' sounds (makeTrackWav in tests/browser/ext-harness.mjs), after `lead` s of silence, at rate sr. */
 function blips({ bpm, kind, seconds = 40, sr = 44100, lead = 0 }) {
@@ -381,4 +382,31 @@ test('a gap found a few ms off, and a second gap after it: the grid kept before 
       assert.ok(Math.abs(off) < 1, `${say}: the grid kept before the second gap is ${off.toFixed(2)} ms off the beats`);
     }
   }
+});
+
+test('a burst whose later gap is found first (as one run captured it): finding the earlier one keeps the clock, and the grids kept, on the beats', () => {
+  // Finding the earlier gap re-phased the clock by its own step from the grid before it, as if it were the newest: the
+  // later gap's step dropped out, the clock sat 31 ms off the beats for seconds, and so did the clocks remembered for
+  // the audio past the later gap (a follower's phase loop then bent 3.9 % against them).
+  const c = JSON.parse(fs.readFileSync(new URL('./fixtures/live-burst-gaps-capture.json', import.meta.url), 'utf8'));
+  const sr = c.sr, T = 60 / 124, on = captureOnsets(c, 'low', T);
+  const deck = new DeckTempo({ sampleRate: sr, fps: c.fps }), evaluate = deck.evaluate.bind(deck), found = [], offs = [];
+  const off = (g, x) => (x - (g.t0 + Math.round((x - g.t0) / g.T) * g.T)) * 1000; // the audio's beat x against grid g, ms
+  deck.evaluate = () => {
+    const was = deck.track.jump;
+    evaluate();
+    const j = deck.track.jump, edge = deck.tracker.lastT / sr, g = deck.get().grid;
+    if (j && j !== was) found.push(`${(j.step * 1000).toFixed(1)} ms at ${j.from.toFixed(2)} s`);
+    const o = on.filter((x) => x < edge - 0.3).at(-1);
+    if (g && o > 40) {
+      const h = deck.heardGrid(Math.round(53.8 * sr), 47.6 * sr), o2 = on.filter((x) => x < 53.8).at(-1);
+      offs.push({ edge, clock: off(g, o), heard: h && edge > 54.5 ? off(h, o2) : null });
+    }
+  };
+  deck.pushBatch({ t0: c.t0, spf: c.spf, full: c.full, low: c.low });
+  assert.ok(found.includes('-30.8 ms at 47.48 s') && found.includes('-9.1 ms at 47.25 s'), `found ${found.join(', ')}`);
+  // (These onsets sit up to 2.5 ms either side of a steady grid, as the beats fall between the analysis frames.)
+  const early = offs.filter((x) => x.edge < 46).map((x) => x.clock).sort((a, b) => a - b), base = early[early.length >> 1];
+  const bad = offs.filter((x) => x.edge > 52 && (Math.abs(x.clock - base) > 6 || (x.heard != null && Math.abs(x.heard - base) > 6)));
+  assert.deepEqual(bad.map((x) => `${x.edge.toFixed(1)} s: clock ${(x.clock - base).toFixed(1)}, kept for 53.8 s ${x.heard == null ? '-' : (x.heard - base).toFixed(1)} ms`), []);
 });

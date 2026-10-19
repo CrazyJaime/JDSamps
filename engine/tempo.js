@@ -912,16 +912,22 @@ export class DeckTempo {
     near.sort((x, y) => x - y);
     if (near.length >= 2) prev.t0 = (near.length > 2 ? near[near.length >> 1] : (near[0] + near[1]) / 2) / sr;
     const t0 = prev.t0 * sr, T = prev.T * sr;
+    // A gap of a burst found after a later one: the clock follows the beats past that one already, and keeps them; the
+    // clocks remembered between the two take this one's step.
+    const next = gaps.reduce((x, g) => (g.at > at && g.at < x ? g.at : x), Infinity);
     this.track.jump = { n: this.track.jump ? this.track.jump.n + 1 : 0, from: at / sr, prev, step: D / sr };
     this.jumpCand = null;
     gaps.push({ at, D });
-    tr.phaseFrom = at;
     tr.cuts.push(at); // the fine fit's beats step there, by however much their own onsets say
     tr.cuts.sort((x, y) => x - y);
     tr.fit = null;
-    clock.t0 = t0 + Math.round((clock.t0 - t0) / T) * T + D;
-    clock.miss = 0;
-    for (const h of this.hist) if (h.t > at) { h.t0 = clock.t0; h.T = clock.T; }
+    if (next === Infinity) {
+      tr.phaseFrom = at;
+      clock.t0 = t0 + Math.round((clock.t0 - t0) / T) * T + D;
+      clock.miss = 0;
+    }
+    const kept = next === Infinity ? { t0: clock.t0, T: clock.T } : { t0: t0 + D, T };
+    for (const h of this.hist) if (h.t > at && h.t <= next) { h.t0 = kept.t0; h.T = kept.T; }
   }
 
   bpmIn() {
