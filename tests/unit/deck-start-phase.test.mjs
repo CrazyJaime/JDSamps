@@ -26,7 +26,7 @@ async function setup() {
   const d = await makeDeck(engine, clock, { id: 2, slot: 2, resident: silence(60) });
   applyAnalysis(d, gridAt(128, -0.0024));
   d.snapAutoCue(d.grids.at(0));
-  assert.ok(Math.abs(d.cue - 0.01) < 1e-9, `cue ${d.cue}: on its first beat, at the first playable input`);
+  assert.equal(d.cue, 0, `cue ${d.cue}: on its first beat, at the first playable input (the track's start)`);
   assert.deepEqual(await d.act('sync', { on: true }), { ok: true });
   run(engine, clock, 0.2);
   return { clock, engine, m, d };

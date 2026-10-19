@@ -214,12 +214,16 @@ export class Deck {
     if (this.cueAuto && !this.hasPlayed) this.setCue(this.firstAudible ?? 0);
   }
 
-  /** The automatic cue moves, once, to the first beat of grid g at the track's first sound. */
+  /**
+   * The automatic cue moves, once, to the first beat of grid g at the track's first sound. A whole track whose first
+   * beat is within one onset frame of its start (the grid is read to about a frame) is cued at the start itself, so
+   * its first attack is whole.
+   */
   snapAutoCue(g) {
     if (!g || !this.cueAuto || this.cueSnapped || this.hasPlayed || this.firstAudible == null) return;
     this.cueSnapped = true;
-    const k = Math.ceil((this.firstAudible - 0.05 - g.t0) / g.T);
-    this.setCue(g.t0 + k * g.T);
+    const k = Math.ceil((this.firstAudible - 0.05 - g.t0) / g.T), b = g.t0 + k * g.T;
+    this.setCue(this.ts.whole && b < 1 / this.tempo.fps ? 0 : b);
   }
 
   noteFirstAudible(L, R, at) {

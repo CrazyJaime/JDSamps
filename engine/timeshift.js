@@ -80,10 +80,11 @@ export class Timeshift {
   rateAt(t) { return this.segAt(t).rate; }
   reserveAt(t) { return Math.max(0, this.liveEdge - this.lat - this.posAt(t)); }
 
-  /** A playable input position: behind a live edge by the latency and a margin, or up to a whole track's last frame. */
+  /** A playable input position: behind a live edge by the latency and a margin, or anywhere from a whole track's first frame to its last. */
   clampInput(x) {
+    const lo = this.whole ? this.historyStart : this.historyStart + 0.01;
     const end = this.whole ? this.liveEdge - 1 / this.sr : this.liveEdge - this.lat - 0.3;
-    return Math.min(Math.max(x, this.historyStart + 0.01), Math.max(this.historyStart + 0.01, end));
+    return Math.min(Math.max(x, lo), Math.max(lo, end));
   }
 
   /** Output time of the last planned change (pending or queued), or -Infinity. */
