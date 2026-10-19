@@ -273,6 +273,31 @@ test('a live deck with two capture gaps in its first beats after the lock, as on
   assert.deepEqual(late, [], `locked at ${lock.t.toFixed(1)} s on ${lock.bpm.toFixed(3)}`);
 });
 
+test('a capture gap whose step is found 4 ms off: the fine fit steps its beats there by their own onsets, within 0.05 %', () => {
+  // The fine fit used to move its beats before a gap by the step found there, so a step found a few ms off (as in the
+  // recorded run below) tilted it by 0.12-0.16 % for seconds: under the 5 ms a step must have to be fitted as one. Here
+  // the gap search reads the beats after the gap 4 ms later than they are; the fit's own onsets are the audio's.
+  for (const [kind, bpm, lead, at, ms] of [['high', 128, 0.2, 7.1, 12], ['low', 124, 0.0052, 7.1, -20], ['mid', 120, 0.2, 7.1, 20]]) {
+    const sr = 44100, x = gap(blips({ kind, bpm, seconds: 30, lead }), sr, at, ms);
+    let deck;
+    const odf = new OdfCore(sr, (f, l, t) => deck.pushFrame(f, l, t));
+    deck = new DeckTempo({ sampleRate: sr, fps: odf.fps });
+    const offsets = deck.beatOffsets.bind(deck), evaluate = deck.evaluate.bind(deck), off = [];
+    deck.beatOffsets = (from) => offsets(from).map((b) => (b.beat > at * sr ? { beat: b.beat, r: b.r + 0.004 * sr } : b));
+    let found = null;
+    deck.evaluate = () => {
+      evaluate();
+      const g = deck.get(), t = deck.tracker.lastT / sr;
+      if (found == null && g.track.jump) found = { t, D: -(deck.gaps.at(-1).D / sr) * 1000 };
+      if (found && t > found.t + 0.5 && t < at + 16 && Math.abs(g.inBpm / bpm - 1) > 5e-4) off.push(`${t.toFixed(1)} s ${g.inBpm.toFixed(3)}`);
+    };
+    for (let s = 0; s + 128 <= x.length; s += 128) odf.push(x.subarray(s, s + 128), s);
+    const say = `${kind} ${bpm} BPM, ${ms > 0 ? 'drop' : 'repeat'} of ${Math.abs(ms)} ms at ${at} s`;
+    assert.ok(found && Math.abs(found.D - (ms - 4)) < 1.5, `${say}: found ${found ? `a ${found.D.toFixed(1)} ms step` : 'no gap'}`);
+    assert.deepEqual(off, [], `${say}: readings off by more than 0.05 %`);
+  }
+});
+
 test('a live deck through capture gaps as one run captured it (one gap found a few ms off, the next missed): within 0.1 %', () => {
   // The fine fit used to move the beats before a gap by the step found there: a step a few ms off (or a second gap
   // not found, its step taken into the first) tilted the fit, 0.18 % off for ten seconds. The beats now step at the
