@@ -693,16 +693,17 @@ export class DeckTempo {
   }
 
   /**
-   * Where the beats measured at the live edge (this.heard: each beat's onset in the window, the last 16 s) put the beat
-   * nearest input frame `at`: the median of those between frames `from` and `to` within 1.5 s of it, each carried there
-   * at period T; null with fewer than 3.
+   * Where the beats measured at the live edge (this.heard: each beat's onset in the window, the last 16 s) put a beat
+   * near input frame `at`: the median of those between frames `from` and `to` within 1.5 s of it, each carried there
+   * at period T, moved by the DJ's GRID nudge (gridOffset: the grid is theirs, the onsets only the tracker's); null
+   * with fewer than 3.
    */
   beatNear(at, T, from = -Infinity, to = Infinity) {
     const w = 1.5 * this.sr, xs = [];
     for (const x of this.heard) if (x >= from && x < to && Math.abs(x - at) <= w) xs.push(x + Math.round((at - x) / T) * T);
     if (xs.length < 3) return null;
     xs.sort((x, y) => x - y);
-    return xs[xs.length >> 1];
+    return xs[xs.length >> 1] + this.gridOffset;
   }
 
   /** Keep where the window's beats rs ({beat, r}, oldest first) are, each its onset, over what was kept for that span. */
@@ -840,11 +841,11 @@ export class DeckTempo {
   }
 
   /**
-   * Each beat of the clock grid since input frame `from` (at most the last 8 s), with the offset
-   * r (input frames) of the strongest onset within T/6 of it: {beat, r}, oldest first.
+   * Each beat of the clock grid, moved back by `shift` (input frames), since input frame `from` (at most the last 8 s),
+   * with the offset r (input frames) of the strongest onset within T/6 of it: {beat, r}, oldest first.
    */
-  beatOffsets(from) {
-    const tr = this.tracker, { t0, T } = this.clock, spf = tr.spf;
+  beatOffsets(from, shift = 0) {
+    const tr = this.tracker, { T } = this.clock, t0 = this.clock.t0 - shift, spf = tr.spf;
     const W = Math.min(tr.full.count, Math.round(8 * this.fps), Math.floor((tr.lastT - from) / spf));
     const half = Math.max(2, Math.round(T / 6 / spf)), out = [];
     if (!(W > 4 * half)) return out;
@@ -883,8 +884,10 @@ export class DeckTempo {
   detectJump() {
     const tr = this.tracker, clock = this.clock, sr = this.sr;
     if (clock.t0 == null || !(clock.T > 0) || tr.cand) { this.jumpCand = null; return; }
-    // The comb's own start (tr.phaseFrom) cuts the window only for a rate step: a gap's is in gaps.
-    const rs = this.beatOffsets(Math.max(this.jumpFrom, this.gaps.length ? -Infinity : tr.phaseFrom, this.track.from * sr));
+    // The comb's own start (tr.phaseFrom) cuts the window only for a rate step: a gap's is in gaps. The beats are the
+    // tracker's, where its onsets are: the DJ's GRID nudge (gridOffset; half a beat puts the clock where none are) is
+    // the grid's.
+    const rs = this.beatOffsets(Math.max(this.jumpFrom, this.gaps.length ? -Infinity : tr.phaseFrom, this.track.from * sr), this.gridOffset);
     this.noteBeats(rs);
     if (rs.length && this.gaps.some((g) => g.at <= rs[0].beat)) this.gaps = this.gaps.filter((g) => g.at > rs[0].beat); // no beat before them left
     const gaps = this.gaps;
@@ -921,8 +924,9 @@ export class DeckTempo {
     // (Leaving out a beat next to the step moves `at` by half a beat.)
     if (!cand || Math.abs(cand.at - at) > 0.75 * clock.T || Math.abs(cand.D - D) > Math.max(0.3 * Math.abs(D), 0.002 * sr)) return;
     // The grid before the gap is the clock as the live edge passed it, at its period put where the last beats before the
-    // gap are (since the gap before them): passed soon after the gap before it was found, that clock was that gap's
-    // re-phase by the step found there, a few ms off the beats when the step was.
+    // gap are (since the gap before them), as the DJ's GRID nudge has them: passed soon after the gap before it was
+    // found, that clock was that gap's re-phase by the step found there, a few ms off the beats when the step was. A
+    // tapped grid's beat is the DJ's, wherever the onsets are.
     const prev = this.gridBefore(at), since = gaps.reduce((x, g) => (g.at < at && g.at > x ? g.at : x), -Infinity);
     const Tp = prev.T * sr, last = rs[ib].beat + rs[ib].r, near = [];
     for (let i = ib; i >= 0 && near.length < 4; i--) {
@@ -932,7 +936,7 @@ export class DeckTempo {
       near.push(x + Math.round((last - x) / Tp) * Tp);
     }
     near.sort((x, y) => x - y);
-    if (near.length >= 2) prev.t0 = (near.length > 2 ? near[near.length >> 1] : (near[0] + near[1]) / 2) / sr;
+    if (near.length >= 2 && !this.tapped) prev.t0 = ((near.length > 2 ? near[near.length >> 1] : (near[0] + near[1]) / 2) + this.gridOffset) / sr;
     const t0 = prev.t0 * sr, T = prev.T * sr;
     // A gap of a burst found after a later one: the clock follows the beats past that one already, and keeps them; the
     // clocks remembered between the two take this one's step.
