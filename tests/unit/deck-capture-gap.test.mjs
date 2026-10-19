@@ -111,10 +111,14 @@ test('a step over 60 ms is no capture gap: no jump', async () => {
 test('two gaps within a beat: one jump, the second step goes to the phase loop', async () => {
   const { clock, engine, d } = await rig();
   const T = 60 / 124;
-  gap(d, clock, 2, 12, 0);
-  gap(d, clock, 2 + 0.3 * T, -10, 1);
-  const w = watch(engine, clock, d, 1.5);
+  const X1 = gap(d, clock, 2, 12, 0), X2 = gap(d, clock, 2 + 0.3 * T, -10, 1);
+  // Watched until the playhead is well past both: a second jump would be planned behind the first and sent after it.
+  const w = watch(engine, clock, d, 5);
+  assert.ok(d.ts.posAt(clock.t) > X2 + 2, 'the playhead went past both gaps');
   assert.equal(w.jumps.length, 1, JSON.stringify(w.jumps));
+  assert.ok(Math.abs(w.jumps[0].at - X1) < 1e-3 && Math.abs(w.jumps[0].by - 0.012) < 1e-6, JSON.stringify(w.jumps[0]));
+  assert.ok(w.bend > 0.005, `the phase loop bent ${(w.bend * 100).toFixed(2)} % for the second step`);
+  assert.ok(Math.abs(clockErrMs(engine, d, clock.t)) < 2, `${clockErrMs(engine, d, clock.t).toFixed(2)} ms off the beat after it`);
 });
 
 test('under a held nudge the gap is played as it came', async () => {
