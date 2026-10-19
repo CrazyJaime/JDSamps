@@ -37,6 +37,10 @@ before(async () => {
   // A 280 s MP3 (the 70 s track four times over), a mix longer than the resident limit the test sets.
   execFileSync('/usr/bin/ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-stream_loop', '3', '-i', path.join(tmp, 'long.wav'), '-codec:a', 'libmp3lame', '-b:a', '64k', path.join(tmp, 'mix.mp3')]);
   files.mixBytes = fs.statSync(path.join(tmp, 'mix.mp3')).size;
+  files.longBytes = fs.statSync(path.join(tmp, 'long.wav')).size;
+  // Opus in WebM, a format that cannot be cut short: 70 s (a little past a 1-minute limit), and 140 s (past twice it).
+  execFileSync('/usr/bin/ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-i', path.join(tmp, 'long.wav'), '-codec:a', 'libopus', '-b:a', '64k', path.join(tmp, 'long.webm')]);
+  execFileSync('/usr/bin/ffmpeg', ['-hide_banner', '-loglevel', 'error', '-y', '-stream_loop', '1', '-i', path.join(tmp, 'long.wav'), '-codec:a', 'libopus', '-b:a', '64k', path.join(tmp, 'twice.webm')]);
   const send = (res, type, file) => { res.writeHead(200, { 'content-type': type, 'cache-control': 'no-store' }); res.end(fs.readFileSync(path.join(tmp, file))); };
   server = http.createServer((req, res) => {
     const u = new URL(req.url, 'http://x');
@@ -45,6 +49,8 @@ before(async () => {
       case '/mix.mp3': return send(res, 'audio/mpeg', 'mix.mp3');
       case '/linked-kick.wav': return send(res, 'audio/wav', 'kick.wav');
       case '/long.wav': return send(res, 'audio/wav', 'long.wav');
+      case '/long.webm': return send(res, 'audio/webm', 'long.webm');
+      case '/twice.webm': return send(res, 'audio/webm', 'twice.webm');
       case '/five.wav': return send(res, 'audio/wav', 'five.wav');
       case '/late.wav': return send(res, 'audio/wav', 'late.wav');
       case '/page.html': res.writeHead(200, { 'content-type': 'text/html' }); return res.end('<!doctype html><title>Not audio</title><p>Hello.</p>');
@@ -60,7 +66,9 @@ before(async () => {
   });
   await new Promise((r) => server.listen(0, '127.0.0.1', r));
   origin = `http://127.0.0.1:${server.address().port}`;
-  h = await launchExtension({ ext: prepareExtension() });
+  const ext = prepareExtension();
+  fs.copyFileSync(new URL('./pages/gap-worklet.js', import.meta.url), path.join(ext.dir, 'gap-worklet.js')); // measures the audio thread
+  h = await launchExtension({ ext });
   deck = await h.context.newPage();
   deck.on('pageerror', (e) => pageErrors.push(String(e)));
   deck.on('console', (m) => { if (m.type() === 'error') pageErrors.push(m.text()); });
@@ -281,6 +289,81 @@ test('a long MP3 link decodes only its first part, a second past the resident li
   }
 });
 
+/** Every buffer the engine's context decodes, by its size, while fn runs (the limit set to 1 minute). */
+async function decodedWhile(fn) {
+  set(deck, null, 'resident.limitMin', 1);
+  await waitFor(async () => (await state(deck)).master.params['resident.limitMin'] === 1);
+  await engine(`window.__decoded = []; const dad = e.ctx.decodeAudioData;
+    e.ctx.decodeAudioData = function (b, ...a) { window.__decoded.push(b.byteLength); return dad.call(this, b, ...a); }; return true;`);
+  try {
+    const seen = (await events(deck)).length, r = await fn();
+    return { r, decoded: await engine('return window.__decoded;'), said: (await events(deck)).slice(seen) };
+  } finally {
+    await engine('delete e.ctx.decodeAudioData; return true;');
+    set(deck, null, 'resident.limitMin', 15);
+  }
+}
+
+test('a long WAV link decodes only its first part, a second past the resident limit, and says how long the whole track is', async () => {
+  const { r, decoded } = await decodedWhile(async () => {
+    const r = await act(deck, null, 'loadUrl', { url: `${origin}/long.wav?cut` });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    const d = await deckWhere((x) => x.title === 'long' && x.kind === 'resident' && x.url.endsWith('?cut'));
+    assert.ok(Math.abs(d.duration - 60) < 1e-3, `duration ${d.duration}`);
+    await waitFor(async () => (await events(deck)).some((e) => /this track is 1\.2 minutes long: the deck holds its first 1 minute\b/.test(e.text)));
+    return d;
+  });
+  assert.equal(decoded.length, 1, JSON.stringify(decoded));
+  assert.ok(decoded[0] < 0.9 * files.longBytes, `decoded ${decoded[0]} of the file's ${files.longBytes} bytes`);
+  assert.equal((await act(deck, r.id, 'eject')).ok, true);
+  await waitFor(async () => !(await decks()).some((x) => x.id === r.id));
+});
+
+test('a file that cannot be cut short (WebM) and is longer than twice the resident limit is refused before it is decoded, saying why', async () => {
+  const had = new Set((await decks()).map((x) => x.id));
+  const { r, decoded } = await decodedWhile(() => act(deck, null, 'loadUrl', { url: `${origin}/twice.webm` }));
+  assert.equal(r.ok, false, JSON.stringify(r));
+  assert.match(r.error, /“twice” is 2\.3 minutes long, too long to decode whole/);
+  assert.deepEqual(decoded, [], 'it was decoded');
+  await waitFor(async () => !(await decks()).some((x) => !had.has(x.id)));
+});
+
+test('a file that cannot be cut short (WebM), within twice the resident limit, still loads its first part', async () => {
+  const { r } = await decodedWhile(async () => {
+    const r = await act(deck, null, 'loadUrl', { url: `${origin}/long.webm` });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    const d = await deckWhere((x) => x.title === 'long' && x.kind === 'resident' && x.url.endsWith('.webm'));
+    assert.ok(Math.abs(d.duration - 60) < 1e-3, `duration ${d.duration}`);
+    return d;
+  });
+  assert.equal((await act(deck, r.id, 'eject')).ok, true);
+  await waitFor(async () => !(await decks()).some((x) => x.id === r.id));
+});
+
+test('tracks loaded all at once are decoded and analysed one at a time, so their memory peaks never stack', async () => {
+  await engine(`window.__heavy = { dec: 0, maxDec: 0, an: 0, maxAn: 0 }; const h = window.__heavy, dad = e.ctx.decodeAudioData;
+    e.ctx.decodeAudioData = function (...a) { h.maxDec = Math.max(h.maxDec, ++h.dec); return dad.apply(this, a).finally(() => { h.dec--; }); };
+    const W = window.__W = globalThis.Worker; // the analysis runs in a Worker of its own
+    globalThis.Worker = class extends W {
+      constructor(...a) { super(...a); h.maxAn = Math.max(h.maxAn, ++h.an); }
+      terminate() { if (!this.gone) { this.gone = true; h.an--; } return super.terminate(); }
+    };
+    return true;`);
+  try {
+    const rs = await Promise.all(['a', 'b', 'c'].map((q) => act(deck, null, 'loadUrl', { url: `${origin}/five.wav?${q}` })));
+    for (const r of rs) assert.equal(r.ok, true, JSON.stringify(rs));
+    const heavy = await engine('return window.__heavy;');
+    assert.equal(heavy.maxDec, 1, `decoded ${heavy.maxDec} at once`);
+    assert.equal(heavy.maxAn, 1, `analysed ${heavy.maxAn} at once`);
+    const ours = (await decks()).filter((x) => /\/five\.wav\?[abc]$/.test(x.url || ''));
+    assert.equal(ours.length, 3);
+    for (const x of ours) assert.equal((await act(deck, x.id, 'eject')).ok, true);
+    await waitFor(async () => !(await decks()).some((x) => ours.some((o) => o.id === x.id)));
+  } finally {
+    await engine('delete e.ctx.decodeAudioData; globalThis.Worker = window.__W; return true;');
+  }
+});
+
 test('a decoded track at another sample rate is resampled to the engine\'s before it goes on a deck', async () => {
   const r = await engine(`
     const sr = e.ctx.sampleRate === 44100 ? 48000 : 44100, n = sr * 3, L = new Float32Array(n);
@@ -293,6 +376,45 @@ test('a decoded track at another sample rate is resampled to the engine\'s befor
   assert.ok(Math.abs(r.duration - 3) < 1e-3, JSON.stringify(r));
   assert.ok(Math.abs(r.frames - 3 * r.to) <= 1, JSON.stringify(r));
   assert.equal((await act(deck, r.res.deckId, 'eject')).ok, true);
+});
+
+test('a 15-minute track goes resident without holding up the audio thread: it is handed to the stretcher, not copied', async () => {
+  const r = await engine(`
+    if (!window.__gap) {
+      await e.ctx.audioWorklet.addModule(chrome.runtime.getURL('gap-worklet.js'));
+      const n = new AudioWorkletNode(e.ctx, 'jds-test-gap'); n.connect(e.silentSink);
+      window.__gap = () => new Promise((r) => { n.port.onmessage = (ev) => r(ev.data); n.port.postMessage(0); });
+    }
+    const sr = e.ctx.sampleRate, n = sr * 900, L = new Float32Array(n);
+    for (let i = 0; i < sr; i++) L[i] = 0.2 * Math.sin(2 * Math.PI * 220 * i / sr);
+    for (let k = sr; k < n; k *= 2) L.copyWithin(k, 0, Math.min(k, n - k));
+    const R = L.slice();
+    await new Promise((r) => setTimeout(r, 300));
+    const quiet = await window.__gap();
+    const res = await e.serial(() => e.startResidentDeck({ pcm: { L, R, sampleRate: sr }, meta: { title: 'fifteen' }, analysis: null }));
+    await new Promise((r) => setTimeout(r, 500));
+    return { res, quiet, gap: await window.__gap(), handed: L.byteLength + R.byteLength === 0, duration: res.ok && e.decks.get(res.deckId).duration };
+  `);
+  assert.equal(r.res.ok, true, JSON.stringify(r));
+  assert.ok(Math.abs(r.duration - 900) < 1e-3, JSON.stringify(r));
+  assert.ok(r.gap < 150, `the audio thread was held up ${r.gap} ms (${r.quiet} ms before the load)`);
+  assert.equal(r.handed, true, 'the engine kept its own copy of the track');
+  assert.equal((await act(deck, r.res.deckId, 'eject')).ok, true);
+  await waitFor(async () => !(await decks()).some((x) => x.id === r.res.deckId));
+});
+
+test('a track given with no analysis is analysed before the stretcher takes it: the deck has its beat grid', async () => {
+  const r = await engine(`
+    const ab = await e.ctx.decodeAudioData(await (await fetch('${origin}/linked-kick.wav?grid')).arrayBuffer());
+    const L = ab.getChannelData(0).slice(), R = L.slice();
+    const res = await e.serial(() => e.startResidentDeck({ pcm: { L, R, sampleRate: ab.sampleRate }, meta: { title: 'gridded' } }));
+    return { res, bpm: res.ok && e.decks.get(res.deckId).state(e.ctx.currentTime).bpm };
+  `);
+  assert.equal(r.res.ok, true, JSON.stringify(r));
+  assert.equal(r.bpm.state, 'LOCKED', JSON.stringify(r.bpm));
+  assert.ok(Math.abs(r.bpm.native - 124) < 0.05, JSON.stringify(r.bpm));
+  assert.equal((await act(deck, r.res.deckId, 'eject')).ok, true);
+  await waitFor(async () => !(await decks()).some((x) => x.id === r.res.deckId));
 });
 
 test('a loading deck that holds a tab\'s capture falls back to live, saying why once', async () => {

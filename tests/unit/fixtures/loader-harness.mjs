@@ -285,6 +285,7 @@ export function makeEngine({ tabs = [], limitMin = 15, hubOk = true } = {}) {
       if (!d || e.leaving.has(d)) return { ok: false, error: 'That deck is gone.' };
       await turn();
       d.kind = 'resident'; d.duration = pcm.L.length / pcm.sampleRate;
+      structuredClone([pcm.L, pcm.R], { transfer: [...new Set([pcm.L.buffer, pcm.R.buffer])] }); // the deck takes the arrays, as the real one does
       d.setLoad({ state: 'ready', progress: 1, strategy: null, error: null });
       if (e.decks.get(deckId) !== d || e.leaving.has(d)) return { ok: false, error: 'That deck is gone.' }; // ejected meanwhile
       e.events.push({ level: 'info', text: `Loaded “${d.meta.title}” on deck ${d.slot}.` });

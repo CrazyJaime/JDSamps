@@ -158,7 +158,9 @@ its tab live says **LIVE**.
 
 A whole track takes about 22 MB of memory per minute. **Settings → Resident track limit**
 (default 15 minutes, about 330 MB per deck) caps each deck: a longer track loads its first part,
-and the deck says so. The top bar warns when the decks hold more than 1.5 GiB of audio; eject
+and the deck says so. Only an MP3 or WAV file can be cut short before it is decoded: a file in
+another format (WebM, Ogg, FLAC, M4A) is decoded whole, so one longer than twice the limit is
+refused, with the reason. The top bar warns when the decks hold more than 1.5 GiB of audio; eject
 some to free memory.
 
 ## Notes and limits

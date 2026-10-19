@@ -10,8 +10,9 @@ import { createMaster } from './master.js';
 import { Recorder } from './recorder.js';
 import { MasterClock } from './sync.js';
 import { Deck } from './deck.js';
-import { fetchArrayBuffer, decodeTo, resample, limitPcm } from './decode.js';
+import { fetchArrayBuffer, decodeTo, resample, limitPcm, wavFrames, mediaDuration, minutes } from './decode.js';
 import { analyseTrack, applyAnalysis } from './analysis.js';
+import { decodePlaced } from './assemble.js';
 import { Loader, Recording, DirectReport, framesOf } from './loader.js';
 
 const STRETCH_URL = new URL('../vendor/signalsmith-stretch/SignalsmithStretch.js', import.meta.url).href;
@@ -59,6 +60,8 @@ class Engine {
     this.holds = new Set(); // 'deckId|key': kills/FX held down in the UI (set with hold:true)
     this.notes = []; // hub notices waiting for a deck page
     this.serialQ = Promise.resolve();
+    this.heavyQ = Promise.resolve(); // decoding and analysing whole tracks, one at a time (heavy()): its last turn
+    this.heavyN = 0;                 // and how many turns are running or waiting
     this.downloads = new Map();
     this.downloadsSettled = new Set(); // blob URLs already reported: the hub may send DOWNLOAD_DONE twice
     this.clipUntil = { L: 0, R: 0 };
@@ -106,6 +109,21 @@ class Engine {
   serial(fn) {
     const run = this.serialQ.then(fn, fn);
     this.serialQ = run.catch(() => {});
+    return run;
+  }
+
+  /**
+   * Decoding a whole track, or analysing one, in turn: tracks loaded together (files dropped at once, tabs) never
+   * stack their memory peaks. With none waiting, fn starts at once. A load stopped while it waits (signal aborted)
+   * is not run. fn never waits on heavy().
+   */
+  heavy(fn, signal) {
+    const go = () => {
+      if (signal && signal.aborted) throw new Error('The load was stopped.');
+      return fn();
+    };
+    const run = this.heavyN++ ? this.heavyQ.then(go) : (async () => go())(), done = () => { this.heavyN--; };
+    this.heavyQ = run.then(done, done);
     return run;
   }
 
@@ -315,7 +333,8 @@ class Engine {
 
   /** Run a loading tab deck's Loader. Its agents' tap messages reach it through deck.loader while it runs. */
   loadTab(deck) {
-    const ac = new AbortController(), loader = new Loader({ engine: this, deck, tabId: deck.tabId, signal: ac.signal });
+    const ac = new AbortController(), turn = (fn) => (...a) => this.heavy(() => fn(...a), ac.signal);
+    const loader = new Loader({ engine: this, deck, tabId: deck.tabId, signal: ac.signal, deps: { decodeFile: turn(decodeTo), decodePlaced: turn(decodePlaced) } });
     const load = { abort: () => ac.abort(), loader };
     this.loads.set(deck.id, load);
     deck.loader = loader;
@@ -432,7 +451,8 @@ class Engine {
    * A deck holding a whole decoded track, pcm {L, R, sampleRate}: a new deck, or the loading deck
    * deckId promoted (a failed promotion leaves it loading, for its loader to decide). Its beat grid
    * comes from gridResident() before it is reported ready: from `analysis` when given (null: none),
-   * else from analysing pcm here.
+   * else from analysing pcm here. The deck takes pcm's arrays (they are transferred to its stretcher),
+   * so the caller reads what it needs of them first.
    */
   async startResidentDeck({ deckId = null, tabId = null, pcm, meta = {}, analysis } = {}) {
     if (!pcm || !(pcm.L && pcm.L.length) || !pcm.R || pcm.R.length !== pcm.L.length) return { ok: false, error: 'There is no audio to load.' };
@@ -447,6 +467,8 @@ class Engine {
     }
     // The stretcher runs at the context's rate.
     if (pcm.sampleRate !== this.ctx.sampleRate) pcm = await resample(pcm, this.ctx.sampleRate);
+    let unfit = null; // analysed before the stretcher takes the track
+    if (analysis === undefined) analysis = await this.analyse(pcm).catch((err) => { unfit = err; return null; });
     if (deck) {
       if (this.decks.get(deck.id) !== deck) return { ok: false, error: 'That deck is gone.' };
       Object.assign(deck.meta, meta);
@@ -459,7 +481,8 @@ class Engine {
       return { ok: false, error: `Deck ${deck.slot} could not take the track: ${err.message}` };
     }
     try {
-      await this.gridResident(deck, pcm, analysis);
+      if (unfit) throw unfit;
+      this.gridResident(deck, analysis);
     } catch (err) {
       this.event('warn', `Deck ${deck.slot}: no beat grid from the whole track (${err.message}). TAP the beat.`, deck.id);
     }
@@ -470,11 +493,10 @@ class Engine {
   }
 
   /**
-   * A resident deck's beat grid, tempo and whole waveform, from whole-track analysis (given, null for
-   * none, or run on pcm). The automatic cue moves to the first beat, as a live deck's does.
+   * A resident deck's beat grid, tempo and whole waveform, from whole-track analysis (null for none).
+   * The automatic cue moves to the first beat, as a live deck's does.
    */
-  async gridResident(deck, pcm, analysis) {
-    if (analysis === undefined) analysis = await this.analyse(pcm);
+  gridResident(deck, analysis) {
     if (!analysis || deck.disposed) return;
     applyAnalysis(deck, analysis);
     deck.analysis = { bpm: analysis.bpm, conf: analysis.conf, octConf: analysis.octConf, bar1: analysis.bar1, residuals: analysis.residuals };
@@ -483,10 +505,10 @@ class Engine {
     else this.event('info', `Deck ${deck.slot}: no steady beat found in “${deck.meta.title || 'the track'}”. TAP it if it has one.`, deck.id);
   }
 
-  /** Whole-track analysis of pcm in a worker, over the BPM range in force. Rejects when signal aborts. */
+  /** Whole-track analysis of pcm in a worker, over the BPM range in force, in its turn (heavy()). Rejects when signal aborts. */
   analyse(pcm, signal) {
     const [lo, hi] = BPM_RANGES[this.params['bpm.range']] || BPM_RANGES.AUTO;
-    return analyseTrack(pcm, { lo, hi, signal });
+    return this.heavy(() => analyseTrack(pcm, { lo, hi, signal }), signal);
   }
 
   /** A loading deck holding a tab's capture plays it live after all; the reason is said once. */
@@ -544,7 +566,7 @@ class Engine {
       return { ok: false, error };
     };
     say({ strategy });
-    let buf, pcm;
+    let buf;
     try {
       buf = await fetchArrayBuffer(src, { signal: ac.signal });
     } catch (err) {
@@ -554,13 +576,22 @@ class Engine {
     if (gone()) return refuse();
     rep.fetched(buf.byteLength);
     say({ progress: 0.5, strategy: 'decoding' });
-    // Longer than the resident limit, an MP3 or ADTS file is cut at the frame a second past it and only that part
-    // is decoded, as a tab's file is (a file in any other format is decoded whole).
-    const limitMin = this.params['resident.limitMin'], w = framesOf(buf, limitMin * 60 + 1);
+    // Longer than the resident limit, an MP3 or ADTS file is cut at the frame a second past it (as a tab's file is),
+    // or a WAV file at the sample, and only that part is decoded. A file in any other format cannot be cut short and
+    // is decoded whole, so only up to twice the limit: its length is read from its header first.
+    const limitMin = this.params['resident.limitMin'], until = limitMin * 60 + 1, w = framesOf(buf, until) || wavFrames(buf, until);
     const own = w ? w.samples / w.sampleRate : 0, cut = own > limitMin * 60 + 0.5 && w.cut ? w.cut : null;
-    if (cut) buf = buf.slice(0, cut.end);
-    try {
-      pcm = await decodeTo(this.ctx, buf);
+    if (cut) buf = cut.bytes || buf.slice(0, cut.end);
+    else if (!w) {
+      const length = await mediaDuration(buf);
+      if (gone()) return refuse();
+      if (length > 2 * limitMin * 60) {
+        return refuse(`“${meta.title}” is ${minutes(length / 60)} long, too long to decode whole: the deck holds ${minutes(limitMin)}. As an MP3 or WAV file, its first ${minutes(limitMin)} would load.`);
+      }
+    }
+    let lim;
+    try { // decoded and cut in one turn: the whole decoded track is let go of before the next one decodes
+      lim = await this.heavy(async () => limitPcm(await decodeTo(this.ctx, buf), limitMin, cut ? own : undefined), ac.signal);
     } catch (_) {
       const error = `“${meta.title}” is not audio this browser can play.`;
       rep.step('decode', 'failed', error);
@@ -568,9 +599,7 @@ class Engine {
     }
     buf = null;
     if (gone()) return refuse();
-    rep.step('decode', 'ok', `${(pcm.L.length / pcm.sampleRate).toFixed(3)} s${cut ? `, the first part of ${own.toFixed(1)} s` : ''}`);
-    const lim = limitPcm(pcm, limitMin, cut ? own : undefined);
-    pcm = null;
+    rep.step('decode', 'ok', `${(lim.pcm.L.length / lim.pcm.sampleRate).toFixed(3)} s${cut ? `, the first part of ${own.toFixed(1)} s` : ''}`);
     rep.limit = lim.notice;
     // Found here rather than in startResidentDeck, so other decks' starts and ejects never queue behind it.
     say({ progress: 0.8, strategy: 'finding the beat' });
