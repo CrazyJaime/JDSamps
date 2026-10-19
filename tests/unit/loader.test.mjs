@@ -2,7 +2,7 @@
 // ladder a page gets, every refusal, monotonic progress, the promotion and the release of the tab.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SITES, firstRung, parseHls, findStart } from '../../engine/loader.js';
+import { SITES, TIMES, firstRung, parseHls, findStart } from '../../engine/loader.js';
 import { defaults, MASTER_PARAMS, PERSISTED_MASTER_KEYS, validateUiMessage } from '../../shared/protocol.js';
 import { load, rendition, file, mp3, code, DUR, SR, OPUS, makeTab, makeEngine, loaderFor, fetcher, settle, turn, decoders, FAST } from './fixtures/loader-harness.mjs';
 
@@ -208,11 +208,19 @@ for (const [reason, re] of [['drm', /protected/], ['worker', /worker/], ['previe
   });
 }
 
-/** load() options: the page reports `reason` as the loader does `when` (a command it sends, or 'beat': the analysis). */
-const lateError = (reason, when) => ({
-  before: ({ tab, engine }) => {
+/**
+ * load() options: the page reports `reason` as the loader does `when` (a command it sends, or 'beat': the analysis),
+ * and then says nothing more (its player hung): the deck goes live at once only if the wait it is in gives way to the
+ * error. seen.error and seen.live: the virtual times of the error and of the deck going live. A drive looks at its
+ * pieces as seldom as it does for real (check), so a wait that does not give way shows.
+ */
+const lateError = (reason, when, seen = {}) => ({
+  times: { ...FAST, check: TIMES.check },
+  before: ({ tab, engine, clock }) => {
     let fired = false;
-    const fire = () => { if (!fired) { fired = true; setImmediate(() => tab.frames[0].emit({ t: 'tap-error', reason, detail: `late ${reason}` })); } };
+    const fire = () => { if (!fired) { fired = true; setImmediate(() => { seen.error = clock.now(); tab.frames[0].emit({ t: 'tap-error', reason, detail: `late ${reason}` }); tab.frames[0].hang(); }); } };
+    const live = engine.failLoadingToLive.bind(engine);
+    engine.failLoadingToLive = (...a) => { seen.live = clock.now(); return live(...a); };
     if (when !== 'beat') { tab.hooks.push((m) => { if (when(m)) fire(); }); return; }
     const f = engine.analyse.bind(engine);
     engine.analyse = async (pcm, s) => { fire(); await settle(10); return f(pcm, s); };
@@ -225,8 +233,9 @@ for (const [reason, re] of [['drm', /protected/], ['worker', /worker/], ['previe
     ['while the beat is found', { kind: 'progressive', src: 'https://site.example/t.mp3', files: { 'https://site.example/t.mp3': file('t', 120.0065) } }, 'beat', ['tap on', 'readTralbum', 'fetch']],
   ]) {
     test(`${reason} said after the first look, ${stage}: live at once with its one message, nothing more asked of the page, nothing promoted`, async () => {
-      const { result, engine, tab } = await load(page, lateError(reason, when));
+      const seen = {}, { result, engine, tab } = await load(page, lateError(reason, when, seen));
       assert.equal(result.kind, 'live', JSON.stringify(result));
+      assert.ok(seen.live - seen.error < 20, `live ${seen.live - seen.error} ms after the error`);
       assert.deepEqual(called(engine, 'startResidentDeck'), []);
       const f = called(engine, 'failLoadingToLive');
       assert.equal(f.length, 1);
@@ -836,6 +845,26 @@ test('another player\'s appends never become the track: one beside it in its fra
       }
     }
   }
+});
+
+test('a decisive error from another player in the tab (an advert that is protected, or a live stream) never sends the track live: it goes in the report', async () => {
+  const track = { kind: 'mse', rendition: hi(), preTap: 6, playing: 2, list: true, segUrls: true };
+  const ad = { kind: 'mse', rendition: rendition('opus-lo', 'https://ads.example'), duration: 30, preTap: 1, status: { audible: 0, muted: true } };
+  for (const [what, adPage, opts] of [
+    ['protected, at the first look', { ...ad, errors: ['drm'] }, {}],
+    ['a live stream, at the first look', { ...ad, duration: Infinity, liveAfter: 5 }, {}],
+    ['protected, while the track\'s pieces are fetched', ad,
+      { before: ({ tab }) => { tab.hooks.push((m, i) => { if (m.t === 'fetch' && i === 0) setImmediate(() => tab.frames[1].emit({ t: 'tap-error', reason: 'drm', detail: 'an encrypted event' })); }); } }],
+  ]) {
+    const { result, engine, deck } = await load({ frames: 2, framePages: [track, adPage] }, opts);
+    assert.equal(result.kind, 'resident', `${what}: ${JSON.stringify(called(engine, 'failLoadingToLive'))}`);
+    assert.ok(near(called(engine, 'startResidentDeck')[0].frames / SR, 120, 0.02), what);
+    assert.match(deck.load.report, /note: another player in the tab \(frame 2\) said (its audio is protected|it is a live stream with no end) \([^)]+\): not the track's, so the load went on/, `${what}: ${deck.load.report}`);
+  }
+  // The track's own frame saying so still sends it live.
+  const own = await load({ frames: 2, framePages: [{ ...track, errors: ['drm'] }, ad] });
+  assert.equal(own.result.kind, 'live');
+  assert.match(called(own.engine, 'failLoadingToLive')[0].reason, /protected/);
 });
 
 test('the opus pieces this harness serves are what the model sites serve', () => {

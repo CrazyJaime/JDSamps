@@ -76,6 +76,8 @@ const UNFLUSHED = {
   sticky: 'it would not fetch again what was taken from behind its place',
 };
 const DECISIVE = ['drm', 'worker', 'preview', 'live'];
+/** A decisive error from a player in the tab that is not the track's (an advert, a jingle), as its report note says it. */
+const OTHERS = { drm: 'its audio is protected', worker: 'it plays from a worker', preview: 'it is a 30-second preview', live: 'it is a live stream with no end' };
 const UNREADABLE = ['drm', 'worker']; // decisive, and the page's bytes cannot be had: only its sound can be recorded
 const NO_LENGTH = "the page's player has not said how long the track is";
 const TAB_CAP = 600 * 2 ** 20;       // bytes from one tab: each frame's tap holds at most this, and so does the whole tab
@@ -362,9 +364,23 @@ export class Loader extends Job {
    * past the limit, so the cut to it lands inside decoded audio, clear of the codec delay at the end).
    */
   target() { const D = this.duration(), L = this.limitSec(); return D == null ? null : D <= L ? D : Math.min(D, L + 1); }
+  /** A decisive tap error from the track's own player: another player's (an advert beside it) never decides the load. */
   decisive() {
-    for (const f of this.attached()) for (const e of f.errors) if (DECISIVE.includes(e.reason)) return e.reason;
+    const f = this.track();
+    for (const e of f ? f.errors : []) if (DECISIVE.includes(e.reason)) return e.reason;
     return null;
+  }
+  /** The other players' decisive errors, as notes for the report. */
+  othersSaid() {
+    const t = this.held(), out = [];
+    for (const f of this.frames.values()) {
+      if (f === t) continue;
+      for (const reason of uniq(f.errors.filter((e) => DECISIVE.includes(e.reason)).map((e) => e.reason))) {
+        const e = f.errors.find((x) => x.reason === reason);
+        out.push(`another player in the tab (frame ${f.n}) said ${OTHERS[reason]} (${e.detail}): not the track's, so the load went on`);
+      }
+    }
+    return out;
   }
 
   // ---------------------------------------------------------------- waiting
@@ -953,7 +969,7 @@ export class Loader extends Job {
       ...(r.limit ? [`Limit: ${r.limit}`] : []),
       'Steps:',
       ...r.steps.map((s) => `  ${s.name}${s.how ? ` (${s.how})` : ''}: ${s.outcome ? `${s.outcome} in ${secs(s.ms)}` : `running for ${secs(this.now() - s.at)}`}${s.why ? ` — ${s.why}` : ''}`),
-      ...r.notes.map((n) => `  note: ${n}`),
+      ...[...r.notes, ...this.othersSaid()].map((n) => `  note: ${n}`),
       `Media types: ${r.mimes.size ? [...r.mimes].join(', ') : 'none seen'}`,
       `Runs: ${p ? p.runs.length : 0}, segments: ${p ? p.runs.reduce((n, x) => n + x.segs.length, 0) : 0}, gaps: ${gaps.length ? gaps.map(span).join(', ') : 'none'}`,
       `Requests seen: ${media} media, ${lists} playlist${lists === 1 ? '' : 's'}`,

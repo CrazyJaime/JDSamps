@@ -96,6 +96,7 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
     const emit = (m) => {
       const v = validateAgentMessage(m);
       if (!v) throw new Error(`the fake agent sent an invalid message: ${JSON.stringify(m)}`);
+      if (fr.hung) return;
       setImmediate(() => { const d = tab.deck; if (!fr.left && d && d.agents.get(fr.id) === fr.a && d.loader) d.loader.onTap(fr.id, v); });
     };
     const sbs = pg.sbs !== undefined ? pg.sbs : pg.kind === 'mse' ? [0] : pg.kind === 'progressive' ? [] : null;
@@ -172,6 +173,7 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
     };
     fr.port = { onCommand, postMessage: (m) => onCommand(structuredClone(m)), disconnect: () => { fr.disconnected = true; } };
     fr.emit = emit; fr.progress = progress; fr.append = append; fr.pg = pg;
+    fr.hang = () => { fr.hung = true; }; // its agent says nothing more (the page's player hung)
     tab.frames.push(fr);
   }
   /** What deck.attachAgent does for a loading deck: register the frame's agent and tell the loader. */
