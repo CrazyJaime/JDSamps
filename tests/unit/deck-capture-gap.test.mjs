@@ -6,6 +6,7 @@
 // master BEAT followers lock to), never under a nudge.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { makeEngine, makeDeck, run, clockErrMs, pairErrMs } from './fixtures/deck-harness.mjs';
 import { OdfCore } from '../../worklets/odf-core.js';
 import { DeckTempo } from '../../engine/tempo.js';
@@ -379,4 +380,45 @@ test('two capture gaps 2.4 s apart, the second taken in by the live grid but not
   let bend = 0;
   for (const s of d.node.map) if (s.active && s.output > clock.t - 25) bend = Math.max(bend, Math.abs(s.rate / ((1 + d.params.pitch) * d.nudgeFactor) - 1));
   assert.ok(bend < 0.002, `the follower bent ${(bend * 100).toFixed(2)} %`);
+});
+
+// A gap found late, while the clock's period was off (the gap itself tilts the fine fit until it is found): the grid
+// after it is the clock re-phased by the step found, anchored at its newest beat, seconds past the gap. Its step
+// against the grid before the gap, at the gap, is the step found plus the two periods' difference over every beat back
+// to the gap: a live-sync master stored +3.8 ms for a gap found -9.6 ms (its capture stepped -8.3 ms there), 12.5 beats
+// back at a period 0.2 % short, and jumped -23.9 ms for the next one, found -16.3 ms (capture -15.7 ms).
+
+/** Deck x follows its tracker input `c` (a capture fixture's ODF frames) as its live edge reaches each frame. */
+function replays(x, c) {
+  let i = 0;
+  x.tempo = new DeckTempo({ sampleRate: c.sr, fps: c.fps });
+  x.grids = new GridMap();
+  x.ts.liveEdge = 0.05;
+  return () => {
+    for (; i < c.full.length && c.t0 + i * c.spf <= x.ts.liveEdge * c.sr; i++) x.tempo.pushFrame(c.full[i], c.low[i], c.t0 + i * c.spf);
+    x.followTempo();
+  };
+}
+
+test('a capture gap found 6 s late, the clock\'s period then 0.2 % short (one run\'s capture): each jump is the step the capture made there', async () => {
+  const c = JSON.parse(fs.readFileSync(new URL('./fixtures/live-late-gap-capture.json', import.meta.url), 'utf8'));
+  const clock = { t: 100 }, engine = makeEngine(clock);
+  engine.params['assist.on'] = false;
+  const m = makeDeck(engine, clock, { id: 1, slot: 1, bpm: 128, liveEdge: 600, capSec: 1e7 });
+  const d = makeDeck(engine, clock, { id: 2, slot: 2, bpm: 124, t0: 0.11, liveEdge: 600, capSec: 1e7 });
+  const feed = replays(m, c);
+  run(engine, clock, 8, feed); // the playhead 8 s behind its live edge: each gap is found before the playhead gets there
+  await m.act('play');
+  engine.clock.follow(1);
+  run(engine, clock, 2, feed);
+  assert.deepEqual(await d.act('syncPlay'), { ok: true });
+  const w = watch(engine, clock, m, 56, { onTick: feed });
+  assert.ok(m.ts.posAt(clock.t) > 55, `played to input ${m.ts.posAt(clock.t).toFixed(1)} s, past the gaps`);
+  const got = w.jumps.map((j) => `${(j.by * 1000).toFixed(1)} ms at input ${j.at.toFixed(2)} s`).join(', ');
+  // where the capture stepped, and by how much (the live-sync judge's reading of these frames)
+  for (const [at, ms] of [[17.12, -20.0], [29.78, 15.2], [38.23, 9.3], [49.94, -8.3], [53.68, -15.7]]) {
+    const j = w.jumps.find((x) => Math.abs(x.at - at) < 0.5);
+    assert.ok(j && Math.abs(j.by * 1000 - ms) <= 2, `the capture stepped ${ms} ms at ${at} s; jumped ${got}`);
+  }
+  assert.equal(w.jumps.length, 5, got);
 });
