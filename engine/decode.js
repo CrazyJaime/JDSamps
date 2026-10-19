@@ -34,13 +34,14 @@ export async function resample({ L, R, sampleRate }, rate) {
 
 /**
  * A track longer than the resident track limit (minutes) keeps its first part, with a notice to show
- * once. The cut is a copy, so the rest of the source can be freed.
+ * once. The cut is a copy, so the rest of the source can be freed. length (s): the whole source's, when
+ * only its first part was decoded.
  */
-export function limitPcm(pcm, limitMin) {
+export function limitPcm(pcm, limitMin, length = pcm.L.length / pcm.sampleRate) {
   const max = Math.round(limitMin * 60 * pcm.sampleRate);
   if (!(pcm.L.length > max)) return { pcm, notice: null };
   return {
     pcm: { L: pcm.L.slice(0, max), R: pcm.R.slice(0, max), sampleRate: pcm.sampleRate },
-    notice: `this track is ${minutes(pcm.L.length / pcm.sampleRate / 60)} long: the deck holds its first ${minutes(limitMin)} (the resident track limit).`,
+    notice: `this track is ${minutes(length / 60)} long: the deck holds its first ${minutes(limitMin)} (the resident track limit).`,
   };
 }

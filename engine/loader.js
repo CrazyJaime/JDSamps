@@ -126,7 +126,7 @@ export function parseHls(text, base) {
  * A whole file's MP3 or ADTS frames, walked (cut: the first frame boundary at or past `until` s), or null for any
  * other format: those have a layout of their own and cannot be cut short at a frame.
  */
-function framesOf(bytes, until) {
+export function framesOf(bytes, until) {
   const u = new Uint8Array(bytes, 0, Math.min(8, bytes.byteLength)), head = String.fromCharCode(...u.subarray(0, 4)), box = String.fromCharCode(...u.subarray(4, 8));
   if (/^(ftyp|moov|styp|moof)$/.test(box) || /^(\x1aE\xdf\xa3|OggS|RIFF|fLaC)$/.test(head)) return null;
   for (const walk of [mp3Frames, adtsFrames]) { const w = walk(bytes, { until }); if (w.frames && !w.midJunk) return w; }

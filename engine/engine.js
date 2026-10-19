@@ -12,7 +12,7 @@ import { MasterClock } from './sync.js';
 import { Deck } from './deck.js';
 import { fetchArrayBuffer, decodeTo, resample, limitPcm } from './decode.js';
 import { analyseTrack, applyAnalysis } from './analysis.js';
-import { Loader, Recording } from './loader.js';
+import { Loader, Recording, framesOf } from './loader.js';
 
 const STRETCH_URL = new URL('../vendor/signalsmith-stretch/SignalsmithStretch.js', import.meta.url).href;
 SignalsmithStretch.moduleUrl = STRETCH_URL;
@@ -534,13 +534,19 @@ class Engine {
     }
     if (gone()) return refuse();
     deck.setLoad({ progress: 0.5, strategy: 'decoding' });
+    // Longer than the resident limit, an MP3 or ADTS file is cut at the frame a second past it and only that part
+    // is decoded, as a tab's file is (a file in any other format is decoded whole).
+    const limitMin = this.params['resident.limitMin'], w = framesOf(buf, limitMin * 60 + 1);
+    const own = w ? w.samples / w.sampleRate : 0, cut = own > limitMin * 60 + 0.5 && w.cut ? w.cut : null;
+    if (cut) buf = buf.slice(0, cut.end);
     try {
       pcm = await decodeTo(this.ctx, buf);
     } catch (_) {
       return refuse(`“${meta.title}” is not audio this browser can play.`);
     }
+    buf = null;
     if (gone()) return refuse();
-    const lim = limitPcm(pcm, this.params['resident.limitMin']);
+    const lim = limitPcm(pcm, limitMin, cut ? own : undefined);
     pcm = null;
     // Found here rather than in startResidentDeck, so other decks' starts and ejects never queue behind it.
     deck.setLoad({ progress: 0.8, strategy: 'finding the beat' });
