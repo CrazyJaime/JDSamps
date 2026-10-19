@@ -139,6 +139,9 @@ before(async () => {
   // Keep each promoted deck's decoded track, to check it against the source.
   await engine(`if (!e.__pcm) { e.__pcm = new Map(); const s = e.startResidentDeck.bind(e);
     e.startResidentDeck = (o) => { if (o && o.deckId != null && o.pcm) e.__pcm.set(o.deckId, o.pcm); return s(o); }; } return true;`);
+  // And each tab load's Loader, to check the pieces a track was assembled from.
+  await engine(`if (!e.__loaders) { e.__loaders = new Map(); const lt = e.loadTab.bind(e);
+    e.loadTab = (d) => { const p = lt(d); e.__loaders.set(d.id, d.loader); return p; }; } return true;`);
 });
 after(async () => {
   await h?.close(); await server?.close(); await rec?.close(); await multi?.close();
@@ -329,15 +332,81 @@ test('a YouTube-like page with single-use links ends resident by driving its pla
   await assertReleased(d, site);
 });
 
-test('a YouTube-like page already playing when it is loaded plays live, naming the start its player buffered before the deck could read it', async () => {
-  // The usual flow. Its player keeps that start and never fetches it again, even when run once more from there (a
-  // player that has let go of it fetches it, and the track loads): live, until a player can be made to append it again.
-  const site = await openSite('opaque');
-  await playing(site.tab);
+/**
+ * Every piece the deck's track was assembled from, against index.json: each byte-identical to a segment (or init) of
+ * a rendition at the same media time, and together covering 0 to the end of the track with no gap.
+ */
+async function assertBytesTrue(deckId) {
+  const pieces = await engine(`
+    const l = e.__loaders.get(${deckId}); e.__loaders.delete(${deckId}); e.__pcm.delete(${deckId});
+    const hex = async (b) => [...new Uint8Array(await crypto.subtle.digest('SHA-256', b))].map((x) => x.toString(16).padStart(2, '0')).join('');
+    const out = [];
+    for (const r of l.rep.placed.runs) {
+      out.push({ init: await hex(r.init) });
+      for (const s of r.segs) out.push({ t0: s.t0, t1: s.t1, sha: await hex(s.bytes) });
+    }
+    return out;`);
+  const known = new Map();
+  for (const [rep, r] of Object.entries(index.reps)) {
+    known.set(r.init.sha256, { rep, init: true });
+    for (const s of r.segs) known.set(s.sha256, { rep, t0: s.t0, t1: s.t1 });
+  }
+  const segs = pieces.filter((p) => !p.init);
+  for (const p of pieces.filter((x) => x.init)) assert.ok(known.get(p.init)?.init, `an init segment that is not one of the renditions': ${p.init}`);
+  for (const p of segs) {
+    const k = known.get(p.sha);
+    assert.ok(k && !k.init, `${p.t0.toFixed(3)}–${p.t1.toFixed(3)} s is not byte-identical to any segment`);
+    assert.ok(Math.abs(k.t0 - p.t0) < 1e-3 && Math.abs(k.t1 - p.t1) < 1e-3, `placed at ${p.t0}–${p.t1}, but it is ${k.rep}'s ${k.t0}–${k.t1}`);
+  }
+  segs.sort((a, b) => a.t0 - b.t0);
+  assert.equal(segs[0].t0, 0);
+  segs.slice(1).forEach((s, i) => assert.ok(Math.abs(s.t0 - segs[i].t1) < 1e-3, `a gap or overlap at ${segs[i].t1}–${s.t0}`));
+  // (The last 6.5 ms of the track is a segment of its own, shorter than a codec frame: assembly leaves it out.)
+  assert.ok(Math.abs(segs.at(-1).t1 - OPUS_END) < 0.02, `ends at ${segs.at(-1).t1}`);
+  return pieces;
+}
+
+for (const name of ['opaque', 'mse', 'abr']) {
+  test(`/m/${name} already playing for 5 s when it is loaded ends resident: every piece byte-true, the length to 15 ms`, async () => {
+    // The usual flow: the DJ hears the track in its tab, then loads it. What its player buffered before the deck's tap
+    // came on is fetched again: from the links it used (mse, abr) or, with single-use links (opaque), by having the
+    // player flush its buffer and driving it from 0.
+    const site = await openSite(name);
+    await waitFor(() => site.tab.evaluate(() => { const m = window.__media(); return !m.paused && m.t > 5; }), 20000);
+    const d = await loadTab(site.tabId);
+    assert.equal(d.kind, 'resident', JSON.stringify(d.load));
+    assert.ok(Math.abs(d.duration - OPUS_END) < 0.015, `duration ${d.duration}`);
+    await assertBytesTrue(d.id);
+    if (name === 'opaque') assert.match(d.load.report, /drive \(seek-hop after a flush\): ok/);
+    await assertReleased(d, site);
+  });
+}
+
+test('a YouTube-like page whose player goes on from its last segment as shaka does (?onward=1), already playing for 5 s when it is loaded, ends resident', async () => {
+  // shaka looks at its buffer only when it seeks, and empties it on a seek outside what it holds only if it still holds
+  // something: emptied under it and sent to 0, it goes on from its last segment and jumps its playhead over the gap.
+  const site = await openSite('opaque', 'autoplay=1&onward=1');
+  await waitFor(() => site.tab.evaluate(() => { const m = window.__media(); return !m.paused && m.t > 5; }), 20000);
   const d = await loadTab(site.tabId);
-  const gap = /the player buffered the whole track, but 0\.0–\d+\.\d s came before the deck could read it/;
-  assert.match(d.load.report, new RegExp(`drive \\(seek-hop, then accelerate 8× from 0\\.0 s\\): failed in \\d+\\.\\d s — ${gap.source}`));
-  await assertLive(d, site, gap);
+  assert.equal(d.kind, 'resident', JSON.stringify(d.load));
+  assert.ok(Math.abs(d.duration - OPUS_END) < 0.015, `duration ${d.duration}`);
+  await assertBytesTrue(d.id);
+  await assertReleased(d, site);
+});
+
+test('a YouTube-like page whose player never fetches a piece twice (?sticky=1), already playing when loaded, plays live: the report says it would not fetch the start again', async () => {
+  const site = await openSite('opaque', 'autoplay=1&sticky=1');
+  await waitFor(() => site.tab.evaluate(() => { const m = window.__media(); return !m.paused && m.t > 5; }), 20000);
+  const d = await loadTab(site.tabId);
+  // The live deck plays from the tab: its player was left what it holds around its place, and plays on.
+  const p0 = await player(site.tab);
+  await waitFor(async () => (await player(site.tab)).t > p0.t + 1.5, 5000)
+    .catch(async () => assert.fail(`the tab does not play on after the live fallback: ${JSON.stringify(p0)} -> ${JSON.stringify(await site.tab.evaluate(() => window.__media()))}`));
+  assert.deepEqual([p0.paused, p0.muted, p0.rate], [false, false, 1]);
+  const why = /the player would not fetch the start again after a flush: 0\.0–2\d\.\d s came before the deck could read it/;
+  assert.match(d.load.report, new RegExp(`drive \\(seek-hop\\): failed in \\d+\\.\\d s — ${why.source}`));
+  assert.deepEqual(await engine(`const has = e.__pcm.has(${d.id}); e.__loaders.delete(${d.id}); return has;`), false, 'never promoted');
+  await assertLive(d, site, why);
 });
 
 test('a Bandcamp-like page ends resident from its own track link', async () => {

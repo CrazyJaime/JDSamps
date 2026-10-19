@@ -223,7 +223,11 @@ export const START_WHY = Object.freeze(['none', 'timeout', 'ambiguous', 'refused
  */
 export const TAP_ERRORS = Object.freeze(['drm', 'worker', 'preview', 'live', 'none', 'fetch']);
 const TAP_KINDS = ['init', 'media', 'file'];
-const TAP_DRIVES = ['seekhop', 'accelerate'], TAP_DRIVE_STATES = ['running', 'done', 'stalled', 'refused'];
+const TAP_DRIVES = ['seekhop', 'accelerate'], TAP_DRIVE_STATES = ['running', 'done', 'stalled', 'refused', 'flushed'];
+// Why a drive asked to flush did not (and drove on unflushed): the player holds pictures only, its media source has
+// ended (a remove would reopen it), it has no media source the tap can flush, it had only just started (nothing behind
+// its place to try a flush on), or it did not fetch again what was taken from behind its place (sticky: the rest is left it).
+const TAP_UNFLUSHED = ['video', 'ended', 'none', 'start', 'sticky'];
 const isCount = (n, max = Number.MAX_SAFE_INTEGER) => Number.isSafeInteger(n) && n >= 0 && n <= max;
 const tapDuration = (d) => (typeof d === 'number' && Number.isFinite(d) && d > 0 ? d : null);
 const isMime = (s) => typeof s === 'string' && s.length <= 256;
@@ -246,10 +250,12 @@ function validateTapMessage(m) {
     // The web source (currentSrc) the reported player plays, when it plays one: the first link to fetch again.
     if (typeof m.src === 'string' && m.src.length <= 8192 && HTTP_URL.test(m.src)) out.src = m.src;
     // How a drive of the player is going: still at it, done (all of it buffered), stalled (it
-    // stopped buffering) or refused (the page fights the rate, or the media cannot be seek-hopped).
+    // stopped buffering) or refused (the page fights the rate, or the media cannot be seek-hopped);
+    // flushed (said once) when it was asked to empty the player's buffer first and has.
     const d = m.drive;
     if (d && typeof d === 'object' && TAP_DRIVES.includes(d.mode) && TAP_DRIVE_STATES.includes(d.state) && Number.isFinite(d.at) && d.at >= 0) {
       out.drive = { mode: d.mode, state: d.state, at: d.at };
+      if (TAP_UNFLUSHED.includes(d.unflushed)) out.drive.unflushed = d.unflushed;
     }
     return out;
   }
