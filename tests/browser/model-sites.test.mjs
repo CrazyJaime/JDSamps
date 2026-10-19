@@ -209,7 +209,13 @@ async function removeAll(page) {
   await new Promise((r) => setTimeout(r, 300)); // no fetch left in flight
   return page.evaluate(() => new Promise((res) => {
     const { ms, sb } = window.__mse, n = window.__page.appends.length;
-    sb.addEventListener('updateend', () => { document.querySelector('audio').currentTime = 0; res(n); }, { once: true });
+    sb.addEventListener('updateend', () => {
+      // What the remove left, read before the seek: the pump fetches again at once, so a later read races it.
+      const b = sb.buffered; window.__afterRemove = [];
+      for (let i = 0; i < b.length; i++) window.__afterRemove.push([b.start(i), b.end(i)]);
+      document.querySelector('audio').currentTime = 0;
+      res(n);
+    }, { once: true });
     sb.remove(0, ms.duration);
   }));
 }
@@ -220,7 +226,7 @@ test('/m/mse, /m/opaque, /m/abr decide what to fetch from the SourceBuffer, as h
     const o = await open(name);
     await clickToPlay(o.page);
     const before = await removeAll(o.page);
-    assert.deepEqual(await sbBuffered(o.page), [], `${name}: emptied`);
+    assert.deepEqual(await o.page.evaluate(() => window.__afterRemove), [], `${name}: emptied`);
     await waitFor(async () => { const b = await sbBuffered(o.page); return b.length === 1 && b[0][0] <= 0.01 && b[0][1] >= 20; }, 10000)
       .catch(async () => assert.fail(`${name}: buffered ${JSON.stringify(await sbBuffered(o.page))}`));
     const again = (await pageState(o.page)).appends.slice(before);
