@@ -733,7 +733,7 @@ export class Loader extends Job {
         stalled = st === 'stalled' ? stalled || now() : 0;
         // It did not fetch again what the flush took from behind its place (so it was left the rest): the start is not to be had.
         if (g0 && d && d.unflushed === 'sticky') { out = { outcome: 'failed', why: unfetched }; break; }
-        if (d && d.unflushed && !unflushed) { unflushed = true; this.rep.notes.push(`the player was not flushed: ${UNFLUSHED[d.unflushed]}`); }
+        if (d && d.unflushed && !unflushed) { unflushed = d.unflushed; this.rep.notes.push(`the player was not flushed: ${UNFLUSHED[d.unflushed]}`); }
         if (st === 'done' || now() - checked >= this.t.check) {
           checked = now();
           placed = await this.complete();
@@ -747,7 +747,8 @@ export class Loader extends Job {
           if (placed) break;
           const gaps = this.gapsNow();
           if (!gaps.length) { out = { outcome: 'failed', why: NO_LENGTH }; break; } // the player no longer gives a length
-          const why = `the player buffered the whole track, but ${gaps.map(span).join(', ')} came before the deck could read it${flushed && gaps[0][0] < 0.05 ? ', and it would not fetch the start again after a flush' : ''}`;
+          // It ended its own stream before the deck could read it (left alone: see the agent's flush): a reload starts it afresh.
+          const why = `the player buffered the whole track, but ${gaps.map(span).join(', ')} came before the deck could read it${flushed && gaps[0][0] < 0.05 ? ', and it would not fetch the start again after a flush' : ''}${unflushed === 'ended' && gaps[0][0] < 0.05 ? ': reload the tab, then load it again' : ''}`;
           // A player keeps only so much behind its playhead: what it held from before the tap may be gone from it by
           // now, and run once more from the first gap it fetches that again (never for appends placed in order only).
           if (!pass && !stampless) { pass = { why, prog: f.prog }; go('accelerate', gaps[0][0]); fresh = now(); continue; }

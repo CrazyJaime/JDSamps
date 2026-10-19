@@ -459,6 +459,19 @@ test('a YouTube-like page loaded a second time, after its first load drove its p
   await assertReleased(d2, site);
 });
 
+test('a YouTube-like page its player already played to the end, its stream ended, plays live and says to reload the tab', async () => {
+  // The player ended its own stream: a flush would reopen it, so it is left alone (only a stream a drive ended is flushed).
+  const site = await openSite('opaque');
+  await playing(site.tab);
+  await site.tab.evaluate(() => { document.querySelector('audio').playbackRate = 8; });
+  await waitFor(() => site.tab.evaluate(() => document.querySelector('audio').ended), 60000);
+  assert.equal(await site.tab.evaluate(() => window.__mse.ms.readyState), 'ended');
+  const d = await loadTab(site.tabId);
+  assert.match(d.load.report, /note: the player was not flushed: it had loaded the whole track and ended its stream/);
+  assert.deepEqual(await engine(`const has = e.__pcm.has(${d.id}); e.__loaders.delete(${d.id}); return has;`), false, 'never promoted');
+  await assertLive(d, site, /reload the tab, then load it again/);
+});
+
 test('a Bandcamp-like page ends resident from its own track link', async () => {
   const site = await openSite('bandcamp');
   await playing(site.tab);
