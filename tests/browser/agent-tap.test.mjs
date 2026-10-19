@@ -94,8 +94,10 @@ function fixtures() {
 // &prog (also a progressive <audio src>) &buf (choose what to fetch from the SourceBuffer's buffered
 // ranges, as real players do, not from what it has appended: what is removed is fetched again)
 // &video (a second SourceBuffer, of pictures, on the same MediaSource: empty until the test appends to __vsb)
-// &eos1 (ends its stream the first time it holds all of it, never again). Event handlers are on*
-// properties, never addEventListener, so the dormancy test can count every listener the agent adds.
+// &eos1 (ends its stream the first time it holds all of it, never again) &hlsq (its SourceBuffer's updatestart and updateend
+// handlers take every update for one it asked for, as hls.js 1.5's buffer-controller does: one it did not ask for throws
+// there, uncaught; &hlsq=listen adds them with addEventListener, as hls.js does). Event handlers are on*
+// properties, never addEventListener (but for &hlsq=listen), so the dormancy test can count every listener the agent adds.
 const PLAYER = `<!doctype html><title>player</title><body><audio id="a"></audio><script>
 (() => {
   const q = new URLSearchParams(location.search);
@@ -109,11 +111,12 @@ const PLAYER = `<!doctype html><title>player</title><body><audio id="a"></audio>
     ? new Promise((res, rej) => { const x = new XMLHttpRequest(); x.open('GET', u); x.responseType = 'arraybuffer'; x.onload = () => res(x.response); x.onerror = rej; x.send(); })
     : fetch(u).then((r) => r.arrayBuffer());
   let ms = null, sb = null, have = new Set(), chain = Promise.resolve();
-  const BUF = q.has('buf');
+  const BUF = q.has('buf'), HLSQ = q.has('hlsq');
   const push = async (buf) => {
     if (BUF) while (sb.updating) await new Promise((r) => setTimeout(r, 5)); // someone else's remove
     return new Promise((res, rej) => {
-      sb.onupdateend = () => res(); sb.onerror = () => rej(new Error('append failed'));
+      if (HLSQ) window.__op = { onStart() {}, onComplete: res }; else sb.onupdateend = () => res();
+      sb.onerror = () => rej(new Error('append failed'));
       (q.has('snap') ? APPEND : sb.appendBuffer).call(sb, buf);
     });
   };
@@ -153,6 +156,13 @@ const PLAYER = `<!doctype html><title>player</title><body><audio id="a"></audio>
     await new Promise((r) => { ms.onsourceopen = r; });
     sb = ms.addSourceBuffer(q.get('mime') || ${JSON.stringify(MIME)});
     window.__sb = sb; window.__ms = ms;
+    if (HLSQ && q.get('hlsq') === 'listen') {
+      sb.addEventListener('updatestart', () => { window.__op.onStart(); });
+      sb.addEventListener('updateend', () => { const op = window.__op; window.__op = null; op.onComplete(); });
+    } else if (HLSQ) {
+      sb.onupdatestart = () => { window.__op.onStart(); };
+      sb.onupdateend = () => { const op = window.__op; window.__op = null; op.onComplete(); };
+    }
     if (q.has('video')) window.__vsb = ms.addSourceBuffer('video/webm; codecs="vp9"');
     if (q.has('raw')) { if (DUR) ms.duration = DUR; return; }
     await push(await get('/fx/' + SET + '/init.mp4'));
@@ -772,6 +782,9 @@ function LOOK() {
     appendBuffer: SourceBuffer.prototype.appendBuffer, addSourceBuffer: MediaSource.prototype.addSourceBuffer,
     fetch: window.fetch, open: XMLHttpRequest.prototype.open, send: XMLHttpRequest.prototype.send, setRequestHeader: XMLHttpRequest.prototype.setRequestHeader,
     requestMediaKeySystemAccess: Navigator.prototype.requestMediaKeySystemAccess, toString: Function.prototype.toString, createObjectURL: URL.createObjectURL,
+    addEventListener: EventTarget.prototype.addEventListener, removeEventListener: EventTarget.prototype.removeEventListener,
+    'get onupdatestart': d(SourceBuffer.prototype, 'onupdatestart').get, 'set onupdatestart': d(SourceBuffer.prototype, 'onupdatestart').set,
+    'set onupdateend': d(SourceBuffer.prototype, 'onupdateend').set, 'set onerror': d(SourceBuffer.prototype, 'onerror').set,
   };
   const look = (fn) => [
     Function.prototype.toString.call(fn), String(fn), fn.toString.toString(), fn.name, fn.length, Object.getOwnPropertyNames(fn),
@@ -782,7 +795,8 @@ function LOOK() {
   return JSON.stringify({
     fns: Object.fromEntries(Object.entries(fns).map(([k, f]) => [k, look(f)])),
     descs: [d(window, 'fetch'), d(Function.prototype, 'toString'), d(SourceBuffer.prototype, 'appendBuffer'), d(MediaSource.prototype, 'addSourceBuffer'),
-      d(XMLHttpRequest.prototype, 'send'), d(Navigator.prototype, 'requestMediaKeySystemAccess'), d(HTMLMediaElement.prototype, 'srcObject'), d(URL, 'createObjectURL')].map(attrs),
+      d(XMLHttpRequest.prototype, 'send'), d(Navigator.prototype, 'requestMediaKeySystemAccess'), d(HTMLMediaElement.prototype, 'srcObject'), d(URL, 'createObjectURL'),
+      d(EventTarget.prototype, 'addEventListener'), d(SourceBuffer.prototype, 'onupdateend')].map(attrs),
   });
 }
 
@@ -1020,6 +1034,27 @@ describe('flushing the player before a drive', { concurrency: 3 }, () => {
     assert.ok(m.t >= t0 && m.t < t0 + 1.5, `back where it was: ${m.t} (drive at ${t0})`);
     await waitFor(async () => (await media(p)).t > m.t + 0.5, 5000).catch(async () => assert.fail(`it does not play again: ${JSON.stringify(await media(p))}`));
     await checkPosted(p);
+    await p.close();
+  });
+
+  for (const [mode, how] of [['hlsq', ''], ['hlsq=listen', ' (its handlers added with addEventListener, as hls.js adds them)']]) test(`a flush reaches the player's own SourceBuffer handlers, and what they throw on it is caught: an hls.js-like player, which takes every update for one it asked for, sees no error, and fetches again what was removed${how}`, async () => {
+    const p = await tapPage(`${LONG}&buf&${mode}`, { init: [REMOVE_SPY] }), seen = [];
+    p.on('pageerror', (e) => seen.push(String(e)));
+    await connect(p);
+    await p.run("window.__go().then(() => document.getElementById('a').play())");
+    await waitFor(async () => { const m = await media(p); return !m.paused && m.t > 1; }, 5000);
+    await bufferedTo(p, 20);
+    await send(p, { t: 'tap', on: true });
+    await send(p, { t: 'drive', mode: 'seekhop', flush: true });
+    await waitFor(async () => (await driveState(p)) === 'done', 15000, 100)
+      .catch(async () => assert.fail(`not done: ${JSON.stringify(await lastProgress(p))}, errors ${JSON.stringify(seen)}`));
+    assert.equal((await removes(p)).length, 2, 'both steps of the flush were made');
+    assert.ok((await driveStates(p)).includes('flushed'));
+    assert.deepEqual(seen, [], 'the page saw an error from the flush');
+    if (mode === 'hlsq') assert.equal(await p.run('String(window.__sb.onupdatestart)'), '() => { window.__op.onStart(); }', 'the page reads back its own handler');
+    const g = await lastProgress(p);
+    assert.ok(g.buffered.length === 1 && g.buffered[0][0] < 0.05 && g.buffered[0][1] > 179.9, JSON.stringify(g.buffered));
+    await send(p, { t: 'drive', mode: 'stop' });
     await p.close();
   });
 

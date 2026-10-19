@@ -54,6 +54,12 @@ before(async () => {
       case '/five.wav': return send(res, 'audio/wav', 'five.wav');
       case '/late.wav': return send(res, 'audio/wav', 'late.wav');
       case '/page.html': res.writeHead(200, { 'content-type': 'text/html' }); return res.end('<!doctype html><title>Not audio</title><p>Hello.</p>');
+      case '/notes.txt': res.writeHead(200, { 'content-type': 'text/plain' }); return res.end('Hello, these are notes, not audio.');
+      case '/radio': // an internet radio station as Icecast serves it: no length, bytes for as long as anyone listens
+        res.writeHead(200, { 'content-type': 'audio/mpeg', 'icy-name': 'Test radio', 'icy-metaint': '16000' });
+        res.write(fs.readFileSync(path.join(tmp, 'kick.mp3')).subarray(0, 16000));
+        req.on('close', () => res.end());
+        return;
       case '/slow.wav': // headers and a little audio, then nothing until the client gives up
         req.on('close', () => { slowClosed = true; });
         res.writeHead(200, { 'content-type': 'audio/wav' });
@@ -187,18 +193,18 @@ test('ejecting a resident deck stops no tab, and the hub hears only of decks bou
 
 test('a link that is not audio, or not there, is refused with a reason; its deck stays FAILED, offering its load report, until it is dismissed', async () => {
   const n = (await decks()).length;
-  const html = await act(deck, null, 'loadUrl', { url: `${origin}/page.html` });
-  assert.equal(html.ok, false);
-  assert.match(html.error, /not audio/);
+  const text = await act(deck, null, 'loadUrl', { url: `${origin}/notes.txt` });
+  assert.equal(text.ok, false);
+  assert.match(text.error, /not audio/);
   const missing = await act(deck, null, 'loadUrl', { url: `${origin}/missing.mp3` });
   assert.equal(missing.ok, false);
   assert.match(missing.error, /404/);
   const failed = await waitFor(async () => { const f = (await decks()).filter((x) => x.kind === 'loading' && x.load.state === 'error'); return f.length === 2 && f; }, 5000);
-  const page = failed.find((x) => x.title === 'page'), gone = failed.find((x) => x.title === 'missing');
+  const page = failed.find((x) => x.title === 'notes'), gone = failed.find((x) => x.title === 'missing');
   assert.ok(page && gone, JSON.stringify(failed));
-  assert.equal(page.load.error, html.error);
+  assert.equal(page.load.error, text.error);
   assert.equal(gone.load.error, missing.error);
-  assert.match(page.load.report, /^JD Samps load report\nSource: a link, 127\.0\.0\.1:\d+\/page\.html\nResult: failed: .*not audio/);
+  assert.match(page.load.report, /^JD Samps load report\nSource: a link, 127\.0\.0\.1:\d+\/notes\.txt\nResult: failed: .*not audio/);
   assert.match(page.load.report, /\n {2}fetch: ok in \d+\.\d s — \d+ kB\n {2}decode: failed in \d+\.\d s — .*not audio[^\n]*\nFirst failure: decode: /);
   assert.match(gone.load.report, /\n {2}fetch: failed in \d+\.\d s — .*404[^\n]*\nFirst failure: fetch: /);
   // The deck page shows each as FAILED, with its reason and the Copy load report button.
@@ -209,6 +215,22 @@ test('a link that is not audio, or not there, is refused with a reason; its deck
     assert.equal(await el.locator('.deck-status [data-copy-report]').isVisible(), true);
   }
   for (const x of [page, gone]) assert.equal((await act(deck, x.id, 'loadCancel')).ok, true);
+  await waitFor(async () => (await decks()).length === n);
+});
+
+test('a web page\'s link (a track\'s page on a site) is refused as a web page, to be opened in a tab; a radio station as a stream with no end', async () => {
+  const n = (await decks()).length;
+  const html = await act(deck, null, 'loadUrl', { url: `${origin}/page.html` });
+  assert.deepEqual(html, { ok: false, error: 'That link is a web page, not an audio file: open it in a tab and add the tab to a deck.' });
+  const radio = await act(deck, null, 'loadUrl', { url: `${origin}/radio` });
+  assert.equal(radio.ok, false);
+  assert.match(radio.error, /: this link is a stream with no end, so there is no whole track to load$/);
+  const failed = await waitFor(async () => { const f = (await decks()).filter((x) => x.kind === 'loading' && x.load.state === 'error'); return f.length === 2 && f; }, 5000);
+  const page = failed.find((x) => x.title === 'page'), stream = failed.find((x) => x.title === 'radio');
+  assert.equal(page.load.error, html.error);
+  assert.match(page.load.report, /\n {2}fetch: failed in \d+\.\d s — That link is a web page[^\n]*\nFirst failure: fetch: That link is a web page/);
+  assert.equal(stream.load.error, radio.error);
+  for (const x of failed) assert.equal((await act(deck, x.id, 'loadCancel')).ok, true);
   await waitFor(async () => (await decks()).length === n);
 });
 

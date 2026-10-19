@@ -2,8 +2,10 @@
 // ladder a page gets, every refusal, monotonic progress, the promotion and the release of the tab.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { SITES, firstRung, parseHls, findStart } from '../../engine/loader.js';
+import { SITES, TIMES, firstRung, parseHls, findStart } from '../../engine/loader.js';
 import { defaults, MASTER_PARAMS, PERSISTED_MASTER_KEYS, validateUiMessage } from '../../shared/protocol.js';
+import { FETCH_STALL, FetchRefused } from '../../engine/decode.js';
+import { placeParts } from '../../engine/assemble.js';
 import { load, rendition, file, mp3, code, DUR, SR, OPUS, makeTab, makeEngine, loaderFor, fetcher, settle, turn, decoders, FAST } from './fixtures/loader-harness.mjs';
 
 const hi = () => rendition('opus-hi');
@@ -107,6 +109,23 @@ test('a media link the page cannot fetch (no CORS) is fetched by the engine itse
   assert.equal(called(engine, 'startResidentDeck')[0].code, code('cdn'));
 });
 
+test('a media link the engine fetches itself that never answers is given up after the stall: the load ends, and says why', async () => {
+  const link = 'https://cdn.example/stalls.mp3';
+  const { result, engine, deck } = await load({ kind: 'progressive', src: link, pageFetch: false, hang: [link] });
+  assert.equal(result.kind, 'live');
+  assert.ok(engine.clock.now() < FETCH_STALL + 5000, `the load ended ${engine.clock.now()} ms in`);
+  assert.match(called(engine, 'failLoadingToLive')[0].reason, /cdn\.example\/stalls\.mp3 could not be fetched \(nothing came from the link for 15 s\)/);
+  assert.match(deck.load.report, /refetch \(fetching the track\): failed in 15\.\d s/);
+});
+
+test('the engine fetches a link itself only within what is left of the tab\'s byte budget: a larger one makes the deck say the track is too large', async () => {
+  const link = 'https://cdn.example/big.mp3';
+  const { result, engine } = await load({ kind: 'progressive', src: link, pageFetch: false, files: { [link]: file('big', 120) } }, { deps: { cap: 20 } });
+  assert.equal(result.kind, 'live');
+  assert.deepEqual(called(engine, 'startResidentDeck'), []);
+  assert.match(called(engine, 'failLoadingToLive')[0].reason, /^the track is too large to hold, so it plays live from the tab\.$/);
+});
+
 test('a media link whose length is not the player\'s is not taken: the deck goes live and says why', async () => {
   const link = 'https://site.example/jingle.mp3';
   const { result, engine, tab } = await load({ kind: 'progressive', src: link, files: { [link]: file('jingle', 30) } });
@@ -134,11 +153,51 @@ test('an MSE page whose links can be fetched again: the playlist is read and onl
   assert.ok(!tab.kinds().some((k) => /drive (seekhop|accelerate)/.test(k)));
 });
 
+test('an MSE page whose server types its playlist audio/mpegurl or audio/x-mpegurl (HLS types): the playlist the page hands over is read, and the track loads', async () => {
+  for (const type of ['audio/mpegurl', 'audio/x-mpegurl']) {
+    const r = hi();
+    const { result, tab, deck } = await load({ kind: 'mse', rendition: r, preTap: 6, playing: 3, list: true, segUrls: true, types: { [r.list]: type } });
+    assert.equal(result.kind, 'resident', `${type}: ${deck.load.report}`);
+    assert.deepEqual(asked(tab), ['tap on', 'readTralbum', 'fetch', 'fetch'], type);
+    assert.match(deck.load.report, /refetch \(fetching the track's pieces\): ok in \d+\.\d s — 29 pieces fetched/, type);
+  }
+});
+
+test('a piece the page handed over that the engine refuses to read is not the page going away: the load goes on without it', async () => {
+  const r = hi(), tab = makeTab({ kind: 'mse', rendition: r, preTap: 6, playing: 3, list: true, segUrls: true }), engine = makeEngine({ tabs: [tab] });
+  const read = fetcher([tab]), refused = [];
+  const fetchBytes = async (u, o) => {
+    if (tab.blobs.has(u) && new TextDecoder().decode(tab.blobs.get(u).slice(0, 7)) === '#EXTM3U') { refused.push(u); throw new FetchRefused('stream', 'this link is a stream with no end, so there is no whole track to load'); }
+    return read(u, o);
+  };
+  const { deck, loader } = loaderFor(tab, engine, { fetchBytes });
+  const result = await loader.run();
+  await settle();
+  assert.equal(refused.length, 1, 'the playlist the page handed over was refused');
+  assert.equal(result.kind, 'resident', deck.load.report);
+  assert.deepEqual(called(engine, 'failLoadingToLive'), []);
+  assert.doesNotMatch(deck.load.report, /the page changed|could not be read/);
+  assert.match(deck.load.report, /refetch \(fetching the track's pieces\): ok in \d+\.\d s — 29 pieces fetched/);
+});
+
 test('an MSE page with nothing to fetch again is driven: seek-hop, then drive stop', async () => {
   const { result, tab, engine } = await load({ kind: 'mse', rendition: hi(), preTap: 0, playing: 2 });
   assert.equal(result.kind, 'resident', JSON.stringify(engine.calls));
   assert.deepEqual(tab.kinds(), ['tap on', 'readTralbum', 'drive seekhop', 'drive stop', 'tap off']);
   assert.ok(near(called(engine, 'startResidentDeck')[0].frames / SR, 120, 0.02));
+});
+
+test('while a player is driven, its pieces are read once each as they come: the whole placement is made once, when they cover the track', async () => {
+  let full = 0;
+  const { result, engine, deck } = await load({ kind: 'mse', rendition: hi(), preTap: 0, playing: 1, seekhop: 'slow' }, {
+    deps: { placeParts: (parts) => { full++; return placeParts(parts); } },
+  });
+  assert.equal(result.kind, 'resident', deck.load.report);
+  assert.ok(near(called(engine, 'startResidentDeck')[0].frames / SR, 120, 0.02));
+  assert.equal(full, 1, `placed from scratch ${full} times`);
+  // The deck's progress still follows the pieces as they come.
+  const ps = deck.loads.map((l) => l.progress);
+  assert.ok(new Set(ps.filter((p) => p > 0.05 && p < 0.8)).size >= 10, `progress: ${[...new Set(ps)].map((p) => p.toFixed(2)).join(' ')}`);
 });
 
 test('a seek-hop that stalls goes on to accelerate, with the pitch unlocked through the drive', async () => {
@@ -148,6 +207,31 @@ test('a seek-hop that stalls goes on to accelerate, with the pitch unlocked thro
   const acc = tab.sent().find((m) => m.t === 'drive' && m.mode === 'accelerate');
   assert.ok(acc.rate > 1 && acc.rate <= 16);
   assert.equal(tab.kinds().filter((k) => k === 'drive stop').length, 1);
+});
+
+test('a page that stops sending while it is driven (its seek-hop stalled, and run fast nothing comes) ends the drive after the stall, saying why, not after its whole budget', async () => {
+  const seen = {};
+  const { result, engine, deck } = await load({ kind: 'mse', rendition: hi(), preTap: 0, playing: 1, seekhop: 'stall', accelerate: 'dead' }, {
+    times: { ...FAST, drive: TIMES.drive, drivePerSec: TIMES.drivePerSec },
+    before: ({ tab, engine: e, clock }) => {
+      tab.hooks.push((m) => { if (m.t === 'drive' && m.mode === 'seekhop') seen.stalled = clock.now(); });
+      const live = e.failLoadingToLive.bind(e);
+      e.failLoadingToLive = (...a) => { seen.live = clock.now(); return live(...a); };
+    },
+  });
+  assert.equal(result.kind, 'live');
+  assert.ok(seen.live - seen.stalled <= 2 * FAST.stall + 3 * FAST.check, `live ${seen.live - seen.stalled} ms after the player said it stalled`);
+  const why = /the page stopped sending the track: nothing new came for 0\.1 s after its player stalled, with 4\.0–120\.0 s still missing/;
+  assert.match(called(engine, 'failLoadingToLive')[0].reason, why);
+  assert.match(deck.load.report, new RegExp(`drive \\(seek-hop, then accelerate 16×\\): failed in \\d+\\.\\d s — ${why.source}`));
+  // Meanwhile the deck said what it was waiting for, rather than sit at a frozen figure as if busy.
+  assert.ok(deck.loads.some((l) => l.strategy === 'waiting for the page to send more of the track'), JSON.stringify([...new Set(deck.loads.map((l) => l.strategy))]));
+});
+
+test('a seek-hop that brings nothing without its player saying it stalled (a player busy with a flush) leaves accelerate its whole budget: resident', async () => {
+  const { result, engine, deck } = await load({ kind: 'mse', rendition: hi(), preTap: 0, playing: 1, seekhop: 'dead', accelerate: 'late' });
+  assert.equal(result.kind, 'resident', `${JSON.stringify(called(engine, 'failLoadingToLive'))} ${deck.load.report}`);
+  assert.match(deck.load.report, /drive \(seek-hop, then accelerate 16×\): ok/);
 });
 
 test('accelerate runs the player at 16×, the most the agent takes, so a 5-minute track can be in well under 30 s (§4.3)', async () => {
@@ -208,11 +292,19 @@ for (const [reason, re] of [['drm', /protected/], ['worker', /worker/], ['previe
   });
 }
 
-/** load() options: the page reports `reason` as the loader does `when` (a command it sends, or 'beat': the analysis). */
-const lateError = (reason, when) => ({
-  before: ({ tab, engine }) => {
+/**
+ * load() options: the page reports `reason` as the loader does `when` (a command it sends, or 'beat': the analysis),
+ * and then says nothing more (its player hung): the deck goes live at once only if the wait it is in gives way to the
+ * error. seen.error and seen.live: the virtual times of the error and of the deck going live. A drive looks at its
+ * pieces as seldom as it does for real (check), so a wait that does not give way shows.
+ */
+const lateError = (reason, when, seen = {}) => ({
+  times: { ...FAST, check: TIMES.check },
+  before: ({ tab, engine, clock }) => {
     let fired = false;
-    const fire = () => { if (!fired) { fired = true; setImmediate(() => tab.frames[0].emit({ t: 'tap-error', reason, detail: `late ${reason}` })); } };
+    const fire = () => { if (!fired) { fired = true; setImmediate(() => { seen.error = clock.now(); tab.frames[0].emit({ t: 'tap-error', reason, detail: `late ${reason}` }); tab.frames[0].hang(); }); } };
+    const live = engine.failLoadingToLive.bind(engine);
+    engine.failLoadingToLive = (...a) => { seen.live = clock.now(); return live(...a); };
     if (when !== 'beat') { tab.hooks.push((m) => { if (when(m)) fire(); }); return; }
     const f = engine.analyse.bind(engine);
     engine.analyse = async (pcm, s) => { fire(); await settle(10); return f(pcm, s); };
@@ -225,8 +317,9 @@ for (const [reason, re] of [['drm', /protected/], ['worker', /worker/], ['previe
     ['while the beat is found', { kind: 'progressive', src: 'https://site.example/t.mp3', files: { 'https://site.example/t.mp3': file('t', 120.0065) } }, 'beat', ['tap on', 'readTralbum', 'fetch']],
   ]) {
     test(`${reason} said after the first look, ${stage}: live at once with its one message, nothing more asked of the page, nothing promoted`, async () => {
-      const { result, engine, tab } = await load(page, lateError(reason, when));
+      const seen = {}, { result, engine, tab } = await load(page, lateError(reason, when, seen));
       assert.equal(result.kind, 'live', JSON.stringify(result));
+      assert.ok(seen.live - seen.error < 20, `live ${seen.live - seen.error} ms after the error`);
       assert.deepEqual(called(engine, 'startResidentDeck'), []);
       const f = called(engine, 'failLoadingToLive');
       assert.equal(f.length, 1);
@@ -262,12 +355,12 @@ const asksToStart = (engine) => engine.events.filter((e) => /^Deck 1: start the 
 test('a page whose play button was not pressed: the deck asks for the track to be started on the tab, and loads it whole once it plays', async () => {
   const link = 'https://site.example/media/t.mp3';
   const { result, engine, deck } = await load({ ...UNSTARTED, files: { [link]: file('t', 120.0065) } }, {
-    before: ({ tab, deck: d }) => {
+    before: ({ tab, deck: d, clock }) => {
       // The DJ presses play on the tab a moment after the deck asks for it: the page's player takes its source.
-      const t = setInterval(() => {
+      const t = clock.setInterval(() => {
         if (d.load.strategy !== START) return;
-        clearInterval(t);
-        setTimeout(() => { const fr = tab.frames[0]; fr.duration = 120.0065; fr.pg.src = link; fr.progress({ sbs: [] }); }, 100);
+        clock.clearInterval(t);
+        clock.setTimeout(() => { const fr = tab.frames[0]; fr.duration = 120.0065; fr.pg.src = link; fr.progress({ sbs: [] }); }, 100);
       }, 5);
       t.unref();
     },
@@ -312,12 +405,11 @@ test('a load that ends live because the page\'s bytes cannot be had says so (noB
 });
 
 test('a page with no player the tap can see (Web Audio only) goes live: no agent ever connects', async () => {
-  const t0 = performance.now();
   const { result, engine, tab } = await load({ kind: 'none' });
   assert.equal(result.kind, 'live');
   assert.deepEqual(tab.log, []);
   assert.match(called(engine, 'failLoadingToLive')[0].reason, /without a media player the deck can read/);
-  assert.ok(performance.now() - t0 < 1000);
+  assert.ok(engine.clock.now() < 1000, `${engine.clock.now()} ms`);
 });
 
 test('a page whose only element the deck could read is silent goes live like a Web-Audio page', async () => {
@@ -464,7 +556,8 @@ test('while a tab loads, its deck carries the load report as it stands, to be co
   assert.equal(result.kind, 'resident');
   assert.equal(typeof during, 'string', 'no load report while the deck loads');
   assert.match(during, /^JD Samps load report\n/);
-  assert.match(during, /Result: still loading: running the player through the track\n/);
+  // (The seek-hop that stalled brought nothing for a while before it gave way: the deck said it waited for the page.)
+  assert.match(during, /Result: still loading: (running the player through the track|waiting for the page to send more of the track)\n/);
   assert.match(during, /file \(reading the page's track link\): skipped in \d+\.\d s — the page has no track link of its own/);
   assert.match(during, /drive \(seek-hop\): running for \d+\.\d s\n/);
   assert.match(during, /First failure: none\nTotal: \d+\.\d s$/);
@@ -591,7 +684,7 @@ async function ejectAt(k, page) {
     if (n++ === k && at == null) {
       at = { what, sent: tab.log.length };
       // Another deck starting holds serial() for a moment, so the eject's turn (and its deck's going) comes later.
-      engine.serial(() => new Promise((r) => setTimeout(r, 25)));
+      engine.serial(() => engine.clock.sleep(25));
       engine.eject(deck.id);
     }
   }
@@ -707,7 +800,7 @@ test('a page that moves on while a link it gave decodes badly is ejected, never 
 test('a single-page site moving on to another track while a link it gave decodes badly is ejected, never played live', async () => {
   const link = 'https://site.example/t.mp3';
   const { result, engine } = await load({ kind: 'progressive', src: link, files: { [link]: file('t', 120.0065) } }, {
-    before: ({ tab, loader }) => { loader.d.decodeFile = async () => { tab.moveInPlace({ to: OTHER }); await new Promise((r) => setTimeout(r, 5)); throw new Error('Unable to decode audio data'); }; },
+    before: ({ tab, loader, clock }) => { loader.d.decodeFile = async () => { tab.moveInPlace({ to: OTHER }); await clock.sleep(5); throw new Error('Unable to decode audio data'); }; },
   });
   assert.deepEqual(result, { ok: false, error: MOVED }, JSON.stringify(engine.events));
   assert.deepEqual(called(engine, 'failLoadingToLive'), []);
@@ -745,15 +838,15 @@ for (const [what, page, opts] of [
     { before: ({ tab, loader }) => { loader.d.decodeFile = async (ctx, buf) => { tab.navigate({ to: OTHER }); await settle(5); return decoders.decodeFile(ctx, buf); }; } }],
   // Checked only when the drive says it is done, so the page goes before the loader has looked at what it holds.
   ['all its pieces captured from the player, before the loader looked', { kind: 'mse', rendition: hi(), preTap: 0, playing: 1 },
-    { times: { ...FAST, check: 1000 }, before: ({ tab }) => { tab.hooks.push((m) => { if (m.t === 'drive' && m.mode === 'seekhop') setTimeout(() => tab.navigate({ to: OTHER }), 2); }); } }],
+    { times: { ...FAST, check: 1000 }, before: ({ tab, clock }) => { tab.hooks.push((m) => { if (m.t === 'drive' && m.mode === 'seekhop') clock.setTimeout(() => tab.navigate({ to: OTHER }), 2); }); } }],
   // The hub's word of the new page (META) can come before the old page's agents have gone.
   ['all its pieces captured from the player, before the loader looked, word of the new page coming before its agents go', { kind: 'mse', rendition: hi(), preTap: 0, playing: 1 },
-    { times: { ...FAST, check: 1000 }, before: ({ tab }) => { tab.hooks.push((m) => { if (m.t === 'drive' && m.mode === 'seekhop') setTimeout(() => { tab.deck.meta.url = OTHER; setTimeout(() => tab.navigate(), 20); }, 2); }); } }],
+    { times: { ...FAST, check: 1000 }, before: ({ tab, clock }) => { tab.hooks.push((m) => { if (m.t === 'drive' && m.mode === 'seekhop') clock.setTimeout(() => { tab.deck.meta.url = OTHER; clock.setTimeout(() => tab.navigate(), 20); }, 2); }); } }],
   // A single-page site moving on in place: its agents stay, and its player goes on to another track.
   ['its pieces fetched, while the beat is found, on a single-page site that moves on in place', { kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true },
-    { before: ({ tab, engine }) => { const f = engine.analyse.bind(engine); engine.analyse = async (p, s) => { tab.moveInPlace({ to: OTHER }); await new Promise((r) => setTimeout(r, 5)); return f(p, s); }; } }],
+    { before: ({ tab, engine, clock }) => { const f = engine.analyse.bind(engine); engine.analyse = async (p, s) => { tab.moveInPlace({ to: OTHER }); await clock.sleep(5); return f(p, s); }; } }],
   ['its link read, while it is decoded, on a single-page site that moves on in place', { kind: 'progressive', src: 'https://site.example/t.mp3', files: { 'https://site.example/t.mp3': file('t', 120.0065) } },
-    { before: ({ tab, loader }) => { loader.d.decodeFile = async (ctx, buf) => { tab.moveInPlace({ to: OTHER }); await new Promise((r) => setTimeout(r, 5)); return decoders.decodeFile(ctx, buf); }; } }],
+    { before: ({ tab, loader, clock }) => { loader.d.decodeFile = async (ctx, buf) => { tab.moveInPlace({ to: OTHER }); await clock.sleep(5); return decoders.decodeFile(ctx, buf); }; } }],
 ]) {
   test(`a page that moves on once every byte of its track is in, ${what}: the deck goes resident and lets go of the tab`, async () => {
     const { result, engine, deck } = await load(page, opts);
@@ -763,6 +856,9 @@ for (const [what, page, opts] of [
     assert.deepEqual(called(engine, 'eject'), []);
     assert.equal(deck.tabId, null, 'released');
     assert.deepEqual(engine.events.filter((e) => e.level === 'error'), []);
+    // The deck holds the track the load began on, under its own page's name, never the page the tab went on to.
+    assert.deepEqual([deck.meta.title, deck.meta.url], ['Model track', 'https://site.example/track']);
+    assert.deepEqual(engine.events.filter((e) => /^Loaded /.test(e.text)).map((e) => e.text), ['Loaded “Model track” on deck 1.']);
   });
 }
 
@@ -791,7 +887,7 @@ test('the page going away with the tab\'s audio gone too ejects the deck with on
 
 test('a length not known at first is waited for; then the track loads', async () => {
   const { result, engine } = await load({ kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true, duration: null }, {
-    before: ({ tab: t }) => { setTimeout(() => { t.frames[0].duration = DUR; t.frames[0].progress(); }, 60); },
+    before: ({ tab: t, clock }) => { clock.setTimeout(() => { t.frames[0].duration = DUR; t.frames[0].progress(); }, 60); },
   });
   assert.equal(result.kind, 'resident');
   assert.ok(near(called(engine, 'startResidentDeck')[0].frames / SR, 120, 0.02));
@@ -805,6 +901,28 @@ test('a length that grows mid-load is never taken at its first value: the rest i
   const [s] = called(engine, 'startResidentDeck');
   assert.ok(near(s.frames / SR, 120, 0.02), `resident at ${s.frames / SR} s`);
   assert.ok(tab.sent().filter((m) => m.t === 'fetch').length >= 3, 'the pieces past 60 s were fetched too');
+});
+
+test('a length that changes while the track decodes is what the report and the live message say, never a count of pieces', async () => {
+  for (const [what, page] of [
+    ['driven', { kind: 'mse', rendition: rendition(), preTap: 0, playing: 1 }],
+    ['fetched again', { kind: 'mse', rendition: rendition(), preTap: 6, playing: 2, list: true, segUrls: true }],
+  ]) {
+    const { result, engine, deck } = await load(page, {
+      before: ({ tab, loader }) => {
+        loader.d.decodePlaced = async (ctx, placed, o) => {
+          const r = await decoders.decodePlaced(ctx, placed, o);
+          tab.frames[0].duration = 125; tab.frames[0].progress(); await settle(5);
+          return r;
+        };
+      },
+    });
+    assert.equal(result.kind, 'live', what);
+    const why = /the track's length changed from 120\.0 s to 125\.0 s while it decoded/;
+    assert.match(called(engine, 'failLoadingToLive')[0].reason, why, what);
+    assert.match(deck.load.report, new RegExp(`First failure: (drive|refetch): ${why.source}`), `${what}: ${deck.load.report}`);
+    assert.doesNotMatch(deck.load.report, /First failure: \w+: \d+ pieces/, what);
+  }
 });
 
 // ---------------------------------------------------------------- several players in one tab
@@ -837,6 +955,26 @@ test('another player\'s appends never become the track: one beside it in its fra
       }
     }
   }
+});
+
+test('a decisive error from another player in the tab (an advert that is protected, or a live stream) never sends the track live: it goes in the report', async () => {
+  const track = { kind: 'mse', rendition: hi(), preTap: 6, playing: 2, list: true, segUrls: true };
+  const ad = { kind: 'mse', rendition: rendition('opus-lo', 'https://ads.example'), duration: 30, preTap: 1, status: { audible: 0, muted: true } };
+  for (const [what, adPage, opts] of [
+    ['protected, at the first look', { ...ad, errors: ['drm'] }, {}],
+    ['a live stream, at the first look', { ...ad, duration: Infinity, liveAfter: 5 }, {}],
+    ['protected, while the track\'s pieces are fetched', ad,
+      { before: ({ tab }) => { tab.hooks.push((m, i) => { if (m.t === 'fetch' && i === 0) setImmediate(() => tab.frames[1].emit({ t: 'tap-error', reason: 'drm', detail: 'an encrypted event' })); }); } }],
+  ]) {
+    const { result, engine, deck } = await load({ frames: 2, framePages: [track, adPage] }, opts);
+    assert.equal(result.kind, 'resident', `${what}: ${JSON.stringify(called(engine, 'failLoadingToLive'))}`);
+    assert.ok(near(called(engine, 'startResidentDeck')[0].frames / SR, 120, 0.02), what);
+    assert.match(deck.load.report, /note: another player in the tab \(frame 2\) said (its audio is protected|it is a live stream with no end) \([^)]+\): not the track's, so the load went on/, `${what}: ${deck.load.report}`);
+  }
+  // The track's own frame saying so still sends it live.
+  const own = await load({ frames: 2, framePages: [{ ...track, errors: ['drm'] }, ad] });
+  assert.equal(own.result.kind, 'live');
+  assert.match(called(own.engine, 'failLoadingToLive')[0].reason, /protected/);
 });
 
 test('the opus pieces this harness serves are what the model sites serve', () => {

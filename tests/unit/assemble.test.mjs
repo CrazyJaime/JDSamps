@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { placeParts, decodePlaced, gapsFor, AssemblyError } from '../../engine/assemble.js';
+import { placeParts, decodePlaced, gapsFor, AssemblyError, PlaceIndex } from '../../engine/assemble.js';
 import { webmItems } from '../../engine/bmff.js';
 import { initSeg, fragSeg, adtsFrame, cat } from './fixtures/bmff-build.mjs';
 
@@ -36,6 +36,45 @@ test('tfdt and timescale place every segment at its true media time', () => {
   assert.deepEqual(placed.gaps, []);
   assert.ok(placed.runs[0].init.byteLength > 0);
   assert.equal(placed.runs[0].mime, MP4);
+});
+
+/** A stream's bytes cut into appends at pseudo-random places (boxes, clusters and frames split across them). */
+function cutUp(buf, { mime, sb = 0, seq = 0, n = 40, seed = 11 } = {}) {
+  const u = new Uint8Array(buf), cuts = new Set([0, u.length]);
+  for (let i = 0; i < n; i++) { seed = (seed * 1103515245 + 12345) % 2 ** 31; cuts.add(seed % u.length); }
+  const at = [...cuts].sort((a, b) => a - b), parts = [];
+  for (let i = 0; i + 1 < at.length; i++) parts.push({ bytes: ab(u.subarray(at[i], at[i + 1])), mime, kind: 'media', sb, seq: seq + i });
+  return parts;
+}
+
+test('the index kept as parts come gives the coverage placeParts gives, part by part, however the parts are cut and whatever order they come in', () => {
+  const webm = read('track.webm'), mp3 = read('track.mp3');
+  const adts = cat(...Array.from({ length: 300 }, () => adtsFrame()));
+  const streams = [
+    ['fMP4, appended segment by segment', load('lo')],
+    ['fMP4 cut mid-box, with an ABR switch on a second SourceBuffer', [...cutUp(cat(...load('lo', [1, 2, 3, 4]).map((p) => new Uint8Array(p.bytes))), { mime: MP4 }),
+      ...load('hi', [4, 5, 6, 7, 8], { sb: 1, seq: 100 })]],
+    ['WebM cut mid-cluster', cutUp(webm, { mime: 'audio/webm; codecs="opus"' })],
+    ['MP3 cut mid-frame', cutUp(mp3, { mime: 'audio/mpeg', n: 60 })],
+    ['ADTS cut mid-frame', cutUp(ab(adts), { mime: 'audio/aac', n: 30 })],
+    ['fMP4, a segment missing', load('lo', [1, 2, 3, 5, 6, 7, 8])],
+  ];
+  for (const [what, parts] of streams) {
+    for (const [order, list] of [['in order', parts], ['out of order', shuffle(parts, 5)]]) {
+      const ix = new PlaceIndex();
+      for (let k = 1; k <= list.length; k++) {
+        const arrived = list.slice(0, k), want = placeParts(arrived), got = ix.update(arrived);
+        assert.ok(got, `${what}, ${order}: the index gave up at part ${k}`);
+        assert.deepEqual(spans(got.coverage), spans(want.coverage), `${what}, ${order}: coverage after ${k} of ${list.length} parts`);
+        for (const D of [END, 30, 120]) assert.deepEqual(spans(gapsFor(got, D)), spans(gapsFor(want, D)), `${what}, ${order}: gaps after ${k} parts`);
+        assert.deepEqual(got.runs.map((r) => r.segs.length), want.runs.map((r) => r.segs.length), `${what}, ${order}: runs after ${k} parts`);
+      }
+    }
+  }
+  // A part that leaves the list (another player feeds the track now): the index starts again from what is left.
+  const ix = new PlaceIndex(), all = load('lo');
+  ix.update(all);
+  assert.deepEqual(spans(ix.update(all.slice(0, 4)).coverage), spans(placeParts(all.slice(0, 4)).coverage));
 });
 
 test('out-of-order parts are placed in order', () => {
@@ -157,6 +196,33 @@ test('a duration that grows after placement is re-checked, not trusted', async (
     assert.deepEqual(e.gaps, [[20, 30]]);
     assert.match(e.message, /20\.0.*30\.0/);
   });
+});
+
+test('a first piece starting a little after 0 is covered or missing by one rule: gapsFor and decodePlaced agree across the frame tolerance', async () => {
+  // A stand-in decoder: each run's bytes carry the length it decodes to; one run decodes at the context rate.
+  const SR = 48000, tol = 0.0213, end = 30;
+  const ctx = { sampleRate: SR, async decodeAudioData(buf) {
+    const n = Number(new TextDecoder().decode(new Uint8Array(buf))), ch = new Float32Array(n).fill(0.25);
+    return { length: n, numberOfChannels: 2, sampleRate: SR, getChannelData: () => ch };
+  } };
+  for (const t0 of [0, 0.005, tol, tol + 0.0005, 0.05]) {
+    const bytes = new TextEncoder().encode(String(Math.round((end - t0) * SR))).buffer;
+    const placed = { runs: [{ mime: MP4, init: null, segs: [{ t0, t1: end, bytes }], delay: 0, rate: SR, key: 'k', preroll: null, cold: false }],
+      coverage: [[t0, end]], gaps: [], tol, tolSamples: Math.round(tol * SR), skipped: 0 };
+    const gaps = gapsFor(placed, end);
+    let out = null, err = null;
+    try { out = await decodePlaced(ctx, placed, { duration: end }); } catch (e) { err = e; }
+    if (!gaps.length) {
+      assert.equal(err, null, `${t0} s: gapsFor finds it whole, so decodePlaced must take it (${err && err.message})`);
+      const lead = Math.round(t0 * SR);
+      assert.equal(out.L.length, end * SR, `${t0} s`);
+      assert.ok(out.L.subarray(0, lead).every((x) => x === 0) && out.L[lead] === 0.25, `${t0} s: silence before the first piece, then the piece at its own time`);
+    } else {
+      assert.ok(t0 > tol, `${t0} s: a gap only past the tolerance`);
+      assert.ok(err instanceof AssemblyError && err.reason === 'gaps', `${t0} s: refused as missing audio, ${err && err.message}`);
+      assert.deepEqual(spans(err.gaps), spans([[0, t0]]));
+    }
+  }
 });
 
 test('captured audio running well past the reported duration is refused', async () => {

@@ -133,7 +133,11 @@
   const EVENTS = ['play', 'playing', 'pause', 'emptied', 'loadedmetadata', 'volumechange', 'timeupdate'];
   function onMedia(e) {
     watchdog();
-    if (e.type === 'timeupdate') { pump(); return; } // about 4 a second while playing, timers or not
+    if (e.type === 'timeupdate') { // about 4 a second while playing, timers or not
+      pump();
+      if (drv.mode === 'accelerate' && e.currentTarget === drv.el) tapDirty(); // its place as it runs (a recording reads it against its capture)
+      return;
+    }
     if (st.enforcing && (e.type === 'playing' || e.type === 'loadedmetadata')) apply(e.currentTarget);
     report();
   }
@@ -820,6 +824,60 @@
   // drive.state 'flushed' once, or drive.unflushed (why not) while the drive goes on without it.
   const sbRemove = window.SourceBuffer ? SourceBuffer.prototype.remove : null, FLUSH_WAIT = 3000, PROBE_WAIT = 3000, KEEP = 1, MIN_CUT = 0.25;
   const msEnd = window.MediaSource ? MediaSource.prototype.endOfStream : null;
+
+  // Our removes fire updatestart, update and updateend on the player's SourceBuffer, and a player's handlers take every
+  // update on its SourceBuffers for one it asked for: hls.js reads its operation queue's current entry there (onStart,
+  // onComplete) and throws, uncaught, on ours. The events must still reach the player (one that looks at its buffer on
+  // updateend sees what was removed, and fetches it again), so what its handlers throw on ours is caught instead. Listeners
+  // run in the order they were added, so none added later can come first: from document_start, the page's listeners for
+  // those events on a SourceBuffer and its on* handlers for them go through wrappers that only pass them on, and while the
+  // SourceBuffer runs our remove (hushed) catch what they throw. No listener of ours is added for this until a flush.
+  const SB_EVENTS = new Set(['updatestart', 'update', 'updateend', 'error', 'abort']), hushed = new WeakSet();
+  const isSB = (x) => tagOf(x) === '[object SourceBuffer]';
+  const capOf = (o) => (typeof o === 'boolean' ? o : !!(o && typeof o === 'object' && o.capture));
+  const proxies = new WeakMap(); // the page's listener -> `${type} ${capture}` -> WeakMap(SourceBuffer -> what was added for it)
+  const proxyOf = (target, type, fn, capture, make) => {
+    let byType = proxies.get(fn);
+    if (!byType) { if (!make) return null; proxies.set(fn, (byType = new Map())); }
+    const k = `${type} ${capture}`;
+    let byTarget = byType.get(k);
+    if (!byTarget) { if (!make) return null; byType.set(k, (byTarget = new WeakMap())); }
+    let p = byTarget.get(target);
+    if (!p && make) byTarget.set(target, (p = make()));
+    return p || null;
+  };
+  {
+    const ET = EventTarget.prototype, origAdd = ET.addEventListener, origRemove = ET.removeEventListener;
+    ET.addEventListener = disguise({ addEventListener(type, fn, opts) {
+      if (!fn || !SB_EVENTS.has(type) || !isSB(this)) return origAdd.call(this, type, fn, opts);
+      const capture = capOf(opts), once = !!(opts && typeof opts === 'object' && opts.once);
+      const p = proxyOf(this, type, fn, capture, () => function (e) {
+        if (once) origRemove.call(this, type, p, capture);
+        if (!hushed.has(this)) return typeof fn === 'function' ? fn.call(this, e) : fn.handleEvent(e);
+        try { return typeof fn === 'function' ? fn.call(this, e) : fn.handleEvent(e); } catch (_) { return undefined; }
+      });
+      return origAdd.call(this, type, p, once ? { ...opts, once: false } : opts);
+    } }.addEventListener, origAdd);
+    ET.removeEventListener = disguise({ removeEventListener(type, fn, opts) {
+      const p = fn && SB_EVENTS.has(type) && isSB(this) ? proxyOf(this, type, fn, capOf(opts), null) : null;
+      return origRemove.call(this, type, p || fn, opts);
+    } }.removeEventListener, origRemove);
+    const SBP = window.SourceBuffer ? SourceBuffer.prototype : null, own = new WeakMap(); // SourceBuffer -> {prop: the page's handler}
+    for (const type of SBP ? SB_EVENTS : []) {
+      const prop = `on${type}`, d = Object.getOwnPropertyDescriptor(SBP, prop);
+      if (!d || !d.set || !d.get || !d.configurable) continue;
+      const { get, set } = Object.getOwnPropertyDescriptor({
+        get [prop]() { const o = own.get(this); return o && prop in o ? o[prop] : d.get.call(this); },
+        set [prop](v) {
+          let o = own.get(this);
+          if (!o) own.set(this, (o = {}));
+          o[prop] = typeof v === 'function' ? v : null;
+          d.set.call(this, typeof v === 'function' ? function (e) { if (!hushed.has(this)) return v.call(this, e); try { return v.call(this, e); } catch (_) { return undefined; } } : v);
+        },
+      }, prop);
+      Object.defineProperty(SBP, prop, { ...d, get: disguise(get, d.get), set: disguise(set, d.set) });
+    }
+  }
   const droveEnd = new WeakSet(); // MediaSources a drive ended
   /** The MediaSource el plays, if the tap saw its blob: URL made. */
   function msOf(el) {
@@ -870,9 +928,19 @@
     if (gen !== drv.gen) return false;
     const b = sb.buffered;
     if (!(to > from) || !b.length || b.start(0) >= to || b.end(b.length - 1) <= from) return true;
-    sbRemove.call(sb, from, to);
+    await unheard(sb, () => sbRemove.call(sb, from, to));
     await free(sb);
     return gen === drv.gen;
+  }
+  /** Run op (our remove) on sb with what the page's handlers throw on its update events caught. -> once its updateend has come (or FLUSH_WAIT). */
+  function unheard(sb, op) {
+    return new Promise((res) => {
+      const end = () => { clearTimeout(timer); unlisten.call(sb, 'updateend', end); hushed.delete(sb); res(); };
+      hushed.add(sb);
+      listen.call(sb, 'updateend', end);
+      const timer = setTimeout(end, FLUSH_WAIT);
+      try { op(); } catch (_) { end(); }
+    });
   }
   const holdsAt = (sb, t) => { try { const b = sb.buffered; for (let i = 0; i < b.length; i++) if (b.start(i) <= t && b.end(i) > t) return true; } catch (_) {} return false; };
   /** Until one of `list` holds media before t again (looked at as each append ends), or `wait` ms. -> whether it does. */
