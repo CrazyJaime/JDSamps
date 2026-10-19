@@ -10,7 +10,7 @@ import { createMaster } from './master.js';
 import { Recorder } from './recorder.js';
 import { MasterClock } from './sync.js';
 import { Deck } from './deck.js';
-import { fetchArrayBuffer, decodeTo, resample, limitPcm } from './decode.js';
+import { fetchArrayBuffer, decodeTo, resample, limitPcm, wavFrames, mediaDuration, minutes } from './decode.js';
 import { analyseTrack, applyAnalysis } from './analysis.js';
 import { Loader, Recording, framesOf } from './loader.js';
 
@@ -537,11 +537,19 @@ class Engine {
     }
     if (gone()) return refuse();
     deck.setLoad({ progress: 0.5, strategy: 'decoding' });
-    // Longer than the resident limit, an MP3 or ADTS file is cut at the frame a second past it and only that part
-    // is decoded, as a tab's file is (a file in any other format is decoded whole).
-    const limitMin = this.params['resident.limitMin'], w = framesOf(buf, limitMin * 60 + 1);
+    // Longer than the resident limit, an MP3 or ADTS file is cut at the frame a second past it (as a tab's file is),
+    // or a WAV file at the sample, and only that part is decoded. A file in any other format cannot be cut short and
+    // is decoded whole, so only up to twice the limit: its length is read from its header first.
+    const limitMin = this.params['resident.limitMin'], until = limitMin * 60 + 1, w = framesOf(buf, until) || wavFrames(buf, until);
     const own = w ? w.samples / w.sampleRate : 0, cut = own > limitMin * 60 + 0.5 && w.cut ? w.cut : null;
-    if (cut) buf = buf.slice(0, cut.end);
+    if (cut) buf = cut.bytes || buf.slice(0, cut.end);
+    else if (!w) {
+      const length = await mediaDuration(buf);
+      if (gone()) return refuse();
+      if (length > 2 * limitMin * 60) {
+        return refuse(`“${meta.title}” is ${minutes(length / 60)} long, too long to decode whole: the deck holds ${minutes(limitMin)}. As an MP3 or WAV file, its first ${minutes(limitMin)} would load.`);
+      }
+    }
     try {
       pcm = await decodeTo(this.ctx, buf);
     } catch (_) {
