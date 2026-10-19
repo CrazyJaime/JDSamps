@@ -413,7 +413,8 @@ export class Deck {
     const input = this.ts.clampInput(p);
     this.ts.change(this.now(), T, { active: true, input, rate: this.effRate(input), semitones: this.semis(input) });
     this.wantPlay = true;
-    this.search = null; // a search is a paused deck's: playing, the held nudge is a nudge again
+    // A search is a paused deck's: PLAY ends it, and the button still held does nothing (phase lock runs) until let go.
+    if (this.search) { this.search = null; this.nudge = 0; this.nudgeFactor = 1; }
     this.hasPlayed = true;
     this.playingSince = T;
     this.settleUntil = T + 0.5;
@@ -505,6 +506,7 @@ export class Deck {
         else { this.engine.clock.follow(this.id); this.syncOn = false; this.phaseMs = null; }
         return OK;
       case 'nudge':
+        if (!arg.dir && !this.nudge) return OK; // nothing held (PLAY ended its search): letting go changes nothing
         // Paused, the nudge buttons search instead: the playhead moves while held (searchTick).
         this.search = !this.wantPlay && arg.dir ? { dir: arg.dir, fine: arg.fine, from: this.ts.posAt(this.landAt(now)), at: now } : null;
         if (this.search) this.cueAuto = false;
