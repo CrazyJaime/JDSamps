@@ -850,17 +850,20 @@ function barShifts(f, Tb, span, lag) {
     if (b - lag < 0 || b + W + lag > f.length) continue;
     const ma = (S1[a + W] - S1[a]) / W, va = S2[a + W] - S2[a] - W * ma * ma;
     if (!(va > 1e-12)) continue;
-    for (let l = -lag; l <= lag; l++) {
-      const o = b + l, mb = (S1[o + W] - S1[o]) / W, vb = S2[o + W] - S2[o] - W * mb * mb;
+    const c = (i) => { // the match at lag i - lag, worked out once
+      if (!isNaN(cs[i])) return cs[i];
+      const o = b + i - lag, mb = (S1[o + W] - S1[o]) / W, vb = S2[o + W] - S2[o] - W * mb * mb;
       let ab = 0;
-      for (let i = 0; i < W; i++) ab += f[a + i] * f[o + i];
-      cs[l + lag] = vb > 1e-12 ? (ab - W * ma * mb) / Math.sqrt(va * vb) : 0;
-    }
-    let best = 0;
-    for (let i = 1; i < cs.length; i++) if (cs[i] > cs[best]) best = i;
-    if (cs[best] < 0.5) continue;
+      for (let j = 0; j < W; j++) ab += f[a + j] * f[o + j];
+      return (cs[i] = vb > 1e-12 ? (ab - W * ma * mb) / Math.sqrt(va * vb) : 0);
+    };
+    cs.fill(NaN);
+    let best = 0; // every other lag, then the two beside the best (a match is wider than a hop)
+    for (let i = 2; i < cs.length; i += 2) if (c(i) > c(best)) best = i;
+    for (const i of [best - 1, best + 1]) if (i >= 0 && i < cs.length && c(i) > c(best)) best = i;
+    if (c(best) < 0.5) continue;
     let off = 0;
-    if (best > 0 && best < cs.length - 1) { const p = cs[best - 1], q = cs[best], r = cs[best + 1], den = p - 2 * q + r; if (den < 0) off = (0.5 * (p - r)) / den; }
+    if (best > 0 && best < cs.length - 1) { const p = c(best - 1), q = c(best), r = c(best + 1), den = p - 2 * q + r; if (den < 0) off = (0.5 * (p - r)) / den; }
     d[k] = best - lag + off;
   }
   const base = new Float64Array(nb).fill(NaN);
@@ -1034,11 +1037,14 @@ export function mendSteps(pcm, T) {
     edits.push([at, len, r]);
   }
   if (!edits.length) return { pcm, steps: [] };
-  // Read again: an edit after which its reading still finds a step there was no skip, or not that one.
+  // Read again about each edit (12 beats either side): an edit after which its reading still finds a step there was
+  // no skip, or not that one.
   let out = edited(pcm, edits), moved = 0;
-  const again = skipReadings(out, T, hop), keep = edits.filter(([at, len, r]) => {
-    const y = again.find((x) => x.i === r.i && x.span === r.span), k = (at - moved) / hop / y.Tb;
+  const keep = edits.filter(([at, len, r]) => {
+    const mid = at - moved, from = Math.max(0, Math.round(mid - 12 * T * sr)), to = Math.min(out.L.length, Math.round(mid + 12 * T * sr));
     moved += len;
+    const part = { L: out.L.subarray(from, to), R: out.R.subarray(from, to), sampleRate: sr }, k = (mid - from) / hop / r.Tb;
+    const y = skipReadings(part, T, hop).find((x) => x.i === r.i && x.span === r.span);
     return !readSteps(y, hop, sr).some((s) => s.mlo - 3 <= k && k <= s.mhi + 3);
   });
   if (!keep.length) return { pcm, steps: [] };
