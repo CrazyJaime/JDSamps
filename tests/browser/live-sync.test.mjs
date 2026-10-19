@@ -148,10 +148,12 @@ after(async () => { await h?.close(); await server?.close(); });
 
 test('two synced live decks: a minute of master recording at one tempo and on one beat, capture gaps jumped, no bend', async (t) => {
   const by = (s, slot) => s.decks.find((d) => d.slot === slot);
+  let seen = '';
   await waitFor(async () => {
     const s = await state(deck), a = by(s, 1), b = by(s, 2);
+    seen = [a, b].map((d) => d && `deck ${d.slot} ${d.bpm.state} ${d.bpm.native} BPM, reserve ${d.reserve}`).join('; ');
     return a?.bpm.state === 'LOCKED' && b?.bpm.state === 'LOCKED' && Math.abs(a.bpm.native - 124) < 0.3 && Math.abs(b.bpm.native - 128) < 0.3;
-  }, 25000);
+  }, 25000).catch((e) => { throw new Error(`${e.message}: ${seen}`); });
   set(deck, null, 'assist.on', false); // the reserve is seconds: deck 1 plays every gap from its buffer, captured at 1x
   assert.equal((await act(deck, 2, 'master')).ok, true);
   assert.equal((await act(deck, 2, 'play')).ok, true);
