@@ -39,7 +39,7 @@ export const TIMES = Object.freeze({
   start: 30000,      // the most to wait for the DJ to start such a player on the tab
   file: 65000,       // the page's track link (the agent gives it 60 s)
   fetchEach: 15000,  // per eight links fetched by the page (the agent gives each 15 s)
-  stall: 5000,       // a seek-hop that brings no new audio this long is given up for accelerate
+  stall: 5000,       // a seek-hop that brings no new audio this long is given up for accelerate; then, accelerate too
   drive: 30000,      // a drive's budget: this, plus drivePerSec for each second of the track
   drivePerSec: 250,
   check: 400,        // between gap checks while driving (each one places every piece)
@@ -52,6 +52,7 @@ const SAY = {
   wait: 'waiting for the page', look: "looking at the page's player", start: 'start the track on the tab', file: "reading the page's track link",
   media: 'fetching the track', pieces: "fetching the track's pieces", hop: 'running the player through the track',
   fast: (r) => `running the player through the track (${r}×)`, decode: 'decoding', beat: 'finding the beat',
+  dry: 'waiting for the page to send more of the track',
 };
 /** Why a deck plays live after all: said once, after "Deck N: ". */
 const LIVE = {
@@ -808,12 +809,13 @@ export class Loader extends Job {
     const startOf = () => { const g = this.gapsNow()[0]; return g && g[0] < 0.05 ? g : null; }, g0 = stampless ? null : startOf();
     const held = g0 && ((f.prog && f.prog.buffered) || []).find(([a, b]) => a <= g0[0] + 0.5 && b > g0[0]);
     const unfetched = g0 && `the player would not fetch the start again after a flush: ${span(held ? [g0[0], Math.min(g0[1], held[1])] : g0)} came before the deck could read it`;
-    let mode = null, placed = null, out = null, pass = null, flushed = false, unflushed = false;
+    let mode = null, placed = null, out = null, pass = null, flushed = false, unflushed = false, stalledOnce = false, dry = false;
     const go = (m, from, flush) => {
       mode = m;
       this.send(f, m === 'seekhop' ? { t: 'drive', mode: m, ...(flush ? { flush: true } : {}) } : { t: 'drive', mode: m, rate: DRIVE_RATE, ...(from != null ? { from } : {}) });
       const how = m === 'seekhop' ? 'seek-hop' : `accelerate ${DRIVE_RATE}×${from != null ? ` from ${from.toFixed(1)} s` : ''}`;
       e.how = e.how ? `${e.how}, then ${how}` : how;
+      dry = false;
       this.say(this.progress, m === 'seekhop' ? SAY.hop : SAY.fast(DRIVE_RATE));
     };
     const band = this.band(), end = this.now() + this.t.drive + T * this.t.drivePerSec;
@@ -829,6 +831,8 @@ export class Loader extends Job {
         await this.until(() => f.prog !== seen || f.left, this.t.check);
         this.check();
         if (f.bytes !== bytes) { bytes = f.bytes; fresh = this.now(); }
+        // Nothing new for a while: the deck says it waits for the page, rather than sit at a figure as if busy.
+        if (dry !== this.now() - fresh > this.t.stall / 2) { dry = !dry; this.say(this.progress, dry ? SAY.dry : mode === 'seekhop' ? SAY.hop : SAY.fast(DRIVE_RATE)); }
         const d = f.prog && f.prog.drive, st = d && d.mode === mode && !(pass && f.prog === pass.prog) ? d.state : 'running';
         stalled = st === 'stalled' ? stalled || this.now() : 0;
         // It did not fetch again what the flush took from behind its place (so it was left the rest): the start is not to be had.
@@ -857,10 +861,16 @@ export class Loader extends Job {
         }
         // A seek-hop stalls when it brings nothing new, or when the player says so while it appends elsewhere (shaka going on
         // from its last segment after a flush): either way, accelerate.
-        if (mode === 'seekhop' && (st === 'refused' || this.now() - fresh > this.t.stall || (stalled && this.now() - stalled > this.t.stall))) { go('accelerate'); fresh = this.now(); continue; }
+        if (mode === 'seekhop' && (st === 'refused' || this.now() - fresh > this.t.stall || (stalled && this.now() - stalled > this.t.stall))) { stalledOnce = st !== 'refused'; go('accelerate'); fresh = this.now(); continue; }
         if (mode === 'accelerate' && st === 'refused') { out = { outcome: 'failed', why: pass ? pass.why : 'the page will not let its player run faster' }; break; }
         // Flushed, and nothing comes even played: a player that never fetches a piece twice. The start is not to be had.
         if (mode === 'accelerate' && flushed && startOf() && this.now() - fresh > this.t.stall) { out = { outcome: 'failed', why: unfetched }; break; }
+        // Its seek-hop stalled, and run fast it brings nothing new either: the page has stopped sending the track (its
+        // connection dropped, or its player gave up). The long budget is for a page that keeps sending.
+        if (mode === 'accelerate' && stalledOnce && !pass && this.now() - fresh > this.t.stall) {
+          out = { outcome: 'failed', why: `the page stopped sending the track: nothing new came for ${secs(this.t.stall)} after its player stalled, with ${this.gapsNow().map(span).join(', ')} still missing` };
+          break;
+        }
         if (this.now() > end) { out = { outcome: 'failed', why: `the player had not given the whole track after ${secs(this.now() - end + this.t.drive + T * this.t.drivePerSec)} (missing ${this.gapsNow().map(span).join(', ')})` }; break; }
       }
     } finally {

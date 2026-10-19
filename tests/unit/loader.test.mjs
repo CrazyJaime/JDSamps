@@ -168,6 +168,25 @@ test('a seek-hop that stalls goes on to accelerate, with the pitch unlocked thro
   assert.equal(tab.kinds().filter((k) => k === 'drive stop').length, 1);
 });
 
+test('a page that stops sending while it is driven (its seek-hop stalled, and run fast nothing comes) ends the drive after the stall, saying why, not after its whole budget', async () => {
+  const seen = {};
+  const { result, engine, deck } = await load({ kind: 'mse', rendition: hi(), preTap: 0, playing: 1, seekhop: 'stall', accelerate: 'dead' }, {
+    times: { ...FAST, drive: TIMES.drive, drivePerSec: TIMES.drivePerSec },
+    before: ({ tab, engine: e, clock }) => {
+      tab.hooks.push((m) => { if (m.t === 'drive' && m.mode === 'seekhop') seen.stalled = clock.now(); });
+      const live = e.failLoadingToLive.bind(e);
+      e.failLoadingToLive = (...a) => { seen.live = clock.now(); return live(...a); };
+    },
+  });
+  assert.equal(result.kind, 'live');
+  assert.ok(seen.live - seen.stalled <= 2 * FAST.stall + 3 * FAST.check, `live ${seen.live - seen.stalled} ms after the player said it stalled`);
+  const why = /the page stopped sending the track: nothing new came for 0\.1 s after its player stalled, with 4\.0–120\.0 s still missing/;
+  assert.match(called(engine, 'failLoadingToLive')[0].reason, why);
+  assert.match(deck.load.report, new RegExp(`drive \\(seek-hop, then accelerate 16×\\): failed in \\d+\\.\\d s — ${why.source}`));
+  // Meanwhile the deck said what it was waiting for, rather than sit at a frozen figure as if busy.
+  assert.ok(deck.loads.some((l) => l.strategy === 'waiting for the page to send more of the track'), JSON.stringify([...new Set(deck.loads.map((l) => l.strategy))]));
+});
+
 test('accelerate runs the player at 16×, the most the agent takes, so a 5-minute track can be in well under 30 s (§4.3)', async () => {
   const mp3 = { mimes: ['audio/mpeg'] };
   for (const [what, page] of [['after a seek-hop that stalls', { seekhop: 'stall' }], ['for appends placed in order only', mp3]]) {
@@ -490,7 +509,8 @@ test('while a tab loads, its deck carries the load report as it stands, to be co
   assert.equal(result.kind, 'resident');
   assert.equal(typeof during, 'string', 'no load report while the deck loads');
   assert.match(during, /^JD Samps load report\n/);
-  assert.match(during, /Result: still loading: running the player through the track\n/);
+  // (The seek-hop that stalled brought nothing for a while before it gave way: the deck said it waited for the page.)
+  assert.match(during, /Result: still loading: (running the player through the track|waiting for the page to send more of the track)\n/);
   assert.match(during, /file \(reading the page's track link\): skipped in \d+\.\d s — the page has no track link of its own/);
   assert.match(during, /drive \(seek-hop\): running for \d+\.\d s\n/);
   assert.match(during, /First failure: none\nTotal: \d+\.\d s$/);

@@ -68,7 +68,8 @@ export const code = (s) => Math.fround([...String(s)].reduce((n, c) => (n * 31 +
  *   src (a progressive element source URL), tralbum ({url, duration}), files ({url: bytes}, served to the page and the engine),
  *   hang ([url]: links the engine's own fetch of never answers),
  *   errors (reasons reported at tap on), seekhop ('ok' | 'stall' | 'refuse' | 'trickle': stalled where it hops, while the player
- *   appends on elsewhere, so bytes keep coming but never what is missing), accelerate ('ok' | 'refuse'), mimes (override),
+ *   appends on elsewhere, so bytes keep coming but never what is missing), accelerate ('ok' | 'refuse' | 'dead': it runs, and
+ *   nothing more comes, as from a page whose connection dropped), mimes (override),
  *   appends (MSE parts as {bytes} the player appends on a drive, in order, for a stream with no timestamps),
  *   status (the frame agent's status, over a heard playing player's), framePages ([{...}]: frame i's page, over this one),
  *   other ({rendition, sb, n}: another player's SourceBuffer in the frame, appending its init and first n segments at tap on),
@@ -113,6 +114,7 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
       const how = pg[mode] || 'ok';
       if (how === 'refuse' || (mode === 'seekhop' && (pg.mimes || []).some((m) => /mpeg|aac/.test(m)))) { progress({ drive: { mode, state: 'refused', at: 0 } }); return; }
       if (how === 'stall') { progress({ drive: { mode, state: 'stalled', at: 24 } }); return; }
+      if (how === 'dead') { progress({ drive: { mode, state: 'running', at: 24 } }); return; }
       if (how === 'trickle') {
         progress({ drive: { mode, state: 'stalled', at: 0 } });
         const k = pg.preTap || 0;
