@@ -390,7 +390,11 @@ export class TempoTracker {
     // runs too short to say it).
     const m = this.beats.length;
     if (m < (this.carried ? 16 : 4)) return;
-    const f = stepFit(this.beats, JUMP.min * sr, m >= 8 ? 3 : 0, 0.001 * sr, this.cuts);
+    let f = stepFit(this.beats, JUMP.min * sr, m >= 8 ? 3 : m >= 5 ? 1 : 0, 0.001 * sr, this.cuts);
+    if (m >= 8 && Math.abs(f.wr) > Math.max(4 * f.rest, 0.004 * sr)) { // one beat the capture moved on its own
+      this.beats.splice(f.worst, 1);
+      f = stepFit(this.beats, JUMP.min * sr, 3, 0.001 * sr, this.cuts);
+    }
     if (!(f.a > 0) || f.se > 1e-3 * f.a) return;
     this.carried = false;
     this.fit = { a: f.a, b: f.b }; this.fineBpm = (60 * sr) / f.a / mult;
@@ -488,9 +492,10 @@ function phaseSteps2(r, K) {
  * between runs, each run with its own level and one slope for all. A step is taken only when it is at least minStep
  * and stands out of the jitter (JUMP.z standard deviations), with 3 beats on each side but at either end of the window
  * (a gap the newest beats have just come through, or one about to leave); at most maxSteps. The beats step at each
- * time in `at` (capture gaps already found) whatever the size. Returns {a, b, se}, b the newest run's level, se the
- * slope's standard error (jitter taken as at least `floor`). Allocation-free but for the result: prefix sums over the
- * beats in SF.
+ * time in `at` (capture gaps already found) whatever the size. Returns {a, b, se, worst, wr, rest}: b the newest
+ * run's level, se the slope's standard error (jitter taken as at least `floor`), worst the beat farthest off the fit,
+ * wr its residual and rest the jitter of the others. Allocation-free but for the result: prefix sums over the beats
+ * in SF.
  */
 const SF = { cap: 0, cuts: new Int32Array(8), cand: new Int32Array(8), s: new Float64Array(3) };
 function stepFit(beats, minStep, maxSteps = 3, floor = 0, at = []) {
@@ -544,7 +549,17 @@ function stepFit(beats, minStep, maxSteps = 3, floor = 0, at = []) {
   }
   sums(cuts, L);
   const se = s[0] > 0 && m > L ? Math.sqrt(Math.max((s[2] - (s[1] * s[1]) / s[0]) / (m - L), floor * floor) / s[0]) : Infinity;
-  return { a, b: t0 + level(cuts[L - 2], m, a) - a * n0, se };
+  let worst = -1, wr = 0, ss = 0;
+  for (let k = 0; k + 1 < L; k++) {
+    const lv = level(cuts[k], cuts[k + 1], a);
+    for (let i = cuts[k]; i < cuts[k + 1]; i++) {
+      const r = beats[i].t - t0 - lv - a * (beats[i].n - n0);
+      ss += r * r;
+      if (Math.abs(r) > Math.abs(wr)) { wr = r; worst = i; }
+    }
+  }
+  const rest = m - L - 1 > 0 ? Math.sqrt(Math.max(0, ss - wr * wr) / (m - L - 1)) : Infinity;
+  return { a, b: t0 + level(cuts[L - 2], m, a) - a * n0, se, worst, wr, rest };
 }
 
 /** One deck's tempo state: tracker + beat clock + manual corrections (×2/½, TAP, GRID, TAP 1). */

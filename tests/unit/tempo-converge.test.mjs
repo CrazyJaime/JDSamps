@@ -193,6 +193,28 @@ test('the e2e Web-Audio page as one run captured it (its lock read 119.26): with
   assert.deepEqual(late, [], `locked at ${lock.t.toFixed(1)} s on ${lock.bpm.toFixed(3)}`);
 });
 
+test('a capture gap just after the lock, found only as the fit reaches seven beats (two runs captured so): within 0.1 %', () => {
+  // A fit of fewer than eight beats took no step: the gap's tilted it 0.3-0.4 % for the evaluation before the gap was
+  // found. From five beats it may take one.
+  for (const name of ['live-gap-at-lock-capture.json', 'live-gap-at-lock-capture-2.json']) {
+    const { lock, late } = captureWander(name, 128);
+    assert.deepEqual(late, [], `${name}: locked at ${lock.t.toFixed(1)} s on ${lock.bpm.toFixed(3)}`);
+  }
+});
+
+test('one beat the capture moved by itself, a few seconds after the lock: the tempo stays within 0.03 %', () => {
+  // Under load the capture can move a single beat by 10-15 ms and back, too small a step to find. In the fit's first
+  // seconds that one beat tilted it by up to 0.1 %. A beat four times further off the fit than the others (and over
+  // 4 ms) is left out.
+  for (const [kind, bpm, k, ms] of [['high', 128, 20, 12], ['high', 128, 21, -10], ['low', 124, 18, 12], ['low', 124, 20, -12]]) {
+    const T = 60 / bpm, lead = 0.003, on = lead + k * T;
+    const x = gap(gap(blips({ kind, bpm, seconds: 30, lead }), 44100, on - 0.1, -ms), 44100, on + ms / 1000 + 0.25, ms);
+    const rs = readings(x, 44100), lock = rs.find((r) => r.state === 'LOCKED');
+    const off = rs.filter((r) => r.t >= lock.t + 2.5 && Math.abs(r.bpm / bpm - 1) > 3e-4).map((r) => `${r.t.toFixed(1)} s ${r.bpm.toFixed(3)}`);
+    assert.deepEqual(off, [], `${kind} ${bpm} BPM, beat ${k} moved ${ms} ms`);
+  }
+});
+
 test('a live deck with two capture gaps in its first beats after the lock, as one run captured it: within 0.1 %', () => {
   // Neither gap was found yet when the fit reached eight beats; its steps cut the beats into runs too short to say
   // the slope, and it read 123.0 (0.8 % slow) for seconds. A fit whose slope is not sure to 0.1 % is not taken.
