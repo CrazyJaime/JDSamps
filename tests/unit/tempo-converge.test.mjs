@@ -207,6 +207,25 @@ test('a capture gap found soon after the lock: the grid before it has the tempo 
   }
 });
 
+test('a capture gap in the first seconds of the clock, before the fine fit: the grid before it gets the fine fit\'s tempo once there is one', () => {
+  // Since the fine fit takes over two seconds after the lock, a gap the test above puts at 8-9 s is passed by the live
+  // edge at the fine tempo already. One passed between the clock's start and the fine fit is the case: the grids
+  // remembered then are at the lock's tempo, and only taking each new clock period puts them right.
+  for (const [kind, bpm, at, ms] of [['high', 128, 4, 15], ['low', 124, 4, 15], ['mid', 120, 4, -15]]) {
+    const x = gap(blips({ kind, bpm, seconds: 30, lead: 0.0052 }), 44100, at, ms);
+    let deck;
+    const odf = new OdfCore(44100, (f, l, t) => deck.pushFrame(f, l, t));
+    deck = new DeckTempo({ sampleRate: 44100, fps: odf.fps });
+    const grids = new GridMap(), evaluate = deck.evaluate.bind(deck);
+    deck.evaluate = () => { evaluate(); const g = deck.get(); grids.update(g.grid, g.track); };
+    for (let s = 0; s + 128 <= x.length; s += 128) odf.push(x.subarray(s, s + 128), s);
+    const j = deck.get().track.jump;
+    assert.ok(j && Math.abs(j.from - at) < 60 / bpm, `${kind} ${bpm} BPM: the gap at ${at} s was found at ${j && j.from}`);
+    const before = grids.at(at - 0.5);
+    assert.ok(Math.abs((60 / before.T) / bpm - 1) < 5e-4, `${kind} ${bpm} BPM: the grid before the gap reads ${(60 / before.T).toFixed(3)} BPM`);
+  }
+});
+
 /** A recorded capture (tests/unit/fixtures) replayed: the tempo read off more than 0.1 % from `after` s past the lock. */
 function captureWander(name, bpm, after = 2.5) {
   const c = JSON.parse(fs.readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8'));
