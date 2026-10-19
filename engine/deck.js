@@ -995,7 +995,7 @@ export class Deck {
     this.skips.add(s);
     // A follower a few ms off the beat, inside the phase loop's deadband, takes that off too: else the jump's own ms of
     // error can tip it over, and the loop bends right after the gap.
-    const off = !this.isMaster() && this.phaseMs != null && Math.abs(this.phaseMs) <= PHASE_DEADBAND * 1000 ? (this.phaseMs / 1000) * ts.rateAt(T) : 0;
+    const off = this.isMaster() ? 0 : this.offBefore(s, T);
     const input = ts.clampInput(ts.posAt(T) + this.gapStep(s) + off), fields = { input, rate: this.effRate(input), semitones: this.semis(input) };
     if (pend >= now) ts.then(now, T, fields); else ts.change(now, T, fields);
     this.skipAt = T;
@@ -1006,6 +1006,18 @@ export class Deck {
   skipFits(s, T) {
     const r = this.ts.rateAt(T);
     return Math.abs(this.gapStep(s)) <= SKIP_MAX && r > 0 && !!s.grid && T - this.skipAt >= s.grid.T / r;
+  }
+
+  /**
+   * A follower's phase error at output time T against the grid before capture gap s, as input seconds, when inside the
+   * phase loop's deadband (else 0). Not the last phase look's: that looks a little ahead, and past a gap found late.
+   */
+  offBefore(s, T) {
+    const segs = this.grids.segs, i = segs.indexOf(s), g = i > 0 ? segs[i - 1].grid : null;
+    const mb = this.engine.clock.beat(T), rate = this.ts.rateAt(T);
+    if (!g || !mb || !(rate > 0)) return 0;
+    const e = phaseError(lastBeatOut(g, this.ts.posAt(T), rate, T), g.T / rate, mb.lastBeat, mb.period);
+    return Math.abs(e) <= PHASE_DEADBAND ? e * rate : 0;
   }
 
   /** The step grid segment s's capture gap makes now: its grid's beat nearest the gap against the grid's before it. */

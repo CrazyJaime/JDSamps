@@ -143,6 +143,25 @@ test('a follower sitting a few ms off the beat (inside the phase loop\'s deadban
   assert.ok(w.bend < 0.002, `bent ${(w.bend * 100).toFixed(2)} %`);
 });
 
+test('a gap found just before the playhead gets there, after a phase look past it: the jump still takes the few ms off', async () => {
+  // Seen in the browser: the gap confirmed 0.17 s before the playhead reached it, the last phase look (it looks a
+  // little ahead) had measured past the gap with no jump planned yet, 23 ms, so the jump took none of the 3-4 ms
+  // the follower sat off, and the loop bent twice after it. The offset is taken against the grid before the gap.
+  const { clock, engine, d } = await rig();
+  const r = d.ts.rateAt(clock.t), T = d.ts.soon(clock.t);
+  d.sched(T, { input: d.ts.posAt(T) - 0.004 * r }); // 4 ms late
+  run(engine, clock, 2);
+  const late = clockErrMs(engine, d, clock.t);
+  assert.ok(late > 3.5 && late < 4.5, `${late.toFixed(2)} ms off before the gap`);
+  const X = gap(d, clock, 0.2, -15);
+  d.phaseMs = late + 15 / r; // what a look past the gap reads
+  const w = watch(engine, clock, d, 3, { quiet: { X, w: 0.02 } });
+  assert.equal(w.jumps.length, 1, JSON.stringify(w.jumps));
+  assert.ok(Math.abs(w.jumps[0].by - (-0.015 + late / 1000 * r)) < 2e-4, `jumped ${(w.jumps[0].by * 1000).toFixed(2)} ms`);
+  assert.ok(Math.abs(clockErrMs(engine, d, clock.t)) < 1, `${clockErrMs(engine, d, clock.t).toFixed(2)} ms off after the gap`);
+  assert.ok(w.bend < 0.002, `bent ${(w.bend * 100).toFixed(2)} %`);
+});
+
 // The tracker refines the grid after a gap for as long as it is the live one; by the time the playhead reaches the gap
 // the step between the two grids is no longer quite the one found (seen in the browser: 15 ms found, 13 ms a few
 // seconds later). A jump of the old step would leave the deck that far off the beat its grid shows, and the phase loop
