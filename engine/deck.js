@@ -13,7 +13,7 @@ import { createIsolator, createTrim } from './eq.js';
 import { createFxRack } from './fx.js';
 import { Recorder } from './recorder.js';
 import { glide } from './params.js';
-import { syncRatio, lastBeatOut, phaseError, planCorrection, engineSemitones, assistStep, pickAutoMaster, MULT_MARGIN } from './sync.js';
+import { syncRatio, lastBeatOut, phaseError, planCorrection, engineSemitones, assistStep, pickAutoMaster, MULT_MARGIN, PHASE_DEADBAND } from './sync.js';
 import { OdfCore } from '../worklets/odf-core.js';
 
 const OK = { ok: true };
@@ -37,6 +37,8 @@ const END_PLAN = 0.6; // s: a resident deck plans its stop at the end of the tra
 // Search (nudge held on a paused deck): slow enough at first to place a cue, then doubling every
 // SEARCH_DOUBLE s up to SEARCH_MAX (input s per s). Fine (Shift) is five times slower.
 const SEARCH_V0 = 0.5, SEARCH_DOUBLE = 0.75, SEARCH_MAX = 16;
+const SKIP_MAX = 0.06; // s: the largest capture gap a beat-locked deck jumps across; a bigger step is not a gap
+const SKIP_LEAD = 0.05; // s: a gap jump is planned once it would land within this of soon(), a tick and a bit
 const frac = (x) => x - Math.floor(x);
 
 /** Input seconds a search held for h s has covered. */
@@ -112,6 +114,9 @@ export class Deck {
     this.lastFxBpm = 0;
     this.crossingFor = null;
     this.crossingSeg = null;
+    this.skips = new WeakSet(); // grid segments past a capture gap that the deck has dealt with
+    this.skipAt = -Infinity;    // output time of its latest jump across one
+    this.skipPlan = null;       // the jump planned and not yet landed: {seg, s, prevAt}
     this.wave = { tStart: null, hop: 0, data: new Uint8Array(0), n: 0 };
     this.disposed = false;
   }
@@ -927,6 +932,7 @@ export class Deck {
         this.sched(ts.soon(now), { input: ts.clampInput(ts.posAt(ts.soon(now)) - 1) });
       }
       this.scheduleCrossing(now, p);
+      this.scheduleSkip(now, p);
       this.reconcileRate(now);
       if (!live) this.planEnd(now);
     } else if (!this.wantPlay && this.starved) {
@@ -994,6 +1000,83 @@ export class Deck {
     const T = Math.max(tCross, this.ts.soon(now));
     this.crossingFor = next.inPos;
     this.crossingSeg = this.ts.change(now, T, { rate: this.effRate(next.inPos + 1e-6), semitones: this.semis(next.inPos + 1e-6) });
+  }
+
+  /**
+   * A capture gap the tracker found ahead of the playhead (a grid segment whose beats come `shift` s later than the
+   * grid before it) is played across by a playhead jump of the same size, landing where the playhead reaches it: a
+   * beat-locked deck (a BEAT follower, or the master such followers lock to) keeps its beats where they were, instead
+   * of the phase loop bending it back into line by up to 4 %. The size is the step the two grids give now (gapStep):
+   * the tracker refines the newer one after the gap was found. Gaps up to SKIP_MAX, at most one jump a beat; under a
+   * nudge, roll or loop the gap is played as it came.
+   *
+   * The jump is the deck's own, never in the DJ's way: planned as late as a tick allows (SKIP_LEAD), and no later
+   * change folds into it and waits for it (a nudge, roll, beat jump or tempo move is heard as soon as ever). Such a
+   * change drops it instead, and the gap is seen to again: planned anew, or by the phase loop.
+   */
+  scheduleSkip(now, p) {
+    const ts = this.ts, plan = this.skipPlan;
+    if (plan && !ts.segs.includes(plan.seg)) { this.skips.delete(plan.s); this.skipAt = plan.prevAt; this.skipPlan = null; }
+    else if (plan && plan.seg.output <= now) this.skipPlan = null;
+    if (!this.beatLocked() || this.nudge || this.rollFrom || this.loop || (this.outOfRange && !this.isMaster())) return;
+    const s = this.grids.segs.find((x) => x.from > p && x.shift && !this.skips.has(x));
+    if (!s) return;
+    const tc = this.reachAt(now, s.from);
+    if (tc == null || tc - ts.soon(now) > SKIP_LEAD) return; // through whatever is planned before it
+    const T = Math.max(tc, ts.soon(now)), pend = ts.pendingUntil();
+    if (!this.skipFits(s, T)) { this.skips.add(s); return; } // the phase loop sees to it
+    if (pend >= T) return; // a change lands after the gap: jumped by the phase loop once it is through
+    this.skips.add(s);
+    // A follower a few ms off the beat, inside the phase loop's deadband, takes that off too: else the jump's own ms of
+    // error can tip it over, and the loop bends right after the gap.
+    const off = this.isMaster() ? 0 : this.offBefore(s, T);
+    const input = ts.clampInput(ts.posAt(T) + this.gapStep(s) + off), fields = { input, rate: this.effRate(input), semitones: this.semis(input) };
+    const seg = pend >= now ? ts.then(now, T, fields) : ts.change(now, T, fields);
+    seg.transport = false; // not a planned transport change for later ones to fold into: they drop it
+    this.skipPlan = { seg, s, prevAt: this.skipAt };
+    this.skipAt = T;
+    this.settleUntil = Math.max(this.settleUntil, T + 0.3);
+  }
+
+  /** Whether grid segment s's capture gap may be jumped at output time T: small enough, and a beat after the last jump. */
+  skipFits(s, T) {
+    const r = this.ts.rateAt(T);
+    return Math.abs(this.gapStep(s)) <= SKIP_MAX && r > 0 && !!s.grid && T - this.skipAt >= s.grid.T / r;
+  }
+
+  /**
+   * A follower's phase error at output time T against the grid before capture gap s, as input seconds, when inside the
+   * phase loop's deadband (else 0). Not the last phase look's: that looks a little ahead, and past a gap found late.
+   */
+  offBefore(s, T) {
+    const segs = this.grids.segs, i = segs.indexOf(s), g = i > 0 ? segs[i - 1].grid : null;
+    const mb = this.engine.clock.beat(T), rate = this.ts.rateAt(T);
+    if (!g || !mb || !(rate > 0)) return 0;
+    const e = phaseError(lastBeatOut(g, this.ts.posAt(T), rate, T), g.T / rate, mb.lastBeat, mb.period);
+    return Math.abs(e) <= PHASE_DEADBAND ? e * rate : 0;
+  }
+
+  /** The step grid segment s's capture gap makes now: its grid's beat nearest the gap against the grid's before it. */
+  gapStep(s) {
+    const segs = this.grids.segs, i = segs.indexOf(s), p = i > 0 ? segs[i - 1].grid : null, g = s.grid;
+    if (!p || !g || !(p.T > 0) || !(g.T > 0)) return s.shift;
+    const b = p.t0 + Math.round((s.from - p.t0) / p.T) * p.T;
+    return g.t0 + Math.round((b - g.t0) / g.T) * g.T - b;
+  }
+
+  /** Output time (from now on) at which the planned playhead reaches input x, or null if a pause, loop or jump comes first. */
+  reachAt(now, x) {
+    const ts = this.ts, segs = ts.segs;
+    let i = segs.length - 1;
+    while (i > 0 && segs[i].output > now) i--;
+    for (; i < segs.length; i++) {
+      const s = segs[i], from = Math.max(s.output, now), end = i + 1 < segs.length ? segs[i + 1].output : Infinity;
+      if (!s.active || !(s.rate > 0) || s.loopEnd > s.loopStart) return null;
+      const p0 = ts.posAt(from);
+      if (x < p0) return null;
+      if (from + (x - p0) / s.rate < end) return from + (x - p0) / s.rate;
+    }
+    return null;
   }
 
   /**
@@ -1126,6 +1209,19 @@ export class Deck {
     this.phaseMs = e * 1000;
     // A starved deck cannot keep up; bending faster would only spend the reserve it is protecting.
     if (starved || now < this.settleUntil || this.ts.pendingUntil() >= now) return;
+    // A capture gap the playhead went through before the tracker found it (or before it could be planned): when
+    // the error is that gap's step, it is jumped back into line as scheduleSkip would have.
+    const gap = this.grids.segs.find((x) => x.shift && x.from <= p && p - x.from < 2 && !this.skips.has(x)
+      && Math.abs(e * rate - this.gapStep(x)) <= Math.max(0.003, 0.3 * Math.abs(this.gapStep(x))));
+    if (gap) {
+      this.skips.add(gap);
+      if (this.skipFits(gap, T)) {
+        this.sched(T, { input: this.ts.clampInput(p + e * rate) });
+        this.skipAt = T;
+        this.settleUntil = T + 0.3;
+        return;
+      }
+    }
     const plan = planCorrection(e, { audible: this.audible(), keyLock: this.params.keyLock });
     if (plan.kind === 'bend') {
       const pEnd = p + rate * (1 + plan.bend) * plan.duration;
