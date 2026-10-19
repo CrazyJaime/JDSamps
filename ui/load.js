@@ -6,7 +6,6 @@ import { HUB } from '../shared/protocol.js';
 
 // Once a load's answer time is up and its deck has gone, how long its answer still has to say why.
 const GONE_MS = 2000;
-const LOADED = 'Loaded onto a deck. It is cued: press PLAY when ready.';
 const AUDIO_EXT = /\.(mp3|wav|wave|ogg|oga|opus|flac|m4a|mp4|aac|webm|weba|aif|aiff|caf)$/i;
 
 /** An audio file by its type, or by its extension when the system gives none (or a video type for an audio container). */
@@ -60,8 +59,9 @@ export class TrackLoader {
 
   /**
    * A tab from the Sources drawer. LOAD_TAB answers once its deck is made (or, from a hub that waits, once the whole
-   * track is in): the load follows its deck until it holds the track, and says so then, once. A load that fails says
-   * why itself (the engine's event); a cancel the DJ asked for says nothing.
+   * track is in): the load follows its deck until it holds the track. The engine says so itself, once, naming the
+   * track and the deck (or why it plays live instead), so nothing more is said here; a hub's refusal is said; a
+   * cancel the DJ asked for says nothing.
    */
   async loadTab(tabId) {
     const l = { token: null, tabId, after: this.maxId, deckId: null, seen: false, cancelled: false, settle: null, at: 0 };
@@ -75,8 +75,7 @@ export class TrackLoader {
         l.at = performance.now();
         gone = !(await new Promise((resolve) => { l.settle = resolve; this.follow(l); })).ok;
       }
-      if (r.ok && !gone) this.toast(LOADED, 'info');
-      else if (!r.ok && !l.cancelled) this.toast(r.error || 'Could not load that tab.', 'warn');
+      if (!r.ok && !l.cancelled) this.toast(r.error || 'Could not load that tab.', 'warn');
       return gone ? { ok: false } : r;
     } finally {
       this.loads.splice(this.loads.indexOf(l), 1);

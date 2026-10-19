@@ -824,7 +824,7 @@ test('a file load follows the deck showing its token, past tabless loading decks
   }
 });
 
-test('a tab loaded from the Sources drawer is followed to its whole track: said once when it holds it, and not at all after a cancel the DJ asked for', async () => {
+test('a tab loaded from the Sources drawer is said loaded once, by the engine, when its deck holds the track; a fall-back to live only by its warning; nothing after a cancel the DJ asked for', async () => {
   const TAB = { id: 55, title: 'A tab', url: 'https://a.example/x', favIconUrl: '', audible: true, granted: true, deckSlot: null };
   await show(kinds());
   await manual(true);
@@ -842,7 +842,11 @@ test('a tab loaded from the Sources drawer is followed to its whole track: said 
     await wait(30);
   };
   const answer = (r) => page.evaluate((x) => window.__tabReply(x), r);
-  const tabDeck = (id, make = loadingDeck) => make({ id, slot: 4, tabId: make === loadingDeck ? 55 : null, title: 'A tab', url: TAB.url, load: make === loadingDeck ? { strategy: 'running the player through the track' } : {} });
+  const tabDeck = (id, make = loadingDeck) => make({ id, slot: 4, tabId: make === residentDeck ? null : 55, title: 'A tab', url: TAB.url, load: make === loadingDeck ? { strategy: 'running the player through the track' } : {} });
+  // What the engine says as the deck turns (engine.js: startResidentDeck's Loaded, failLoadingToLive's reason).
+  const LOADED = 'Loaded “A tab” on deck 4. It is cued: press PLAY when you\'re ready.';
+  const LIVE = 'Deck 4: this page makes its sound without a media player the deck can read, so it plays live from the tab.';
+  const engineSays = (level, text, id) => ui.push({ t: 'event', level, text, deck: id });
   const cancel = async (id) => {
     await deckEl(4).locator('[data-act="loadCancel"]').click();
     await wait(50);
@@ -866,15 +870,32 @@ test('a tab loaded from the Sources drawer is followed to its whole track: said 
     await cancel(512);
     await wait(50);
     assert.deepEqual(await toasts(), []);
-    // One that loads: said once, when its deck holds the track (and has let its tab go).
+    // One that loads: said once, by the engine, with the track and its deck, when its deck holds it (its tab let go).
     await loadTab();
     await answer({ ok: true, deckId: 513, slot: 4 });
     await show(kinds((s) => { s.decks.push(tabDeck(513)); }));
     await wait(50);
     assert.deepEqual(await toasts(), []);
+    await engineSays('info', LOADED, 513);
     await show(kinds((s) => { s.decks.push(tabDeck(513, residentDeck)); }));
     await wait(50);
-    assert.deepEqual(await toasts(), ['Loaded onto a deck. It is cued: press PLAY when ready.']);
+    assert.deepEqual(await toasts(), [LOADED]);
+    // One that falls back to live: the engine's warning says what it is; nothing calls it cued after it.
+    await clearToasts();
+    await loadTab();
+    await answer({ ok: true, deckId: 514, slot: 4 });
+    await show(kinds((s) => { s.decks.push(tabDeck(514)); }));
+    await engineSays('warn', LIVE, 514);
+    await show(kinds((s) => { s.decks.push(tabDeck(514, deck)); }));
+    await wait(50);
+    assert.deepEqual(await toasts(), [LIVE]);
+    // A hub that answers only once the whole track is in: the engine's word only.
+    await clearToasts();
+    await loadTab();
+    await engineSays('info', LOADED, 515);
+    await answer({ ok: true });
+    await wait(50);
+    assert.deepEqual(await toasts(), [LOADED]);
     // A load the hub refuses still says why.
     await clearToasts();
     await loadTab();
