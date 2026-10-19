@@ -970,8 +970,8 @@ test('recording a whole track through a capture that skips (a busy computer lose
 });
 
 test('recording a whole track through a capture that skips in its first beats and its last (10 ms of silence put in 0.6 s in, 10 ms lost 1 s before the end): both mended, every beat on the line', async (t) => {
-  // In kick 1, and between kicks 30 and 31: steps the bars alone never mend (one 1.2 s in they do, once the take
-  // starts even 10 ms before the first sound).
+  // In kick 1, and between kicks 30 and 31: steps the bars alone never mend (1.2 s in they mend silence put in, and a
+  // loss once the take starts even 10 ms before the first sound).
   await engine(`await (${idealCapture})('${rec.origin}/rec.mp3', { ins: 0.6, lose: 14.97 }); return true;`);
   try {
     const { site, d } = await liveDeck(`${rec.origin}/rec`);
