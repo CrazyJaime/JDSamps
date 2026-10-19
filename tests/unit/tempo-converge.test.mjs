@@ -5,6 +5,7 @@
 // toward the truth until it is within 0.1 % of it, and then stays within 0.1 %.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { OdfCore } from '../../worklets/odf-core.js';
 import { DeckTempo } from '../../engine/tempo.js';
 import { GridMap } from '../../engine/timeshift.js';
@@ -164,4 +165,16 @@ test('a capture gap found soon after the lock: the grid before it has the tempo 
     const before = grids.at(at - 1);
     assert.ok(Math.abs((60 / before.T) / bpm - 1) < 2e-4, `${kind} ${bpm} BPM: the grid before the gap reads ${(60 / before.T).toFixed(3)} BPM`);
   }
+});
+
+test('the e2e Web-Audio page as one run captured it (its lock read 119.26): within 0.1 % from 2.5 s after the lock', () => {
+  // That run's "native 119.264" failure: the lock read 0.6 % slow, and the tempo shown stayed at it until the fine fit
+  // had 8 beats, 3.5 s later. Four beats whose slope is sure are enough.
+  const c = JSON.parse(fs.readFileSync(new URL('./fixtures/webaudio-capture.json', import.meta.url), 'utf8'));
+  const deck = new DeckTempo({ sampleRate: c.sr, fps: c.fps }), rs = [], evaluate = deck.evaluate.bind(deck);
+  deck.evaluate = () => { evaluate(); const g = deck.get(); rs.push({ t: deck.tracker.lastT / c.sr, state: g.state, bpm: g.inBpm }); };
+  deck.pushBatch({ t0: c.t0, spf: c.spf, full: c.full, low: c.low });
+  const lock = rs.find((r) => r.state === 'LOCKED');
+  const late = rs.filter((r) => r.t >= lock.t + 2.5 && Math.abs(r.bpm / 120 - 1) > 1e-3);
+  assert.deepEqual(late.map((r) => `${r.t.toFixed(1)} s ${r.bpm.toFixed(3)}`), [], `locked at ${lock.t.toFixed(1)} s on ${lock.bpm.toFixed(3)}`);
 });

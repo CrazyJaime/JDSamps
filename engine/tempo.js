@@ -299,7 +299,7 @@ export class TempoTracker {
    */
   bestBpm() {
     if (this.fineBpm && rel(this.fineBpm, this.bpm) < 0.01) return this.fineBpm;
-    return this.shown && rel(this.shown, this.bpm) < 0.005 ? this.shown : this.bpm;
+    return this.shown && rel(this.shown, this.bpm) < 0.0025 ? this.shown : this.bpm;
   }
   snapshot(tag) { return { state: tag || this.state, bpm: this.bestBpm(), coarse: this.bpm, conf: this.conf, octConf: this.octConf }; }
 
@@ -383,10 +383,14 @@ export class TempoTracker {
     const n = Math.round((t - this.anchor) / T);
     if (last && last.n === n) last.t = t; else this.beats.push({ n, t });
     while (this.beats.length && t - this.beats[0].t > this.o.fineSpanSec * sr) this.beats.shift();
-    if (this.beats.length < (this.carried ? 16 : 8)) return;
+    // Four beats are enough once their slope is sure to a tenth of a percent (each beat's own onset, at least a
+    // millisecond's jitter): a lock can read 0.6 % off, and the tempo shown is the lock's until the fit is there.
+    const m = this.beats.length;
+    if (m < (this.carried ? 16 : 4)) return;
+    const f = stepFit(this.beats, JUMP.min * sr, m >= 8 ? 3 : 0, 0.001 * sr);
+    if (!(f.a > 0) || (m < 8 && f.se > 1e-3 * f.a)) return;
     this.carried = false;
-    const f = stepFit(this.beats, JUMP.min * sr);
-    if (f.a > 0) { this.fit = { a: f.a, b: f.b }; this.fineBpm = (60 * sr) / f.a / mult; }
+    this.fit = { a: f.a, b: f.b }; this.fineBpm = (60 * sr) / f.a / mult;
   }
 }
 
@@ -480,11 +484,12 @@ function phaseSteps2(r, K) {
  * Least-squares line t = b + a·n through beats {n, t} (oldest first) that allows for capture gaps: the beats may step
  * between runs, each run with its own level and one slope for all. A step is taken only when it is at least minStep
  * and stands out of the jitter (JUMP.z standard deviations), with 3 beats on each side but at either end of the window
- * (a gap the newest beats have just come through, or one about to leave); at most 3. Returns {a, b}, b the newest
- * run's level. Allocation-free but for the result: prefix sums over the beats in SF.
+ * (a gap the newest beats have just come through, or one about to leave); at most maxSteps. Returns {a, b, se}, b the
+ * newest run's level, se the slope's standard error (jitter taken as at least `floor`). Allocation-free but for the
+ * result: prefix sums over the beats in SF.
  */
 const SF = { cap: 0 };
-function stepFit(beats, minStep) {
+function stepFit(beats, minStep, maxSteps = 3, floor = 0) {
   const m = beats.length;
   if (SF.cap < m + 1) {
     const c = 2 * m + 2;
@@ -508,7 +513,7 @@ function stepFit(beats, minStep) {
   cuts[0] = 0; cuts[1] = m;
   sums(cuts, L);
   let a = s[0] > 0 ? s[1] / s[0] : 0;
-  for (let pass = 0; pass < 3; pass++) {
+  for (let pass = 0; pass < maxSteps; pass++) {
     let sse = Infinity, bk = -1, bj = -1;
     for (let k = 0; k + 1 < L; k++) {
       for (let j = cuts[k] + (k === 0 ? 1 : 3); j <= cuts[k + 1] - (k + 2 === L ? 1 : 3); j++) {
@@ -527,7 +532,9 @@ function stepFit(beats, minStep) {
     L++;
     a = a2;
   }
-  return { a, b: t0 + level(cuts[L - 2], m, a) - a * n0 };
+  sums(cuts, L);
+  const se = s[0] > 0 && m > L ? Math.sqrt(Math.max((s[2] - (s[1] * s[1]) / s[0]) / (m - L), floor * floor) / s[0]) : Infinity;
+  return { a, b: t0 + level(cuts[L - 2], m, a) - a * n0, se };
 }
 
 /** One deck's tempo state: tracker + beat clock + manual corrections (×2/½, TAP, GRID, TAP 1). */
@@ -756,7 +763,7 @@ export class DeckTempo {
    * grid between two beats; once the same step shows in two evaluations in a row, record it as
    * track.jump (the audio before it keeps the grid it had there) and re-phase at once: the beat
    * clock moves by the step from that grid, the phase comb looks only past the jump, and the
-   * fine tempo fit keeps its older beats, moved by the step. Under a load spike the capture skips
+   * fine tempo fit keeps its beats, those before it moved by the step. Under a load spike the capture skips
    * in bursts, a few beats apart: the gaps already found are taken out of the beats before them, and
    * the oldest step that stands out in the beats up to the next one is the one found, so each gap of
    * a burst is found with its own step.
@@ -791,7 +798,7 @@ export class DeckTempo {
     this.jumpCand = null;
     gaps.push({ at, D });
     tr.phaseFrom = at;
-    tr.beats = tr.beats.filter((x) => x.t < at).map((x) => ({ n: x.n, t: x.t + D }));
+    tr.beats = tr.beats.map((x) => (x.t < at ? { n: x.n, t: x.t + D } : x)); // each beat its own onset: those after it stand
     tr.fit = null;
     clock.t0 = t0 + Math.round((clock.t0 - t0) / T) * T + D;
     clock.miss = 0;
