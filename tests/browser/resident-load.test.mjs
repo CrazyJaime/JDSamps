@@ -314,6 +314,30 @@ test('a file that cannot be cut short (WebM), within twice the resident limit, s
   await waitFor(async () => !(await decks()).some((x) => x.id === r.id));
 });
 
+test('tracks loaded all at once are decoded and analysed one at a time, so their memory peaks never stack', async () => {
+  await engine(`window.__heavy = { dec: 0, maxDec: 0, an: 0, maxAn: 0 }; const h = window.__heavy, dad = e.ctx.decodeAudioData;
+    e.ctx.decodeAudioData = function (...a) { h.maxDec = Math.max(h.maxDec, ++h.dec); return dad.apply(this, a).finally(() => { h.dec--; }); };
+    const W = window.__W = globalThis.Worker; // the analysis runs in a Worker of its own
+    globalThis.Worker = class extends W {
+      constructor(...a) { super(...a); h.maxAn = Math.max(h.maxAn, ++h.an); }
+      terminate() { if (!this.gone) { this.gone = true; h.an--; } return super.terminate(); }
+    };
+    return true;`);
+  try {
+    const rs = await Promise.all(['a', 'b', 'c'].map((q) => act(deck, null, 'loadUrl', { url: `${origin}/five.wav?${q}` })));
+    for (const r of rs) assert.equal(r.ok, true, JSON.stringify(rs));
+    const heavy = await engine('return window.__heavy;');
+    assert.equal(heavy.maxDec, 1, `decoded ${heavy.maxDec} at once`);
+    assert.equal(heavy.maxAn, 1, `analysed ${heavy.maxAn} at once`);
+    const ours = (await decks()).filter((x) => /\/five\.wav\?[abc]$/.test(x.url || ''));
+    assert.equal(ours.length, 3);
+    for (const x of ours) assert.equal((await act(deck, x.id, 'eject')).ok, true);
+    await waitFor(async () => !(await decks()).some((x) => ours.some((o) => o.id === x.id)));
+  } finally {
+    await engine('delete e.ctx.decodeAudioData; globalThis.Worker = window.__W; return true;');
+  }
+});
+
 test('a decoded track at another sample rate is resampled to the engine\'s before it goes on a deck', async () => {
   const r = await engine(`
     const sr = e.ctx.sampleRate === 44100 ? 48000 : 44100, n = sr * 3, L = new Float32Array(n);
