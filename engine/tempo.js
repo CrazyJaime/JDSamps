@@ -422,20 +422,21 @@ const JUMP = { min: 0.005, max: 1 / 8, z: 6, bend: 3 };
 /**
  * Where per-beat onset offsets r (oldest first; the first K of them) step: the least-squares fit
  * r_i = a + b·i + D·[i ≥ j] (a level, a drift from a slightly wrong period, and a step) over every
- * split j with at least 4 beats before it and 3 after, leaving out beat `skip`. Returns the best
- * {j, D, clear, worst, sse} or null; clear when the step stands out of the jitter, outweighs the drift
+ * split j with at least 4 beats before it and 3 after, leaving out the w beats from `skip`. Returns the best
+ * {j, D, a, b, clear, worst, sse} or null; clear when the step stands out of the jitter, outweighs the drift
  * across the window and every beat sits nearer its own side of the step; worst is the beat farthest
  * off the fit, sse its squared error.
  */
 const det3 = (a, b, c, d, e, f, g, h, i) => a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g);
-function phaseStep(r, skip = -1, K = r.length) {
-  const n = K - (skip >= 0 && skip < K ? 1 : 0);
+function phaseStep(r, skip = -1, K = r.length, w = 1) {
+  const lo = skip >= 0 ? skip : K, hi = Math.min(K, lo + w), out = (i) => i >= lo && i < hi;
+  const n = K - (hi - lo);
   if (n < 7) return null;
   let Si = 0, Sii = 0, Sr = 0, Sir = 0, Srr = 0, j = -1, a = 0, b = 0, D = 0, sse = Infinity;
-  for (let i = 0; i < K; i++) if (i !== skip) { Si += i; Sii += i * i; Sr += r[i]; Sir += i * r[i]; Srr += r[i] * r[i]; }
+  for (let i = 0; i < K; i++) if (!out(i)) { Si += i; Sii += i * i; Sr += r[i]; Sir += i * r[i]; Srr += r[i] * r[i]; }
   for (let jj = 1; jj < K; jj++) {
     let Su = 0, Siu = 0, Sur = 0;
-    for (let i = jj; i < K; i++) if (i !== skip) { Su++; Siu += i; Sur += r[i]; }
+    for (let i = jj; i < K; i++) if (!out(i)) { Su++; Siu += i; Sur += r[i]; }
     if (n - Su < 4 || Su < 3) continue;
     const det = det3(n, Si, Su, Si, Sii, Siu, Su, Siu, Su);
     if (!det) continue;
@@ -448,24 +449,43 @@ function phaseStep(r, skip = -1, K = r.length) {
   if (j < 0) return null;
   let worst = -1, we = -1;
   for (let i = 0; i < K; i++) {
-    const e = i === skip ? 0 : Math.abs(r[i] - a - b * i - (i >= j ? D : 0));
+    const e = out(i) ? 0 : Math.abs(r[i] - a - b * i - (i >= j ? D : 0));
     if (e > we) { we = e; worst = i; }
   }
   const clear = Math.abs(D) >= JUMP.z * Math.sqrt(Math.max(0, sse) / (n - 3)) && Math.max(we, Math.abs(b) * (K - 1)) < Math.abs(D) / 2;
-  return { j, D, worst, clear, sse };
+  return { j, D, a, b, worst, clear, sse };
 }
 
 /**
- * The least squared error of a bend in per-beat onset offsets r (the first K, leaving out beat `skip`): r_i = a + b·i +
- * c·max(0, i − m), the beats on one slope and from m on another, the best m in quarter beats. A real tempo change bends
- * the offsets so (a cut exactly, a ramp over a few beats near enough); a capture gap steps them, which no bend fits.
+ * A step that came over two beats (the capture moved two beats in a row part of the way each): phaseStep leaving out
+ * the two beats p, p + 1 around split j, which then sit between the levels on either side, in order. Returns the best
+ * such step, with skip p, or null.
  */
-function bendSse(r, K, skip = -1) {
+function phaseRamp(r, j, K) {
+  let best = null;
+  for (let p = Math.max(4, j - 2); p <= Math.min(j, K - 5); p++) {
+    const s = phaseStep(r, p, K, 2);
+    if (!s || !s.clear || s.j < p || s.j > p + 2) continue;
+    const f0 = (r[p] - s.a - s.b * p) / s.D, f1 = (r[p + 1] - s.a - s.b * (p + 1)) / s.D;
+    if (!(f0 > 0.1 && f1 < 0.9 && f0 <= f1)) continue;
+    if (!best || s.sse < best.sse) best = { ...s, skip: p };
+  }
+  return best;
+}
+
+/**
+ * The least squared error of a bend in per-beat onset offsets r (the first K, leaving out the w beats from `skip`): r_i =
+ * a + b·i + c·max(0, i − m), the beats on one slope and from m on another, the best m in quarter beats. A real tempo
+ * change bends the offsets so (a cut exactly, a ramp over a few beats near enough); a capture gap steps them, which no
+ * bend fits.
+ */
+function bendSse(r, K, skip = -1, w = 1) {
+  const lo = skip >= 0 ? skip : K, hi = lo + w;
   let best = Infinity;
   for (let m = 1; m <= K - 2; m += 0.25) {
     let n = 0, Si = 0, Sii = 0, Su = 0, Suu = 0, Siu = 0, Sr = 0, Sir = 0, Sur = 0, Srr = 0;
     for (let i = 0; i < K; i++) {
-      if (i === skip) continue;
+      if (i >= lo && i < hi) continue;
       const u = Math.max(0, i - m), v = r[i];
       n++; Si += i; Sii += i * i; Su += u; Suu += u * u; Siu += i * u; Sr += v; Sir += i * v; Sur += u * v; Srr += v * v;
     }
@@ -824,7 +844,9 @@ export class DeckTempo {
    * the oldest step that stands out in the beats up to the next one is the one found, so each gap of
    * a burst is found with its own step. A real tempo change is no gap: it bends the beats onto a new slope that keeps
    * drifting off the grid, and a step fitted to its first few beats can look clear. A step is taken only when it fits
-   * the beats clearly better (JUMP.bend times) than any bend does.
+   * the beats clearly better (JUMP.bend times) than any bend does. A capture under load can also make its step over two
+   * beats, each moved part of the way: found as one step, the gap between them. Missed, it took the clock's period with
+   * it, and every gap after it was missed too.
    */
   detectJump() {
     const tr = this.tracker, clock = this.clock, sr = this.sr;
@@ -834,20 +856,29 @@ export class DeckTempo {
     if (rs.length && this.gaps.some((g) => g.at <= rs[0].beat)) this.gaps = this.gaps.filter((g) => g.at > rs[0].beat); // no beat before them left
     const gaps = this.gaps;
     const r = rs.map((x) => { let v = x.r; for (const g of gaps) if (x.beat < g.at) v += g.D; return v; });
-    let st = null, skip = -1, big = false;
+    let st = null, skip = -1, sw = 1, big = false;
     for (let k = r.length; k >= 7 && !(st && k === r.length - 1); k--) { // a clear step in the whole window is the only one
-      // The gap itself can click: a beat next to the jump whose strongest onset is that click may be left out.
-      let s = phaseStep(r, -1, k), sk = -1;
+      // The gap itself can click: a beat next to the jump whose strongest onset is that click may be left out. The
+      // capture can also move two beats in a row part of the way each: both may be left out when they sit between.
+      let s = phaseStep(r, -1, k), sk = -1, w = 1;
       if (k === r.length) big = !!s && Math.abs(s.D) >= JUMP.min * sr;
-      if (s && !s.clear) { sk = s.worst; s = phaseStep(r, sk, k); if (s && sk !== s.j - 1 && sk !== s.j) s = null; }
-      if (s && s.clear && (!st || s.j < st.j - 1) && bendSse(r, k, sk) > JUMP.bend * s.sse) { st = s; skip = sk; }
+      if (s && !s.clear) {
+        const j = s.j;
+        sk = s.worst; s = phaseStep(r, sk, k); if (s && sk !== s.j - 1 && sk !== s.j) s = null;
+        if (!s || !s.clear) { s = phaseRamp(r, j, k); sk = s ? s.skip : -1; w = s ? 2 : 1; }
+      }
+      if (s && s.clear && (!st || s.j < st.j - 1) && bendSse(r, k, sk, w) > JUMP.bend * s.sse) { st = s; skip = sk; sw = w; }
     }
     if (!st && big) { // two gaps too close for a step on its own: the first of them
       const s2 = phaseSteps2(r, r.length);
       if (s2 && s2.clear && bendSse(r, r.length) > JUMP.bend * s2.sse) { st = { j: s2.j1, D: s2.D1 }; skip = -1; }
     }
     if (!st || Math.abs(st.D) < JUMP.min * sr || Math.abs(st.D) > JUMP.max * clock.T) { this.jumpCand = null; return; }
-    const D = st.D, before = rs[st.j - 1 === skip ? st.j - 2 : st.j - 1], after = rs[st.j === skip ? st.j + 1 : st.j];
+    const out = (i) => skip >= 0 && i >= skip && i < skip + sw;
+    let ib = st.j - 1, ia = st.j;
+    while (out(ib)) ib--;
+    while (out(ia)) ia++;
+    const D = st.D, before = rs[ib], after = rs[ia];
     const at = (before.beat + after.beat + D) / 2; // between the last beat before the jump and the first after
     const cand = this.jumpCand;
     this.jumpCand = { at, D };

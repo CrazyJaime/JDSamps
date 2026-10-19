@@ -305,3 +305,28 @@ test('a live deck through capture gaps as one run captured it (one gap found a f
   const { lock, late } = captureWander('live-gaps-capture.json', 124);
   assert.deepEqual(late, [], `locked at ${lock.t.toFixed(1)} s on ${lock.bpm.toFixed(3)}`);
 });
+
+test('a capture step that comes over two beats, as one run captured it: found, and so is the gap after it; within 0.1 %', () => {
+  // The box's capture moved the beats -10.8 ms at 40.92 s over two beats (-4 and -6 ms, then a few ms more over the next
+  // three). The window's step fit leaves out at most one beat next to a step, so it was never clear; the clock and the
+  // fine fit took it in instead, the fit read 124.34 (0.27 % fast), and the beats then drifted a millisecond a beat off
+  // the clock: the -20 ms gap spliced in at 47.7 s was never clear either, and nothing was found for 16 s.
+  const c = JSON.parse(fs.readFileSync(new URL('./fixtures/live-ramp-gap-capture.json', import.meta.url), 'utf8'));
+  const deck = new DeckTempo({ sampleRate: c.sr, fps: c.fps }), rs = [], gaps = [], evaluate = deck.evaluate.bind(deck);
+  deck.evaluate = () => {
+    const was = deck.track.jump;
+    evaluate();
+    const g = deck.get(), j = g.track.jump;
+    rs.push({ t: deck.tracker.lastT / c.sr, state: g.state, bpm: g.inBpm });
+    if (j && j !== was) gaps.push({ from: j.from, D: (deck.gaps.at(-1).D / c.sr) * 1000 });
+  };
+  deck.pushBatch({ t0: c.t0, spf: c.spf, full: c.full, low: c.low });
+  const say = `found ${gaps.map((g) => `${g.D.toFixed(1)} ms at ${g.from.toFixed(2)} s`).join(', ')}`;
+  // where the capture stepped, and by how much (the live-sync judge's reading of these frames)
+  for (const [at, ms] of [[23.52, -14.5], [24.96, -11.1], [36.09, 11.2], [37.06, -9.5], [40.92, -10.8], [47.67, -19.8]]) {
+    assert.ok(gaps.some((g) => Math.abs(g.from - at) < 0.6 && Math.abs(g.D - ms) <= 3), `the capture stepped ${ms} ms at ${at} s; ${say}`);
+  }
+  const lock = rs.find((r) => r.state === 'LOCKED');
+  const late = rs.filter((r) => r.t >= lock.t + 2.5 && Math.abs(r.bpm / 124 - 1) > 1e-3).map((r) => `${r.t.toFixed(1)} s ${r.bpm.toFixed(3)}`);
+  assert.deepEqual(late, [], `locked at ${lock.t.toFixed(1)} s on ${lock.bpm.toFixed(3)}`);
+});
