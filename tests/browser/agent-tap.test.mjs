@@ -96,8 +96,8 @@ function fixtures() {
 // &video (a second SourceBuffer, of pictures, on the same MediaSource: empty until the test appends to __vsb)
 // &eos1 (ends its stream the first time it holds all of it, never again) &hlsq (its SourceBuffer's updatestart and updateend
 // handlers take every update for one it asked for, as hls.js 1.5's buffer-controller does: one it did not ask for throws
-// there, uncaught). Event handlers are on*
-// properties, never addEventListener, so the dormancy test can count every listener the agent adds.
+// there, uncaught; &hlsq=listen adds them with addEventListener, as hls.js does). Event handlers are on*
+// properties, never addEventListener (but for &hlsq=listen), so the dormancy test can count every listener the agent adds.
 const PLAYER = `<!doctype html><title>player</title><body><audio id="a"></audio><script>
 (() => {
   const q = new URLSearchParams(location.search);
@@ -156,7 +156,10 @@ const PLAYER = `<!doctype html><title>player</title><body><audio id="a"></audio>
     await new Promise((r) => { ms.onsourceopen = r; });
     sb = ms.addSourceBuffer(q.get('mime') || ${JSON.stringify(MIME)});
     window.__sb = sb; window.__ms = ms;
-    if (HLSQ) {
+    if (HLSQ && q.get('hlsq') === 'listen') {
+      sb.addEventListener('updatestart', () => { window.__op.onStart(); });
+      sb.addEventListener('updateend', () => { const op = window.__op; window.__op = null; op.onComplete(); });
+    } else if (HLSQ) {
       sb.onupdatestart = () => { window.__op.onStart(); };
       sb.onupdateend = () => { const op = window.__op; window.__op = null; op.onComplete(); };
     }
@@ -1034,8 +1037,8 @@ describe('flushing the player before a drive', { concurrency: 3 }, () => {
     await p.close();
   });
 
-  test('a flush reaches the player\'s own SourceBuffer handlers, and what they throw on it is caught: an hls.js-like player, which takes every update for one it asked for, sees no error, and fetches again what was removed', async () => {
-    const p = await tapPage(`${LONG}&buf&hlsq`, { init: [REMOVE_SPY] }), seen = [];
+  for (const [mode, how] of [['hlsq', ''], ['hlsq=listen', ' (its handlers added with addEventListener, as hls.js adds them)']]) test(`a flush reaches the player's own SourceBuffer handlers, and what they throw on it is caught: an hls.js-like player, which takes every update for one it asked for, sees no error, and fetches again what was removed${how}`, async () => {
+    const p = await tapPage(`${LONG}&buf&${mode}`, { init: [REMOVE_SPY] }), seen = [];
     p.on('pageerror', (e) => seen.push(String(e)));
     await connect(p);
     await p.run("window.__go().then(() => document.getElementById('a').play())");
@@ -1048,7 +1051,7 @@ describe('flushing the player before a drive', { concurrency: 3 }, () => {
     assert.equal((await removes(p)).length, 2, 'both steps of the flush were made');
     assert.ok((await driveStates(p)).includes('flushed'));
     assert.deepEqual(seen, [], 'the page saw an error from the flush');
-    assert.equal(await p.run('String(window.__sb.onupdatestart)'), '() => { window.__op.onStart(); }', 'the page reads back its own handler');
+    if (mode === 'hlsq') assert.equal(await p.run('String(window.__sb.onupdatestart)'), '() => { window.__op.onStart(); }', 'the page reads back its own handler');
     const g = await lastProgress(p);
     assert.ok(g.buffered.length === 1 && g.buffered[0][0] < 0.05 && g.buffered[0][1] > 179.9, JSON.stringify(g.buffered));
     await send(p, { t: 'drive', mode: 'stop' });
