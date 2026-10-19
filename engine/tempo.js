@@ -385,11 +385,13 @@ export class TempoTracker {
     while (this.beats.length && t - this.beats[0].t > this.o.fineSpanSec * sr) this.beats.shift();
     while (this.cuts.length && this.cuts[0] <= this.beats[0].t) this.cuts.shift();
     // Four beats are enough once their slope is sure to a tenth of a percent (each beat's own onset, at least a
-    // millisecond's jitter): a lock can read 0.6 % off, and the tempo shown is the lock's until the fit is there.
+    // millisecond's jitter): a lock can read 0.6 % off, and the tempo shown is the lock's until the fit is there. A
+    // fit whose slope is not that sure is not taken at any count (capture gaps not found yet can cut its beats into
+    // runs too short to say it).
     const m = this.beats.length;
     if (m < (this.carried ? 16 : 4)) return;
     const f = stepFit(this.beats, JUMP.min * sr, m >= 8 ? 3 : 0, 0.001 * sr, this.cuts);
-    if (!(f.a > 0) || (m < 8 && f.se > 1e-3 * f.a)) return;
+    if (!(f.a > 0) || f.se > 1e-3 * f.a) return;
     this.carried = false;
     this.fit = { a: f.a, b: f.b }; this.fineBpm = (60 * sr) / f.a / mult;
   }

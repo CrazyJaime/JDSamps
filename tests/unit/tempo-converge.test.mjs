@@ -193,6 +193,13 @@ test('the e2e Web-Audio page as one run captured it (its lock read 119.26): with
   assert.deepEqual(late, [], `locked at ${lock.t.toFixed(1)} s on ${lock.bpm.toFixed(3)}`);
 });
 
+test('a live deck with two capture gaps in its first beats after the lock, as one run captured it: within 0.1 %', () => {
+  // Neither gap was found yet when the fit reached eight beats; its steps cut the beats into runs too short to say
+  // the slope, and it read 123.0 (0.8 % slow) for seconds. A fit whose slope is not sure to 0.1 % is not taken.
+  const { lock, late } = captureWander('live-early-gaps-capture.json', 124);
+  assert.deepEqual(late, [], `locked at ${lock.t.toFixed(1)} s on ${lock.bpm.toFixed(3)}`);
+});
+
 test('a live deck through capture gaps as one run captured it (one gap found a few ms off, the next missed): within 0.1 %', () => {
   // The fine fit used to move the beats before a gap by the step found there: a step a few ms off (or a second gap
   // not found, its step taken into the first) tilted the fit, 0.18 % off for ten seconds. The beats now step at the
