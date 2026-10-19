@@ -325,6 +325,11 @@ test('a file that cannot be cut short (WebM) and is longer than twice the reside
   assert.equal(r.ok, false, JSON.stringify(r));
   assert.match(r.error, /“twice” is 2\.3 minutes long, too long to decode whole/);
   assert.deepEqual(decoded, [], 'it was decoded');
+  // A failed load stays on its deck as FAILED, with the reason and its report, until the DJ clears it.
+  const f = await deckWhere((x) => !had.has(x.id) && x.load.state === 'error');
+  assert.match(f.load.error, /too long to decode whole/);
+  assert.match(f.load.report, /failed: .*too long to decode whole/);
+  assert.equal((await act(deck, f.id, 'loadCancel')).ok, true);
   await waitFor(async () => !(await decks()).some((x) => !had.has(x.id)));
 });
 
