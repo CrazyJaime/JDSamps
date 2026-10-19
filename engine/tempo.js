@@ -674,6 +674,9 @@ export class DeckTempo {
     if (this.tapped) this.clock.T = ph.periodT;
     else if (ph.clarity >= 2 || this.clock.t0 == null) this.clock.update(ph.beatT + this.gridOffset, ph.periodT);
     else this.clock.T = ph.periodT;
+    // One tempo since the grid was last replaced or rescaled, and the fit only refines it: the grids remembered since
+    // take it, so the audio before a gap found later keeps its beat at the tempo found by then, not the lock's.
+    for (const h of this.hist) if (h.t > this.jumpFrom) h.T = this.clock.T;
     this.detectJump();
   }
 

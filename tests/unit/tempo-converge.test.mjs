@@ -7,6 +7,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { OdfCore } from '../../worklets/odf-core.js';
 import { DeckTempo } from '../../engine/tempo.js';
+import { GridMap } from '../../engine/timeshift.js';
 import { synth, PATTERNS, FS } from './fixtures/synth.mjs';
 
 /** The e2e test pages' sounds (makeTrackWav in tests/browser/ext-harness.mjs), after `lead` s of silence, at rate sr. */
@@ -143,5 +144,24 @@ test('capture gaps a few beats apart are each found, each with its own step', ()
       // A drop (ms > 0) brings the beats after it early: the grid's beats step by -ms.
       for (const [i, g] of want.entries()) assert.ok(Math.abs(f[i].D + g.ms) < 3 && Math.abs(f[i].from - at[i]) < T, say);
     }
+  }
+});
+
+test('a capture gap found soon after the lock: the grid before it has the tempo the fine fit found, not the lock\'s', () => {
+  // The grid the audio before a gap keeps is the one the clock had when the live edge passed it, seconds after the
+  // lock: at the tempo the lock read (0.15-0.4 % off), not the fine fit's that came later. A deck playing that audio
+  // seconds behind the live edge (a master, for the clock its followers lock to) ran that much fast or slow.
+  for (const [kind, bpm, at] of [['high', 128, 8.6], ['low', 124, 8.3], ['mid', 120, 8.9]]) {
+    const x = gap(blips({ kind, bpm, seconds: 30, lead: 0.0052 }), 44100, at, 15);
+    let deck;
+    const odf = new OdfCore(44100, (f, l, t) => deck.pushFrame(f, l, t));
+    deck = new DeckTempo({ sampleRate: 44100, fps: odf.fps });
+    const grids = new GridMap(), evaluate = deck.evaluate.bind(deck);
+    deck.evaluate = () => { evaluate(); const g = deck.get(); grids.update(g.grid, g.track); };
+    for (let s = 0; s + 128 <= x.length; s += 128) odf.push(x.subarray(s, s + 128), s);
+    const j = deck.get().track.jump;
+    assert.ok(j && Math.abs(j.from - at) < 60 / bpm, `${kind} ${bpm} BPM: the gap at ${at} s was found at ${j && j.from}`);
+    const before = grids.at(at - 1);
+    assert.ok(Math.abs((60 / before.T) / bpm - 1) < 2e-4, `${kind} ${bpm} BPM: the grid before the gap reads ${(60 / before.T).toFixed(3)} BPM`);
   }
 });
