@@ -228,7 +228,8 @@ test('two synced live decks: a minute of master recording at one tempo and on on
   assert.ok(Math.abs(m.tempoErr) < 0.002, `tempo error ${(m.tempoErr * 100).toFixed(4)} %`);
   assert.ok(med <= 20 && max <= 40, `beat offsets median ${med.toFixed(1)} ms, max ${max.toFixed(1)} ms`);
   // Around each spliced gap (from 2 s before it, the beats that lead into it, to 3 s after), neither deck bends; a gap
-  // with the box's own trouble around it is not judged, but most must be.
+  // with the box's own trouble around it (one of its capture skips can land on a spliced gap: both decks' captures skip
+  // together, seen twice in one run) is not judged, but half of them must be.
   let judged = 0;
   for (const g of heard) {
     const near = (slot) => bent[slot].filter((x) => x.t > g.t - 2 && x.t < g.t + 3 && smooth(x.t) && smooth(x.t + 1.5));
@@ -239,5 +240,5 @@ test('two synced live decks: a minute of master recording at one tempo and on on
       assert.ok(Math.abs(w.dev) <= 0.005, `deck ${slot} bent ${pct(w)} of the recording, around deck ${g.slot}'s ${g.ms} ms gap at ${g.t.toFixed(2)} s`);
     }
   }
-  assert.ok(judged >= 4, `only ${judged} of ${heard.length} spliced gaps clear of the box's own capture trouble: the run says too little`);
+  assert.ok(judged >= heard.length / 2, `only ${judged} of ${heard.length} spliced gaps clear of the box's own capture trouble: the run says too little`);
 });
