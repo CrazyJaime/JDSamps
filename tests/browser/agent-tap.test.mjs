@@ -93,7 +93,8 @@ function fixtures() {
 // &xhr (load with XMLHttpRequest) &raw (open a SourceBuffer and append nothing: __push does)
 // &prog (also a progressive <audio src>) &buf (choose what to fetch from the SourceBuffer's buffered
 // ranges, as real players do, not from what it has appended: what is removed is fetched again)
-// &video (a second SourceBuffer, of pictures, on the same MediaSource: empty until the test appends to __vsb). Event handlers are on*
+// &video (a second SourceBuffer, of pictures, on the same MediaSource: empty until the test appends to __vsb)
+// &eos1 (ends its stream the first time it holds all of it, never again). Event handlers are on*
 // properties, never addEventListener, so the dormancy test can count every listener the agent adds.
 const PLAYER = `<!doctype html><title>player</title><body><audio id="a"></audio><script>
 (() => {
@@ -142,7 +143,7 @@ const PLAYER = `<!doctype html><title>player</title><body><audio id="a"></audio>
       await push(buf);
       window.__fx.appended.push(k);
     }
-    if (sb === s && (BUF ? full() : have.size === N) && ms.readyState === 'open' && !sb.updating) ms.endOfStream();
+    if (sb === s && (BUF ? full() : have.size === N) && ms.readyState === 'open' && !sb.updating && !(q.has('eos1') && window.__eos)) { window.__eos = true; ms.endOfStream(); }
   }
   const pump = () => (chain = chain.then(pass, pass));
   window.__pump = pump; // __limit (s): a player that will not buffer past it
@@ -1114,6 +1115,88 @@ describe('flushing the player before a drive', { concurrency: 3 }, () => {
     assert.deepEqual(await sbRanges(p), held);
     await send(p, { t: 'drive', mode: 'stop' });
     assert.deepEqual([(await media(p)).t, (await media(p)).muted], [0, false]);
+    await checkPosted(p);
+    await p.close();
+  });
+
+  // Loading the same tab again: the first load's drive had the player buffer all of the track, and the player ended its
+  // stream. The tap was told to forget, so all of it has to come from the player again.
+  const release = async (p) => { await send(p, { t: 'drive', mode: 'stop' }); await send(p, { t: 'stop' }); await send(p, { t: 'tap', on: false, forget: true }); };
+  const since = async (p, k0, t) => (await posted(p)).slice(k0).filter((m) => m.t === t);
+
+  test('a MediaSource the drive itself ended is flushed on a later drive: the second load captures the whole track again, byte for byte', async () => {
+    const p = await tapPage(`${LONG}&buf`, { init: [REMOVE_SPY] });
+    await connect(p);
+    await p.run("window.__go().then(() => document.getElementById('a').play())");
+    await waitFor(async () => { const m = await media(p); return !m.paused && m.t > 1; }, 5000);
+    await bufferedTo(p, 20);
+    await send(p, { t: 'tap', on: true });
+    await send(p, { t: 'drive', mode: 'seekhop', flush: true });
+    await waitFor(async () => (await driveState(p)) === 'done', 15000, 100);
+    await waitFor(() => p.run("window.__ms.readyState === 'ended'"), 5000); // holding all of it, the player ended its stream
+    await release(p);
+    assert.equal(await p.run('window.__ms.readyState'), 'ended');
+    // The DJ plays it on the tab for a while, then loads it again.
+    await p.run("document.getElementById('a').play()");
+    const t1 = (await media(p)).t;
+    await waitFor(async () => (await media(p)).t > t1 + 1, 5000);
+    const k0 = (await posted(p)).length, r0 = (await removes(p)).length;
+    await send(p, { t: 'tap', on: true });
+    const t0 = (await media(p)).t;
+    await send(p, { t: 'drive', mode: 'seekhop', flush: true });
+    const said = async () => (await since(p, k0, 'tap-progress')).filter((g) => g.drive).map((g) => g.drive);
+    await waitFor(async () => (await said()).some((d) => d.state === 'done' || d.unflushed), 15000, 100);
+    assert.ok(!(await said()).some((d) => d.unflushed), `flushed, not refused: ${JSON.stringify(await said())}`);
+    await waitFor(async () => (await said()).some((d) => d.state === 'done'), 15000, 100)
+      .catch(async () => assert.fail(`not done: ${JSON.stringify(await lastProgress(p))}, appended ${await p.run('JSON.stringify(window.__fx.appended)')}`));
+    const states = (await said()).map((d) => d.state);
+    assert.equal(states.filter((x) => x === 'flushed').length, 1, `flushed said once: ${states}`);
+    const rm = (await removes(p)).slice(r0);
+    assert.ok(rm.length === 2 && rm.every((r) => r[0] === MIME) && rm[0][1] === 0 && rm[0][2] > 0.25 && rm[0][2] < t0 && rm[1][1] === rm[0][2] && rm[1][2] > 179.9,
+      `what lies behind its place, then the rest: ${JSON.stringify(rm)} (at ${t0})`);
+    const parts = async () => (await since(p, k0, 'tap-ready')).flatMap((m) => m.parts);
+    await waitFor(async () => (await parts()).length >= 46, 3000);
+    const got = await blobShas(p, (await parts()).map((x) => x.blobUrl)), want = [fx.long.init, ...fx.long.segs.slice(0, 45)].map(sha);
+    assert.deepEqual(want.filter((x) => !got.includes(x)), [], 'every piece from 0 to the end of the 3:00, again');
+    assert.deepEqual(got.filter((x) => !want.includes(x)), [], 'byte for byte the files served');
+    await send(p, { t: 'drive', mode: 'stop' });
+    const m = await media(p);
+    assert.deepEqual([m.paused, m.muted, m.rate, m.pp], [false, false, 1, true]);
+    assert.ok(m.t >= t0 && m.t < t0 + 1.5, `back where it was: ${m.t} (drive at ${t0})`);
+    await waitFor(async () => (await media(p)).t > m.t + 0.5, 5000).catch(async () => assert.fail(`it does not play again: ${JSON.stringify(await media(p))}`));
+    await checkPosted(p);
+    await p.close();
+  });
+
+  test('a stream the drive ended, reopened by a later flush the player does not fetch back (it never fetches a piece twice), is ended again: said sticky, its length kept, and it still plays to its end', async () => {
+    const p = await tapPage(`${LONG}&eos1`, { init: [REMOVE_SPY] }); // no &buf; &eos1: it ends its stream once only
+    await connect(p);
+    await send(p, { t: 'tap', on: true }); // on from the start: nothing to flush the first time
+    await p.run('window.__go()');
+    await bufferedTo(p, 20);
+    await send(p, { t: 'drive', mode: 'seekhop' });
+    await waitFor(async () => (await driveState(p)) === 'done', 15000, 100);
+    await waitFor(() => p.run("window.__ms.readyState === 'ended'"), 5000);
+    await release(p);
+    const len = await p.run('window.__ms.duration');
+    assert.ok(len > 179.9, `${len}`);
+    await p.run("document.getElementById('a').currentTime = 10"); // the DJ moves it on in the tab, then loads it again
+    await waitFor(() => p.run("!document.getElementById('a').seeking"), 3000);
+    const k0 = (await posted(p)).length, r0 = (await removes(p)).length;
+    await send(p, { t: 'tap', on: true });
+    await send(p, { t: 'drive', mode: 'seekhop', flush: true });
+    const said = async () => (await since(p, k0, 'tap-progress')).filter((g) => g.drive).map((g) => g.drive);
+    await waitFor(async () => (await said()).some((d) => d.unflushed), 8000)
+      .catch(async () => assert.fail(`nothing said: ${JSON.stringify(await said())}`));
+    assert.equal((await said()).find((d) => d.unflushed).unflushed, 'sticky');
+    assert.deepEqual((await removes(p)).slice(r0), [[MIME, 0, 9]], 'only what lies behind its place');
+    assert.deepEqual([await p.run('window.__ms.readyState'), await p.run('window.__ms.duration')], ['ended', len], 'ended again, at its own length');
+    await send(p, { t: 'drive', mode: 'stop' });
+    const m = await media(p);
+    assert.deepEqual([m.t, m.paused, m.muted], [10, true, false]);
+    await p.run("(() => { const a = document.getElementById('a'); a.currentTime = 178; return a.play(); })()");
+    await waitFor(() => p.run("document.getElementById('a').ended"), 8000)
+      .catch(async () => assert.fail(`it does not reach its end: ${JSON.stringify(await media(p))}, ${await p.run('window.__ms.readyState')}`));
     await checkPosted(p);
     await p.close();
   });

@@ -439,6 +439,26 @@ test('a YouTube-like page whose player never fetches a piece twice (?sticky=1), 
   await assertLive(d, site, why);
 });
 
+test('a YouTube-like page loaded a second time, after its first load drove its player through the whole track, ends resident again', async () => {
+  // The first load's drive leaves the player holding all of the track, its stream ended. The DJ plays the track on the
+  // tab again for a while (or wants it on a second deck too), then loads the tab again.
+  const site = await openSite('opaque');
+  await waitFor(() => site.tab.evaluate(() => { const m = window.__media(); return !m.paused && m.t > 3; }), 20000);
+  const d1 = await loadTab(site.tabId);
+  assert.equal(d1.kind, 'resident', JSON.stringify(d1.load));
+  await deckWhere((x) => x.id === d1.id && x.tabId === null, 5000);
+  assert.equal(await site.tab.evaluate(() => window.__mse.ms.readyState), 'ended', 'the drive had the player buffer all of it');
+  await site.tab.evaluate(() => document.querySelector('audio').play());
+  const t1 = (await player(site.tab)).t;
+  await waitFor(async () => (await player(site.tab)).t > t1 + 2, 8000);
+  const d2 = await loadTab(site.tabId);
+  assert.equal(d2.kind, 'resident', JSON.stringify(d2.load));
+  assert.ok(Math.abs(d2.duration - OPUS_END) < 0.015, `duration ${d2.duration}`);
+  await assertBytesTrue(d2.id);
+  assert.match(d2.load.report, /drive \(seek-hop after a flush\): ok/);
+  await assertReleased(d2, site);
+});
+
 test('a Bandcamp-like page ends resident from its own track link', async () => {
   const site = await openSite('bandcamp');
   await playing(site.tab);

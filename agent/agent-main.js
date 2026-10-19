@@ -720,7 +720,9 @@
     if (!el) { emit(JSON.stringify({ t: 'tap-error', reason: 'none', detail: 'no player to drive' })); return; }
     if (!drv.mode) {
       drv.el = el;
-      drv.base = { t: el.currentTime, paused: el.paused, rate: el.playbackRate, dflt: el.defaultPlaybackRate, pp: el.preservesPitch, muted: el.muted, volume: el.volume };
+      const ms = msOf(el);
+      drv.base = { t: el.currentTime, paused: el.paused, rate: el.playbackRate, dflt: el.defaultPlaybackRate, pp: el.preservesPitch, muted: el.muted, volume: el.volume,
+        open: ms && ms.readyState === 'open' ? ms : null };
       drv.timer = setInterval(driveCheck, 250);
     } else if (st.enforcing) release(); // from accelerate to seekhop
     drv.mode = m.mode; drv.since = performance.now(); drv.gen++;
@@ -788,6 +790,7 @@
     Object.assign(drv, { mode: null, el: null, base: null, state: '', timer: 0, flushing: false, told: false, unflushed: '' });
     drv.gen++; // a flush still waiting on the player stops there
     if (st.enforcing) release();
+    try { if (base.open && base.open.readyState === 'ended') droveEnd.add(base.open); } catch (_) {}
     try {
       el.defaultPlaybackRate = base.dflt; el.playbackRate = base.rate; el.preservesPitch = base.pp;
       el.muted = base.muted; el.volume = base.volume;
@@ -810,24 +813,47 @@
   // its place to try this on: not flushed, said 'start'. A player that empties its buffer itself on that
   // seek (shaka, while it holds anything) has let go of all it held from before the tap: the rest is not
   // taken from it, which would leave it a hole it never fetches.
-  // A MediaSource that has ended is left alone: a remove would reopen it and fire sourceopen, which a
-  // player may take for a fresh start, and nothing would end the stream again. Said in tap-progress:
+  // A MediaSource the player has ended is left alone: a remove would reopen it and fire sourceopen, which a
+  // player may take for a fresh start, and nothing would end the stream again. One a drive ended (it buffered
+  // all of it because it was driven) is flushed all the same, or the tab could never be loaded again; if the
+  // player does not take its buffer back, the stream is ended again, at its own length. Said in tap-progress:
   // drive.state 'flushed' once, or drive.unflushed (why not) while the drive goes on without it.
   const sbRemove = window.SourceBuffer ? SourceBuffer.prototype.remove : null, FLUSH_WAIT = 3000, PROBE_WAIT = 3000, KEEP = 1, MIN_CUT = 0.25;
-  /** The driven player's MediaSource and its sound SourceBuffers, or {why} it cannot be flushed. */
-  function flushable(el) {
+  const msEnd = window.MediaSource ? MediaSource.prototype.endOfStream : null;
+  const droveEnd = new WeakSet(); // MediaSources a drive ended
+  /** The MediaSource el plays, if the tap saw its blob: URL made. */
+  function msOf(el) {
     let src = '';
     try { src = el.currentSrc || el.src || ''; } catch (_) {}
-    const r = /^blob:/i.test(src) ? msUrls.get(src) : null, ms = r && r.deref();
+    const r = /^blob:/i.test(src) ? msUrls.get(src) : null;
+    return (r && r.deref()) || null;
+  }
+  /** The driven player's MediaSource and its sound SourceBuffers (ended: a drive ended it), or {why} it cannot be flushed. */
+  function flushable(el) {
+    const ms = msOf(el);
     if (!ms || !sbRemove) return { why: 'none' };
     try {
-      if (ms.readyState === 'ended') return { why: 'ended' };
-      if (ms.readyState !== 'open') return { why: 'none' };
+      const ended = ms.readyState === 'ended';
+      if (ended && !droveEnd.has(ms)) return { why: 'ended' };
+      if (!ended && ms.readyState !== 'open') return { why: 'none' };
       const list = [], all = ms.sourceBuffers;
       let pics = 0;
       for (let i = 0; i < all.length; i++) { const rec = sbs.get(all[i]); if (rec && rec.skip) pics++; else if (rec) list.push(all[i]); }
-      return list.length ? { ms, list } : { why: pics ? 'video' : 'none' };
+      return list.length ? { ms, list, ended } : { why: pics ? 'video' : 'none' };
     } catch (_) { return { why: 'none' }; }
+  }
+  /** End again a stream a flush reopened and could not empty, unless that would cut its length (or it is busy). */
+  function endAgain(ms) {
+    try {
+      const all = ms.sourceBuffers;
+      let end = 0;
+      for (let i = 0; i < all.length; i++) {
+        if (all[i].updating) return;
+        const b = all[i].buffered;
+        if (b.length) end = Math.max(end, b.end(b.length - 1));
+      }
+      if (ms.readyState === 'open' && msEnd && end >= ms.duration - 0.01) msEnd.call(ms);
+    } catch (_) {}
   }
   /** Until sb is free and stays so into the next task (a player appends again right after its own updateend). */
   async function free(sb) {
@@ -864,6 +890,7 @@
     if (!f.why && !(at >= MIN_CUT)) f.why = 'start';
     if (f.why) { drv.unflushed = f.why; go(); return; }
     drv.flushing = true;
+    let whole = false;
     try {
       const ends = []; // where what each held from before the tap ends
       for (const sb of f.list) {
@@ -883,11 +910,13 @@
           if (!Number.isFinite(end)) { const b = sb.buffered; end = b.length ? b.end(b.length - 1) : 0; }
           if (!(await cut(sb, at, end, gen))) return;
         }
-        drv.told = true;
+        drv.told = whole = true;
       }
     } catch (_) {
       if (gen !== drv.gen) return;
       drv.unflushed = 'none'; // the player took its buffer back meanwhile, or the remove failed
+    } finally {
+      if (f.ended && !whole) endAgain(f.ms);
     }
     drv.flushing = false;
     go();
