@@ -318,6 +318,54 @@ test('MSE that carries no timestamps (MP3) is never seek-hopped: the player is r
   assert.deepEqual(asked(tab), ['tap on', 'readTralbum', 'drive accelerate']);
 });
 
+/**
+ * An HLS playlist of MP3 pieces (packed audio: no EXT-X-MAP, .mp3 pieces) as a SoundCloud-style MSE player reads it,
+ * appending 'audio/mpeg': 30 pieces of 4.032 s (56 frames of 72 ms), their times only in the playlist's EXTINF.
+ */
+function mp3Hls(origin = 'https://cdn.example') {
+  const SEG = 56 * 0.072, base = `${origin}/media`;
+  const r = { rep: 'mp3', mime: 'audio/mpeg', list: `${base}/mp3.m3u8`, init: { url: `${base}/unused-init`, bytes: new ArrayBuffer(0) },
+    segs: Array.from({ length: 30 }, (_, k) => ({ url: `${base}/seg-${k}.mp3`, t0: k * SEG, t1: (k + 1) * SEG, bytes: mp3(4) })) };
+  const text = ['#EXTM3U', '#EXT-X-VERSION:3', '#EXT-X-TARGETDURATION:5', '#EXT-X-PLAYLIST-TYPE:VOD',
+    ...r.segs.flatMap((s, k) => [`#EXTINF:${SEG.toFixed(3)},`, `seg-${k}.mp3`]), '#EXT-X-ENDLIST', ''].join('\n');
+  return { r, D: 30 * SEG, before: ({ tab }) => { tab.net.set(r.list, new TextEncoder().encode(text).buffer); } };
+}
+
+for (const [when, preTap] of [['already playing when it is loaded', 2], ['started after the tap', 0]]) {
+  test(`an HLS playlist of MP3 pieces (no timestamps of their own), its player ${when}: every piece from the first is fetched and placed alone, resident`, async () => {
+    const { r, D, before } = mp3Hls();
+    const { result, tab, engine, deck } = await load({ kind: 'mse', rendition: r, preTap, playing: 2, list: true, segUrls: true, mimes: ['audio/mpeg'], duration: D }, { before });
+    assert.equal(result.kind, 'resident', deck.load.report);
+    const [list, pieces] = tab.sent().filter((m) => m.t === 'fetch');
+    assert.deepEqual(list.urls, [r.list]);
+    assert.deepEqual(pieces.urls, r.segs.map((s) => s.url), 'every piece, in order from the first: where the capture starts cannot be known');
+    const [s] = called(engine, 'startResidentDeck');
+    assert.ok(near(s.frames / SR, D, 0.01), `${s.frames / SR} s of ${D} s`);
+    assert.match(deck.load.report, /refetch \(fetching the track's pieces\): ok in \d+\.\d s — 30 pieces fetched/);
+    assert.ok(!tab.kinds().some((k) => /drive (seekhop|accelerate)/.test(k)), 'not driven');
+  });
+}
+
+test('an HLS playlist of MP3 pieces longer than the resident limit fetches only the pieces up to it, from the first', async () => {
+  const { r, D, before } = mp3Hls();
+  const { result, tab, engine } = await load({ kind: 'mse', rendition: r, preTap: 2, playing: 2, list: true, segUrls: true, mimes: ['audio/mpeg'], duration: D }, { before, limitMin: 1 });
+  assert.equal(result.kind, 'resident');
+  assert.deepEqual(tab.sent().filter((m) => m.t === 'fetch')[1].urls, r.segs.slice(0, 16).map((s) => s.url), 'pieces 0–15: up to a second past the limit');
+  assert.equal(called(engine, 'startResidentDeck')[0].frames, 60 * SR);
+  assert.match(engine.notes[0].text, /the deck holds its first 1 minute/);
+});
+
+test('MP3 pieces from a playlist that cannot all be fetched are never placed beside the player\'s capture: the drive gives the whole track', async () => {
+  const { r, D, before } = mp3Hls(), lost = r.segs[10];
+  const { result, tab, engine, deck } = await load({ kind: 'mse', rendition: r, preTap: 0, playing: 2, list: true, segUrls: true, mimes: ['audio/mpeg'], duration: D },
+    { before: (o) => { before(o); o.tab.net.delete(lost.url); } });
+  assert.equal(result.kind, 'resident', deck.load.report);
+  assert.match(deck.load.report, /refetch \(fetching the track's pieces\): failed in \d+\.\d s — 29 pieces fetched, 1 failed, still missing 40\.3–44\.4 s/);
+  assert.match(deck.load.report, /drive \(accelerate 8×\): ok/);
+  assert.deepEqual(tab.sent().filter((m) => m.t === 'drive' && m.mode !== 'stop').map((m) => m.mode), ['accelerate']);
+  assert.ok(near(called(engine, 'startResidentDeck')[0].frames / SR, D, 0.01));
+});
+
 // ---------------------------------------------------------------- the load report (R4.2)
 test('a resident load leaves a plain-text report: host, every rung and how it ended, mimes, counts, bytes, timings, no failure', async () => {
   const { deck } = await load({ kind: 'mse', rendition: hi(), preTap: 6, playing: 3, list: true, segUrls: true });
