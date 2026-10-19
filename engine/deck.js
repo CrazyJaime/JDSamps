@@ -13,7 +13,7 @@ import { createIsolator, createTrim } from './eq.js';
 import { createFxRack } from './fx.js';
 import { Recorder } from './recorder.js';
 import { glide } from './params.js';
-import { syncRatio, lastBeatOut, phaseError, planCorrection, engineSemitones, assistStep, pickAutoMaster, MULT_MARGIN } from './sync.js';
+import { syncRatio, lastBeatOut, phaseError, planCorrection, engineSemitones, assistStep, pickAutoMaster, MULT_MARGIN, PHASE_DEADBAND } from './sync.js';
 import { OdfCore } from '../worklets/odf-core.js';
 
 const OK = { ok: true };
@@ -992,7 +992,10 @@ export class Deck {
     if (!this.skipFits(s, T)) { this.skips.add(s); return; } // the phase loop sees to it
     if (pend >= T) return; // a change lands after the gap: jumped by the phase loop once it is through
     this.skips.add(s);
-    const input = ts.clampInput(ts.posAt(T) + s.shift), fields = { input, rate: this.effRate(input), semitones: this.semis(input) };
+    // A follower a few ms off the beat, inside the phase loop's deadband, takes that off too: else the jump's own ms of
+    // error can tip it over, and the loop bends right after the gap.
+    const off = !this.isMaster() && this.phaseMs != null && Math.abs(this.phaseMs) <= PHASE_DEADBAND * 1000 ? (this.phaseMs / 1000) * ts.rateAt(T) : 0;
+    const input = ts.clampInput(ts.posAt(T) + s.shift + off), fields = { input, rate: this.effRate(input), semitones: this.semis(input) };
     if (pend >= now) ts.then(now, T, fields); else ts.change(now, T, fields);
     this.skipAt = T;
     this.settleUntil = Math.max(this.settleUntil, T + 0.3);

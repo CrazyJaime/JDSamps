@@ -126,6 +126,23 @@ test('under a held nudge the gap is played as it came', async () => {
   assert.deepEqual(w.jumps, []);
 });
 
+test('a follower sitting a few ms off the beat (inside the phase loop\'s deadband) jumps that off with the gap', async () => {
+  // Otherwise the jump's own millisecond of error can tip it over the deadband, and the loop bends 1.5 % right after
+  // the gap (seen in the browser: 4.5 ms off before a 20 ms gap, 6.1 ms after, then a bend).
+  const { clock, engine, d } = await rig();
+  const r = d.ts.rateAt(clock.t), T = d.ts.soon(clock.t);
+  d.sched(T, { input: d.ts.posAt(T) - 0.004 * r }); // 4 ms late
+  run(engine, clock, 2);
+  const late = clockErrMs(engine, d, clock.t);
+  assert.ok(late > 3.5 && late < 4.5, `${late.toFixed(2)} ms off before the gap`);
+  const X = gap(d, clock, 2, -15);
+  const w = watch(engine, clock, d, 4, { quiet: { X, w: 0.02 } });
+  assert.equal(w.jumps.length, 1, JSON.stringify(w.jumps));
+  assert.ok(Math.abs(w.jumps[0].by - (-0.015 + late / 1000 * r)) < 2e-4, `jumped ${(w.jumps[0].by * 1000).toFixed(2)} ms`);
+  assert.ok(Math.abs(clockErrMs(engine, d, clock.t)) < 1, `${clockErrMs(engine, d, clock.t).toFixed(2)} ms off after the gap`);
+  assert.ok(w.bend < 0.002, `bent ${(w.bend * 100).toFixed(2)} %`);
+});
+
 test('a gap found after the playhead went through it: the phase loop jumps the step when its error is that step', async () => {
   const { clock, engine, d } = await rig();
   run(engine, clock, 0.5 - ((clock.t - 100) % 0.5) + TICK); // just past a phase-loop look
