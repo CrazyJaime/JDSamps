@@ -642,7 +642,7 @@ export class DeckTempo {
   }
 
   /** Look for capture gaps only after input frame t (the grid was replaced or rescaled there). */
-  jumpsFrom(t) { this.jumpFrom = t; this.jumpCand = null; this.gaps = []; }
+  jumpsFrom(t) { this.jumpFrom = t; this.jumpCand = null; this.gaps = []; this.heard = []; }
 
   /**
    * New BPM range: fold the tempo into it by octaves, keeping the lock, the grid (anchor beat
@@ -690,6 +690,27 @@ export class DeckTempo {
     let h = null;
     for (const e of this.hist) { if (e.t <= at) h = e; else break; }
     return h && h.t >= from ? { t0: h.t0 / this.sr, T: h.T / this.sr } : null;
+  }
+
+  /**
+   * Where the beats measured at the live edge (this.heard: each beat's onset in the window, the last 16 s) put the beat
+   * nearest input frame `at`: the median of those between frames `from` and `to` within 1.5 s of it, each carried there
+   * at period T; null with fewer than 3.
+   */
+  beatNear(at, T, from = -Infinity, to = Infinity) {
+    const w = 1.5 * this.sr, xs = [];
+    for (const x of this.heard) if (x >= from && x < to && Math.abs(x - at) <= w) xs.push(x + Math.round((at - x) / T) * T);
+    if (xs.length < 3) return null;
+    xs.sort((x, y) => x - y);
+    return xs[xs.length >> 1];
+  }
+
+  /** Keep where the window's beats rs ({beat, r}, oldest first) are, each its onset, over what was kept for that span. */
+  noteBeats(rs) {
+    if (!rs.length) return;
+    const T = this.clock.T, lo = rs[0].beat - T / 2, h = this.heard.filter((x) => x < lo && x > this.tracker.lastT - 16 * this.sr);
+    for (const x of rs) h.push(x.beat + x.r);
+    this.heard = h;
   }
 
   /**
@@ -864,6 +885,7 @@ export class DeckTempo {
     if (clock.t0 == null || !(clock.T > 0) || tr.cand) { this.jumpCand = null; return; }
     // The comb's own start (tr.phaseFrom) cuts the window only for a rate step: a gap's is in gaps.
     const rs = this.beatOffsets(Math.max(this.jumpFrom, this.gaps.length ? -Infinity : tr.phaseFrom, this.track.from * sr));
+    this.noteBeats(rs);
     if (rs.length && this.gaps.some((g) => g.at <= rs[0].beat)) this.gaps = this.gaps.filter((g) => g.at > rs[0].beat); // no beat before them left
     const gaps = this.gaps;
     const r = rs.map((x) => { let v = x.r; for (const g of gaps) if (x.beat < g.at) v += g.D; return v; });

@@ -1247,17 +1247,20 @@ export class Deck {
 
   /**
    * The grid of the audio at input position p, for its beat and tempo as heard: in a grid map segment of the track the
-   * tracker follows, its clock as the live edge passed p, when that was in the segment. The segment's own grid is one
-   * for all of it: until a later gap is found, the live clock, which follows the beats at the live edge, seconds on,
-   * and takes in a gap there before it is found (a master's clock published from it moved 10 ms off its audio's beat,
-   * a gap found 6 s late, and its followers bent after it); once frozen, the beats just before that gap, off those
-   * before a step in it the tracker never found.
+   * tracker follows, at the period its clock had as the live edge passed p, through the beats the tracker measured
+   * there (in the segment, within 1.5 s); without three of them, its clock then, when that was in the segment. The
+   * segment's own grid is one for all of it: until a later gap is found, the live clock, which follows the beats at the
+   * live edge, seconds on, and takes in a gap there before it is found (a master's clock published from it moved 10 ms
+   * off its audio's beat, a gap found 6 s late, and its followers bent after it); once frozen, the beats just before
+   * that gap. The clock as the live edge passed p can still be settling after a burst of gaps (7-8 ms off its beats).
    */
   gridAt(p) {
-    const s = this.grids.seg(p), t = this.tempo;
+    const segs = this.grids.segs, s = this.grids.seg(p), t = this.tempo;
     if (!s || !s.grid || !t || t.seeded || t.tapped || !t.heardGrid || s.track !== t.track.n) return s ? s.grid : null;
-    const h = t.heardGrid(Math.round(p * t.sr), s.from * t.sr);
-    return h ? { ...s.grid, t0: h.t0, T: h.T } : s.grid;
+    const sr = t.sr, at = Math.round(p * sr), i = segs.indexOf(s), to = i + 1 < segs.length ? segs[i + 1].from * sr : Infinity;
+    const h = t.heardGrid(at, s.from * sr), T = h ? h.T : s.grid.T, b = t.beatNear(at, T * sr, s.from * sr, to);
+    if (b == null) return h ? { ...s.grid, t0: h.t0, T } : s.grid;
+    return { ...s.grid, t0: b / sr, T };
   }
 
   /**

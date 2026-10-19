@@ -553,3 +553,38 @@ test('a follower whose live grid takes in a gap of its own not found yet (the sa
   assert.ok(bend < 0.002, `the follower bent ${(bend * 100).toFixed(2)} %`);
 });
 
+test('a follower through a burst of capture gaps (one run\'s capture): put back on the master\'s beat at once, then left unbent', async () => {
+  // The burst's steps (-51 ms over two beats) were jumped but for 10 ms, played as they came. The clocks the tracker
+  // remembered as the live edge passed that audio had not taken those 10 ms in yet: a follower measuring its beat
+  // against them read itself on the beat for 5 s with its audio 7-9 ms off the master's, then, as the clocks caught
+  // up, 9 ms off, and bent 2.2 % there, seconds from any capture trouble (a live-sync run's failure). The fine fit's own
+  // beats, each its onset, say where its audio's beats are.
+  const c = JSON.parse(fs.readFileSync(new URL('./fixtures/live-burst-recover-capture.json', import.meta.url), 'utf8'));
+  const clock = { t: 100 }, engine = makeEngine(clock), T = 60 / 124, on = captureOnsets(c, 'low', T);
+  engine.params['assist.on'] = false;
+  const m = makeDeck(engine, clock, { id: 1, slot: 1, bpm: 128, liveEdge: 600, capSec: 1e7 });
+  const d = makeDeck(engine, clock, { id: 2, slot: 2, bpm: 124, liveEdge: 600, capSec: 1e7 });
+  const feed = replays(d, c);
+  await m.act('play');
+  engine.clock.follow(1);
+  run(engine, clock, 6, feed); // the follower's playhead will be 6 s behind its live edge
+  assert.deepEqual(await d.act('syncPlay'), { ok: true });
+  // Its audio's beat (its last onset played since its last change of segment) against the master's clock, and its bends.
+  const offs = [];
+  let bend = 0, at = null;
+  run(engine, clock, 53.5, (t) => {
+    feed(t);
+    const p = d.node.posAt(t), seg = d.node.segAt(t), mb = engine.clock.beat(t);
+    if (p > 50 && bendOf(d, t) > bend) { bend = bendOf(d, t); at = p; }
+    if (!seg.active || !(seg.rate > 0) || !mb) return;
+    let b = 0;
+    while (b + 1 < on.length && on[b + 1] <= p) b++;
+    if (on[b] >= seg.input) offs.push({ p, e: phaseError(t - (p - on[b]) / seg.rate, T / seg.rate, mb.lastBeat, mb.period) * 1000 });
+  });
+  assert.ok(d.ts.posAt(clock.t) > 53.5, `played to input ${d.ts.posAt(clock.t).toFixed(1)} s`);
+  // (These onsets sit up to 2.5 ms either side of a steady grid, as the beats fall between the analysis frames.)
+  const P = (T * 1000 * 124) / 128, wrap = (x) => x - Math.round(x / P) * P, ref = offs.find((o) => o.p > 37).e;
+  const off = offs.filter((o) => o.p > 50 && Math.abs(wrap(o.e - ref)) > 4).map((o) => `${wrap(o.e - ref).toFixed(1)} ms at ${o.p.toFixed(2)} s`);
+  assert.deepEqual(off.filter((x, i) => i % 10 === 0), [], `its audio off the master's beat as before the burst by over 4 ms ${off.length} times`);
+  assert.ok(bend < 0.002, `the follower bent ${(bend * 100).toFixed(2)} % at input ${at && at.toFixed(2)} s`);
+});
