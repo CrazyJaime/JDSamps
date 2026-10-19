@@ -611,7 +611,8 @@ export class DeckTempo {
     // and prev is the previous track's grid as it stood there. jump is the latest capture gap in
     // it: n counts them, from (input s) is where the beat phase jumped and prev the grid before.
     this.track = { n: this.track ? this.track.n + 1 : 0, from: this.tracker.lastT / this.sr, prev: null, jump: null };
-    this.hist = []; // recent beat-clock states {t, t0, T} (input frames), oldest first
+    this.hist = []; // recent beat-clock states {t, t0, T} (input frames), oldest first; fine: T was the fine fit's
+    this.clockFine = false; // the clock's period is the fine fit's
     // Whether the grid was worth phase-locking to as the live edge passed each input frame, as
     // {t, ok} runs, so the deck can ask about the audio under the playhead and not the live edge.
     this.vouch = [];
@@ -647,7 +648,7 @@ export class DeckTempo {
   /** Remember the beat clock as it stands now, for the grid an old track keeps after a track change. */
   remember() {
     const t = this.tracker.lastT;
-    this.hist.push({ t, t0: this.clock.t0, T: this.clock.T });
+    this.hist.push({ t, t0: this.clock.t0, T: this.clock.T, fine: this.clockFine });
     while (this.hist.length && this.hist[0].t < t - 16 * this.sr) this.hist.shift();
   }
 
@@ -726,14 +727,18 @@ export class DeckTempo {
     const usable = this.tapped || this.tracker.state === 'locked';
     if (!bpm || !usable || this.snap.state === 'hold') return;
     if (this.tracker.full.count < (2.2 * 60 * this.fps) / bpm) return;
+    const fine = !this.tapped && this.tracker.fineBpm > 0 && this.snap.bpm === this.tracker.fineBpm; // (phase() moves the fit)
     const ph = this.tracker.phase(bpm, this.tapped ? 1 : this.mult);
     // A tapped grid is the DJ's: detection may follow the period, never the anchor beat they set.
     if (this.tapped) this.clock.T = ph.periodT;
     else if (ph.clarity >= 2 || this.clock.t0 == null) this.clock.update(ph.beatT + this.gridOffset, ph.periodT);
     else this.clock.T = ph.periodT;
-    // One tempo since the grid was last replaced or rescaled, and the fit only refines it: the grids remembered since
-    // take it, so the audio before a gap found later keeps its beat at the tempo found by then, not the lock's.
-    for (const h of this.hist) if (h.t > this.jumpFrom) h.T = this.clock.T;
+    // One tempo since the grid was last replaced or rescaled, and the fit only refines it: the grids remembered since,
+    // before the fine fit took over, take its period, so the audio before a gap found later keeps its beat at the tempo
+    // found by then, not the lock's. Those remembered at the fine fit's period keep theirs: a new track bleeding into the
+    // clock before it is taken as one must not move the old track's.
+    this.clockFine = fine;
+    if (fine) for (const h of this.hist) if (h.t > this.jumpFrom && !h.fine) h.T = this.clock.T;
     this.detectJump();
   }
 

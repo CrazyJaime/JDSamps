@@ -224,6 +224,32 @@ test('the old track keeps the grid it had before the new track bled into the bea
   assert.ok(checked);
 });
 
+test('crossfaded into a new track: the old track keeps the tempo and beat it had, to a hundredth of a percent', () => {
+  // While the new track bleeds into the beat clock (seconds before its tempo is taken as a new track), the clock's
+  // period moves toward it. The grids remembered for the old track must keep the period they had: the audio still to
+  // play from it (the playhead is seconds behind) was 0.04-0.05 % slow and up to 6 ms off its beat 12 s back.
+  const A = synth({ ...PATTERNS.house, bars: 40, tail: 0 });
+  for (const [name, bpm, xf] of [['techno', 129, 4], ['techno', 129, 6], ['house', 128.9, 6], ['techno', 132.7, 4]]) {
+    const B = synth({ ...PATTERNS[name], bpm, bars: 30, tail: 0, seed: 9 });
+    const n = Math.round(xf * FS), start = A.x.length - n, x = new Float32Array(A.x.length + B.x.length - n);
+    for (let i = 0; i < A.x.length; i++) x[i] += A.x[i] * (i < start ? 1 : 1 - (i - start) / n);
+    for (let i = 0; i < B.x.length; i++) x[start + i] += B.x[i] * (i < n ? i / n : 1);
+    const end = start / FS, grids = new GridMap();
+    let seen = null;
+    run(x, {}, {
+      onEval: (t, d) => {
+        const g = d.get();
+        grids.update(g.grid, g.track);
+        if (!seen && g.track.n > 0 && t > d.track.from + 6) seen = { g: grids.at(end - 1), e12: gridErrMs(grids.at(end - 12), end - 12, A.truth) };
+      },
+    });
+    const say = `${name} ${bpm} BPM, ${xf} s crossfade`;
+    assert.ok(seen, `${say}: no track change`);
+    assert.ok(Math.abs(bpmOf(seen.g) / 124 - 1) < 1e-4, `${say}: the old track's grid reads ${bpmOf(seen.g).toFixed(3)} BPM`);
+    assert.ok(Math.abs(seen.e12) < 1.5, `${say}: the old track's beat 12 s before the fade is ${seen.e12.toFixed(1)} ms off`);
+  }
+});
+
 test('½× / 2× after TAP scale the tapped tempo instead of discarding it', () => {
   const d = new DeckTempo({ sampleRate: FS, fps: 93.75 });
   for (let k = 0; k < 8; k++) d.tap(Math.round(10 * FS + k * 0.75 * FS));
