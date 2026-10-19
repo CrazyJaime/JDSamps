@@ -15,6 +15,7 @@ import {
   prepareExtension, launchExtension, startTrackServer, hubCall, tabIdFor, waitFor, installClient, act, set, state, events, offscreenEval, makeTrackWav,
   downloadIds, waitForDownload, parseWav, bandOnsets, medianBpm, steadyBeats,
 } from './ext-harness.mjs';
+import { synth, PATTERNS, FS } from '../unit/fixtures/synth.mjs';
 
 const SITES = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../fixtures/sites');
 const index = JSON.parse(fs.readFileSync(path.join(SITES, 'index.json'), 'utf8'));
@@ -26,10 +27,23 @@ const decks = async () => (await state(deck)).decks;
 const deckWhere = (fn, ms = 60000) => waitFor(async () => (await decks()).find(fn), ms, 150);
 const engine = (body) => offscreenEval(h, `(async () => { const e = globalThis.__jdsEngine; ${body} })()`);
 
+/** A 16-bit mono WAV of x (at the synth's rate), peak-normalised to -2 dBFS. */
+function loopWav(x) {
+  let peak = 0;
+  for (const v of x) peak = Math.max(peak, Math.abs(v));
+  const g = 0.8 / peak, n = x.length, buf = Buffer.alloc(44 + n * 2);
+  for (let i = 0; i < n; i++) buf.writeInt16LE(Math.max(-32768, Math.min(32767, Math.round(x[i] * g * 32767))), 44 + i * 2);
+  buf.write('RIFF', 0); buf.writeUInt32LE(36 + n * 2, 4); buf.write('WAVE', 8); buf.write('fmt ', 12);
+  buf.writeUInt32LE(16, 16); buf.writeUInt16LE(1, 20); buf.writeUInt16LE(1, 22); buf.writeUInt32LE(FS, 24);
+  buf.writeUInt32LE(FS * 2, 28); buf.writeUInt16LE(2, 32); buf.writeUInt16LE(16, 34); buf.write('data', 36); buf.writeUInt32LE(n * 2, 40);
+  return buf;
+}
+
 /**
  * MP3s behind <audio src> pages, served with byte ranges (so their players know their length): 16 s at /rec (124 BPM
- * kick) and /rec2 (128 BPM click); 150 s at /long, and behind a Bandcamp-like page (data-tralbum) at /bc-long. And a
- * WAV the same way: 60 s of the 128 BPM click at /click128.
+ * kick) and /rec2 (128 BPM click); 150 s at /long, and behind a Bandcamp-like page (data-tralbum) at /bc-long. And
+ * WAVs the same way: 60 s of the 128 BPM click at /click128, and 12 bars of a techno loop with a continuous bed (kick,
+ * hats, bass and a pad: PATTERNS.techno, 132.7 BPM) at /techno.
  */
 async function startRecServer() {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'jds-rec-'));
@@ -40,13 +54,14 @@ async function startRecServer() {
     mp3s[name] = fs.readFileSync(path.join(tmp, `${name}.mp3`));
   }
   const files = { ...Object.fromEntries(Object.entries(mp3s).map(([k, v]) => [`${k}.mp3`, { type: 'audio/mpeg', buf: v }])),
-    'click128.wav': { type: 'audio/wav', buf: makeTrackWav({ bpm: 128, kind: 'high', seconds: 60 }) } };
+    'click128.wav': { type: 'audio/wav', buf: makeTrackWav({ bpm: 128, kind: 'high', seconds: 60 }) },
+    'techno.wav': { type: 'audio/wav', buf: loopWav(synth({ ...PATTERNS.techno, bars: 12, tail: 0.5 }).x) } };
   const media = `<script>window.__media = () => { const a = document.getElementById('a'); return { t: a.currentTime, rate: a.playbackRate, pp: a.preservesPitch, paused: a.paused, duration: a.duration }; };</script>`;
   const srv = http.createServer((req, res) => {
-    const u = new URL(req.url, 'http://x'), page = /^\/(rec2?|long|click128)$/.exec(u.pathname), file = files[u.pathname.slice(1)];
+    const u = new URL(req.url, 'http://x'), page = /^\/(rec2?|long|click128|techno)$/.exec(u.pathname), file = files[u.pathname.slice(1)];
     if (page) {
       res.writeHead(200, { 'content-type': 'text/html' });
-      res.end(`<!doctype html><title>Track ${page[1]}</title><audio id="a" src="/${page[1]}.${page[1] === 'click128' ? 'wav' : 'mp3'}" autoplay></audio>${media}`);
+      res.end(`<!doctype html><title>Track ${page[1]}</title><audio id="a" src="/${page[1]}.${files[`${page[1]}.wav`] ? 'wav' : 'mp3'}" autoplay></audio>${media}`);
       return;
     }
     if (u.pathname === '/bc-long') {
@@ -589,6 +604,51 @@ test('recording a whole track through a capture that skips (a busy computer lose
     assert.ok(Math.abs(r.bpm.native - 124) < 0.1, `bpm ${r.bpm.native}`);
     // (A busy box may skip the real capture too: those are mended and listed beside these two.)
     assert.match(r.load.report, /^Mended: \d+ skips in the capture \(the computer was busy\): (.*, )?20 ms put in at \d+\.\d s, (.*, )?20 ms lost at \d+\.\d s(,.*)?$/m);
+  } finally { await engine('window.__undoSkips && window.__undoSkips(); return true;'); }
+});
+
+/**
+ * How a promoted deck's kept track lines up with the source at `url` (decoded here, at the engine's rate): the lag of
+ * the deck against it in 50 ms windows every 250 ms, both low-passed at 8 kHz (the recording lost its highs), as
+ * [s, ms, correlation]. The lag is followed from window to window, and looked for over ±40 ms where it is lost.
+ */
+const lagsOf = (deckId, url) => engine(`
+  const pcm = e.__pcm.get(${deckId}), ref = await e.ctx.decodeAudioData(await (await fetch('${url}')).arrayBuffer()), sr = pcm.sampleRate;
+  const lp = (x) => { const y = new Float32Array(x.length), k = Math.exp(-2 * Math.PI * 8000 / sr); let s1 = 0, s2 = 0;
+    for (let i = 0; i < x.length; i++) { s1 = (1 - k) * x[i] + k * s1; s2 = (1 - k) * s1 + k * s2; y[i] = s2; } return y; };
+  const a = lp(pcm.L), b = lp(ref.getChannelData(0)), W = Math.round(0.05 * sr), out = [];
+  const corr = (l, s) => { let ab = 0, aa = 0, bb = 0; for (let i = 0; i < W; i++) { const x = a[s + l + i], y = b[s + i]; ab += x * y; aa += x * x; bb += y * y; } return ab / Math.sqrt(aa * bb + 1e-20); };
+  const search = (s, from, to, step) => { let best = { l: 0, c: -2 }; for (let l = from; l <= to; l += step) { if (s + l < 0 || s + l + W > a.length) continue; const c = corr(l, s); if (c > best.c) best = { l, c }; } return best; };
+  let cur = 0;
+  for (let s = Math.round(0.3 * sr); s + W + Math.round(0.05 * sr) < Math.min(a.length, b.length); s += Math.round(0.25 * sr)) {
+    let best = search(s, cur - Math.round(0.003 * sr), cur + Math.round(0.003 * sr), 1);
+    if (best.c < 0.9) { const wide = search(s, -Math.round(0.04 * sr), Math.round(0.04 * sr), 3); if (wide.c > best.c) best = search(s, wide.l - 3, wide.l + 3, 1); }
+    out.push([+(s / sr).toFixed(2), +((best.l / sr) * 1000).toFixed(1), +best.c.toFixed(3)]);
+    if (best.c > 0.9) cur = best.l;
+  }
+  e.__pcm.delete(${deckId});
+  return out;`);
+
+test('recording a whole track of a loop with a continuous bed through a capture that skips: each skip mended, nothing else touched, the deck on the track', async (t) => {
+  await engine(`(${captureSkips})(14, 34); return true;`);
+  try {
+    const { site, d } = await liveDeck(`${rec.origin}/techno`);
+    await playing(site.tab);
+    assert.deepEqual(await act(deck, d.id, 'recordWhole'), { ok: true, error: undefined });
+    const loading = await deckWhere((x) => x.id !== d.id && x.kind === 'loading', 5000);
+    const r = await deckWhere((x) => x.id === loading.id && x.kind === 'resident', 40000);
+    const mended = r.load.report.split('\n').find((l) => /^Mended/.test(l)) || 'nothing mended', lags = await lagsOf(loading.id, `${rec.origin}/techno.wav`);
+    t.diagnostic(`bpm ${r.bpm.native}; ${mended}`);
+    t.diagnostic(`[s, lag ms, corr]: ${JSON.stringify(lags)}`);
+    // Both skips played in are mended, and nothing else bigger than a burst of them (a clean beat is never cut).
+    assert.match(mended, /^Mended: \d+ skips in the capture \(the computer was busy\): (.*, )?20 ms put in at \d+\.\d s, (.*, )?20 ms lost at \d+\.\d s(,.*)?$/);
+    for (const [, ms] of mended.matchAll(/(\d+) ms (put in|lost)/g)) assert.ok(+ms <= 52, mended);
+    // The deck's audio is the track's, in place: the lag in nine windows out of ten within 3 ms of where it starts
+    // (the stretch between a loss and the silence given back is up to two beats off).
+    const good = lags.filter(([, , c]) => c >= 0.8), at = median(good.slice(0, 8).map(([, l]) => l)), off = good.filter(([, l]) => Math.abs(l - at) > 3);
+    assert.ok(good.length >= 0.9 * lags.length, `${lags.length - good.length} of ${lags.length} windows don't match the source`);
+    assert.ok(off.length <= 0.1 * good.length, `${off.length} windows off the track: ${JSON.stringify(off)}`);
+    assert.ok(Math.abs(r.bpm.native - PATTERNS.techno.bpm) < 0.15, `bpm ${r.bpm.native}`);
   } finally { await engine('window.__undoSkips && window.__undoSkips(); return true;'); }
 });
 

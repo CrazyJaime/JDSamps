@@ -90,3 +90,98 @@ test('a track with no steady beat is left alone', () => {
   const pcm = { L, R: L.slice(), sampleRate: SR };
   assert.equal(mendSteps(pcm, T).pcm, pcm);
 });
+
+// ---------------------------------------------------------------- drum loops with a continuous bed, as a 2× capture
+// The capture is the track played at 2× and taken at the context's rate (44.1 or 48 kHz), in 16 bits. Its skips are
+// as a busy computer's tab capture makes them: 10 ms of silence (exact zeros) put in, 10 ms lost, or a burst of both.
+import { synth, PATTERNS, FS } from './fixtures/synth.mjs';
+
+/** A loop recorded from the page at 2×: low-passed, resampled to sr, and quantised as the recorder hands it over. */
+function capture2x(x, sr) {
+  const ratio = (2 * FS) / sr, a = Math.exp((-2 * Math.PI * 0.225 * sr) / FS), lp = new Float32Array(x.length);
+  let y = 0;
+  for (let i = 0; i < x.length; i++) { y = (1 - a) * x[i] + a * y; lp[i] = y; }
+  y = 0;
+  for (let i = x.length - 1; i >= 0; i--) { y = (1 - a) * lp[i] + a * y; lp[i] = y; }
+  const out = new Float32Array(Math.floor((x.length - 2) / ratio));
+  for (let i = 0; i < out.length; i++) { const p = i * ratio, k = Math.floor(p), f = p - k; out[i] = Math.round((lp[k] * (1 - f) + lp[k + 1] * f) * 32767) / 32768; }
+  return out;
+}
+const tracks = new Map(), loops = new Map();
+/** {pcm, T (s, the capture's beat), x}: 16 bars of a PATTERNS loop as a 2× capture at sr. */
+function loop(name, sr) {
+  const key = `${name}@${sr}`;
+  if (!tracks.has(name)) tracks.set(name, synth({ ...PATTERNS[name], bars: 16, tail: 0 }).x);
+  if (!loops.has(key)) loops.set(key, capture2x(tracks.get(name), sr));
+  const x = loops.get(key);
+  return { x, T: 60 / PATTERNS[name].bpm / 2, pcm: { L: x, R: x, sampleRate: sr } };
+}
+/** The capture with skips [at (fraction of its length), frames (> 0 silence put in, < 0 lost)], placed in the clean capture's time. */
+function skipped(x, skips) {
+  let y = x;
+  for (const [fr, n] of [...skips].sort((p, q) => q[0] - p[0])) { const at = Math.round(x.length * fr); y = n > 0 ? ins(y, at, n) : cut(y, at, -n); }
+  return y;
+}
+/** Where the mended capture differs from the clean one: [first, last] frames, or null where it is the same. */
+function differs(a, b) {
+  let first = -1, last = -1;
+  for (let i = 0; i < Math.min(a.length, b.length); i++) if (a[i] !== b[i]) { if (first < 0) first = i; last = i; }
+  return first < 0 ? null : [first, last];
+}
+const RATES = [44100, 48000];
+// Loops on the grid: a skip shows against the bar before it. (Loops played by hand, off the grid by a few ms, are
+// only ever left alone: their bars don't line up closely enough to tell a skip.)
+const STEADY = ['house', 'techno', 'noisy128', 'dense150', 'dembow', 'trap', 'dnb', 'halftime140'];
+
+test('a clean 2× capture of any drum loop, at 44.1 or 48 kHz, is left as it is', () => {
+  for (const sr of RATES) for (const name of Object.keys(PATTERNS)) {
+    const { pcm, T } = loop(name, sr), r = mendSteps(pcm, T);
+    assert.deepEqual(r.steps, [], `${name} at ${sr}: ${JSON.stringify(r.steps)}`);
+    assert.equal(r.pcm, pcm);
+  }
+});
+
+test('a clean capture is left as it is when the beat it is given is a little off, or an octave off', () => {
+  for (const name of ['house', 'techno', 'pop', 'trap', 'swing126']) for (const k of [0.996, 1.004, 0.5, 2]) {
+    const { pcm, T } = loop(name, 48000), r = mendSteps(pcm, T * k);
+    assert.deepEqual(r.steps, [], `${name}, beat ×${k}: ${JSON.stringify(r.steps)}`);
+  }
+});
+
+test('10 ms of silence the capture put in a loop with a continuous bed is taken out: the audio is the track, sample for sample', () => {
+  for (const sr of RATES) for (const name of [...STEADY, 'pop']) {
+    const { x, T } = loop(name, sr), BUF = sr / 100;
+    for (const skips of [[[0.31, BUF]], [[0.55, 2 * BUF]]]) {
+      const r = mendSteps({ L: skipped(x, skips), R: skipped(x, skips), sampleRate: sr }, T);
+      assert.deepEqual(r.steps.map((s) => Math.round(s.ms)), skips.map(([, n]) => (n / sr) * 1000), `${name} at ${sr}: ${JSON.stringify(r.steps)}`);
+      assert.equal(differs(r.pcm.L, x), null, `${name} at ${sr}`);
+      assert.equal(r.pcm.L.length, x.length);
+    }
+  }
+});
+
+test('10 ms the capture lost from a loop with a continuous bed is given back as silence near it: every later beat in its place', () => {
+  for (const sr of RATES) for (const name of STEADY) {
+    const { x, T } = loop(name, sr), BUF = sr / 100;
+    for (const skips of [[[0.47, -BUF]], [[0.4, -2 * BUF]], [[0.3, BUF], [0.7, -BUF]]]) {
+      const r = mendSteps({ L: skipped(x, skips), R: skipped(x, skips), sampleRate: sr }, T);
+      assert.deepEqual(r.steps.map((s) => Math.round(s.ms)), skips.map(([, n]) => (n / sr) * 1000), `${name} at ${sr}: ${JSON.stringify(r.steps)}`);
+      assert.equal(r.pcm.L.length, x.length, `${name} at ${sr}`);
+      // Only the stretch between the loss and the silence given back differs from the track: in the quiet between
+      // the onsets about it, within two beats (a sparse loop's onsets can be that far apart).
+      const lost = Math.round(x.length * skips.find(([, n]) => n < 0)[0]), d = differs(r.pcm.L, x);
+      assert.ok(d && d[0] >= lost - 2 * T * sr && d[1] < lost + 2 * T * sr, `${name} at ${sr}: lost at ${(lost / sr).toFixed(3)} s, differs ${d && d.map((v) => (v / sr).toFixed(3))} s`);
+    }
+  }
+});
+
+test('a burst of skips (10 ms lost, then 24 ms and 10 ms of silence put in) is mended to what it adds up to: every later beat in its place', () => {
+  for (const sr of RATES) for (const name of ['house', 'techno', 'noisy128', 'dense150', 'dembow']) {
+    const { x, T } = loop(name, sr), BUF = sr / 100, at = Math.round(x.length * 0.6), Z = Math.round(0.0242 * sr);
+    let y = ins(x, at + 5000, BUF);
+    y = cut(ins(y, at + 3000, Z), at, BUF);
+    const r = mendSteps({ L: y, R: y.slice(), sampleRate: sr }, T), d = differs(r.pcm.L, x);
+    assert.equal(r.pcm.L.length, x.length, `${name} at ${sr}: ${JSON.stringify(r.steps)}`);
+    assert.ok(d && d[0] >= at && d[1] < at + T * sr, `${name} at ${sr}: differs ${d && d.map((v) => (v / sr).toFixed(3))} s`);
+  }
+});
