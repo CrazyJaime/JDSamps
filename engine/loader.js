@@ -44,6 +44,7 @@ export const TIMES = Object.freeze({
   drivePerSec: 250,
   check: 400,        // between gap checks while driving (each one places every piece)
   away: 1500,        // after the page went away: the most to wait for word of what became of the tab (closed, another page)
+  report: 1000,      // between refreshes of the load report while nothing else moves the deck's progress
 });
 
 /** Plain words for the deck's loading state. */
@@ -192,8 +193,10 @@ class Job {
   say(p, strategy) {
     if (this.done) return;
     this.progress = Math.max(this.progress, Math.min(0.99, p));
-    this.deck.setLoad(strategy === undefined ? { progress: this.progress } : { progress: this.progress, strategy });
+    this.deck.setLoad({ ...(strategy === undefined ? { progress: this.progress } : { progress: this.progress, strategy }), ...this.also(strategy) });
   }
+  /** What else the deck's load shows with its progress (a Loader: its report as it stands). */
+  also() { return {}; }
   /** A rung's own 0..1 mapped onto what is left of the bar before decoding. */
   band(hi = 0.8) { const lo = Math.min(this.progress, hi); return (x) => lo + Math.max(0, Math.min(1, x)) * (hi - lo); }
 }
@@ -227,6 +230,19 @@ export class Loader extends Job {
     this.bytes = 0;            // read from the tab, all frames
     this.host = hostOf(deck.meta && deck.meta.url);
     this.rep = { steps: [], mimes: new Set(), refetched: 0, placed: null, limit: null, result: null, notes: [], t0: now() };
+    this.doing = '';           // what the load is doing now, in plain words (its report says so until it ends)
+    this.reportedAt = -Infinity;
+  }
+
+  /**
+   * The load report as it stands goes with the progress (§11: it can be copied while the deck loads): at once when what
+   * the load does changes, else at most every 250 ms.
+   */
+  also(strategy) {
+    if (strategy !== undefined) this.doing = strategy;
+    if (strategy === undefined && now() - this.reportedAt < 250) return {};
+    this.reportedAt = now();
+    return { report: this.report() };
   }
 
   // ---------------------------------------------------------------- the deck's agents
@@ -394,6 +410,8 @@ export class Loader extends Job {
   /** -> {ok:true, kind:'resident'|'live', deckId, slot} or {ok:false, error}. Never rejects. */
   async run() {
     let out;
+    // While a step waits long (a look, a fetch, a page's answer), its report still keeps up with how long it has taken.
+    const tick = setInterval(() => { if (!this.done) this.deck.setLoad({ report: this.report() }); }, this.t.report);
     try {
       this.say(0, SAY.wait);
       await this.connect();
@@ -406,6 +424,7 @@ export class Loader extends Job {
     } catch (err) {
       out = await this.fail(err);
     } finally {
+      clearInterval(tick);
       this.end();
     }
     return out;
@@ -482,7 +501,7 @@ export class Loader extends Job {
 
   /** Run one rung, noting how it went: its result is {done: {pcm, notice}} or {outcome, why}. */
   async step(name, fn) {
-    const e = { name, how: '', outcome: '', why: '', ms: 0 }, t0 = now();
+    const t0 = now(), e = { name, how: '', outcome: '', why: '', ms: 0, at: t0 };
     this.rep.steps.push(e);
     try {
       const r = await fn(e);
@@ -920,17 +939,17 @@ export class Loader extends Job {
     const lines = [
       'JD Samps load report',
       `Page: ${this.host || 'unknown'} (${site ? `site table: ${site} starts at ${SITES[site]}` : 'generic site: file, refetch, drive, then live'})`,
-      `Result: ${r.result}`,
+      `Result: ${r.result || `still loading: ${this.doing || 'starting'}`}`,
       `Track length: ${D != null ? `${D.toFixed(3)} s (the page's player)` : 'not known'}`,
       ...(r.limit ? [`Limit: ${r.limit}`] : []),
       'Steps:',
-      ...r.steps.map((s) => `  ${s.name}${s.how ? ` (${s.how})` : ''}: ${s.outcome} in ${secs(s.ms)}${s.why ? ` — ${s.why}` : ''}`),
+      ...r.steps.map((s) => `  ${s.name}${s.how ? ` (${s.how})` : ''}: ${s.outcome ? `${s.outcome} in ${secs(s.ms)}` : `running for ${secs(now() - s.at)}`}${s.why ? ` — ${s.why}` : ''}`),
       ...r.notes.map((n) => `  note: ${n}`),
       `Media types: ${r.mimes.size ? [...r.mimes].join(', ') : 'none seen'}`,
       `Runs: ${p ? p.runs.length : 0}, segments: ${p ? p.runs.reduce((n, x) => n + x.segs.length, 0) : 0}, gaps: ${gaps.length ? gaps.map(span).join(', ') : 'none'}`,
       `Requests seen: ${media} media, ${lists} playlist${lists === 1 ? '' : 's'}`,
       `Bytes: ${kb(captured)} captured from the player, ${kb(r.refetched)} fetched again`,
-      `First failure: ${failed ? `${failed.name}: ${failed.why}` : r.result.startsWith('live: ') ? r.result.slice(6) : 'none'}`,
+      `First failure: ${failed ? `${failed.name}: ${failed.why}` : (r.result || '').startsWith('live: ') ? r.result.slice(6) : 'none'}`,
       `Total: ${secs(now() - r.t0)}`,
     ];
     return lines.join('\n');
@@ -1018,10 +1037,41 @@ export class Loader extends Job {
   }
 }
 
+/**
+ * The load report of a file or a link loaded straight onto a deck (engine.loadDirect), for "Copy load report": what it
+ * is, each step with how it ended, why and how long it took, and the result. Shown while the deck loads, and kept on
+ * the deck it leaves, resident or failed.
+ */
+export class DirectReport {
+  /** file: its name; else url: the link. */
+  constructor({ file, url }) {
+    this.source = file != null ? `a file, “${file}”` : `a link, ${short(url)}`;
+    this.steps = [];
+    this.t0 = this.at = now();
+    this.result = null;
+    this.limit = null;
+  }
+  /** The step that ran since the last one ended: how it ended, and why. */
+  step(name, outcome, why = '') { const t = now(); this.steps.push({ name, outcome, why, ms: t - this.at }); this.at = t; }
+  /** The fetch step done: n bytes. */
+  fetched(n) { this.step('fetch', 'ok', kb(n)); }
+  /** The report; doing: what the load is doing now (until it has a result). */
+  text(doing) {
+    const failed = this.steps.find((s) => s.outcome === 'failed');
+    return [
+      'JD Samps load report', `Source: ${this.source}`, `Result: ${this.result || `still loading: ${doing || 'starting'}`}`,
+      ...(this.limit ? [`Limit: ${this.limit}`] : []), 'Steps:',
+      ...this.steps.map((s) => `  ${s.name}: ${s.outcome} in ${secs(s.ms)}${s.why ? ` — ${s.why}` : ''}`),
+      ...(this.result ? [] : [`  ${doing || 'starting'}: running for ${secs(now() - this.at)}`]),
+      `First failure: ${failed ? `${failed.name}: ${failed.why}` : 'none'}`, `Total: ${secs(now() - this.t0)}`,
+    ].join('\n');
+  }
+}
+
 // ---------------------------------------------------------------- recording a whole track (§4.4)
-// Opt-in, never automatic: for a page whose bytes cannot be had, the live deck's own capture records the tab's
-// sound while its player runs the track at 2× from the start (pitch unlocked), and the recording is slowed back
-// by 2. Whatever lay above a quarter of the media's rate (12 kHz at 48 kHz) is gone, and the deck says so.
+// Opt-in (the ⓘ action, or the setting that does it without asking): for a page whose bytes cannot be had, the live
+// deck's own capture records the tab's sound while its player runs the track at 2× from the start (pitch unlocked),
+// and the recording is slowed back by 2. Whatever lay above a quarter of the media's rate (12 kHz at 48 kHz) is gone, and the deck says so.
 const REC_RATE = 2;
 const AUDIBLE = 0.003; // about -50 dBFS, as a deck's first audible sample
 const HOLD_MS = 700;   // the player held silent at the start: longer than a recorder batch and the capture's delay

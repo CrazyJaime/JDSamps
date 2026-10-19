@@ -456,6 +456,23 @@ test('a resident load leaves a plain-text report: host, every rung and how it en
   assert.doesNotMatch(r, /undefined|NaN|\[object/);
 });
 
+test('while a tab loads, its deck carries the load report as it stands, to be copied (§11): the steps so far, the one running, how long', async () => {
+  let during = null;
+  const { result, deck } = await load({ kind: 'mse', rendition: hi(), preTap: 0, playing: 2, seekhop: 'stall' }, {
+    before: ({ tab, deck: d }) => { tab.hooks.push((m) => { if (m.t === 'drive' && m.mode === 'accelerate' && during == null) during = d.load.report; }); },
+  });
+  assert.equal(result.kind, 'resident');
+  assert.equal(typeof during, 'string', 'no load report while the deck loads');
+  assert.match(during, /^JD Samps load report\n/);
+  assert.match(during, /Result: still loading: running the player through the track\n/);
+  assert.match(during, /file \(reading the page's track link\): skipped in \d+\.\d s — the page has no track link of its own/);
+  assert.match(during, /drive \(seek-hop\): running for \d+\.\d s\n/);
+  assert.match(during, /First failure: none\nTotal: \d+\.\d s$/);
+  assert.doesNotMatch(during, /undefined|NaN|null|\[object/);
+  // From the first state the deck shows, every one of them has a report.
+  assert.ok(deck.loads.length > 3 && deck.loads.every((l) => typeof l.report === 'string'), JSON.stringify(deck.loads.map((l) => [l.strategy, !!l.report])));
+});
+
 test('a load that ends live leaves a report naming the rung that failed first, and why', async () => {
   const { deck } = await load({ kind: 'mse', rendition: hi(), preTap: 6, playing: 1 });
   const r = deck.load.report;

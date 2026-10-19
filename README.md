@@ -145,9 +145,10 @@ its tab live says **LIVE**.
 - A track page loaded before its play button was pressed has nothing to fetch yet: the deck says
   **start the track on the tab**, and loads it once it plays (it waits 30 seconds).
 - While it loads, the deck shows **LOADING · 42%** and what it is doing; only eject and the cancel
-  **✕** work meanwhile. A load that fails says why. **Copy load report** (on the failed deck, or
-  in the **ⓘ** menu of a deck that has a report) copies a short plain-text report: send it in so
-  the site can be fixed.
+  **✕** work meanwhile. A load that fails says why; a file or link that fails stays on its deck as
+  **FAILED** until you dismiss it with **✕**. **Copy load report** (on the failed deck, or in the
+  **ⓘ** menu of a loading deck or any deck that has a report) copies a short plain-text report:
+  send it in so the site can be fixed.
 - When a page's audio cannot be read at all, the deck plays live. **Record whole track (2×,
   reduced highs)** in its **ⓘ** menu records the tab at double speed instead, losing the highest
   frequencies; Settings → **Record whole track at 2× when bytes are unavailable** (off by

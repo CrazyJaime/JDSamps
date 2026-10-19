@@ -368,7 +368,11 @@ test('a page loaded before its play button was pressed asks for the track to be 
   const d = await loadTab(site.tabId, {
     // The DJ presses play on the tab only once the deck asks for it.
     during: async (r) => {
-      await deckWhere((x) => x.id === r.deckId && x.load.strategy === 'start the track on the tab', 15000);
+      const waiting = await deckWhere((x) => x.id === r.deckId && x.load.strategy === 'start the track on the tab', 15000);
+      // Meanwhile its load report can be copied, from the ⓘ in its header on the deck page.
+      assert.match(waiting.load.report, /^JD Samps load report\n[^]*Result: still loading: start the track on the tab\n/);
+      const el = deck.locator('.deck', { has: deck.locator('[data-title]', { hasText: 'Model site: mse' }) });
+      await waitFor(() => el.locator('[data-report-btn]').isVisible(), 5000);
       await site.tab.click('#play');
     },
   });

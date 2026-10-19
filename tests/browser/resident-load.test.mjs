@@ -85,7 +85,10 @@ test('a local file loads onto a resident deck: the whole track, named after the 
   assert.equal(r.ok, true, JSON.stringify(r));
   const d = await deckWhere((x) => x.title === 'kick' && x.kind === 'resident');
   assert.ok(Math.abs(d.duration - files.kick) < 0.1, `duration ${d.duration}, file ${files.kick}`);
-  assert.deepEqual(d.load, { state: 'ready', progress: 1, strategy: null, error: null, report: null });
+  const { report, ...load } = d.load;
+  assert.deepEqual(load, { state: 'ready', progress: 1, strategy: null, error: null });
+  assert.match(report, new RegExp(`^JD Samps load report\\nSource: a file, “kick\\.mp3”\\nResult: resident, ${d.duration.toFixed(3)} s\\n`));
+  assert.match(report, /\n {2}fetch: ok in \d+\.\d s — \d+ kB\n {2}decode: ok in \d+\.\d s — \d+\.\d{3} s\n {2}beat: ok in \d+\.\d s — 124\.\d\d BPM\nFirst failure: none\nTotal: \d+\.\d s$/);
   assert.equal(d.tabId, null);
   assert.equal(d.liveEdge, d.duration);
   assert.equal(d.historyStart, 0);
@@ -174,7 +177,7 @@ test('ejecting a resident deck stops no tab, and the hub hears only of decks bou
   for (const m of changed) assert.ok(m.decks.every((x) => Number.isInteger(x.tabId)), JSON.stringify(m));
 });
 
-test('a link that is not audio, or not there, is refused with a reason and leaves no deck', async () => {
+test('a link that is not audio, or not there, is refused with a reason; its deck stays FAILED, offering its load report, until it is dismissed', async () => {
   const n = (await decks()).length;
   const html = await act(deck, null, 'loadUrl', { url: `${origin}/page.html` });
   assert.equal(html.ok, false);
@@ -182,6 +185,22 @@ test('a link that is not audio, or not there, is refused with a reason and leave
   const missing = await act(deck, null, 'loadUrl', { url: `${origin}/missing.mp3` });
   assert.equal(missing.ok, false);
   assert.match(missing.error, /404/);
+  const failed = await waitFor(async () => { const f = (await decks()).filter((x) => x.kind === 'loading' && x.load.state === 'error'); return f.length === 2 && f; }, 5000);
+  const page = failed.find((x) => x.title === 'page'), gone = failed.find((x) => x.title === 'missing');
+  assert.ok(page && gone, JSON.stringify(failed));
+  assert.equal(page.load.error, html.error);
+  assert.equal(gone.load.error, missing.error);
+  assert.match(page.load.report, /^JD Samps load report\nSource: a link, 127\.0\.0\.1:\d+\/page\.html\nResult: failed: .*not audio/);
+  assert.match(page.load.report, /\n {2}fetch: ok in \d+\.\d s — \d+ kB\n {2}decode: failed in \d+\.\d s — .*not audio[^\n]*\nFirst failure: decode: /);
+  assert.match(gone.load.report, /\n {2}fetch: failed in \d+\.\d s — .*404[^\n]*\nFirst failure: fetch: /);
+  // The deck page shows each as FAILED, with its reason and the Copy load report button.
+  for (const x of [page, gone]) {
+    const el = deck.locator('.deck', { has: deck.locator('[data-title]', { hasText: new RegExp(`^\\s*${x.title}\\s*$`) }) });
+    await waitFor(async () => (await el.locator('[data-kind]').textContent()).trim() === 'FAILED');
+    assert.equal((await el.locator('[data-load-line]').textContent()).trim(), x.load.error);
+    assert.equal(await el.locator('.deck-status [data-copy-report]').isVisible(), true);
+  }
+  for (const x of [page, gone]) assert.equal((await act(deck, x.id, 'loadCancel')).ok, true);
   await waitFor(async () => (await decks()).length === n);
 });
 
@@ -192,6 +211,13 @@ test('a deck shows that it is loading, with its load\'s token, refuses to play m
   assert.equal(d.load.token, 'tok-slow-1', 'the deck page knows the deck by its load\'s token');
   assert.equal(d.load.state, 'loading');
   assert.match(d.load.strategy, /fetching/);
+  // Its load report can be copied while it loads: from the ⓘ in its header on the deck page.
+  assert.match(d.load.report, /^JD Samps load report\nSource: a link, 127\.0\.0\.1:\d+\/slow\.wav\nResult: still loading: fetching the link\n[^]*\n {2}fetching the link: running for \d+\.\d s\n/);
+  const el = deck.locator('.deck', { has: deck.locator('[data-title]', { hasText: /^\s*slow\s*$/ }) });
+  await waitFor(() => el.locator('[data-report-btn]').isVisible());
+  await el.locator('[data-report-btn]').click();
+  assert.equal(await el.locator('[data-report-menu]').getByRole('button', { name: 'Copy load report' }).isVisible(), true);
+  await deck.keyboard.press('Escape');
   assert.match((await act(deck, d.id, 'play')).error, /still loading/);
   assert.equal((await act(deck, d.id, 'loadCancel')).ok, true);
   const r = await pending;
