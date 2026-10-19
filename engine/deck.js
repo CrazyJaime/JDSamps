@@ -767,11 +767,25 @@ export class Deck {
     return true;
   }
 
-  /** TAP at heard input position p: the tapped grid holds there, and is carried across its track at each source rate. */
+  /**
+   * A manual grid {t0, T} (a TAP, a typed tempo) for the audio at p. A whole-track analysis's pieces (a
+   * mix, a drummer who drifts) each keep their own tempo: every piece of the track is scaled by the new
+   * period over the old one at p, as ½× / 2× scale them, and the piece at p takes the grid. Any other
+   * grid is carried across its track at each source rate.
+   */
+  regridAt(p, grid) {
+    const seg = this.grids.seg(p);
+    if (!this.tempo.seeded || !seg || !seg.grid) { this.grids.retime(p, grid, (x) => this.src.rateAt(x)); return; }
+    const k = seg.grid.T / grid.T;
+    this.grids.editTrack(seg.track, (x) => ({ ...x, T: x.T / k }));
+    seg.grid = { ...seg.grid, t0: grid.t0, T: grid.T };
+  }
+
+  /** TAP at heard input position p: the tapped grid holds there, and is carried across its track (regridAt). */
   tapAt(p) {
     const fit = this.tempo.tapFit(Math.round(p * this.sr));
     if (!fit) return;
-    this.grids.retime(p, { t0: fit.t0 / this.sr, T: fit.T / this.sr }, (x) => this.src.rateAt(x));
+    this.regridAt(p, { t0: fit.t0 / this.sr, T: fit.T / this.sr });
     if (this.followsTrackAt(p)) {
       const segs = this.grids.segs, live = segs.length ? segs[segs.length - 1].grid : null;
       this.tempo.applyTap(live
@@ -834,7 +848,7 @@ export class Deck {
     }
     const g = this.grids.at(p), rate = this.src.rateAt(p), T = 60 / (bpm * rate);
     const b = g ? g.t0 + Math.round((p - g.t0) / g.T) * g.T : this.wantPlay ? p : this.cue;
-    this.grids.retime(p, { t0: b, T }, (x) => this.src.rateAt(x));
+    this.regridAt(p, { t0: b, T });
     if (this.followsTrackAt(p)) {
       const segs = this.grids.segs, live = segs.length ? segs[segs.length - 1].grid : null;
       this.tempo.applyTap(live
