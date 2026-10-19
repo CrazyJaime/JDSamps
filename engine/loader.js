@@ -1385,7 +1385,7 @@ function edgeShifts(r, dir, tol, from) {
  * off the line by one amount S, then, past at most `span` that straddle the step, windows on it, sitting as closely as
  * the bars about a step must; the step within EDGE beats of that first window. Windows not told by are passed over.
  * -> {step: {S, A, B, lo, hi, bar, edge} or null, seen: the first beat (dir 1) or the last (-1) a step could be seen
- * past (hops), or null where nothing at that end is told by}.
+ * past (hops), or null where nothing at that end is told by, drift: true where the beat there drifts}.
  */
 function edgeStep(r, dir, hop, sr) {
   const tol = (SKIP_TOL * sr) / hop, min = (SKIP_MIN * sr) / hop, max = (SKIP_MAX * sr) / hop, { f, span, Tb } = r, none = { step: null, seen: null };
@@ -1404,17 +1404,24 @@ function edgeStep(r, dir, hop, sr) {
   while (f[seen] < 0.5 * top) seen++;
   const v = h(first);
   if (!(Math.abs(v) >= min)) return { step: null, seen };
-  let last = first, q = -1, across = 0;
+  let last = first, q = -1;
+  const across = []; // straddling the step
   for (let k = first + 1; k < K && q < 0; k++) {
     if (!told(k)) continue;
-    if (Math.abs(h(k) - v) <= tol && !across) last = k;
+    if (Math.abs(h(k) - v) <= tol && !across.length) last = k;
     else if (Math.abs(h(k)) <= tol) q = k;
-    else across++; // straddling the step
+    else across.push(h(k));
   }
-  const run = [];
+  const run = [], off = [];
   for (let k = first; k <= last; k++) if (told(k)) run.push(h(k));
+  for (let k = first; k < q; k++) if (told(k)) off.push(h(k));
   const S = medianOf(run);
-  if (q < 0 || Math.abs(S) > max || run.some((x) => Math.abs(x - S) > tol) || across > span || q > first + EDGE) return { step: null, seen };
+  // A track whose own tempo moves there comes back to the line a little every beat, not at once: one-beat windows
+  // nearer the line beat by beat all the way from the edge are its drift, and no step at that end is a skip. A run off
+  // the line too short to tell from a drift, then windows between it and the line, is not a step either.
+  const drift = span === 1 && q >= 0 && q <= first + EDGE && off.length >= 2 && off.every((x, i) => Math.sign(x) === Math.sign(v) && (!i || Math.abs(x) < Math.abs(off[i - 1]) - tol / 2));
+  if (drift || (run.length < 3 && across.some((x) => Math.sign(x) === Math.sign(S) && Math.abs(x) < Math.abs(S) - tol))) return { step: null, seen, drift };
+  if (q < 0 || Math.abs(S) > max || run.some((x) => Math.abs(x - S) > tol) || across.length > span || q > first + EDGE) return { step: null, seen };
   const rest = [];
   let stray = 0, quiet = 0;
   for (let k = q; k < Math.min(K, q + 9); k++) {
@@ -1446,9 +1453,10 @@ function edited({ L, R, sampleRate }, edits) {
  * A recording's skips mended, so every beat is in its place: silence the capture put in is cut (the run of zeros a
  * step long, or the step's worth of a longer one), and audio it lost is given back as silence in the quietest 10 ms
  * where the step is. A loss must show in two readings; an edit stays only where the mended recording reads as one
- * beat there. Steps in the first beats and the last are read against the beat line of the bars past them. T: the beat
- * period (s). -> {pcm, steps: [{at: s, ms}], seen: [s, s] (the first beat and the last: a step before the one or after
- * the other cannot be seen) or null (no beat to tell by)}; pcm is the same object when nothing was mended.
+ * beat there. Steps in the first beats and the last are read against the beat line of the bars past them; an end
+ * whose beat drifts back to that line (a track whose own tempo moves there) is left as it is. T: the beat period (s).
+ * -> {pcm, steps: [{at: s, ms}], seen: [s, s] (the first beat and the last: a step before the one or after the other
+ * cannot be seen) or null (no beat to tell by)}; pcm is the same object when nothing was mended.
  */
 export function mendSteps(pcm, T) {
   const { L, R, sampleRate: sr } = pcm, hop = Math.max(1, Math.round(0.0005 * sr));
@@ -1460,14 +1468,17 @@ export function mendSteps(pcm, T) {
     else same.all.push({ r, s });
   };
   let first = Infinity, last = -Infinity;
+  const ends = [], drifts = new Set();
   for (const r of rs) {
     for (const s of readSteps(r, hop, sr)) add(r, s);
     for (const dir of [1, -1]) {
-      const { step, seen } = edgeStep(r, dir, hop, sr);
+      const { step, seen, drift } = edgeStep(r, dir, hop, sr);
       if (seen != null) { if (dir > 0) first = Math.min(first, seen); else last = Math.max(last, seen); }
-      if (step) add(r, step);
+      if (step) ends.push([r, step]);
+      if (drift) drifts.add(dir);
     }
   }
+  for (const [r, step] of ends) if (!drifts.has(step.edge)) add(r, step); // an end whose beat drifts has no skip told there
   const beats = first < last ? [(first * hop) / sr, (last * hop) / sr] : null;
   // Each step as its readings put it: the median of how far they see it move, and how many see that. A run read bar
   // against bar may start no earlier than the fifth beat, so where an end's reading puts the step counts too.

@@ -127,7 +127,7 @@ test('a track with no steady beat is left alone', () => {
 // ---------------------------------------------------------------- drum loops with a continuous bed, as a 2× capture
 // The capture is the track played at 2× and taken at the context's rate (44.1 or 48 kHz), in 16 bits. Its skips are
 // as a busy computer's tab capture makes them: 10 ms of silence (exact zeros) put in, 10 ms lost, or a burst of both.
-import { synth, PATTERNS, FS } from './fixtures/synth.mjs';
+import { synth, PATTERNS, FS, makeRng } from './fixtures/synth.mjs';
 
 /** A loop recorded from the page at 2×: low-passed, resampled to sr, and quantised as the recorder hands it over. */
 function capture2x(x, sr) {
@@ -232,6 +232,63 @@ test('10 ms put in or lost in the first beats of a loop with a continuous bed, o
       assert.equal(r.pcm.L.length, x.length, where);
       if (n > 0) assert.equal(d, null, where);
       else assert.ok(d && d[0] >= at - 2 * T * sr && d[1] < at + 2 * T * sr, `${where}: differs ${d && d.map((v) => (v / sr).toFixed(3))} s`);
+    }
+  }
+});
+
+// ---------------------------------------------------------------- a track whose own tempo moves near an end
+// No skip at all: the first beats (or the last) drift off the line of the bars past them a little more every beat.
+// No edit puts that on the line, and a track whose own tempo moves keeps its wandering beat (put to the player's
+// clock, keptPace): nothing is put in or cut.
+
+/** 24 s of kicks with off-beat hats on a tempo map (as tests/browser/resident-tabs.test.mjs makes them). */
+function tempoTrack(bpm, seconds = 24) {
+  const x = new Float32Array(Math.round(seconds * FS)), rnd = makeRng(99);
+  const add = (t0, len, fn) => { const s0 = Math.round(t0 * FS); for (let i = 0; i < len * FS && s0 + i < x.length; i++) x[s0 + i] += fn(i / FS); };
+  for (let t = 0; t < seconds; t += 60 / bpm(t)) {
+    add(t, 0.2, (u) => 0.8 * Math.sin(2 * Math.PI * (45 + 70 * Math.exp(-u * 35)) * u) * Math.exp(-u * 18));
+    add(t + 30 / bpm(t), 0.05, (u) => 0.15 * (2 * rnd() - 1) * Math.exp(-u / 0.015));
+  }
+  return x;
+}
+/** x played at a speed that moves: rate(t) s of x for each s played. */
+function warp(x, rate) {
+  const out = [];
+  for (let p = 0, i = 0; p < x.length - 2; i++) { const k = Math.floor(p), f = p - k; out.push(x[k] * (1 - f) + x[k + 1] * f); p += rate(i / FS); }
+  return Float32Array.from(out);
+}
+
+test('a clean 2× capture of a track whose own tempo steps, slows or speeds up in its first beats or its last is left as it is, however close the beat it is given', () => {
+  for (const [what, bpm] of [
+    ['124 BPM, then 126 from 22.5 s', (t) => (t < 22.5 ? 124 : 126)], ['124, then 126 from 22 s', (t) => (t < 22 ? 124 : 126)],
+    ['124, then 126 from 21 s', (t) => (t < 21 ? 124 : 126)], ['124, then 125 from 21.5 s', (t) => (t < 21.5 ? 124 : 125)],
+    ['124, then 123 from 2 s', (t) => (t < 2 ? 124 : 123)], ['126, then 124 from 1.5 s', (t) => (t < 1.5 ? 126 : 124)],
+    ['slowing 10 % over the last 4 s', (t) => (t < 20 ? 124 : 124 * (1 - (0.1 * (t - 20)) / 4))],
+    ['speeding up 3 % over the first 2 s', (t) => (t > 2 ? 124 : 124 * (1 - (0.03 * (2 - t)) / 2))],
+    ['speeding up 6 % over the first 2 s', (t) => (t > 2 ? 124 : 124 * (1 - (0.06 * (2 - t)) / 2))],
+    ['speeding up 5 % over the first 4 s', (t) => (t > 4 ? 124 : 124 * (1 - (0.05 * (4 - t)) / 4))],
+  ]) {
+    const x = tempoTrack(bpm);
+    for (const sr of RATES) {
+      const c = capture2x(x, sr), pcm = { L: c, R: c, sampleRate: sr };
+      for (const k of [1, 0.996, 1.004]) {
+        const r = mendSteps(pcm, (60 / 124 / 2) * k);
+        assert.deepEqual(r.steps, [], `${what} at ${sr}, beat ×${k}: ${JSON.stringify(r.steps)}`);
+        assert.equal(r.pcm, pcm);
+      }
+    }
+  }
+});
+
+test('a clean 2× capture of a loop with a continuous bed played 1-2 % faster for its first or last seconds is left as it is: no silence put in the bed', () => {
+  for (const [name, k, secs, end] of [
+    ['house', 1.01, 2, true], ['techno', 1.01, 2, true], ['dembow', 1.01, 3, true], ['dembow', 1.02, 1.75, true], ['trap', 1.01, 2, true], ['trap', 1.02, 1.25, true],
+    ['house', 1.01, 2, false], ['techno', 1.01, 2, false], ['trap', 1.01, 1.5, false], ['trap', 1.01, 2, false],
+  ]) {
+    const x = synth({ ...PATTERNS[name], bars: 12, tail: 0 }).x, at = end ? x.length / FS - secs : secs;
+    for (const sr of RATES) {
+      const c = capture2x(warp(x, (t) => ((end ? t >= at : t < at) ? k : 1)), sr), r = mendSteps({ L: c, R: c, sampleRate: sr }, 60 / PATTERNS[name].bpm / 2);
+      assert.deepEqual(r.steps, [], `${name} at ${sr}, ×${k} for its ${end ? 'last' : 'first'} ${secs} s: ${JSON.stringify(r.steps)}`);
     }
   }
 });
