@@ -1132,6 +1132,32 @@ for (const [stage, hold] of [
   });
 }
 
+test('the tab going on to another page while the beat is found, every byte of the track in: the deck goes resident under its own page\'s name', async () => {
+  await engine(`window.__held = false; const f = e.analyse; e.__unhold = () => { e.analyse = f; };
+    e.analyse = (...a) => { window.__held = true; return new Promise((r) => { window.__go = r; }).then(() => f.apply(e, a)); }; return true;`);
+  try {
+    const site = await openSite('progressive');
+    await playing(site.tab);
+    const title = await site.tab.title(), seen = (await events(deck)).length;
+    const r = await hubCall(deck, { type: 'LOAD_TAB', tabId: site.tabId });
+    assert.equal(r.ok, true, JSON.stringify(r));
+    await waitFor(() => engine('return window.__held;'), 30000);
+    await site.tab.goto(`${rec.origin}/rec2`);
+    // The hub's word of the new page reaches the loading deck before the load goes on.
+    await waitFor(() => engine(`const d = e.decks.get(${r.deckId}); return !!d && d.meta.url.startsWith(${JSON.stringify(rec.origin)});`), 10000);
+    await engine('window.__go(); return true;');
+    assert.equal(await endOf(r.deckId), 'resident');
+    const d = await deckWhere((x) => x.id === r.deckId && x.tabId === null, 5000);
+    assert.equal(d.title, title, 'named for the page the track came from');
+    assert.ok(d.url.startsWith(server.origin), d.url);
+    const loaded = (await events(deck)).slice(seen).filter((e) => /^Loaded /.test(e.text)).map((e) => e.text);
+    assert.deepEqual(loaded, [`Loaded “${title}” on deck ${d.slot}. It is cued: press PLAY when you're ready.`]);
+  } finally {
+    await engine('e.__unhold(); delete e.__unhold; return true;');
+    await tidy();
+  }
+});
+
 // ---------------------------------------------------------------- beat-matched decks (R6.2 acceptance)
 // Two decks synced and playing, the master recorded and measured with the harness's onset tools: one deck plays a
 // low kick, the other a high click, so each is heard in its own band. Every beat of one is within 20 ms of a beat

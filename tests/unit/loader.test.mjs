@@ -771,6 +771,9 @@ for (const [what, page, opts] of [
     assert.deepEqual(called(engine, 'eject'), []);
     assert.equal(deck.tabId, null, 'released');
     assert.deepEqual(engine.events.filter((e) => e.level === 'error'), []);
+    // The deck holds the track the load began on, under its own page's name, never the page the tab went on to.
+    assert.deepEqual([deck.meta.title, deck.meta.url], ['Model track', 'https://site.example/track']);
+    assert.deepEqual(engine.events.filter((e) => /^Loaded /.test(e.text)).map((e) => e.text), ['Loaded “Model track” on deck 1.']);
   });
 }
 

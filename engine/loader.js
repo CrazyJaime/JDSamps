@@ -102,6 +102,7 @@ const kb = (n) => (n < 1e6 ? `${Math.round(n / 1e3)} kB` : `${(n / 1e6).toFixed(
 const minutes = (m) => `${+m.toFixed(1)} minute${m === 1 ? '' : 's'}`;
 const short = (u) => { try { const x = new URL(u); return `${x.host}${x.pathname.length > 40 ? `…${x.pathname.slice(-40)}` : x.pathname}`; } catch (_) { return String(u).slice(0, 60); } };
 const uniq = (xs) => [...new Set(xs)];
+const pageOf = (m = {}) => ({ title: m.title, url: m.url, favIconUrl: m.favIconUrl });
 
 /**
  * An HLS playlist: {variants: [{bw, url}]} for a master playlist, {init, segs: [{url, t0, t1}], ts?} for a media
@@ -233,6 +234,7 @@ export class Loader extends Job {
     this.have = false;         // every byte of the track is in hand: the page going away no longer matters
     this.closed = false;       // the hub said the tab was closed while every byte was in hand (tabClosed)
     this.url0 = (deck.meta && deck.meta.url) || '';
+    this.page = pageOf(deck.meta); // the name, address and icon of the page the track is on, kept for the resident deck
     this.big = false;
     this.bytes = 0;            // read from the tab, all frames
     this.host = hostOf(deck.meta && deck.meta.url);
@@ -390,6 +392,11 @@ export class Loader extends Job {
    * or a single-page site's move to its next track, which leaves the page and its agents in place.
    */
   moved() { const page = (u) => String(u || '').split('#')[0]; return page(this.deck.meta && this.deck.meta.url) !== page(this.url0); }
+  /** Any word from the page or the hub: a newer name of the track's own page is kept, never one of a page the tab went on to. */
+  poke() {
+    if (this.page && !this.moved()) this.page = pageOf(this.deck.meta);
+    super.poke();
+  }
   /** Waits give way to a decisive tap error once the page has been looked at, and to the page going away or moving on. */
   urgent() { return (this.looked && !!this.decisive()) || ((!!this.gone || this.moved()) && !this.have); }
   /**
@@ -931,7 +938,8 @@ export class Loader extends Job {
     this.check();
     this.rep.steps.push({ name: 'beat', outcome: analysis ? 'ok' : 'none', why: analysis && analysis.bpm > 0 ? `${analysis.bpm.toFixed(2)} BPM` : 'no steady beat', ms: this.now() - t0 });
     const length = pcm.L.length / pcm.sampleRate; // read first: the deck takes the arrays
-    const res = await e.serial(() => e.startResidentDeck({ deckId: d.id, pcm, analysis }));
+    // Named for the page the track came from, though the tab may show another by now (the hub's META renames the deck).
+    const res = await e.serial(() => e.startResidentDeck({ deckId: d.id, pcm, analysis, meta: this.page }));
     if (!res.ok) { this.check(); throw new Stop('live', LIVE.failed(res.error)); }
     this.done = true; // the tap's messages are not this load's any more
     // With the promotion, before any other task: no snapshot shows the resident deck without its report.

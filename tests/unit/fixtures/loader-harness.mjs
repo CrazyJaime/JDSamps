@@ -189,7 +189,7 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
   };
   /**
    * The page navigates away: its agents' ports drop and the blob URLs it minted die. to: the page the tab shows now,
-   * which the hub tells the engine (META) metaAfter ms later; a reload stays on the same page.
+   * which the hub tells the engine (META) metaAfter ms later (0: as the agents go); a reload stays on the same page.
    */
   tab.navigate = ({ to = null, metaAfter = 0 } = {}) => {
     blobs.clear();
@@ -198,7 +198,8 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
       const d = tab.deck;
       if (d && d.agents.get(fr.id) === fr.a) { d.agents.delete(fr.id); if (d.loader) d.loader.onDetach(fr.id, fr.a); }
     }
-    if (to) tab.clock.setTimeout(() => { if (tab.deck) Object.assign(tab.deck.meta, { url: to }); }, metaAfter);
+    const meta = () => { if (tab.deck) Object.assign(tab.deck.meta, { url: to, title: 'Another page' }); };
+    if (to) { if (metaAfter) tab.clock.setTimeout(meta, metaAfter); else meta(); }
   };
   /**
    * A single-page site moves on to another track in place (history.pushState): the address changes, which the hub
@@ -208,7 +209,7 @@ export function makeTab({ tabId = 7, url = 'https://site.example/track', frames 
    * of its own, which the tap says feeds it now.
    */
   tab.moveInPlace = ({ to, rendition: r2 = null, duration, appendAfter = 10 } = {}) => {
-    if (tab.deck) Object.assign(tab.deck.meta, { url: to });
+    if (tab.deck) Object.assign(tab.deck.meta, { url: to, title: 'Another track' });
     for (const fr of tab.frames) {
       if (fr.left) continue;
       if (fr.pg.rendition) fr.pg.rendition.segs.forEach((_, k) => fr.appended.add(k));
@@ -287,11 +288,12 @@ export function makeEngine({ tabs = [], limitMin = 15, hubOk = true, clock = (ta
       if (signal && signal.aborted) throw new Error('Track analysis cancelled');
       return { bpm: 124, conf: 0.9, octConf: 1, segments: [], bar1: null, residuals: { median: 1, max: 2 }, wave: null };
     },
-    async startResidentDeck({ deckId, pcm, analysis, ...rest }) {
+    async startResidentDeck({ deckId, pcm, analysis, meta = {}, ...rest }) {
       e.calls.push({ fn: 'startResidentDeck', deckId, frames: pcm.L.length, code: pcm.L[0], analysis: !!analysis, rest });
       const d = e.decks.get(deckId);
       if (!d || e.leaving.has(d)) return { ok: false, error: 'That deck is gone.' };
       await turn();
+      Object.assign(d.meta, meta);
       d.kind = 'resident'; d.duration = pcm.L.length / pcm.sampleRate;
       structuredClone([pcm.L, pcm.R], { transfer: [...new Set([pcm.L.buffer, pcm.R.buffer])] }); // the deck takes the arrays, as the real one does
       d.setLoad({ state: 'ready', progress: 1, strategy: null, error: null });

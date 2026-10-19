@@ -253,7 +253,8 @@ class Engine {
       }
       case ENGINE.META: {
         const d = this.deckByTab(msg.tabId);
-        if (d) { Object.assign(d.meta, msg.meta || {}); if (d.loader) d.loader.poke(); } // a load waits on no page that moved on
+        // A load waits on no page that moved on. A resident deck letting go of its tab is not renamed by the next page.
+        if (d && d.kind !== 'resident') { Object.assign(d.meta, msg.meta || {}); if (d.loader) d.loader.poke(); }
         return { ok: true };
       }
       case ENGINE.PING: return { ok: true, decks: [...this.decks.values()].map((d) => ({ tabId: d.tabId, slot: d.slot })) };
