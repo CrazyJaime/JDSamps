@@ -841,10 +841,10 @@ const kicksOf = (deckId) => engine(`const pcm = e.__pcm.get(${deckId}), L = pcm.
  * In the engine (offscreen page): every jds-recorder made from now on records the track at `url` as a 2× player puts it
  * out, captured perfectly, from the moment the real capture first sounds after the page was held silent (before that,
  * the real capture passes through). So no busy computer's own skips get into it, and what is done to it is all that is
- * done to it: before batch `ins` 10 ms of silence is put in, and from batch `lose` 10 ms is lost, as a busy computer's
- * tab capture skips; from batch `leak` on, 1 ms is lost from every batch (a capture whose speed changes). Each batch
- * keeps its length (and context frame), so all the audio after a skip comes late (or early). undo() puts
- * AudioWorkletNode back.
+ * done to it, at fixed places in the track (s of it, from its first sound), however long the page took to start: at
+ * `ins` 10 ms of the capture's silence is put in, and at `lose` 10 ms of it is lost, as a busy computer's tab capture
+ * skips; from `leak` on, 1 ms is lost from every 8192 frames (a capture whose speed changes). The recorder's batches
+ * keep their length, so all the audio after a skip comes late (or early). undo() puts AudioWorkletNode back.
  */
 async function idealCapture(url, { ins = -1, lose = -1, leak = -1 } = {}) {
   const ctx = globalThis.__jdsEngine.ctx, sr = ctx.sampleRate;
@@ -854,26 +854,25 @@ async function idealCapture(url, { ins = -1, lose = -1, leak = -1 } = {}) {
   const two = await off.startRendering(), A = two.getChannelData(0), B = two.getChannelData(1);
   let s0 = 0;
   while (s0 < A.length && Math.abs(A[s0]) <= 0.003 && Math.abs(B[s0]) <= 0.003) s0++; // the track's first sound in it
-  const BUF = Math.round(0.01 * sr), LEAK = Math.round(0.001 * sr), i16 = (x) => Math.max(-32768, Math.min(32767, Math.round(x * 32767)));
+  const BUF = Math.round(0.01 * sr), LEAK = Math.round(0.001 * sr), at = (t) => (t < 0 ? Infinity : Math.round((t / 2) * sr));
+  const INS = at(ins), LOSE = at(lose), LEAKS = at(leak), i16 = (x) => Math.max(-32768, Math.min(32767, Math.round(x * 32767)));
+  // Where frame r (from the first sound) of the edited capture is read from in the perfect one, or -1 for silence put in.
+  const from = (r) => {
+    if (r >= INS && r < INS + BUF) return -1;
+    return r + s0 - (r >= INS ? BUF : 0) + (r >= LOSE ? BUF : 0) + (r >= LEAKS ? LEAK * (1 + Math.floor((r - LEAKS) / 8192)) : 0);
+  };
   const edit = () => {
-    let batch = 0, pos = 0, quiet = 0, anchor = -1, shift = 0; // shift: where the track is read from, against where it would be
+    let pos = 0, quiet = 0, anchor = -1;
     return (m) => {
       if (!m || m.t !== 'data') return m;
-      const n = m.frames, real = m.buf, out = new Int16Array(2 * n), b = batch++;
-      let hush = 0;
-      if (anchor >= 0) { // the edits, at the start of the batch: what is lost is skipped, silence put in delays the rest
-        if (b === lose) shift += BUF;
-        if (leak >= 0 && b >= leak) shift += LEAK;
-        if (b === ins) { hush = BUF; shift -= BUF; }
-      }
+      const n = m.frames, real = m.buf, out = new Int16Array(2 * n);
       for (let i = 0; i < n; i++) {
         if (anchor < 0) {
           const loud = Math.abs(real[2 * i]) > 98 || Math.abs(real[2 * i + 1]) > 98; // above -50 dBFS
           if (loud && quiet >= 0.3 * sr) anchor = pos + i; else quiet = loud ? 0 : quiet + 1;
           if (anchor < 0) { out[2 * i] = real[2 * i]; out[2 * i + 1] = real[2 * i + 1]; continue; }
         }
-        if (i < hush) continue;
-        const k = pos + i - anchor + s0 + shift;
+        const k = from(pos + i - anchor);
         if (k >= 0 && k < A.length) { out[2 * i] = i16(A[k]); out[2 * i + 1] = i16(B[k]); }
       }
       pos += n;
@@ -894,7 +893,7 @@ async function idealCapture(url, { ins = -1, lose = -1, leak = -1 } = {}) {
 }
 
 test('recording a whole track through a capture that skips (a busy computer loses or repeats 10 ms now and then): every beat in its place', async (t) => {
-  await engine(`await (${idealCapture})('${rec.origin}/rec.mp3', { ins: 14, lose: 34 }); return true;`); // 2.4 s and 5.8 s into the capture: about 3.4 s and 10.2 s of the track
+  await engine(`await (${idealCapture})('${rec.origin}/rec.mp3', { ins: 3.4, lose: 10.7 }); return true;`); // each inside a kick, as the tests of mendSteps have them
   try {
     const { site, d } = await liveDeck(`${rec.origin}/rec`);
     await playing(site.tab);
@@ -941,7 +940,7 @@ const lagsOf = (deckId, url) => engine(`
   return out;`);
 
 test('recording a whole track of a loop with a continuous bed through a capture that skips: each skip mended, nothing else touched, the deck on the track', async (t) => {
-  await engine(`await (${idealCapture})('${rec.origin}/techno.wav', { ins: 14, lose: 34 }); return true;`);
+  await engine(`await (${idealCapture})('${rec.origin}/techno.wav', { ins: 3.4, lose: 10.7 }); return true;`);
   try {
     const { site, d } = await liveDeck(`${rec.origin}/techno`);
     await playing(site.tab);
@@ -963,7 +962,7 @@ test('recording a whole track of a loop with a continuous bed through a capture 
 });
 
 test('a recording whose capture ran at a changing speed (losing a little all the time from half way) is refused, saying so once, with its report: never a deck at the wrong speed', async () => {
-  await engine(`await (${idealCapture})('${rec.origin}/rec.mp3', { leak: 24 }); return true;`); // from about 8 s of the track on
+  await engine(`await (${idealCapture})('${rec.origin}/rec.mp3', { leak: 6.5 }); return true;`);
   try {
     const { site, d } = await liveDeck(`${rec.origin}/rec`);
     await playing(site.tab);

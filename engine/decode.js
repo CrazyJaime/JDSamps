@@ -43,9 +43,10 @@ export async function fetchArrayBuffer(url, { signal, stall = FETCH_STALL, cap =
       arm();
       const { done, value } = await reader.read();
       if (done) break;
-      if (n + value.byteLength > limit) {
+      const left = Math.min(cap, budget ? took + budget.left : Infinity); // the others sharing the budget take from it too
+      if (n + value.byteLength > left) {
         throw size == null ? refuse('stream', 'this link is a stream with no end, so there is no whole track to load')
-          : refuse('big', `it holds more than the ${mb(limit)} a deck takes`);
+          : refuse('big', `it holds more than the ${mb(left)} a deck takes`);
       }
       if (out && n + value.byteLength > out.length) { parts.push(out.subarray(0, n)); out = null; } // longer than it said (a coded body)
       if (out) out.set(value, n); else parts.push(value);

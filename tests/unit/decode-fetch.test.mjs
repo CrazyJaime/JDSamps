@@ -105,6 +105,12 @@ test('a budget shared by several fetches is a cap on them all', async () => {
   assert.equal((await fetchArrayBuffer(`${origin}/file.mp3`, { budget })).byteLength, 300 * KB);
   assert.equal(budget.left, 100 * KB);
   await refused(fetchArrayBuffer(`${origin}/file.mp3`, { budget }), 'big', /more than the 0\.1 MB a deck takes/);
+  // Two at once, sharing it: what they keep together never passes it.
+  const shared = { left: 400 * KB }, rs = await Promise.allSettled([1, 2].map(() => fetchArrayBuffer(`${origin}/file.mp3`, { budget: shared })));
+  const kept = rs.filter((r) => r.status === 'fulfilled');
+  assert.equal(kept.length, 1, JSON.stringify(rs.map((r) => r.status)));
+  assert.ok(rs.find((r) => r.status === 'rejected').reason instanceof FetchRefused);
+  assert.equal(shared.left, 100 * KB);
 });
 
 test('a web page is refused as one: open it in a tab', async () => {
