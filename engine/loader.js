@@ -1157,7 +1157,7 @@ const REC_RATE = 2;
 const AUDIBLE = 0.003; // about -50 dBFS, as a deck's first audible sample
 const HOLD_MS = 700;   // the player held silent at the start: longer than a recorder batch and the capture's delay
 const CAP_LAG = 0.03;  // s: by how much the player's clock puts its time 0 early in the capture (measured: 28-35 ms)
-const LEAD_MIN = 0.02; // s of the capture: a silence before the first sound shorter than this is not told from the clock's scatter
+const LEAD_MIN = 0.1;  // s of the capture: a silence before the first sound shorter than this is not told from the clock's error (on a busy computer the capture comes up to 70 ms later than the clock puts it)
 const DISTURBED = 'the recording was disturbed (the computer was busy); try again';
 
 /** The first audible frame in [from, to) of a recording, or -1. */
@@ -1230,13 +1230,13 @@ function barShifts(f, Tb, span, lag) {
     for (let j = Math.max(0, k - 16); j <= Math.min(nb - 1, k + 16); j++) if (!isNaN(d[j])) w.push(d[j]);
     if (w.length >= 8) base[k] = medianOf(w);
   }
-  return { f, d, base, nb, start, Tb, span };
+  return { f, d, base, nb, start, Tb, span, lag, S1, S2 };
 }
 
-/** A recording's readings at beat T (s): both envelopes, in windows of one beat and of two. */
-function skipReadings(pcm, T, hop) {
+/** A recording's readings at beat T (s): both envelopes, in windows of one beat and of two (or only the one `as` is). */
+function skipReadings(pcm, T, hop, as = null) {
   const sr = pcm.sampleRate, lag = Math.round((SKIP_LAG * sr) / hop), out = [];
-  for (const [i, f] of skipEnvelopes(pcm, hop).entries()) for (const span of [1, 2]) out.push({ i, ...barShifts(f, (T * sr) / hop, span, lag) });
+  for (const [i, f] of skipEnvelopes(pcm, hop).entries()) for (const span of [1, 2]) if (!as || (as.i === i && as.span === span)) out.push({ i, ...barShifts(f, (T * sr) / hop, span, lag) });
   return out;
 }
 
@@ -1244,7 +1244,8 @@ function skipReadings(pcm, T, hop) {
  * The steps in one reading: a run of windows off their bar by one amount S, with the beat as it was either side of
  * it (past the windows that straddle the step, which may read anything), where the bars about it (two bars either
  * side) sit together.
- * -> [{S (hops), mlo, mhi, first, last}]: the first window wholly after the step is one of mlo..mhi.
+ * -> [{S (hops), mlo, mhi, first, last, A, B, lo, hi, bar}]: the first window wholly after the step is one of mlo..mhi;
+ * the step lies in A..B (hops), lo..hi is the stretch it is told by, and bar (hops) is the bar there.
  */
 function readSteps(r, hop, sr) {
   const { d, base, nb, span } = r, tol = (SKIP_TOL * sr) / hop, min = (SKIP_MIN * sr) / hop, max = (SKIP_MAX * sr) / hop;
@@ -1275,8 +1276,9 @@ function readSteps(r, hop, sr) {
     if (last + 2 >= nb) { mark(); continue; } // the track ends: no telling
     if (!side(first - 1, -1) || !side(last + 1, 1)) continue;
     mark();
-    const mlo = Math.max(1, first, last - 3);
-    out.push({ S, mlo, mhi: Math.max(mlo, Math.min(first + span, last - 3 + span)), first, last });
+    const mlo = Math.max(1, first, last - 3), mhi = Math.max(mlo, Math.min(first + span, last - 3 + span)), { Tb, start } = r;
+    out.push({ S, mlo, mhi, first, last, A: Math.round(start(mlo - 1) - 0.25 * Tb), B: Math.round(start(mhi) + 0.25 * Tb),
+      lo: start(mlo - 1) - Tb, hi: start(mhi) + Tb, bar: 4 * Tb + (base[mhi] || 0) });
   }
   return out.filter((s) => {
     const rest = [];
@@ -1293,13 +1295,15 @@ function readSteps(r, hop, sr) {
 }
 
 /**
- * Where about step s (hops) the music leaves its bar-before self at the old place and meets it moved by S, on the
- * rises of both envelopes: {lo, hi}, the split that fits best (a stretch, where nothing rises).
+ * Where in A..B (hops) of step s the music leaves its bar-before self at the old place and meets it moved by S, on the
+ * rises of both envelopes: {lo, hi}, the split that fits best (a stretch, where nothing rises). Within a bar of the
+ * start it is read against the bar after instead: moved by S before the step, and at its place after it.
  */
-function whereStep(fs, r, s) {
-  const { Tb, start, base } = r, A = Math.max(1, Math.round(start(s.mlo - 1) - 0.25 * Tb)), B = Math.min(fs[0].length - 1, Math.round(start(s.mhi) + 0.25 * Tb));
-  const b = base[Math.min(base.length - 1, s.mhi)] || 0, n = B - A, E = new Float64Array(n + 1), SM = 4;
-  if (n <= 0 || A - 4 * Tb - b - Math.abs(s.S) - SM - 2 < 0) return { lo: A, hi: B };
+function whereStep(fs, s) {
+  const SM = 4, B = Math.min(fs[0].length - 1, s.B), reach = s.bar + Math.abs(s.S) + SM + 2;
+  const dir = Math.max(1, s.A) - reach >= 0 ? -1 : B + reach < fs[0].length ? 1 : 0;
+  const A = Math.max(dir > 0 ? SM + 1 : 1, s.A), n = B - A, E = new Float64Array(Math.max(0, n) + 1);
+  if (n <= 0 || !dir) return { lo: A, hi: B };
   for (const f of fs) {
     const sm = (x) => { const i = Math.floor(x), t = x - i; let acc = 0; for (let j = 0; j < SM; j++) acc += f[i - j] * (1 - t) + f[i - j + 1] * t; return acc / SM; };
     const rise = (x) => Math.max(0, sm(x) - sm(x - 1));
@@ -1307,9 +1311,9 @@ function whereStep(fs, r, s) {
     for (let x = A; x < B; x++) norm += rise(x) ** 2;
     const P0 = new Float64Array(n + 1), PS = new Float64Array(n + 1);
     for (let i = 0; i < n; i++) {
-      const x = A + i, back = x - 4 * Tb - b, v = rise(x);
-      P0[i + 1] = P0[i] + (v - rise(back)) ** 2 / norm;
-      PS[i + 1] = PS[i] + (v - rise(back - s.S)) ** 2 / norm;
+      const x = A + i, ref = x + dir * s.bar, v = rise(x);
+      P0[i + 1] = P0[i] + (v - rise(dir < 0 ? ref : ref + s.S)) ** 2 / norm;
+      PS[i + 1] = PS[i] + (v - rise(dir < 0 ? ref - s.S : ref)) ** 2 / norm;
     }
     for (let i = 0; i <= n; i++) E[i] += P0[i] + PS[n] - PS[i];
   }
@@ -1320,6 +1324,117 @@ function whereStep(fs, r, s) {
   while (lo > 0 && E[lo - 1] <= eps) lo--;
   while (hi < n && E[hi + 1] <= eps) hi++;
   return { lo: A + lo, hi: A + hi };
+}
+
+// The first beats and the last have no bar before them (or after them) to read a step against. There each window is
+// read against the beat line the steady bars on the far side run on (EDGE_BARS of them, past where a step is looked
+// for), carried on to the edge: a step shows as the windows between it and the edge all off that line by one amount,
+// and those past it on it. Nothing shows of a step before the first beat, or after the last.
+const EDGE = 8;      // beats from the first window told by, where a step is looked for (bar against bar sees further in)
+const EDGE_BARS = 3; // bars on the far side each window is read against
+
+/** How far (hops) about c the window [a, a + W) of reading r matches best, or NaN where it matches badly or past its lag. */
+function matchNear(r, a, W, c) {
+  const { f, S1, S2, lag } = r, o = Math.round(c), cs = new Float64Array(2 * lag + 1).fill(NaN);
+  if (a < 0 || a + W > f.length || o - lag < 0 || o + lag + W > f.length) return NaN;
+  const ma = (S1[a + W] - S1[a]) / W, va = S2[a + W] - S2[a] - W * ma * ma;
+  if (!(va > 1e-12)) return NaN;
+  const c1 = (i) => { // the match at lag i - lag, worked out once
+    if (!isNaN(cs[i])) return cs[i];
+    const p = o + i - lag, mb = (S1[p + W] - S1[p]) / W, vb = S2[p + W] - S2[p] - W * mb * mb;
+    let ab = 0;
+    for (let j = 0; j < W; j++) ab += f[a + j] * f[p + j];
+    return (cs[i] = vb > 1e-12 ? (ab - W * ma * mb) / Math.sqrt(va * vb) : 0);
+  };
+  let best = 0; // every other lag, then the two beside the best (as barShifts)
+  for (let i = 2; i < cs.length; i += 2) if (c1(i) > c1(best)) best = i;
+  for (const i of [best - 1, best + 1]) if (i >= 0 && i < cs.length && c1(i) > c1(best)) best = i;
+  if (c1(best) < 0.5 || best === 0 || best === cs.length - 1) return NaN;
+  const p = c1(best - 1), q = c1(best), s = c1(best + 1), den = p - 2 * q + s;
+  return o + best - lag + (den < 0 ? (0.5 * (p - s)) / den : 0) - c;
+}
+
+/**
+ * Reading r's windows at one end (dir 1: from the start; -1: from the end, inward), each from a quarter beat before a
+ * beat counted from that end (a take that starts or ends on a beat has its onsets well inside them), read against the
+ * beat line through the bars past `from` + EDGE beats. -> window k => {h: how far (hops) those bars sit past where the line puts them (later is
+ * positive, as in d), the median of the readings that agree, or NaN where fewer than two agree; a: its start; w: its
+ * length}, each read once; or null where those bars have no beat to tell by.
+ */
+function edgeShifts(r, dir, tol, from) {
+  const { f, Tb, span, base, nb } = r, n = f.length, W = Math.floor(Tb * span), bs = [], memo = [];
+  for (let j = from + EDGE; j < from + EDGE + 16; j++) { const k = dir > 0 ? j : nb - 1 - j; if (k >= 0 && k < nb && !isNaN(base[k])) bs.push(base[k]); }
+  if (!bs.length) return null;
+  const bar = 4 * Tb + medianOf(bs);
+  const read = (k) => {
+    let a = dir > 0 ? Math.round((k - 0.25) * Tb) : n - W - Math.round((k + 0.25) * Tb), w = W, h = NaN;
+    if (a < 0) { w += a; a = 0; } // the first, cut at the start
+    const m0 = Math.max(1, Math.ceil((from + EDGE + 1 - k) / 4)), xs = [];
+    for (let m = m0; m < m0 + EDGE_BARS; m++) { const x = matchNear(r, a, w, a + dir * m * bar); if (!isNaN(x)) xs.push(dir * x); }
+    const v = medianOf(xs), agree = xs.filter((x) => Math.abs(x - v) <= tol);
+    if (xs.length >= 2 && agree.length >= 2 && agree.length >= xs.length - 1) h = medianOf(agree);
+    return { h, a, w };
+  };
+  const at = (k) => memo[k] || (memo[k] = read(k));
+  at.bar = bar;
+  return at;
+}
+
+/**
+ * The step at one end of reading r (dir as edgeShifts): from the first window there told by (past silence), windows
+ * off the line by one amount S, then, past at most `span` that straddle the step, windows on it, sitting as closely as
+ * the bars about a step must; the step within EDGE beats of that first window. Windows not told by are passed over.
+ * -> {step: {S, A, B, lo, hi, bar, edge} or null, seen: the first beat (dir 1) or the last (-1) a step could be seen
+ * past (hops), or null where nothing at that end is told by, drift: true where the beat there drifts}.
+ */
+function edgeStep(r, dir, hop, sr) {
+  const tol = (SKIP_TOL * sr) / hop, min = (SKIP_MIN * sr) / hop, max = (SKIP_MAX * sr) / hop, { f, span, Tb } = r, none = { step: null, seen: null };
+  const lead = edgeShifts(r, dir, tol, 0);
+  let first = 0;
+  while (lead && first < 16 && isNaN(lead(first).h)) first++;
+  const e = !lead || first >= 16 ? null : first ? edgeShifts(r, dir, tol, first) : lead;
+  if (!e) return none;
+  const K = first + EDGE + span + 10, h = (k) => e(k).h, told = (k) => !isNaN(h(k));
+  while (first < K && !told(first)) first++;
+  if (first + EDGE + span + 6 > K) return none;
+  // The beat in the first window told by: where the music first rises through half its loudest there.
+  const { a, w } = e(first);
+  let top = 0, seen = a;
+  for (let i = a; i < a + w; i++) top = Math.max(top, f[i]);
+  while (f[seen] < 0.5 * top) seen++;
+  const v = h(first);
+  if (!(Math.abs(v) >= min)) return { step: null, seen };
+  let last = first, q = -1;
+  const across = []; // straddling the step
+  for (let k = first + 1; k < K && q < 0; k++) {
+    if (!told(k)) continue;
+    if (Math.abs(h(k) - v) <= tol && !across.length) last = k;
+    else if (Math.abs(h(k)) <= tol) q = k;
+    else across.push(h(k));
+  }
+  const run = [], off = [];
+  for (let k = first; k <= last; k++) if (told(k)) run.push(h(k));
+  for (let k = first; k < q; k++) if (told(k)) off.push(h(k));
+  const S = medianOf(run);
+  // A track whose own tempo moves there comes back to the line a little every beat, not at once: one-beat windows
+  // nearer the line beat by beat all the way from the edge are its drift, and no step at that end is a skip. A run off
+  // the line too short to tell from a drift, then windows between it and the line, is not a step either.
+  const drift = span === 1 && q >= 0 && q <= first + EDGE && off.length >= 2 && off.every((x, i) => Math.sign(x) === Math.sign(v) && (!i || Math.abs(x) < Math.abs(off[i - 1]) - tol / 2));
+  if (drift || (run.length < 3 && across.some((x) => Math.sign(x) === Math.sign(S) && Math.abs(x) < Math.abs(S) - tol))) return { step: null, seen, drift };
+  if (q < 0 || Math.abs(S) > max || run.some((x) => Math.abs(x - S) > tol) || across.length > span || q > first + EDGE) return { step: null, seen };
+  const rest = [];
+  let stray = 0, quiet = 0;
+  for (let k = q; k < Math.min(K, q + 9); k++) {
+    if (!told(k)) continue;
+    if (rest.length < 3 && Math.abs(h(k)) <= tol) quiet++;
+    rest.push(Math.abs(h(k)));
+    if (Math.abs(h(k)) >= min) stray++;
+  }
+  rest.sort((x, y) => x - y);
+  if (quiet < 2 || rest.length < 6 || (rest[Math.floor(0.9 * (rest.length - 1))] * hop) / sr > SKIP_NOISE || stray) return { step: null, seen };
+  // Between the music of the last window off the line and that of the first on it.
+  const [x, y] = dir > 0 ? [e(last), e(q)] : [e(q), e(last)], A = Math.round(x.a - 0.25 * Tb), B = Math.round(y.a + y.w + 0.25 * Tb);
+  return { step: { S, A, B, lo: A - 0.75 * Tb, hi: B + 0.75 * Tb, bar: e.bar, edge: dir }, seen };
 }
 
 /** A recording with edits [at, frames cut (> 0) or silence put in (< 0)], in order. */
@@ -1338,18 +1453,41 @@ function edited({ L, R, sampleRate }, edits) {
  * A recording's skips mended, so every beat is in its place: silence the capture put in is cut (the run of zeros a
  * step long, or the step's worth of a longer one), and audio it lost is given back as silence in the quietest 10 ms
  * where the step is. A loss must show in two readings; an edit stays only where the mended recording reads as one
- * beat there. T: the beat period (s). -> {pcm, steps: [{at: s, ms}]}; pcm is the same object when nothing was mended.
+ * beat there. Steps in the first beats and the last are read against the beat line of the bars past them; an end
+ * whose beat drifts back to that line (a track whose own tempo moves there) is left as it is. T: the beat period (s).
+ * -> {pcm, steps: [{at: s, ms}], seen: [s, s] (the first beat and the last: a step before the one or after the other
+ * cannot be seen) or null (no beat to tell by)}; pcm is the same object when nothing was mended.
  */
 export function mendSteps(pcm, T) {
   const { L, R, sampleRate: sr } = pcm, hop = Math.max(1, Math.round(0.0005 * sr));
-  if (!(T > 0) || L.length < 12 * T * sr) return { pcm, steps: [] };
-  const rs = skipReadings(pcm, T, hop), fs = rs.filter((r) => r.span === 1).map((r) => r.f), found = [];
-  for (const r of rs) for (const s of readSteps(r, hop, sr)) {
-    const lo = r.start(s.mlo - 1) - r.Tb, hi = r.start(s.mhi) + r.Tb, same = found.find((x) => x.lo < hi && lo < x.hi);
-    if (!same) found.push({ r, s, lo, hi, seen: 1 });
-    else if (Math.abs(same.s.S - s.S) <= (SKIP_TOL * sr) / hop) same.seen++;
+  if (!(T > 0) || L.length < 12 * T * sr) return { pcm, steps: [], seen: null };
+  const rs = skipReadings(pcm, T, hop), fs = rs.filter((r) => r.span === 1).map((r) => r.f), near = [];
+  const add = (r, s) => {
+    const same = near.find((x) => x.lo < s.hi && s.lo < x.hi);
+    if (!same) near.push({ lo: s.lo, hi: s.hi, all: [{ r, s }] });
+    else same.all.push({ r, s });
+  };
+  let first = Infinity, last = -Infinity;
+  const ends = [], drifts = new Set();
+  for (const r of rs) {
+    for (const s of readSteps(r, hop, sr)) add(r, s);
+    for (const dir of [1, -1]) {
+      const { step, seen, drift } = edgeStep(r, dir, hop, sr);
+      if (seen != null) { if (dir > 0) first = Math.min(first, seen); else last = Math.max(last, seen); }
+      if (step) ends.push([r, step]);
+      if (drift) drifts.add(dir);
+    }
   }
-  found.sort((p, q) => p.lo - q.lo);
+  for (const [r, step] of ends) if (!drifts.has(step.edge)) add(r, step); // an end whose beat drifts has no skip told there
+  const beats = first < last ? [(first * hop) / sr, (last * hop) / sr] : null;
+  // Each step as its readings put it: the median of how far they see it move, and how many see that. A run read bar
+  // against bar may start no earlier than the fifth beat, so where an end's reading puts the step counts too.
+  const found = near.map(({ lo, all }) => {
+    const S = medianOf(all.map((x) => x.s.S)), agree = all.filter((x) => Math.abs(x.s.S - S) <= (SKIP_TOL * sr) / hop);
+    const { r, s } = agree.reduce((p, x) => (Math.abs(x.s.S - S) < Math.abs(p.s.S - S) ? x : p)), ends = agree.filter((x) => x.s.edge);
+    const A = Math.min(s.A, ...ends.map((x) => x.s.A)), B = Math.max(s.B, ...ends.map((x) => x.s.B));
+    return { r, s: { ...s, S, A, B, edge: ends.length ? ends[0].s.edge : 0 }, seen: agree.length, lo };
+  }).sort((p, q) => p.lo - q.lo);
   const BUF = Math.round(0.01 * sr), tol = Math.round(SKIP_TOL * sr), edits = [];
   for (const { r, s, seen } of found) {
     let D = Math.round(s.S * hop), at = -1, len;
@@ -1359,8 +1497,7 @@ export function mendSteps(pcm, T) {
     if (D > 0) {
       // The capture's silence: a run of zeros as long as the step; or, where the track is near silent there too, a
       // near-silent run the step longer than the same place a bar away (silence it fell into).
-      const lo = Math.max(0, Math.round(r.start(s.mlo - 1) - 0.25 * r.Tb) * hop), hi = Math.min(L.length, Math.round(r.start(s.mhi) + 0.25 * r.Tb) * hop);
-      const bar = Math.round((4 * r.Tb + (r.base[s.mhi] || 0)) * hop);
+      const lo = Math.max(0, s.A * hop), hi = Math.min(L.length, s.B * hop), bar = Math.round(s.bar * hop);
       const runs = (still) => {
         const runAt = (i) => { if (!still(i)) return 0; let a = i, j = i; while (still(a - 1)) a--; while (still(j)) j++; return j - a; };
         const out = [];
@@ -1383,7 +1520,7 @@ export function mendSteps(pcm, T) {
       if (Math.abs(best.run - D) <= tol && zero(best.a)) { at = best.a; len = best.run; } else at = best.a + ((best.run - D) >> 1);
     } else {
       if (seen < 2) continue; // a loss leaves nothing behind: two readings must see it
-      const sp = whereStep(fs, r, s), w = Math.min(-D, BUF), a0 = Math.max(0, sp.lo * hop - (w >> 1)), b0 = Math.min(L.length, (sp.hi + 1) * hop + (w >> 1));
+      const sp = whereStep(fs, s), w = Math.min(-D, BUF), a0 = Math.max(0, sp.lo * hop - (w >> 1)), b0 = Math.min(L.length, (sp.hi + 1) * hop + (w >> 1));
       const sum = new Float64Array(Math.max(0, b0 - a0) + 1);
       for (let i = a0; i < b0; i++) sum[i - a0 + 1] = sum[i - a0] + Math.max(Math.abs(L[i]), Math.abs(R[i]));
       let low = Infinity;
@@ -1392,22 +1529,24 @@ export function mendSteps(pcm, T) {
     }
     const prev = edits[edits.length - 1];
     if (prev && at < prev[0] + Math.max(0, prev[1])) continue;
-    edits.push([at, len, r]);
+    edits.push([at, len, r, s]);
   }
-  if (!edits.length) return { pcm, steps: [] };
-  // Read again about each edit (12 beats either side): an edit after which its reading still finds a step there was
-  // no skip, or not that one.
+  if (!edits.length) return { pcm, steps: [], seen: beats };
+  // Read again about each edit (12 beats either side, and the end it was read at): an edit after which its reading
+  // still finds a step there was no skip, or not that one.
   let out = edited(pcm, edits), moved = 0;
-  const keep = edits.filter(([at, len, r]) => {
+  const keep = edits.filter(([at, len, r, s]) => {
     const mid = at - moved, from = Math.max(0, Math.round(mid - 12 * T * sr)), to = Math.min(out.L.length, Math.round(mid + 12 * T * sr));
     moved += len;
     const part = { L: out.L.subarray(from, to), R: out.R.subarray(from, to), sampleRate: sr }, k = (mid - from) / hop / r.Tb;
-    const y = skipReadings(part, T, hop).find((x) => x.i === r.i && x.span === r.span);
-    return !readSteps(y, hop, sr).some((s) => s.mlo - 3 <= k && k <= s.mhi + 3);
+    if (readSteps(skipReadings(part, T, hop, r)[0], hop, sr).some((x) => x.mlo - 3 <= k && k <= x.mhi + 3)) return false;
+    if (!s.edge) return true;
+    const n = out.L.length, size = Math.min(n, Math.round(((3 * EDGE + 4 * EDGE_BARS + 16) * T * sr) / hop) * hop), a = s.edge > 0 ? 0 : n - size;
+    return !edgeStep(skipReadings({ L: out.L.subarray(a, a + size), R: out.R.subarray(a, a + size), sampleRate: sr }, T, hop, r)[0], s.edge, hop, sr).step;
   });
-  if (!keep.length) return { pcm, steps: [] };
+  if (!keep.length) return { pcm, steps: [], seen: beats };
   if (keep.length < edits.length) out = edited(pcm, keep);
-  return { pcm: out, steps: keep.map(([at, len]) => ({ at: at / sr, ms: (len / sr) * 1000 })) };
+  return { pcm: out, steps: keep.map(([at, len]) => ({ at: at / sr, ms: (len / sr) * 1000 })), seen: beats };
 }
 
 const DRIFT_TOL = 0.003; // s (of the track): how far the beat about any bar may sit from the track's own, in a recording that keeps time
@@ -1583,11 +1722,12 @@ export class Recording extends Job {
           return null;
         }
       };
-      let analysis = await analyse(), mended = [], held = { L: take.L, R: take.R, sampleRate: sr };
+      let analysis = await analyse(), mended = [], looked, held = { L: take.L, R: take.R, sampleRate: sr };
       this.check();
       // The capture's skips, mended against its own bars (a bar apart everywhere else), and the beat found again.
       if (analysis && analysis.bpm > 0) {
         const m = mendSteps(held, 60 / analysis.bpm / REC_RATE);
+        looked = m.seen;
         if (m.steps.length) {
           mended = m.steps;
           held = m.pcm;
@@ -1603,6 +1743,8 @@ export class Recording extends Job {
         `Recorded: ${(need / sr).toFixed(3)} s of the tab's sound from deck ${live.slot}'s capture, slowed back by ${REC_RATE}, from the player's time 0 (its first sound ${lead.toFixed(3)} s in)`,
         ...(mended.length ? [`Mended: ${mended.length} skip${mended.length === 1 ? '' : 's'} in the capture (the computer was busy): ${mended.map((x) =>
           `${Math.round(Math.abs(x.ms) * REC_RATE)} ms ${x.ms > 0 ? 'put in' : 'lost'} at ${(x.at * REC_RATE).toFixed(1)} s`).join(', ')}`] : []),
+        ...(looked === undefined ? [] : [looked ? `Skips: looked for between its first beat (${(looked[0] * REC_RATE).toFixed(1)} s in) and its last (${(looked[1] * REC_RATE).toFixed(1)} s in); one before the first or after the last cannot be seen`
+          : 'Skips: not looked for (no steady beat to read them by)']),
         ...(kept && kept.spread != null ? [`Beat: ${kept.steady ? 'steady all through' : kept.ok ? 'moving' : 'not steady'}: the beat about a bar ${kept.steady ? 'within' : 'up to'} ${(kept.spread * REC_RATE * 1000).toFixed(1)} ms of the track's${
           kept.steady ? '' : kept.ok ? " (the track's own tempo: the capture kept the player's pace)" : ' (the capture ran at a changing speed)'}`] : []),
         ...(kept ? [kept.pace == null ? "Pace: not known (the player said where it was too seldom)"

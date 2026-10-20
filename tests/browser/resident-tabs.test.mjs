@@ -745,6 +745,21 @@ async function recordWholeTrack(t, d) {
   }
 }
 
+/** How a promoted deck's kept track lines up with the source at `url` over its first 4 s: {lag (s), corr}, where it matches best within 30 ms. */
+const againstSource = (deckId, url) => engine(`
+  const pcm = e.__pcm.get(${deckId});
+  const ref = await e.ctx.decodeAudioData(await (await fetch('${url}')).arrayBuffer());
+  const a = pcm.L, b = ref.getChannelData(0), sr = pcm.sampleRate, n = Math.round(4 * sr), W = Math.round(0.03 * sr);
+  let best = { lag: 0, corr: -1 };
+  for (let lag = -W; lag <= W; lag += 2) {
+    let ab = 0, aa = 0, bb = 0;
+    for (let i = W; i < n; i++) { const x = a[i + lag], y = b[i]; ab += x * y; aa += x * x; bb += y * y; }
+    const corr = ab / Math.sqrt(aa * bb);
+    if (corr > best.corr) best = { lag: lag / sr, corr };
+  }
+  e.__pcm.delete(${deckId});
+  return best;`);
+
 test('recording a whole track from a media page: its player run at 2× from the start, the capture slowed back, a resident deck labelled as such', async (t) => {
   const { site, d } = await liveDeck(`${rec.origin}/rec`);
   await playing(site.tab);
@@ -762,20 +777,7 @@ test('recording a whole track from a media page: its player run at 2× from the 
   t.diagnostic(`beat to beat (ms): ${kicks.slice(1).map((x, i) => Math.round((x - kicks[i]) * 1000)).join(' ')}; ${r.load.report.split('\n').filter((l) => /^Mended/.test(l)).join('') || 'nothing mended'}`);
   assert.ok(Math.abs(r.bpm.native - 124) < 0.5, `bpm ${r.bpm.native}`);
   // Slowed back to the track's own pitch: lined up with the source (to within a few ms), the audio matches it.
-  const c = await engine(`
-    const pcm = e.__pcm.get(${loading.id});
-    const ref = await e.ctx.decodeAudioData(await (await fetch('${rec.origin}/rec.mp3')).arrayBuffer());
-    const a = pcm.L, b = ref.getChannelData(0), sr = pcm.sampleRate, n = Math.round(4 * sr), W = Math.round(0.03 * sr);
-    let best = { lag: 0, corr: -1 };
-    for (let lag = -W; lag <= W; lag += 2) {
-      let ab = 0, aa = 0, bb = 0;
-      for (let i = W; i < n; i++) { const x = a[i + lag], y = b[i]; ab += x * y; aa += x * x; bb += y * y; }
-      const corr = ab / Math.sqrt(aa * bb);
-      if (corr > best.corr) best = { lag: lag / sr, corr };
-    }
-    e.__pcm.delete(${loading.id});
-    return best;
-  `);
+  const c = await againstSource(loading.id, `${rec.origin}/rec.mp3`);
   t.diagnostic(`deck ${r.duration.toFixed(3)} s of a ${D.toFixed(3)} s track in ${took.toFixed(1)} s; against the source: ${JSON.stringify(c)}; ${r.load.report.split('\n').find((l) => /^Recorded/.test(l))}`);
   assert.ok(c.corr > 0.8, JSON.stringify(c));
   // The live deck it came from is gone, and with it the tab's capture: the page is paused, at its own rate, and the
@@ -886,10 +888,11 @@ const kicksOf = (deckId) => engine(`const pcm = e.__pcm.get(${deckId}), L = pcm.
  * `ins` 10 ms of the capture's silence is put in, and at `lose` 10 ms of it is lost, as a busy computer's tab capture
  * skips: the recorder's batches keep their length, so all the audio after a skip comes late (or early). From `leak` on,
  * 1 ms is lost every 2048 frames as an engine too busy to keep up loses it (a capture whose speed changes): the audio
- * jumps on by it, and the batches come that much short, the capture falling behind the player's clock. undo() puts
- * AudioWorkletNode back.
+ * jumps on by it, and the batches come that much short, the capture falling behind the player's clock. With `late`
+ * (s of the track) the capture comes that much later than the player's clock puts it, as a busy computer's can: as
+ * much silence before the track's first sound. undo() puts AudioWorkletNode back.
  */
-async function idealCapture(url, { ins = -1, lose = -1, leak = -1 } = {}) {
+async function idealCapture(url, { ins = -1, lose = -1, leak = -1, late = 0 } = {}) {
   const ctx = globalThis.__jdsEngine.ctx, sr = ctx.sampleRate;
   const src = await ctx.decodeAudioData(await (await fetch(url)).arrayBuffer());
   const off = new OfflineAudioContext(2, Math.ceil(src.length / 2) + 256, sr), node = off.createBufferSource();
@@ -898,9 +901,11 @@ async function idealCapture(url, { ins = -1, lose = -1, leak = -1 } = {}) {
   let s0 = 0;
   while (s0 < A.length && Math.abs(A[s0]) <= 0.003 && Math.abs(B[s0]) <= 0.003) s0++; // the track's first sound in it
   const BUF = Math.round(0.01 * sr), LEAK = Math.round(0.001 * sr), at = (t) => (t < 0 ? Infinity : Math.round((t / 2) * sr));
-  const INS = at(ins), LOSE = at(lose), LEAKS = at(leak), i16 = (x) => Math.max(-32768, Math.min(32767, Math.round(x * 32767)));
+  const INS = at(ins), LOSE = at(lose), LEAKS = at(leak), LATE = Math.round((late / 2) * sr), i16 = (x) => Math.max(-32768, Math.min(32767, Math.round(x * 32767)));
   // Where frame r (from the first sound) of the edited capture is read from in the perfect one, or -1 for silence put in.
   const from = (r) => {
+    if (r < LATE) return -1;
+    r -= LATE;
     if (r >= INS && r < INS + BUF) return -1;
     return r + s0 - (r >= INS ? BUF : 0) + (r >= LOSE ? BUF : 0) + (r >= LEAKS ? LEAK * (1 + Math.floor((r - LEAKS) / 2048)) : 0);
   };
@@ -961,6 +966,55 @@ test('recording a whole track through a capture that skips (a busy computer lose
     // The two skips are mended, and nothing else is touched (the capture has no skips of its own).
     assert.match(r.load.report, /^Mended: 2 skips in the capture \(the computer was busy\): 20 ms put in at \d+\.\d s, 20 ms lost at \d+\.\d s$/m);
     assert.match(r.load.report, /^Beat: steady all through: /m);
+  } finally { await engine('window.__undoSkips && window.__undoSkips(); return true;'); }
+});
+
+test('recording a whole track through a capture that skips in its first beats and its last (10 ms of silence put in 0.6 s in, 10 ms lost 1 s before the end): both mended, every beat on the line', async (t) => {
+  // In kick 1, and between kicks 30 and 31: steps the bars alone never mend (1.2 s in they mend silence put in, and a
+  // loss once the take starts even 10 ms before the first sound).
+  await engine(`await (${idealCapture})('${rec.origin}/rec.mp3', { ins: 0.6, lose: 14.97 }); return true;`);
+  try {
+    const { site, d } = await liveDeck(`${rec.origin}/rec`);
+    await playing(site.tab);
+    assert.deepEqual(await act(deck, d.id, 'recordWhole'), { ok: true, error: undefined });
+    const loading = await deckWhere((x) => x.id !== d.id && x.kind === 'loading', 5000);
+    const r = await deckWhere((x) => x.id === loading.id && x.kind === 'resident', 40000);
+    const kicks = await kicksOf(loading.id), iv = kicks.slice(1).map((x, i) => (x - kicks[i]) * 1000);
+    t.diagnostic(`beat to beat (ms): ${iv.map(Math.round).join(' ')}; bpm ${r.bpm.native}; ${r.load.report.split('\n').filter((l) => /^(Mended|Skips)/.test(l)).join(' | ')}`);
+    assert.ok(kicks.length >= 32, `${kicks.length} kicks`);
+    // Every beat on one straight line, the first two and the last two with them (the line starts at the second, as above).
+    const on = kicks.slice(1), k = on.map((x) => Math.round((x - on[0]) / (60 / 124))), n = on.length;
+    const mk = k.reduce((a, b) => a + b) / n, mt = on.reduce((a, b) => a + b) / n;
+    const P = k.reduce((a, x, i) => a + (x - mk) * (on[i] - mt), 0) / k.reduce((a, x) => a + (x - mk) ** 2, 0);
+    const off = on.map((x, i) => (x - mt - (k[i] - mk) * P) * 1000);
+    assert.ok(off.every((x) => Math.abs(x) <= 6), `beats off the line (ms): ${off.map((x) => x.toFixed(1)).join(' ')}`);
+    // Both mended where they were (s of the take, which may start a little before the first sound, by the player's
+    // clock): the silence put in is cut where it fell, and the 20 ms lost is given back between kicks 30 and 31.
+    const lead = +/its first sound (\d+\.\d{3}) s in/.exec(r.load.report)[1];
+    const m = /^Mended: 2 skips in the capture \(the computer was busy\): 20 ms put in at (\d+\.\d) s, 20 ms lost at (\d+\.\d) s$/m.exec(r.load.report);
+    assert.ok(m && Math.abs(+m[1] - lead - 0.6) <= 0.1 && Math.abs(+m[2] - lead - 14.85) <= 0.2, r.load.report);
+    const seen = /^Skips: looked for between its first beat \((\d+\.\d) s in\) and its last \((\d+\.\d) s in\); one before the first or after the last cannot be seen$/m.exec(r.load.report);
+    assert.ok(seen && Math.abs(+seen[1] - lead) <= 0.1 && Math.abs(+seen[2] - lead - 32 * (60 / 124)) <= 0.1, r.load.report);
+    assert.match(r.load.report, /^Beat: steady all through: /m);
+  } finally { await engine('window.__undoSkips && window.__undoSkips(); return true;'); }
+});
+
+test('recording a whole track through a capture that comes later than the player\'s clock puts it (0.08 s of the track, as on a busy computer): the deck still starts at the track\'s first sound, on the source', async (t) => {
+  await engine(`await (${idealCapture})('${rec.origin}/rec.mp3', { late: 0.08 }); return true;`);
+  try {
+    const { site, d } = await liveDeck(`${rec.origin}/rec`);
+    await playing(site.tab);
+    assert.deepEqual(await act(deck, d.id, 'recordWhole'), { ok: true, error: undefined });
+    const loading = await deckWhere((x) => x.id !== d.id && x.kind === 'loading', 5000);
+    const r = await deckWhere((x) => x.id === loading.id && x.kind === 'resident', 40000);
+    const c = await againstSource(loading.id, `${rec.origin}/rec.mp3`);
+    t.diagnostic(`against the source: ${JSON.stringify(c)}; ${r.load.report.split('\n').find((l) => /^Recorded/.test(l))}`);
+    // The track opens with sound: a silence before it this short is the capture's delay, not the track's.
+    assert.match(r.load.report, /from the player's time 0 \(its first sound 0\.000 s in\)$/m);
+    assert.ok(c.corr > 0.8, JSON.stringify(c));
+    assert.equal((await act(deck, r.id, 'eject')).ok, true);
+    await waitFor(async () => !(await decks()).some((x) => x.id === r.id), 8000);
+    await site.tab.close();
   } finally { await engine('window.__undoSkips && window.__undoSkips(); return true;'); }
 });
 
