@@ -434,6 +434,54 @@ test('a gap found a few ms off, and a second gap after it: the grid kept before 
   }
 });
 
+/** The e2e pages' sounds at `bpm`, after `lead` s, each beat k at k beats but those in `moved` ({k: ms}), moved on their own. */
+function blipsMoved({ bpm, kind, seconds = 30, sr = 44100, lead = 0, moved = {} }) {
+  const T = 60 / bpm, x = new Float32Array(Math.round((lead + seconds) * sr));
+  for (let k = 0; k * T < seconds; k++) {
+    const at = Math.round((lead + k * T + (moved[k] || 0) / 1000) * sr);
+    for (let i = at; i < x.length && i < at + 0.2 * sr; i++) {
+      const t = (i - at) / sr;
+      if (kind === 'low') x[i] = 0.8 * Math.sin(2 * Math.PI * (45 + 70 * Math.exp(-t * 35)) * t) * Math.exp(-t * 18);
+      else if (kind === 'high' && t < 0.04) x[i] = 0.6 * Math.sin(2 * Math.PI * 3000 * t) * Math.exp(-t * 90);
+      else if (kind === 'mid' && t < 0.08) x[i] = 0.6 * Math.sin(2 * Math.PI * 800 * t) * Math.exp(-t * 50);
+    }
+  }
+  return x;
+}
+
+test('one beat the capture moved on its own a few beats before a gap: the grid kept before the gap stays on the other beats', () => {
+  // The grid kept before a gap is where its last beats are. As the mean of every beat since the gap before, one beat the
+  // box's capture moved by itself (17 ms in one run) pulled it by its share: 2 ms here, where a follower jumps the gap
+  // and measures its offset. The median of the last four leaves it out.
+  for (const [kind, bpm, lead] of [['high', 128, 0.2], ['low', 124, 0.0052], ['mid', 120, 0.2]]) {
+    // gaps of ms1 and ms2 midway after beats n1 and n2; beat n2 - back + 1 moved mv ms
+    for (const [n1, ms1, n2, ms2, back, mv] of [[21, 12, 28, -30, 2, 12], [21, -15, 28, 30, 2, -12], [21, -12, 28, 28, 3, 12], [21, -15, 27, 30, 2, 12]]) {
+      const sr = 44100, T = 60 / bpm, at1 = lead + (n1 + 0.5) * T, at2 = lead + (n2 + 0.5) * T - ms1 / 1000;
+      const kept = (moved) => { // the gaps found, and the grid kept before the second
+        const x = gap(gap(blipsMoved({ kind, bpm, lead, moved }), sr, at1, ms1), sr, at2, ms2), out = [];
+        let deck;
+        const odf = new OdfCore(sr, (f, l, t) => deck.pushFrame(f, l, t));
+        deck = new DeckTempo({ sampleRate: sr, fps: odf.fps });
+        const detect = deck.detectJump.bind(deck);
+        deck.detectJump = () => {
+          const was = deck.track.jump;
+          detect();
+          const j = deck.track.jump;
+          if (j && j !== was) out.push({ from: j.from, D: (deck.gaps.at(-1).D / sr) * 1000, prev: { ...j.prev } });
+        };
+        for (let s = 0; s + 128 <= x.length; s += 128) odf.push(x.subarray(s, s + 128), s);
+        return { say: out.map((g) => `${g.D.toFixed(1)} ms at ${g.from.toFixed(2)} s`).join(', '), prev: out.find((g) => Math.abs(g.from - at2) < 0.6)?.prev };
+      };
+      const a = kept({}), b = kept({ [n2 - back + 1]: mv });
+      const say = `${kind} ${bpm} BPM, gaps of ${ms1} ms at ${at1.toFixed(2)} s and ${ms2} ms at ${at2.toFixed(2)} s, the beat ${back} before the second moved ${mv} ms: found ${b.say} (unmoved: ${a.say})`;
+      assert.ok(a.prev && b.prev, say);
+      const beat = (g, x) => g.t0 + Math.round((x - g.t0) / g.T) * g.T, x = at2 - T / 2;
+      const off = (beat(b.prev, x) - beat(a.prev, x)) * 1000;
+      assert.ok(Math.abs(off) < 1, `${say}: the grid kept before the second gap moved ${off.toFixed(2)} ms`);
+    }
+  }
+});
+
 test('a burst whose later gap is found first (as one run captured it): finding the earlier one keeps the clock, and the grids kept, on the beats', () => {
   // Finding the earlier gap re-phased the clock by its own step from the grid before it, as if it were the newest: the
   // later gap's step dropped out, the clock sat 31 ms off the beats for seconds, and so did the clocks remembered for
@@ -446,7 +494,7 @@ test('a burst whose later gap is found first (as one run captured it): finding t
     const was = deck.track.jump;
     evaluate();
     const j = deck.track.jump, edge = deck.tracker.lastT / sr, g = deck.get().grid;
-    if (j && j !== was) found.push(`${(j.step * 1000).toFixed(1)} ms at ${j.from.toFixed(2)} s`);
+    if (j && j !== was) found.push({ D: j.step * 1000, from: j.from });
     const o = on.filter((x) => x < edge - 0.3).at(-1);
     if (g && o > 40) {
       const h = deck.heardGrid(Math.round(53.8 * sr), 47.6 * sr), o2 = on.filter((x) => x < 53.8).at(-1);
@@ -454,7 +502,8 @@ test('a burst whose later gap is found first (as one run captured it): finding t
     }
   };
   deck.pushBatch({ t0: c.t0, spf: c.spf, full: c.full, low: c.low });
-  assert.ok(found.includes('-30.8 ms at 47.48 s') && found.includes('-9.1 ms at 47.25 s'), `found ${found.join(', ')}`);
+  const say = `found ${found.map((g) => `${g.D.toFixed(1)} ms at ${g.from.toFixed(2)} s`).join(', ')}`;
+  for (const [ms, at] of [[-30.8, 47.48], [-9.1, 47.25]]) assert.ok(found.some((g) => Math.abs(g.D - ms) < 1 && Math.abs(g.from - at) < 0.1), say);
   // (These onsets sit up to 2.5 ms either side of a steady grid, as the beats fall between the analysis frames.)
   const early = offs.filter((x) => x.edge < 46).map((x) => x.clock).sort((a, b) => a - b), base = early[early.length >> 1];
   const bad = offs.filter((x) => x.edge > 52 && (Math.abs(x.clock - base) > 6 || (x.heard != null && Math.abs(x.heard - base) > 6)));
