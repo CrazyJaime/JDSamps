@@ -189,6 +189,45 @@ test('a real tempo change of 1-3 % in a live source, at once or over 2 s, is no 
   assert.deepEqual(bad, []);
 });
 
+/** The e2e pages' sounds at a tempo of bpmAt(t) BPM at each second t, their beats unbroken. */
+function tempoCurve({ kind, bpmAt, seconds = 30, sr = 44100, lead = 0.0052 }) {
+  const x = new Float32Array(Math.round(seconds * sr));
+  let ph = 0, onset = lead;
+  for (let i = Math.round(lead * sr); i < x.length; i++) {
+    const t = i / sr, was = ph;
+    ph += bpmAt(t) / 60 / sr;
+    if (Math.floor(ph) !== Math.floor(was)) onset = t;
+    const u = t - onset;
+    if (kind === 'low' && u < 0.2) x[i] = 0.8 * Math.sin(2 * Math.PI * (45 + 70 * Math.exp(-u * 35)) * u) * Math.exp(-u * 18);
+    else if (kind === 'high' && u < 0.04) x[i] = 0.6 * Math.sin(2 * Math.PI * 3000 * u) * Math.exp(-u * 90);
+    else if (kind === 'mid' && u < 0.08) x[i] = 0.6 * Math.sin(2 * Math.PI * 800 * u) * Math.exp(-u * 50);
+  }
+  return x;
+}
+
+test('a live source ridden 0.5-2 % for 2-2.5 s and back, or wobbling 0.3-1 % over 4-16 s, has no capture gap', () => {
+  // A DJ stream riding its pitch, or a band drifting, moves the beats along a ramp of four or five beats between two
+  // levels: two of its beats left out, the rest fit a step over two beats (a capture's under load) well enough. Taken as
+  // a gap, a beat-locked deck jumped 8-34 ms of its audio where nothing was dropped.
+  const bad = [];
+  for (const [kind, b0] of [['low', 124], ['high', 128], ['mid', 120]]) {
+    for (const pct of [-2, -1, -0.5, 0.5, 1, 2]) {
+      for (const d of [2, 2.5]) {
+        const f = found(tempoCurve({ kind, bpmAt: (t) => (t >= 18 && t < 18 + d ? b0 * (1 + pct / 100) : b0) }), 44100);
+        if (f.length) bad.push(`${kind} ${b0} BPM ridden ${pct} % for ${d} s: ${f.map((g) => `${g.D.toFixed(1)} ms at ${g.from.toFixed(2)} s`).join(', ')}`);
+      }
+    }
+    // (The 800 Hz blip wobbling every 4 s: a step with a beat left out fits it as well, as it did before steps over two beats.)
+    for (const a of [0.3, 0.6, 1]) {
+      for (const P of kind === 'mid' ? [8, 16] : [4, 8, 16]) {
+        const f = found(tempoCurve({ kind, seconds: 40, bpmAt: (t) => (t < 12 ? b0 : b0 * (1 + (a / 100) * Math.sin((2 * Math.PI * (t - 12)) / P))) }), 44100);
+        if (f.length) bad.push(`${kind} ${b0} BPM wobbling ±${a} % every ${P} s: ${f.map((g) => `${g.D.toFixed(1)} ms at ${g.from.toFixed(2)} s`).join(', ')}`);
+      }
+    }
+  }
+  assert.deepEqual(bad, []);
+});
+
 test('a capture gap found soon after the lock: the grid before it has the tempo the fine fit found, not the lock\'s', () => {
   // The grid the audio before a gap keeps is the one the clock had when the live edge passed it, seconds after the
   // lock: at the tempo the lock read (0.15-0.4 % off), not the fine fit's that came later. A deck playing that audio

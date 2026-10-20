@@ -302,11 +302,16 @@ test('a gap found after the playhead went through it: the phase loop jumps the s
 
 /** A kick track at 48 kHz going from b0 to b1 BPM at input second 20, at once or over `ramp` s, its beats unbroken. */
 function kicks(b0, b1, ramp, seconds = 50, sr = 48000) {
+  return kicksAt((t) => b0 + (b1 - b0) * (t < 20 ? 0 : ramp > 0 ? Math.min(1, (t - 20) / ramp) : 1), seconds, sr);
+}
+
+/** A kick track at 48 kHz at bpmAt(t) BPM at each input second t, its beats unbroken. */
+function kicksAt(bpmAt, seconds = 50, sr = 48000) {
   const x = new Float32Array(seconds * sr);
   let ph = 0, onset = 0;
   for (let i = 0; i < x.length; i++) {
-    const t = i / sr, f = t < 20 ? 0 : ramp > 0 ? Math.min(1, (t - 20) / ramp) : 1, was = ph;
-    ph += (b0 + (b1 - b0) * f) / 60 / sr;
+    const t = i / sr, was = ph;
+    ph += bpmAt(t) / 60 / sr;
     if (Math.floor(ph) !== Math.floor(was)) onset = t;
     const u = t - onset;
     if (u < 0.2) x[i] = 0.8 * Math.sin(2 * Math.PI * (45 + 70 * Math.exp(-u * 35)) * u) * Math.exp(-u * 18);
@@ -327,34 +332,51 @@ function tracks(x, audio) {
   };
 }
 
+/** A master and a SYNC PLAYed BEAT follower, `who` of them playing `audio` with its real tracker: neither playhead jumps. */
+async function noJumps(who, audio) {
+  const clock = { t: 100 }, engine = makeEngine(clock);
+  engine.params['assist.on'] = false;
+  const m = makeDeck(engine, clock, { id: 1, slot: 1, bpm: 128, liveEdge: 600, capSec: 1e7 });
+  const d = makeDeck(engine, clock, { id: 2, slot: 2, bpm: 124, t0: 0.11, liveEdge: 600, capSec: 1e7 });
+  const x = who === 'master' ? m : d, feed = tracks(x, audio);
+  run(engine, clock, 9, feed); // the playhead plays from the start of the capture, seconds behind its live edge
+  assert.equal(x.tempo.get().state, 'LOCKED');
+  await m.act('play');
+  engine.clock.follow(1);
+  run(engine, clock, 1, feed);
+  assert.deepEqual(await d.act('syncPlay'), { ok: true });
+  run(engine, clock, 3, feed);
+  const other = x === m ? d : m, theirs = other.node.map.length;
+  const w = watch(engine, clock, x, 32, { onTick: feed });
+  assert.ok(x.ts.posAt(clock.t) > 28, `played to input ${x.ts.posAt(clock.t).toFixed(1)} s, past the change`);
+  assert.deepEqual(w.jumps.map((j) => `${(j.by * 1000).toFixed(1)} ms at input ${j.at.toFixed(2)} s`), [], `${who} playhead jumps`);
+  const gaps = x.grids.segs.filter((s) => s.shift).map((s) => `${(s.shift * 1000).toFixed(1)} ms at ${s.from.toFixed(2)} s`);
+  assert.deepEqual(gaps, [], 'capture gaps on its grid');
+  const tj = [];
+  for (let i = Math.max(1, theirs); i < other.node.map.length; i++) {
+    const a = other.node.map[i - 1], b = other.node.map[i], at = a.input + a.rate * (b.output - a.output);
+    if (a.active && b.active !== false && Math.abs(b.input - at) > 1e-4) tj.push(b);
+  }
+  assert.deepEqual(tj, [], 'the other deck\'s playhead jumps');
+}
+
 for (const [who, b0, b1, ramp] of [['follower', 124, 125, 0], ['follower', 120, 118, 2], ['master', 124, 125, 0], ['master', 128, 126.5, 2]]) {
   test(`a real tempo change of ${b0} to ${b1} BPM${ramp ? ` over ${ramp} s` : ''} in a ${who}'s live source: no playhead jump on it or its ${who === 'master' ? 'follower' : 'master'}`, async () => {
-    const clock = { t: 100 }, engine = makeEngine(clock);
-    engine.params['assist.on'] = false;
-    const m = makeDeck(engine, clock, { id: 1, slot: 1, bpm: 128, liveEdge: 600, capSec: 1e7 });
-    const d = makeDeck(engine, clock, { id: 2, slot: 2, bpm: 124, t0: 0.11, liveEdge: 600, capSec: 1e7 });
-    const x = who === 'master' ? m : d, feed = tracks(x, kicks(b0, b1, ramp));
-    run(engine, clock, 9, feed); // the playhead plays from the start of the capture, seconds behind its live edge
-    assert.equal(x.tempo.get().state, 'LOCKED');
-    await m.act('play');
-    engine.clock.follow(1);
-    run(engine, clock, 1, feed);
-    assert.deepEqual(await d.act('syncPlay'), { ok: true });
-    run(engine, clock, 3, feed);
-    const other = x === m ? d : m, theirs = other.node.map.length;
-    const w = watch(engine, clock, x, 32, { onTick: feed });
-    assert.ok(x.ts.posAt(clock.t) > 24 + ramp, `played to input ${x.ts.posAt(clock.t).toFixed(1)} s, past the change`);
-    assert.deepEqual(w.jumps.map((j) => `${(j.by * 1000).toFixed(1)} ms at input ${j.at.toFixed(2)} s`), [], `${who} playhead jumps`);
-    const gaps = x.grids.segs.filter((s) => s.shift).map((s) => `${(s.shift * 1000).toFixed(1)} ms at ${s.from.toFixed(2)} s`);
-    assert.deepEqual(gaps, [], 'capture gaps on its grid');
-    const tj = [];
-    for (let i = Math.max(1, theirs); i < other.node.map.length; i++) {
-      const a = other.node.map[i - 1], b = other.node.map[i], at = a.input + a.rate * (b.output - a.output);
-      if (a.active && b.active !== false && Math.abs(b.input - at) > 1e-4) tj.push(b);
-    }
-    assert.deepEqual(tj, [], 'the other deck\'s playhead jumps');
+    await noJumps(who, kicks(b0, b1, ramp));
   });
 }
+
+// The tempo ridden away for a couple of seconds and back (a DJ stream's pitch ride), or wobbling (a band): the beats
+// move along a ramp of four or five, which a capture step over two beats fit well enough.
+for (const [who, b0, pct] of [['follower', 124, 1], ['follower', 124, -2], ['master', 128, -1], ['master', 128, 2]]) {
+  test(`a ${who}'s live source ridden ${pct > 0 ? '+' : ''}${pct} % for 2 s and back: no playhead jump on it or its ${who === 'master' ? 'follower' : 'master'}`, async () => {
+    await noJumps(who, kicksAt((t) => (t >= 20 && t < 22 ? b0 * (1 + pct / 100) : b0)));
+  });
+}
+
+test('a follower\'s live source wobbling ±0.6 % every 8 s: no playhead jump on it or its master', async () => {
+  await noJumps('follower', kicksAt((t) => (t < 12 ? 124 : 124 * (1 + 0.006 * Math.sin((2 * Math.PI * (t - 12)) / 8)))));
+});
 
 // The newer grid of a gap is the tracker's live clock until a later gap is found, and the live clock follows the beats
 // at the live edge, seconds past the gap: through a later gap it has not found yet, which it then partly takes in. Seen

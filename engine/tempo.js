@@ -416,8 +416,9 @@ export class BeatClock {
 
 // Capture gaps: smallest phase jump (s) acted on, largest (beats), how far it must stand out of
 // the per-beat jitter (standard deviations), how many times better than a bend (a real tempo
-// change) its step must fit the beats, and how many times better when they drift off the clock.
-const JUMP = { min: 0.005, max: 1 / 8, z: 6, bend: 3, drift: 10 };
+// change) its step must fit the beats, how many times better when they drift off the clock, and
+// at most how many times worse than a ride (the tempo away and back) a step that is not sharp may.
+const JUMP = { min: 0.005, max: 1 / 8, z: 6, bend: 3, drift: 10, ride: 1.75 };
 
 /**
  * Where per-beat onset offsets r (oldest first; the first K of them) step: the least-squares fit
@@ -461,15 +462,43 @@ function phaseStep(r, skip = -1, K = r.length, w = 1) {
  * A step that came over two beats (the capture moved two beats in a row part of the way each): phaseStep leaving out
  * the two beats p, p + 1 around split j, which then sit between the levels on either side, in order, the second further
  * on (on one level, they lie between two steps: each its own gap). Returns the best such step, with skip p, or null.
+ * The tempo ridden away and back for a couple of seconds moves the beats so too, along a straight ramp of four or five,
+ * and a wobble does until it turns back: none unless five beats after them hold the new level, and none when a ride
+ * fits the beats clearly better (JUMP.ride). A capture's step is sharper: most of it at once, the rest over a few beats.
  */
 function phaseRamp(r, j, K) {
   let best = null;
-  for (let p = Math.max(4, j - 2); p <= Math.min(j, K - 5); p++) {
+  for (let p = Math.max(4, j - 2); p <= Math.min(j, K - 7); p++) {
     const s = phaseStep(r, p, K, 2);
     if (!s || !s.clear || s.j < p || s.j > p + 2) continue;
     const f0 = (r[p] - s.a - s.b * p) / s.D, f1 = (r[p + 1] - s.a - s.b * (p + 1)) / s.D;
     if (!(f0 > 0.1 && f1 < 0.9 && f1 - f0 >= 0.1)) continue;
     if (!best || s.sse < best.sse) best = { ...s, skip: p };
+  }
+  return best && JUMP.ride * rideSse(r, K) >= best.sse ? best : null;
+}
+
+/**
+ * The least squared error of a ride in per-beat onset offsets r (the first K): r_i = a + b·i + c·(min(max(i, m1), m2) −
+ * m1), the beats on one slope but from m1 to m2, where another takes them to a new level (the tempo away and back), m1
+ * and m2 in quarter beats.
+ */
+function rideSse(r, K) {
+  let best = Infinity;
+  for (let m1 = 0; m1 < K - 1; m1 += 0.25) {
+    for (let m2 = m1 + 0.25; m2 <= K - 1; m2 += 0.25) {
+      let n = 0, Si = 0, Sii = 0, Su = 0, Suu = 0, Siu = 0, Sr = 0, Sir = 0, Sur = 0, Srr = 0;
+      for (let i = 0; i < K; i++) {
+        const u = Math.min(Math.max(i, m1), m2) - m1, v = r[i];
+        n++; Si += i; Sii += i * i; Su += u; Suu += u * u; Siu += i * u; Sr += v; Sir += i * v; Sur += u * v; Srr += v * v;
+      }
+      const det = det3(n, Si, Su, Si, Sii, Siu, Su, Siu, Suu);
+      if (!det) continue;
+      const a = det3(Sr, Si, Su, Sir, Sii, Siu, Sur, Siu, Suu) / det;
+      const b = det3(n, Sr, Su, Si, Sir, Siu, Su, Sur, Suu) / det;
+      const c = det3(n, Si, Sr, Si, Sii, Sir, Su, Siu, Sur) / det;
+      best = Math.min(best, Srr - a * Sr - b * Sir - c * Sur);
+    }
   }
   return best;
 }
@@ -921,9 +950,9 @@ export class DeckTempo {
       }
       if (s && s.clear && (!st || s.j < st.j - 1) && bendSse(r, k, sk, w) > JUMP.bend * s.sse) { st = s; skip = sk; sw = w; }
     }
-    if (!st && big) { // two gaps too close for a step on its own: the first of them
+    if (!st && big) { // two gaps too close for a step on its own (and no ride): the first of them
       const s2 = phaseSteps2(r, r.length);
-      if (s2 && s2.clear && bendSse(r, r.length) > JUMP.bend * s2.sse) { st = { j: s2.j1, D: s2.D1 }; skip = -1; }
+      if (s2 && s2.clear && bendSse(r, r.length) > JUMP.bend * s2.sse && JUMP.ride * rideSse(r, r.length) >= s2.sse) { st = { j: s2.j1, D: s2.D1 }; skip = -1; }
     }
     if (!st || Math.abs(st.D) < JUMP.min * sr || Math.abs(st.D) > JUMP.max * clock.T) { this.jumpCand = null; return; }
     const out = (i) => skip >= 0 && i >= skip && i < skip + sw;
