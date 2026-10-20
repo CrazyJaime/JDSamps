@@ -122,6 +122,8 @@ kbd { font: 0.8rem var(--mono); padding: 0.05rem 0.35rem; border: 1px solid var(
 .logo { width: 2rem; height: 2rem; border-radius: 0.4rem; }
 .brand-text h1 { font-size: 1.05rem; letter-spacing: 0.02em; }
 .tag { font-size: 0.75rem; color: var(--muted); }
+.tag a { color: inherit; text-decoration: underline; text-underline-offset: 2px; }
+.tag a:hover, .tag a:focus-visible { color: var(--txt); }
 .build { margin-left: 0.45rem; font-size: 0.75rem; color: var(--muted); white-space: nowrap; }
 .spacer { flex: 1; }
 .clock { display: flex; align-items: baseline; gap: 0.55rem; padding: 0.3rem 0.7rem; border: 1px solid var(--line); border-radius: var(--r); background: var(--panel-2); }

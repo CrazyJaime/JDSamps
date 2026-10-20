@@ -46,6 +46,15 @@ test('renders three decks and waveform rows in slot order', async () => {
   assert.equal(await page.locator('#clockMode').textContent(), 'DECK 2');
 });
 
+test('"made by godspee" links godspee to its SoundCloud page, in a new tab', async () => {
+  const a = page.locator('.brand .tag a');
+  assert.equal(await a.textContent(), 'godspee');
+  assert.equal(await a.getAttribute('href'), 'https://soundcloud.com/godspee');
+  assert.equal(await a.getAttribute('target'), '_blank');
+  assert.match(await a.getAttribute('rel'), /noopener/);
+  assert.equal((await page.locator('.brand .tag').textContent()).trim(), 'made by godspee');
+});
+
 test('hostile page titles render as text', async () => {
   const t = deckEl(3).locator('[data-title]');
   assert.equal(await t.textContent(), '<img src=x onerror="window.pwned=1"> Bandcamp exclusive');

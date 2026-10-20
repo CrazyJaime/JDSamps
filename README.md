@@ -1,6 +1,6 @@
 # JD Samps
 
-*made by godspee*
+*made by [godspee](https://soundcloud.com/godspee)*
 
 A DJ deck for your browser. Load any tab that plays audio onto a **deck**, beat-sync decks
 **on the audio itself**, shape them with a DJ isolator EQ and per-deck effects, mix with a
