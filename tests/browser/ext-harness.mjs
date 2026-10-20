@@ -44,10 +44,28 @@ export async function launchExtension({ ext, headless = process.env.HEADLESS !==
     ignoreDefaultArgs: ['--mute-audio'],
     acceptDownloads: true,
   });
-  let sw = context.serviceWorkers().find((w) => w.url().startsWith(`chrome-extension://${ext.id}/`));
-  if (!sw) sw = await context.waitForEvent('serviceworker', { predicate: (w) => w.url().startsWith(`chrome-extension://${ext.id}/`), timeout: 15000 });
-  const cdp = await context.browser().newBrowserCDPSession();
-  await cdp.send('Browser.setDownloadBehavior', { behavior: 'default' });
+  const ours = (w) => w.url().startsWith(`chrome-extension://${ext.id}/`);
+  let sw;
+  try {
+    sw = context.serviceWorkers().find(ours);
+    // On a busy machine the worker can start late: an extension page of its own wakes it, then it is waited for again.
+    if (!sw) sw = await context.waitForEvent('serviceworker', { predicate: ours, timeout: 15000 }).catch(() => null);
+    if (!sw) sw = context.serviceWorkers().find(ours);
+    if (!sw) {
+      const page = await context.newPage();
+      const woke = context.waitForEvent('serviceworker', { predicate: ours, timeout: 30000 });
+      await page.goto(`chrome-extension://${ext.id}/manifest.json`).catch(() => {});
+      sw = context.serviceWorkers().find(ours) || (await woke);
+      await page.close();
+    }
+    const cdp = await context.browser().newBrowserCDPSession();
+    await cdp.send('Browser.setDownloadBehavior', { behavior: 'default' });
+  } catch (err) {
+    // A launch that fails closes its browser, so the test process is not left waiting on it.
+    await context.close().catch(() => {});
+    for (const d of [userDataDir, ...(ownDownloads ? [downloadsDir] : [])]) fs.rmSync(d, { recursive: true, force: true });
+    throw err;
+  }
   return {
     context, sw, extId: ext.id, userDataDir, downloadsDir,
     async close() {
