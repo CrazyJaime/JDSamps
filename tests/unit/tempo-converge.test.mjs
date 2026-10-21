@@ -10,6 +10,7 @@ import { OdfCore } from '../../worklets/odf-core.js';
 import { DeckTempo } from '../../engine/tempo.js';
 import { GridMap } from '../../engine/timeshift.js';
 import { synth, PATTERNS, FS } from './fixtures/synth.mjs';
+import { captureOnsets } from './fixtures/capture-onsets.mjs';
 
 /** The e2e test pages' sounds (makeTrackWav in tests/browser/ext-harness.mjs), after `lead` s of silence, at rate sr. */
 function blips({ bpm, kind, seconds = 40, sr = 44100, lead = 0 }) {
@@ -188,6 +189,45 @@ test('a real tempo change of 1-3 % in a live source, at once or over 2 s, is no 
   assert.deepEqual(bad, []);
 });
 
+/** The e2e pages' sounds at a tempo of bpmAt(t) BPM at each second t, their beats unbroken. */
+function tempoCurve({ kind, bpmAt, seconds = 30, sr = 44100, lead = 0.0052 }) {
+  const x = new Float32Array(Math.round(seconds * sr));
+  let ph = 0, onset = lead;
+  for (let i = Math.round(lead * sr); i < x.length; i++) {
+    const t = i / sr, was = ph;
+    ph += bpmAt(t) / 60 / sr;
+    if (Math.floor(ph) !== Math.floor(was)) onset = t;
+    const u = t - onset;
+    if (kind === 'low' && u < 0.2) x[i] = 0.8 * Math.sin(2 * Math.PI * (45 + 70 * Math.exp(-u * 35)) * u) * Math.exp(-u * 18);
+    else if (kind === 'high' && u < 0.04) x[i] = 0.6 * Math.sin(2 * Math.PI * 3000 * u) * Math.exp(-u * 90);
+    else if (kind === 'mid' && u < 0.08) x[i] = 0.6 * Math.sin(2 * Math.PI * 800 * u) * Math.exp(-u * 50);
+  }
+  return x;
+}
+
+test('a live source ridden 0.5-2 % for 2-2.5 s and back, or wobbling 0.3-1 % over 4-16 s, has no capture gap', () => {
+  // A DJ stream riding its pitch, or a band drifting, moves the beats along a ramp of four or five beats between two
+  // levels: two of its beats left out, the rest fit a step over two beats (a capture's under load) well enough. Taken as
+  // a gap, a beat-locked deck jumped 8-34 ms of its audio where nothing was dropped.
+  const bad = [];
+  for (const [kind, b0] of [['low', 124], ['high', 128], ['mid', 120]]) {
+    for (const pct of [-2, -1, -0.5, 0.5, 1, 2]) {
+      for (const d of [2, 2.5]) {
+        const f = found(tempoCurve({ kind, bpmAt: (t) => (t >= 18 && t < 18 + d ? b0 * (1 + pct / 100) : b0) }), 44100);
+        if (f.length) bad.push(`${kind} ${b0} BPM ridden ${pct} % for ${d} s: ${f.map((g) => `${g.D.toFixed(1)} ms at ${g.from.toFixed(2)} s`).join(', ')}`);
+      }
+    }
+    // (The 800 Hz blip wobbling every 4 s: a step with a beat left out fits it as well, as it did before steps over two beats.)
+    for (const a of [0.3, 0.6, 1]) {
+      for (const P of kind === 'mid' ? [8, 16] : [4, 8, 16]) {
+        const f = found(tempoCurve({ kind, seconds: 40, bpmAt: (t) => (t < 12 ? b0 : b0 * (1 + (a / 100) * Math.sin((2 * Math.PI * (t - 12)) / P))) }), 44100);
+        if (f.length) bad.push(`${kind} ${b0} BPM wobbling ±${a} % every ${P} s: ${f.map((g) => `${g.D.toFixed(1)} ms at ${g.from.toFixed(2)} s`).join(', ')}`);
+      }
+    }
+  }
+  assert.deepEqual(bad, []);
+});
+
 test('a capture gap found soon after the lock: the grid before it has the tempo the fine fit found, not the lock\'s', () => {
   // The grid the audio before a gap keeps is the one the clock had when the live edge passed it, seconds after the
   // lock: at the tempo the lock read (0.15-0.4 % off), not the fine fit's that came later. A deck playing that audio
@@ -304,4 +344,168 @@ test('a live deck through capture gaps as one run captured it (one gap found a f
   // gap by however much their own onsets say.
   const { lock, late } = captureWander('live-gaps-capture.json', 124);
   assert.deepEqual(late, [], `locked at ${lock.t.toFixed(1)} s on ${lock.bpm.toFixed(3)}`);
+});
+
+/** A recorded capture (tests/unit/fixtures) replayed: each evaluation {t, state, bpm}, and the capture gaps found {from, D (ms)}. */
+function captureGaps(name) {
+  const c = JSON.parse(fs.readFileSync(new URL(`./fixtures/${name}`, import.meta.url), 'utf8'));
+  const deck = new DeckTempo({ sampleRate: c.sr, fps: c.fps }), rs = [], gaps = [], evaluate = deck.evaluate.bind(deck);
+  deck.evaluate = () => {
+    const was = deck.track.jump;
+    evaluate();
+    const g = deck.get(), j = g.track.jump;
+    rs.push({ t: deck.tracker.lastT / c.sr, state: g.state, bpm: g.inBpm });
+    if (j && j !== was) gaps.push({ from: j.from, D: (deck.gaps.at(-1).D / c.sr) * 1000 });
+  };
+  deck.pushBatch({ t0: c.t0, spf: c.spf, full: c.full, low: c.low });
+  gaps.say = `found ${gaps.map((g) => `${g.D.toFixed(1)} ms at ${g.from.toFixed(2)} s`).join(', ')}`;
+  return { rs, gaps };
+}
+
+test('a capture step that comes over two beats, as one run captured it: found, and so is the gap after it; within 0.1 %', () => {
+  // The box's capture moved the beats -10.8 ms at 40.92 s over two beats (-4 and -6 ms, then a few ms more over the next
+  // three). The window's step fit leaves out at most one beat next to a step, so it was never clear; the clock and the
+  // fine fit took it in instead, the fit read 124.34 (0.27 % fast), and the beats then drifted a millisecond a beat off
+  // the clock: the -20 ms gap spliced in at 47.7 s was never clear either, and nothing was found for 16 s.
+  const { rs, gaps } = captureGaps('live-ramp-gap-capture.json'), say = gaps.say;
+  // where the capture stepped, and by how much (the live-sync judge's reading of these frames)
+  for (const [at, ms] of [[23.52, -14.5], [24.96, -11.1], [36.09, 11.2], [37.06, -9.5], [40.92, -10.8], [47.67, -19.8]]) {
+    assert.ok(gaps.some((g) => Math.abs(g.from - at) < 0.6 && Math.abs(g.D - ms) <= 3), `the capture stepped ${ms} ms at ${at} s; ${say}`);
+  }
+  const lock = rs.find((r) => r.state === 'LOCKED');
+  const late = rs.filter((r) => r.t >= lock.t + 2.5 && Math.abs(r.bpm / 124 - 1) > 1e-3).map((r) => `${r.t.toFixed(1)} s ${r.bpm.toFixed(3)}`);
+  assert.deepEqual(late, [], `locked at ${lock.t.toFixed(1)} s on ${lock.bpm.toFixed(3)}`);
+});
+
+test('two capture steps two beats apart (as one run captured them): each is found with its own step, not as one over two beats', () => {
+  // The two beats between the steps sit on one level, part of the way: a step over two beats moves them part of the way
+  // each, the second further than the first. Taken as one, the -48.7 ms of both was found between those two beats, and
+  // the deck jumped it there: its audio 28 ms off for the beat until the second step.
+  const { gaps } = captureGaps('live-two-steps-capture.json'), say = gaps.say;
+  const near = (at) => gaps.filter((g) => Math.abs(g.from - at) < 0.6);
+  assert.ok(near(47.68).some((g) => Math.abs(g.D + 18.6) <= 3), `the capture stepped -18.6 ms at 47.68 s; ${say}`);
+  assert.ok(near(48.62).some((g) => g.from > 48.15 && Math.abs(g.D + 30.1) <= 4), `and -30.1 ms at 48.62 s; ${say}`);
+  assert.ok(!gaps.some((g) => Math.abs(g.D + 48.7) <= 6), `no gap of both: ${say}`);
+});
+
+test('capture gaps while the clock\'s period is off (a burst the fine fit took in, as one run captured it): each is found', () => {
+  // A spliced gap and three of the box's own capture skips over three seconds were never found: the fine fit took them in
+  // and read 0.4-0.6 % fast, so the beats drifted 2-3 ms a beat off the clock. The window's step fit allows for a drift,
+  // but a step was taken only when it outweighed the drift across the window: the box's -29.6 ms skip and the 10 ms gap
+  // spliced in after it were never found (the live-sync deck did not jump the gap). A step that fits the beats ten times
+  // better than any bend is a step however they drift.
+  const { gaps } = captureGaps('live-drift-gaps-capture.json');
+  // where the capture stepped, and by how much (the live-sync judge's reading of these frames)
+  for (const [at, ms] of [[35.94, 12.2], [37.87, -21.1], [55.22, -29.6], [59.57, 10.5]]) {
+    assert.ok(gaps.some((g) => Math.abs(g.from - at) < 0.6 && Math.abs(g.D - ms) <= 3), `the capture stepped ${ms} ms at ${at} s; ${gaps.say}`);
+  }
+});
+
+test('a gap found a few ms off, and a second gap after it: the grid kept before the second is where the beats are', () => {
+  // The grid kept before a gap is the clock as the live edge passed it. When that was soon after the gap before it was
+  // found, it is that gap's re-phase (the grid before it moved by the step found), which the clock then still had: a
+  // step found 4 ms off left the beats before the second gap 4 ms off their grid. A follower jumping the second gap
+  // takes its offset against that grid (deck.js offBefore), and a beat-locked deck plays the audio before it against it.
+  for (const [kind, bpm, lead] of [['high', 128, 0.2], ['low', 124, 0.0052], ['mid', 120, 0.2]]) {
+    for (const [at1, ms1, dt, ms2, bias] of [[10.1, 12, 2.3, -10, 4], [10.1, -15, 2.0, 12, -4], [10.1, 20, 2.6, 15, 4]]) {
+      const sr = 44100, at2 = at1 + dt, x = gap(gap(blips({ kind, bpm, seconds: 30, lead }), sr, at1, ms1), sr, at2 - ms1 / 1000, ms2);
+      let deck;
+      const odf = new OdfCore(sr, (f, l, t) => deck.pushFrame(f, l, t));
+      deck = new DeckTempo({ sampleRate: sr, fps: odf.fps });
+      // the gap search reads the beats after the first gap `bias` ms later than they are, until it is found
+      const offsets = deck.beatOffsets.bind(deck), detect = deck.detectJump.bind(deck), found = [];
+      deck.beatOffsets = (from) => offsets(from).map((b) => (!found.length && b.beat > at1 * sr ? { beat: b.beat, r: b.r + (bias / 1000) * sr } : b));
+      deck.detectJump = () => {
+        const was = deck.track.jump;
+        detect();
+        const j = deck.track.jump;
+        if (j && j !== was) found.push({ from: j.from, D: (deck.gaps.at(-1).D / sr) * 1000, prev: { ...j.prev } });
+      };
+      for (let s = 0; s + 128 <= x.length; s += 128) odf.push(x.subarray(s, s + 128), s);
+      const say = `${kind} ${bpm} BPM, gaps of ${ms1} ms at ${at1} s and ${ms2} ms at ${at2.toFixed(2)} s: found ${found.map((f) => `${f.D.toFixed(1)} ms at ${f.from.toFixed(2)} s`).join(', ')}`;
+      assert.equal(found.length, 2, say);
+      assert.ok(Math.abs(found[0].D + ms1 - bias) < 1.5, `${say}: the first is found ${bias} ms off`);
+      // the beats before the second gap: the first gap's grid's beat there, on at the track's period, moved by the step
+      // the audio made at the first; against them, the grid kept before the second
+      const beat = (g, x) => g.t0 + Math.round((x - g.t0) / g.T) * g.T, T = 60 / bpm, b1 = beat(found[0].prev, at1);
+      const truth = b1 + Math.round((at2 - b1) / T) * T - ms1 / 1000, off = (beat(found[1].prev, truth) - truth) * 1000;
+      assert.ok(Math.abs(off) < 1, `${say}: the grid kept before the second gap is ${off.toFixed(2)} ms off the beats`);
+    }
+  }
+});
+
+/** The e2e pages' sounds at `bpm`, after `lead` s, each beat k at k beats but those in `moved` ({k: ms}), moved on their own. */
+function blipsMoved({ bpm, kind, seconds = 30, sr = 44100, lead = 0, moved = {} }) {
+  const T = 60 / bpm, x = new Float32Array(Math.round((lead + seconds) * sr));
+  for (let k = 0; k * T < seconds; k++) {
+    const at = Math.round((lead + k * T + (moved[k] || 0) / 1000) * sr);
+    for (let i = at; i < x.length && i < at + 0.2 * sr; i++) {
+      const t = (i - at) / sr;
+      if (kind === 'low') x[i] = 0.8 * Math.sin(2 * Math.PI * (45 + 70 * Math.exp(-t * 35)) * t) * Math.exp(-t * 18);
+      else if (kind === 'high' && t < 0.04) x[i] = 0.6 * Math.sin(2 * Math.PI * 3000 * t) * Math.exp(-t * 90);
+      else if (kind === 'mid' && t < 0.08) x[i] = 0.6 * Math.sin(2 * Math.PI * 800 * t) * Math.exp(-t * 50);
+    }
+  }
+  return x;
+}
+
+test('one beat the capture moved on its own a few beats before a gap: the grid kept before the gap stays on the other beats', () => {
+  // The grid kept before a gap is where its last beats are. As the mean of every beat since the gap before, one beat the
+  // box's capture moved by itself (17 ms in one run) pulled it by its share: 2 ms here, where a follower jumps the gap
+  // and measures its offset. The median of the last four leaves it out.
+  for (const [kind, bpm, lead] of [['high', 128, 0.2], ['low', 124, 0.0052], ['mid', 120, 0.2]]) {
+    // gaps of ms1 and ms2 midway after beats n1 and n2; beat n2 - back + 1 moved mv ms
+    for (const [n1, ms1, n2, ms2, back, mv] of [[21, 12, 28, -30, 2, 12], [21, -15, 28, 30, 2, -12], [21, -12, 28, 28, 3, 12], [21, -15, 27, 30, 2, 12]]) {
+      const sr = 44100, T = 60 / bpm, at1 = lead + (n1 + 0.5) * T, at2 = lead + (n2 + 0.5) * T - ms1 / 1000;
+      const kept = (moved) => { // the gaps found, and the grid kept before the second
+        const x = gap(gap(blipsMoved({ kind, bpm, lead, moved }), sr, at1, ms1), sr, at2, ms2), out = [];
+        let deck;
+        const odf = new OdfCore(sr, (f, l, t) => deck.pushFrame(f, l, t));
+        deck = new DeckTempo({ sampleRate: sr, fps: odf.fps });
+        const detect = deck.detectJump.bind(deck);
+        deck.detectJump = () => {
+          const was = deck.track.jump;
+          detect();
+          const j = deck.track.jump;
+          if (j && j !== was) out.push({ from: j.from, D: (deck.gaps.at(-1).D / sr) * 1000, prev: { ...j.prev } });
+        };
+        for (let s = 0; s + 128 <= x.length; s += 128) odf.push(x.subarray(s, s + 128), s);
+        return { say: out.map((g) => `${g.D.toFixed(1)} ms at ${g.from.toFixed(2)} s`).join(', '), prev: out.find((g) => Math.abs(g.from - at2) < 0.6)?.prev };
+      };
+      const a = kept({}), b = kept({ [n2 - back + 1]: mv });
+      const say = `${kind} ${bpm} BPM, gaps of ${ms1} ms at ${at1.toFixed(2)} s and ${ms2} ms at ${at2.toFixed(2)} s, the beat ${back} before the second moved ${mv} ms: found ${b.say} (unmoved: ${a.say})`;
+      assert.ok(a.prev && b.prev, say);
+      const beat = (g, x) => g.t0 + Math.round((x - g.t0) / g.T) * g.T, x = at2 - T / 2;
+      const off = (beat(b.prev, x) - beat(a.prev, x)) * 1000;
+      assert.ok(Math.abs(off) < 1, `${say}: the grid kept before the second gap moved ${off.toFixed(2)} ms`);
+    }
+  }
+});
+
+test('a burst whose later gap is found first (as one run captured it): finding the earlier one keeps the clock, and the grids kept, on the beats', () => {
+  // Finding the earlier gap re-phased the clock by its own step from the grid before it, as if it were the newest: the
+  // later gap's step dropped out, the clock sat 31 ms off the beats for seconds, and so did the clocks remembered for
+  // the audio past the later gap (a follower's phase loop then bent 3.9 % against them).
+  const c = JSON.parse(fs.readFileSync(new URL('./fixtures/live-burst-gaps-capture.json', import.meta.url), 'utf8'));
+  const sr = c.sr, T = 60 / 124, on = captureOnsets(c, 'low', T);
+  const deck = new DeckTempo({ sampleRate: sr, fps: c.fps }), evaluate = deck.evaluate.bind(deck), found = [], offs = [];
+  const off = (g, x) => (x - (g.t0 + Math.round((x - g.t0) / g.T) * g.T)) * 1000; // the audio's beat x against grid g, ms
+  deck.evaluate = () => {
+    const was = deck.track.jump;
+    evaluate();
+    const j = deck.track.jump, edge = deck.tracker.lastT / sr, g = deck.get().grid;
+    if (j && j !== was) found.push({ D: j.step * 1000, from: j.from });
+    const o = on.filter((x) => x < edge - 0.3).at(-1);
+    if (g && o > 40) {
+      const h = deck.heardGrid(Math.round(53.8 * sr), 47.6 * sr), o2 = on.filter((x) => x < 53.8).at(-1);
+      offs.push({ edge, clock: off(g, o), heard: h && edge > 54.5 ? off(h, o2) : null });
+    }
+  };
+  deck.pushBatch({ t0: c.t0, spf: c.spf, full: c.full, low: c.low });
+  const say = `found ${found.map((g) => `${g.D.toFixed(1)} ms at ${g.from.toFixed(2)} s`).join(', ')}`;
+  for (const [ms, at] of [[-30.8, 47.48], [-9.1, 47.25]]) assert.ok(found.some((g) => Math.abs(g.D - ms) < 1 && Math.abs(g.from - at) < 0.1), say);
+  // (These onsets sit up to 2.5 ms either side of a steady grid, as the beats fall between the analysis frames.)
+  const early = offs.filter((x) => x.edge < 46).map((x) => x.clock).sort((a, b) => a - b), base = early[early.length >> 1];
+  const bad = offs.filter((x) => x.edge > 52 && (Math.abs(x.clock - base) > 6 || (x.heard != null && Math.abs(x.heard - base) > 6)));
+  assert.deepEqual(bad.map((x) => `${x.edge.toFixed(1)} s: clock ${(x.clock - base).toFixed(1)}, kept for 53.8 s ${x.heard == null ? '-' : (x.heard - base).toFixed(1)} ms`), []);
 });

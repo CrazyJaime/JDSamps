@@ -8,6 +8,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import { makeEngine, makeDeck, run, clockErrMs, pairErrMs } from './fixtures/deck-harness.mjs';
+import { phaseError } from '../../engine/sync.js';
+import { captureOnsets } from './fixtures/capture-onsets.mjs';
 import { OdfCore } from '../../worklets/odf-core.js';
 import { DeckTempo } from '../../engine/tempo.js';
 import { GridMap } from '../../engine/timeshift.js';
@@ -96,6 +98,23 @@ test('the master BEAT followers lock to jumps a gap in its own capture, so neith
   assert.ok(Math.abs(mw.jumps[0].by + 0.012) < 1e-6 && Math.abs(mw.jumps[0].at - X) < 1e-3, `master jumped ${JSON.stringify(mw.jumps[0])}`);
   assert.ok(mw.bend < 0.002 && dBend < 0.002, `bent: master ${(mw.bend * 100).toFixed(2)} %, follower ${(dBend * 100).toFixed(2)} %`);
   assert.ok(pair < 1, `follower and master ${pair.toFixed(1)} ms apart across the gap`);
+});
+
+test('a master jumping back over a drop in its capture publishes its clock unmoved while it plays the audio before the gap again', async () => {
+  // A drop brings the beats after the gap early, so the master jumps back by the step and plays that much of the audio
+  // before the gap a second time. Its clock was published from the grid before the gap there, its beat that much late:
+  // a follower whose phase look fell in those ms read the master off by the step and bent (seen in the live-sync
+  // acceptance: 12.3 ms, a 3 % bend, at a master's -11.8 ms jump).
+  const { clock, engine, m } = await rig();
+  const X = gap(m, clock, 2, -40);
+  const ref = engine.clock.beat(clock.t), offs = [];
+  watch(engine, clock, m, 4, { onTick: (t) => {
+    const mb = engine.clock.beat(t), ph = (mb.lastBeat - ref.lastBeat) / ref.period;
+    offs.push({ p: m.node.posAt(t), ms: (ph - Math.round(ph)) * ref.period * 1000 });
+  } });
+  assert.ok(m.ts.posAt(clock.t) > X + 1, 'the master played through the gap');
+  const off = offs.filter((o) => Math.abs(o.ms) > 1).map((o) => `${o.ms.toFixed(1)} ms with its playhead at ${o.p.toFixed(3)} s`);
+  assert.deepEqual(off, [], `the gap is at ${X.toFixed(3)} s`);
 });
 
 test('a deck that is not beat-locked plays a capture gap as it came: unsynced, TEMPO sync, or a master nobody locks to', async () => {
@@ -283,11 +302,16 @@ test('a gap found after the playhead went through it: the phase loop jumps the s
 
 /** A kick track at 48 kHz going from b0 to b1 BPM at input second 20, at once or over `ramp` s, its beats unbroken. */
 function kicks(b0, b1, ramp, seconds = 50, sr = 48000) {
+  return kicksAt((t) => b0 + (b1 - b0) * (t < 20 ? 0 : ramp > 0 ? Math.min(1, (t - 20) / ramp) : 1), seconds, sr);
+}
+
+/** A kick track at 48 kHz at bpmAt(t) BPM at each input second t, its beats unbroken. */
+function kicksAt(bpmAt, seconds = 50, sr = 48000) {
   const x = new Float32Array(seconds * sr);
   let ph = 0, onset = 0;
   for (let i = 0; i < x.length; i++) {
-    const t = i / sr, f = t < 20 ? 0 : ramp > 0 ? Math.min(1, (t - 20) / ramp) : 1, was = ph;
-    ph += (b0 + (b1 - b0) * f) / 60 / sr;
+    const t = i / sr, was = ph;
+    ph += bpmAt(t) / 60 / sr;
     if (Math.floor(ph) !== Math.floor(was)) onset = t;
     const u = t - onset;
     if (u < 0.2) x[i] = 0.8 * Math.sin(2 * Math.PI * (45 + 70 * Math.exp(-u * 35)) * u) * Math.exp(-u * 18);
@@ -308,34 +332,51 @@ function tracks(x, audio) {
   };
 }
 
+/** A master and a SYNC PLAYed BEAT follower, `who` of them playing `audio` with its real tracker: neither playhead jumps. */
+async function noJumps(who, audio) {
+  const clock = { t: 100 }, engine = makeEngine(clock);
+  engine.params['assist.on'] = false;
+  const m = makeDeck(engine, clock, { id: 1, slot: 1, bpm: 128, liveEdge: 600, capSec: 1e7 });
+  const d = makeDeck(engine, clock, { id: 2, slot: 2, bpm: 124, t0: 0.11, liveEdge: 600, capSec: 1e7 });
+  const x = who === 'master' ? m : d, feed = tracks(x, audio);
+  run(engine, clock, 9, feed); // the playhead plays from the start of the capture, seconds behind its live edge
+  assert.equal(x.tempo.get().state, 'LOCKED');
+  await m.act('play');
+  engine.clock.follow(1);
+  run(engine, clock, 1, feed);
+  assert.deepEqual(await d.act('syncPlay'), { ok: true });
+  run(engine, clock, 3, feed);
+  const other = x === m ? d : m, theirs = other.node.map.length;
+  const w = watch(engine, clock, x, 32, { onTick: feed });
+  assert.ok(x.ts.posAt(clock.t) > 28, `played to input ${x.ts.posAt(clock.t).toFixed(1)} s, past the change`);
+  assert.deepEqual(w.jumps.map((j) => `${(j.by * 1000).toFixed(1)} ms at input ${j.at.toFixed(2)} s`), [], `${who} playhead jumps`);
+  const gaps = x.grids.segs.filter((s) => s.shift).map((s) => `${(s.shift * 1000).toFixed(1)} ms at ${s.from.toFixed(2)} s`);
+  assert.deepEqual(gaps, [], 'capture gaps on its grid');
+  const tj = [];
+  for (let i = Math.max(1, theirs); i < other.node.map.length; i++) {
+    const a = other.node.map[i - 1], b = other.node.map[i], at = a.input + a.rate * (b.output - a.output);
+    if (a.active && b.active !== false && Math.abs(b.input - at) > 1e-4) tj.push(b);
+  }
+  assert.deepEqual(tj, [], 'the other deck\'s playhead jumps');
+}
+
 for (const [who, b0, b1, ramp] of [['follower', 124, 125, 0], ['follower', 120, 118, 2], ['master', 124, 125, 0], ['master', 128, 126.5, 2]]) {
   test(`a real tempo change of ${b0} to ${b1} BPM${ramp ? ` over ${ramp} s` : ''} in a ${who}'s live source: no playhead jump on it or its ${who === 'master' ? 'follower' : 'master'}`, async () => {
-    const clock = { t: 100 }, engine = makeEngine(clock);
-    engine.params['assist.on'] = false;
-    const m = makeDeck(engine, clock, { id: 1, slot: 1, bpm: 128, liveEdge: 600, capSec: 1e7 });
-    const d = makeDeck(engine, clock, { id: 2, slot: 2, bpm: 124, t0: 0.11, liveEdge: 600, capSec: 1e7 });
-    const x = who === 'master' ? m : d, feed = tracks(x, kicks(b0, b1, ramp));
-    run(engine, clock, 9, feed); // the playhead plays from the start of the capture, seconds behind its live edge
-    assert.equal(x.tempo.get().state, 'LOCKED');
-    await m.act('play');
-    engine.clock.follow(1);
-    run(engine, clock, 1, feed);
-    assert.deepEqual(await d.act('syncPlay'), { ok: true });
-    run(engine, clock, 3, feed);
-    const other = x === m ? d : m, theirs = other.node.map.length;
-    const w = watch(engine, clock, x, 32, { onTick: feed });
-    assert.ok(x.ts.posAt(clock.t) > 24 + ramp, `played to input ${x.ts.posAt(clock.t).toFixed(1)} s, past the change`);
-    assert.deepEqual(w.jumps.map((j) => `${(j.by * 1000).toFixed(1)} ms at input ${j.at.toFixed(2)} s`), [], `${who} playhead jumps`);
-    const gaps = x.grids.segs.filter((s) => s.shift).map((s) => `${(s.shift * 1000).toFixed(1)} ms at ${s.from.toFixed(2)} s`);
-    assert.deepEqual(gaps, [], 'capture gaps on its grid');
-    const tj = [];
-    for (let i = Math.max(1, theirs); i < other.node.map.length; i++) {
-      const a = other.node.map[i - 1], b = other.node.map[i], at = a.input + a.rate * (b.output - a.output);
-      if (a.active && b.active !== false && Math.abs(b.input - at) > 1e-4) tj.push(b);
-    }
-    assert.deepEqual(tj, [], 'the other deck\'s playhead jumps');
+    await noJumps(who, kicks(b0, b1, ramp));
   });
 }
+
+// The tempo ridden away for a couple of seconds and back (a DJ stream's pitch ride), or wobbling (a band): the beats
+// move along a ramp of four or five, which a capture step over two beats fit well enough.
+for (const [who, b0, pct] of [['follower', 124, 1], ['follower', 124, -2], ['master', 128, -1], ['master', 128, 2]]) {
+  test(`a ${who}'s live source ridden ${pct > 0 ? '+' : ''}${pct} % for 2 s and back: no playhead jump on it or its ${who === 'master' ? 'follower' : 'master'}`, async () => {
+    await noJumps(who, kicksAt((t) => (t >= 20 && t < 22 ? b0 * (1 + pct / 100) : b0)));
+  });
+}
+
+test('a follower\'s live source wobbling ±0.6 % every 8 s: no playhead jump on it or its master', async () => {
+  await noJumps('follower', kicksAt((t) => (t < 12 ? 124 : 124 * (1 + 0.006 * Math.sin((2 * Math.PI * (t - 12)) / 8)))));
+});
 
 // The newer grid of a gap is the tracker's live clock until a later gap is found, and the live clock follows the beats
 // at the live edge, seconds past the gap: through a later gap it has not found yet, which it then partly takes in. Seen
@@ -421,4 +462,151 @@ test('a capture gap found 6 s late, the clock\'s period then 0.2 % short (one ru
     assert.ok(j && Math.abs(j.by * 1000 - ms) <= 2, `the capture stepped ${ms} ms at ${at} s; jumped ${got}`);
   }
   assert.equal(w.jumps.length, 5, got);
+});
+
+// A follower's jump over a gap takes off the few ms it sat off the beat, measured against the grid kept before the gap
+// (offBefore). That grid was the clock as the live edge passed the gap: soon after the gap before it was found, that
+// gap's re-phase by the step found there. A step found 4 ms off left the follower 4 ms off its audio's beat with its grid
+// saying 0, and it jumped the next gap by the step alone: 4 ms off for good, with nothing to bend it back inside the
+// phase loop's deadband. Measured here against the audio's own beats, not the deck's grids.
+test('a follower through two gaps, the first found 4 ms off: at the second it jumps back onto its audio\'s beat', async () => {
+  const clock = { t: 100 }, engine = makeEngine(clock), T = 60 / 128;
+  engine.params['assist.on'] = false;
+  const m = makeDeck(engine, clock, { id: 1, slot: 1, bpm: 124, liveEdge: 600, capSec: 1e7 });
+  const d = makeDeck(engine, clock, { id: 2, slot: 2, bpm: 128, liveEdge: 600, capSec: 1e7 });
+  const drops = [{ ms: 12, at: 15.1 }, { ms: 15, at: 17.4 }], feed = tracks(d, clicks(40, drops));
+  // the gap search reads the beats after the first gap 4 ms later than they are, until it is found
+  const offsets = d.tempo.beatOffsets.bind(d.tempo);
+  d.tempo.beatOffsets = (from) => offsets(from).map((b) => (!d.tempo.track.jump && b.beat > 15.1 * 48000 ? { beat: b.beat, r: b.r + 0.004 * 48000 } : b));
+  // where the audio's beats are in the capture (input s), and the follower's heard beat against the master's clock (ms)
+  const beats = [];
+  for (let k = 0; k * T < 40; k++) beats.push(k * T - drops.filter((g) => g.at < k * T).reduce((s, g) => s + g.ms / 1000, 0));
+  const heardErr = (t) => {
+    const p = d.node.posAt(t), seg = d.node.segAt(t), mb = engine.clock.beat(t);
+    if (!seg.active || !(seg.rate > 0) || !mb) return null;
+    let b = 0;
+    while (b + 1 < beats.length && beats[b + 1] <= p) b++;
+    return phaseError(t - (p - beats[b]) / seg.rate, T / seg.rate, mb.lastBeat, mb.period) * 1000;
+  };
+  await m.act('play');
+  engine.clock.follow(1);
+  run(engine, clock, 8, feed); // the follower's playhead will be 8 s behind its live edge: each gap is found before it gets there
+  assert.deepEqual(await d.act('syncPlay'), { ok: true });
+  const errs = [];
+  const w = watch(engine, clock, d, 22, { onTick: (t) => { feed(t); const p = d.node.posAt(t), e = heardErr(t); if (e != null) errs.push({ p, e }); } });
+  assert.ok(d.ts.posAt(clock.t) > 19, `played to input ${d.ts.posAt(clock.t).toFixed(1)} s, past both gaps`);
+  const got = w.jumps.map((j) => `${(j.by * 1000).toFixed(1)} ms at input ${j.at.toFixed(2)} s`).join(', ');
+  assert.equal(w.jumps.length, 2, got);
+  const med = (xs) => xs.map((x) => x.e).sort((a, b) => a - b)[xs.length >> 1];
+  const before = med(errs.filter((x) => x.p > 11 && x.p < 14.5)), between = med(errs.filter((x) => x.p > 15.6 && x.p < 16.9));
+  const after = med(errs.filter((x) => x.p > 18 && x.p < 19));
+  assert.ok(Math.abs(Math.abs(between - before) - 3.5) < 1.5, `${(between - before).toFixed(1)} ms off its beat between the gaps (the first jumped 4 ms short); jumped ${got}`);
+  assert.ok(Math.abs(after - before) < 1, `${(after - before).toFixed(1)} ms off its beat after the second gap; jumped ${got}`);
+  assert.ok(w.bend < 0.002, `bent ${(w.bend * 100).toFixed(2)} %`);
+});
+
+// The grid at a playhead seconds behind the live edge is the tracker's live clock until a later gap is found, and the
+// live clock follows the beats at the live edge: through a later gap not found yet, which it takes in. A master
+// publishes its clock from the grid at its playhead, so its clock moved off its own audio's beat by that much, and its
+// followers bent after it (seen in the live-sync acceptance; here a master's capture whose gap was found 6 s late).
+
+test('a master whose live clock takes in a gap not found yet (one run\'s capture): its clock stays on its audio\'s beat, and its follower never bends', async () => {
+  const c = JSON.parse(fs.readFileSync(new URL('./fixtures/live-late-gap-capture.json', import.meta.url), 'utf8'));
+  const clock = { t: 100 }, engine = makeEngine(clock), T = 60 / 128, on = captureOnsets(c, 'full', T);
+  engine.params['assist.on'] = false;
+  const m = makeDeck(engine, clock, { id: 1, slot: 1, bpm: 128, liveEdge: 600, capSec: 1e7 });
+  const d = makeDeck(engine, clock, { id: 2, slot: 2, bpm: 124, t0: 0.11, liveEdge: 600, capSec: 1e7 });
+  const feed = replays(m, c);
+  run(engine, clock, 8, feed); // the playhead 8 s behind its live edge: the 49.9 s gap is found as it reaches 48 s
+  await m.act('play');
+  engine.clock.follow(1);
+  run(engine, clock, 2, feed);
+  assert.deepEqual(await d.act('syncPlay'), { ok: true });
+  // The master's audio beat (its last onset played since its last change of segment) against its published clock, and
+  // the follower's bends, up to 47 s (its capture's own -7 ms step at 47.13 s was never found: its audio is off every
+  // grid after it, and the follower follows it there by the phase loop).
+  const offs = [];
+  let bend = 0;
+  watch(engine, clock, d, 50, { onTick: (t) => {
+    feed(t);
+    const p = m.node.posAt(t), seg = m.node.segAt(t), mb = engine.clock.beat(t);
+    if (p < 47) bend = Math.max(bend, bendOf(d, t));
+    if (!seg.active || !(seg.rate > 0) || !mb) return;
+    let b = 0;
+    while (b + 1 < on.length && on[b + 1] <= p) b++;
+    if (on[b] >= seg.input) offs.push({ p, e: phaseError(t - (p - on[b]) / seg.rate, T / seg.rate, mb.lastBeat, mb.period) * 1000 });
+  } });
+  assert.ok(m.ts.posAt(clock.t) > 51, `played to input ${m.ts.posAt(clock.t).toFixed(1)} s, past the gap found late`);
+  const es = offs.map((o) => o.e).sort((a, b) => a - b), base = es[es.length >> 1];
+  const off = offs.filter((o) => o.p > 10 && o.p < 47 && Math.abs(o.e - base) > 3).map((o) => `${(o.e - base).toFixed(1)} ms at ${o.p.toFixed(2)} s`);
+  assert.deepEqual(off.filter((x, i) => i % 10 === 0), [], `the master's clock off its audio's beat by over 3 ms ${off.length} times`);
+  assert.ok(bend < 0.002, `the follower bent ${(bend * 100).toFixed(2)} %`);
+});
+
+test('a follower whose live grid takes in a gap of its own not found yet (the same capture): it stays on the master\'s beat, unbent', async () => {
+  // The follower's phase loop measured its beat on that grid too: an error that was not in its audio, bent away 1.4 %.
+  const c = JSON.parse(fs.readFileSync(new URL('./fixtures/live-late-gap-capture.json', import.meta.url), 'utf8'));
+  const clock = { t: 100 }, engine = makeEngine(clock), T = 60 / 128, on = captureOnsets(c, 'full', T);
+  engine.params['assist.on'] = false;
+  const m = makeDeck(engine, clock, { id: 1, slot: 1, bpm: 124, liveEdge: 600, capSec: 1e7 });
+  const d = makeDeck(engine, clock, { id: 2, slot: 2, bpm: 128, liveEdge: 600, capSec: 1e7 });
+  const feed = replays(d, c);
+  await m.act('play');
+  engine.clock.follow(1);
+  run(engine, clock, 8, feed); // the follower's playhead will be 8 s behind its live edge
+  assert.deepEqual(await d.act('syncPlay'), { ok: true });
+  // The follower's audio beat (its last onset played since its last change of segment) against the master's clock, and
+  // its bends, up to 47 s (its capture's own -7 ms step at 47.13 s was never found).
+  const offs = [];
+  let bend = 0;
+  run(engine, clock, 50, (t) => {
+    feed(t);
+    const p = d.node.posAt(t), seg = d.node.segAt(t), mb = engine.clock.beat(t);
+    if (p < 47) bend = Math.max(bend, bendOf(d, t));
+    if (!seg.active || !(seg.rate > 0) || !mb) return;
+    let b = 0;
+    while (b + 1 < on.length && on[b + 1] <= p) b++;
+    if (on[b] >= seg.input) offs.push({ p, e: phaseError(t - (p - on[b]) / seg.rate, T / seg.rate, mb.lastBeat, mb.period) * 1000 });
+  });
+  assert.ok(d.ts.posAt(clock.t) > 47, `played to input ${d.ts.posAt(clock.t).toFixed(1)} s`);
+  const es = offs.filter((o) => o.p > 10).map((o) => o.e).sort((a, b) => a - b), base = es[es.length >> 1];
+  const off = offs.filter((o) => o.p > 10 && o.p < 47 && Math.abs(o.e - base) > 4).map((o) => `${(o.e - base).toFixed(1)} ms at ${o.p.toFixed(2)} s`);
+  assert.deepEqual(off.filter((x, i) => i % 10 === 0), [], `the follower's audio off the master's beat by over 4 ms ${off.length} times`);
+  assert.ok(bend < 0.002, `the follower bent ${(bend * 100).toFixed(2)} %`);
+});
+
+test('a follower through a burst of capture gaps (one run\'s capture): put back on the master\'s beat at once, then left unbent', async () => {
+  // The burst's steps (-51 ms over two beats) were jumped but for 10 ms, played as they came. The clocks the tracker
+  // remembered as the live edge passed that audio had not taken those 10 ms in yet: a follower measuring its beat
+  // against them read itself on the beat for 5 s with its audio 7-9 ms off the master's, then, as the clocks caught
+  // up, 9 ms off, and bent 2.2 % there, seconds from any capture trouble (a live-sync run's failure). The fine fit's own
+  // beats, each its onset, say where its audio's beats are.
+  const c = JSON.parse(fs.readFileSync(new URL('./fixtures/live-burst-recover-capture.json', import.meta.url), 'utf8'));
+  const clock = { t: 100 }, engine = makeEngine(clock), T = 60 / 124, on = captureOnsets(c, 'low', T);
+  engine.params['assist.on'] = false;
+  const m = makeDeck(engine, clock, { id: 1, slot: 1, bpm: 128, liveEdge: 600, capSec: 1e7 });
+  const d = makeDeck(engine, clock, { id: 2, slot: 2, bpm: 124, liveEdge: 600, capSec: 1e7 });
+  const feed = replays(d, c);
+  await m.act('play');
+  engine.clock.follow(1);
+  run(engine, clock, 6, feed); // the follower's playhead will be 6 s behind its live edge
+  assert.deepEqual(await d.act('syncPlay'), { ok: true });
+  // Its audio's beat (its last onset played since its last change of segment) against the master's clock, and its bends.
+  const offs = [];
+  let bend = 0, at = null;
+  run(engine, clock, 53.5, (t) => {
+    feed(t);
+    const p = d.node.posAt(t), seg = d.node.segAt(t), mb = engine.clock.beat(t);
+    if (p > 50 && bendOf(d, t) > bend) { bend = bendOf(d, t); at = p; }
+    if (!seg.active || !(seg.rate > 0) || !mb) return;
+    let b = 0;
+    while (b + 1 < on.length && on[b + 1] <= p) b++;
+    if (on[b] >= seg.input) offs.push({ p, e: phaseError(t - (p - on[b]) / seg.rate, T / seg.rate, mb.lastBeat, mb.period) * 1000 });
+  });
+  assert.ok(d.ts.posAt(clock.t) > 53.5, `played to input ${d.ts.posAt(clock.t).toFixed(1)} s`);
+  // (These onsets sit up to 2.5 ms either side of a steady grid, as the beats fall between the analysis frames.)
+  const P = (T * 1000 * 124) / 128, wrap = (x) => x - Math.round(x / P) * P, ref = offs.find((o) => o.p > 37).e;
+  const off = offs.filter((o) => o.p > 50 && Math.abs(wrap(o.e - ref)) > 4).map((o) => `${wrap(o.e - ref).toFixed(1)} ms at ${o.p.toFixed(2)} s`);
+  assert.deepEqual(off.filter((x, i) => i % 10 === 0), [], `its audio off the master's beat as before the burst by over 4 ms ${off.length} times`);
+  assert.ok(bend < 0.002, `the follower bent ${(bend * 100).toFixed(2)} % at input ${at && at.toFixed(2)} s`);
 });
