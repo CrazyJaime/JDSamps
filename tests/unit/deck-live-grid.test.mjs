@@ -218,3 +218,105 @@ for (const [name, audio, beats] of [['a kick-only loop', () => clicks(70, 124), 
     assert.ok(over.length <= beats, `${over.length} of ${offs.length} ticks over 5 ms off its beat: ${over.filter((o, i) => i % 20 === 0).map((o) => `${(o.e - b0).toFixed(1)} ms at ${o.p.toFixed(2)} s`).join(', ')}`);
   });
 }
+
+// ½× makes the grid coarser: of a double-time clock's beats it keeps every other one. The clocks the tracker remembered
+// as the live edge passed the audio still to be played each had the latest beat at the live edge for their anchor, so
+// half of them, rescaled, sat half a beat off: a master published its beat that far off its audio for seconds, and a
+// follower bent 4 % for 14 s after it. The audio the live edge passed before the press takes its grid map's beat; so
+// does a BPM range that folds the tempo to half, and the tracker's own re-read at half the tempo.
+
+test('½× on a live master that locked an 88 BPM loop at 176: its published clock stays on its audio\'s beats', async () => {
+  const clock = { t: 100 }, engine = makeEngine(clock), s = synth({ ...PATTERNS.techno, bpm: 88, bars: 20, tail: 0, seed: 11 }), T = s.beatSec;
+  engine.params['assist.on'] = false;
+  const m = makeDeck(engine, clock, { id: 1, slot: 1, bpm: 124, liveEdge: 600, capSec: 1e7 });
+  const feed = tracks(m, s.x);
+  run(engine, clock, 8, feed); // the playhead 8 s behind its live edge
+  await m.act('play');
+  engine.clock.follow(1);
+  run(engine, clock, 14, feed);
+  assert.ok(Math.abs(m.tempo.get().inBpm - 176) < 1, `locked at ${m.tempo.get().inBpm.toFixed(1)} BPM`);
+  assert.deepEqual(await m.act('mult', { factor: 0.5 }), { ok: true });
+  run(engine, clock, 1, feed);
+  const offs = published(engine, clock, m, T, 11, feed), over = offs.filter((o) => Math.abs(o.e) > 12);
+  assert.ok(Math.abs(m.tempo.get().inBpm - 88) < 1, `${m.tempo.get().inBpm.toFixed(1)} BPM after ½×`);
+  assert.ok(over.length === 0, `${over.length} of ${offs.length} ticks over 12 ms off its beat: ${over.filter((o, i) => i % 10 === 0).map((o) => `${o.e.toFixed(1)} ms at ${o.p.toFixed(2)} s`).join(', ')}`);
+});
+
+test('a BPM range that folds a live master\'s 176 to 88 (an 88 BPM loop): its published clock stays on its audio\'s beats', async () => {
+  const clock = { t: 100 }, engine = makeEngine(clock), s = synth({ ...PATTERNS.techno, bpm: 88, bars: 20, tail: 0, seed: 11 }), T = s.beatSec;
+  engine.params['assist.on'] = false;
+  const m = makeDeck(engine, clock, { id: 1, slot: 1, bpm: 124, liveEdge: 600, capSec: 1e7 });
+  const feed = tracks(m, s.x);
+  run(engine, clock, 8, feed);
+  await m.act('play');
+  engine.clock.follow(1);
+  run(engine, clock, 14, feed);
+  assert.ok(Math.abs(m.tempo.get().inBpm - 176) < 1, `locked at ${m.tempo.get().inBpm.toFixed(1)} BPM`);
+  engine.params['bpm.range'] = '55-115';
+  m.setRange(55, 115);
+  run(engine, clock, 1, feed);
+  const offs = published(engine, clock, m, T, 11, feed), over = offs.filter((o) => Math.abs(o.e) > 12);
+  assert.ok(Math.abs(m.tempo.get().inBpm - 88) < 1, `${m.tempo.get().inBpm.toFixed(1)} BPM in the range 55-115`);
+  assert.ok(over.length === 0, `${over.length} of ${offs.length} ticks over 12 ms off its beat: ${over.filter((o, i) => i % 10 === 0).map((o) => `${o.e.toFixed(1)} ms at ${o.p.toFixed(2)} s`).join(', ')}`);
+});
+
+test('the tracker re-reads the beats at half the tempo: no clock remembered before is the heard grid; at double, they still are', () => {
+  const clock = { t: 100 }, engine = makeEngine(clock);
+  engine.params['assist.on'] = false;
+  const m = makeDeck(engine, clock, { id: 1, slot: 1, bpm: 124, liveEdge: 600, capSec: 1e7 });
+  const feed = tracks(m, clicks(40, 128));
+  run(engine, clock, 14, feed);
+  const t = m.tempo, at = Math.round((m.ts.liveEdge - 6) * FS), was = t.heardGrid(at, 0);
+  assert.ok(was, 'a clock remembered 6 s back');
+  t.reread(2); // (every beat of the grid before is one of the finer grid's)
+  assert.ok(Math.abs(t.heardGrid(at, 0).T - was.T / 2) < 1e-9, 'at double, the clock remembered there at half its period');
+  t.reread(0.5);
+  assert.equal(t.heardGrid(at, 0), null);
+  run(engine, clock, 2, feed);
+  assert.ok(t.heardGrid(Math.round((m.ts.liveEdge - 0.6) * FS), 0), 'a clock remembered since');
+});
+
+for (const hold of [4, 10]) {
+  test(`2× held ${hold} s on a live master playing a house loop, then ½×: its published clock stays on its audio's beats`, async () => {
+    const clock = { t: 100 }, engine = makeEngine(clock), s = synth({ ...PATTERNS.house, bpm: 128, bars: 36, tail: 0, seed: 11 }), T = s.beatSec;
+    engine.params['assist.on'] = false;
+    const m = makeDeck(engine, clock, { id: 1, slot: 1, bpm: 124, liveEdge: 600, capSec: 1e7 });
+    const feed = tracks(m, s.x);
+    run(engine, clock, 8, feed);
+    await m.act('play');
+    engine.clock.follow(1);
+    run(engine, clock, 10, feed);
+    assert.deepEqual(await m.act('mult', { factor: 2 }), { ok: true });
+    run(engine, clock, hold, feed);
+    assert.deepEqual(await m.act('mult', { factor: 0.5 }), { ok: true });
+    run(engine, clock, 1, feed);
+    const offs = published(engine, clock, m, T, 15, feed), over = offs.filter((o) => Math.abs(o.e) > 12);
+    assert.ok(over.length === 0, `${over.length} of ${offs.length} ticks over 12 ms off its beat: ${over.filter((o, i) => i % 10 === 0).map((o) => `${o.e.toFixed(1)} ms at ${o.p.toFixed(2)} s`).join(', ')}`);
+  });
+}
+
+test('2× held 4 s on a live BEAT follower playing a house loop, then ½×: its audio stays on the master\'s beat', async () => {
+  const clock = { t: 100 }, engine = makeEngine(clock), s = synth({ ...PATTERNS.house, bpm: 128, bars: 50, tail: 0, seed: 11 }), T = s.beatSec;
+  engine.params['assist.on'] = false;
+  const m = makeDeck(engine, clock, { id: 1, slot: 1, bpm: 124, liveEdge: 600, capSec: 1e7 });
+  const d = makeDeck(engine, clock, { id: 2, slot: 2, bpm: 128, liveEdge: 600, capSec: 1e7 });
+  const feed = tracks(d, s.x);
+  await m.act('play');
+  engine.clock.follow(1);
+  run(engine, clock, 8, feed); // the follower's playhead will be 8 s behind its live edge
+  assert.deepEqual(await d.act('syncPlay'), { ok: true });
+  run(engine, clock, 10, feed);
+  assert.deepEqual(await d.act('mult', { factor: 2 }), { ok: true });
+  run(engine, clock, 4, feed);
+  assert.deepEqual(await d.act('mult', { factor: 0.5 }), { ok: true });
+  const wins = [];
+  let bent = 0;
+  for (let k = 0; k < 10; k++) wins.push(offClock(engine, clock, d, every(T, 100), 2, (t) => {
+    feed(t);
+    const seg = d.node.segAt(t);
+    if (seg.active && Math.abs(seg.rate / ((1 + d.params.pitch) * d.nudgeFactor) - 1) > 0.01) bent += 1536 / 48000;
+  }));
+  // (Base: its audio within 9 ms of the master's beat in every 2 s, a bend at each press.)
+  assert.ok(wins.every((e) => Math.abs(e) < 15), `its audio off the master's beat (median per 2 s): ${wins.map((e) => e.toFixed(1)).join(' ')} ms`);
+  assert.ok(bent < 4, `bent over 1 % for ${bent.toFixed(1)} s`);
+});

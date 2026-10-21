@@ -664,6 +664,9 @@ export class DeckTempo {
     this.track = { n: this.track ? this.track.n + 1 : 0, from: this.tracker.lastT / this.sr, prev: null, jump: null };
     this.hist = []; // recent beat-clock states {t, t0, T} (input frames), oldest first; fine: T was the fine fit's
     this.clockFine = false; // the clock's period is the fine fit's
+    // Input frame of the last rescale that made the grid coarser (½×, a re-read at half the tempo): the clocks remembered
+    // before it kept their anchor, any beat of the finer grid, so half of them sit on a beat the coarser grid drops.
+    this.coarseFrom = -Infinity;
     // Whether the grid was worth phase-locking to as the live edge passed each input frame, as
     // {t, ok} runs, so the deck can ask about the audio under the playhead and not the live edge.
     this.vouch = [];
@@ -690,6 +693,7 @@ export class DeckTempo {
       const T = this.clock.T;
       if (T && Math.abs(this.gridOffset) > T / 2) this.gridOffset -= Math.round(this.gridOffset / T) * T;
       for (const h of this.hist) h.T /= f;
+      if (f < 1) this.coarseFrom = tr.lastT;
       this.jumpsFrom(tr.lastT);
     }
     this.snap = { ...this.snap, bpm: tr.bestBpm(), coarse: tr.bpm };
@@ -712,13 +716,14 @@ export class DeckTempo {
   }
 
   /**
-   * The beat clock {t0, T} (input s) as the live edge passed input frame `at`, when that was at frame `from` or later,
-   * else null: the grid of the audio there before any later capture gap pulled the clock.
+   * The beat clock {t0, T} (input s) as the live edge passed input frame `at`, when that was at frame `from` or later
+   * and since the grid last got coarser, else null: the grid of the audio there before any later capture gap pulled the
+   * clock.
    */
   heardGrid(at, from) {
     let h = null;
     for (const e of this.hist) { if (e.t <= at) h = e; else break; }
-    return h && h.t >= from ? { t0: h.t0 / this.sr, T: h.T / this.sr } : null;
+    return h && h.t >= from && h.t > this.coarseFrom ? { t0: h.t0 / this.sr, T: h.T / this.sr } : null;
   }
 
   /**
@@ -856,6 +861,7 @@ export class DeckTempo {
       this.clock.miss = 0;
     }
     for (const h of this.hist) h.T /= f;
+    if (f < 1) this.coarseFrom = this.tracker.lastT;
     this.jumpsFrom(this.tracker.lastT);
   }
 
@@ -1020,6 +1026,7 @@ export class DeckTempo {
     }
     this.tracker.resetFine();
     for (const h of this.hist) h.T /= factor;
+    if (factor < 1) this.coarseFrom = this.tracker.lastT;
     this.jumpsFrom(this.tracker.lastT);
     return true;
   }
